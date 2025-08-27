@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.ini
+*.json
+
+# Project-specific cache/data
+data/
+polygon_api_option_data/
+monthly_backtest_data/
+backtest_debug.log
