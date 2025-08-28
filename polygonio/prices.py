@@ -1,28 +1,17 @@
+# polygonio/prices.py
 from __future__ import annotations
+
+import os
 import time
-from datetime import date, datetime, timedelta
-from typing import Union
+from datetime import datetime, timedelta, date
+from typing import Union, Optional, List
 
 import pandas as pd
 import requests
 
-from .config import get_settings
-from .paths import (
-    get_yf_price_cache_file,
-    get_polygon_price_cache_file,
-    ensure_dir,
-)
 from .symbols import to_vendor_ticker
-
-
-# ---------------------------------------------------------
-# Yahoo Finance (chart API) — daily or 1m
-# ---------------------------------------------------------
-
-def _to_naive_dt(dt_like: Union[date, datetime]) -> datetime:
-    if isinstance(dt_like, date) and not isinstance(dt_like, datetime):
-        return datetime.combine(dt_like, datetime.min.time())
-    return dt_like  # assume naive
+from .paths import yf_price_cache_file, polygon_price_cache_file
+from .config import get_settings
 
 
 def fetch_yfinance_data(
@@ -33,31 +22,45 @@ def fetch_yfinance_data(
     interval: str = "1d",
     auto_adjust: bool = False,
 ) -> pd.DataFrame:
-    """Download close data from Yahoo Finance and return DataFrame with 'date' and 'close'.
+    """
+    Download close data from Yahoo Finance and return a DataFrame with 'date' and 'close' columns.
 
     Parameters
     ----------
     ticker : str
-        The stock ticker symbol.
+        Vendor-normalized Yahoo symbol (e.g., BRK-B, ^VIX).
     start_date, end_date : date | datetime
-        Range of data to fetch (inclusive for start; end treated exclusive by API so we +1d).
+        The date range for the data (inclusive).
     interval : {"1d", "1m"}
-        Data interval.
+        The data interval ('1d' for daily, '1m' for 1-minute).
     auto_adjust : bool
         Whether to auto-adjust prices.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['date', 'close']
     """
     if interval not in {"1d", "1m"}:
         raise ValueError("interval must be '1d' or '1m'")
 
-    yf_ticker = to_vendor_ticker(ticker, vendor="yfinance")
+    def _to_naive_dt(dt: Union[date, datetime]) -> datetime:
+        if isinstance(dt, date) and not isinstance(dt, datetime):
+            return datetime.combine(dt, datetime.min.time())
+        return dt
+
     start_dt = _to_naive_dt(start_date)
     end_dt = _to_naive_dt(end_date)
 
+    # For intraday, extend end_dt to now if start == end
+    if interval == "1m" and start_dt.date() == end_dt.date():
+        end_dt = datetime.now()
+
     # Yahoo's chart API treats period2 as exclusive
     if interval == "1d":
-        end_dt = end_dt + timedelta(days=1)
-    else:
-        end_dt = end_dt + timedelta(seconds=60)
+        end_dt += timedelta(days=1)
+    else:  # "1m"
+        end_dt += timedelta(seconds=60)
 
     session = requests.Session()
     session.headers.update(
@@ -68,7 +71,7 @@ def fetch_yfinance_data(
     )
 
     url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_ticker}"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         f"?period1={int(start_dt.timestamp())}"
         f"&period2={int(end_dt.timestamp())}"
         f"&interval={interval}"
@@ -76,7 +79,7 @@ def fetch_yfinance_data(
         f"&adjusted={str(auto_adjust).lower()}"
     )
 
-    resp = session.get(url, timeout=10)
+    resp = session.get(url, timeout=15)
     resp.raise_for_status()
     payload = resp.json()
 
@@ -96,159 +99,148 @@ def fetch_yfinance_data(
     return df[["date", "close"]]
 
 
-# ---------------------------------------------------------
-# Unified price fetcher with CSV caching (Yahoo or Polygon)
-# ---------------------------------------------------------
-
 def get_historical_prices(
     ticker: str,
     start_date: str,
     end_date: str,
-    *,
     vol_lookback: int = 5,
     data_source: str = "yfinance",
 ) -> pd.DataFrame:
-    """Fetch historical prices and compute returns/vol/MA, with CSV caching.
-
-    Behavior matches legacy script:
-    - Per-source CSV caches
-    - Weekend rollover for "today" and effective_end semantics
-    - Polygon pulled in ≤500-bar chunks
     """
-    s = get_settings()  # currently unused, kept for future knobs
+    Fetch historical prices using either Yahoo Finance (yfinance) or Polygon.io and
+    return a DataFrame with calculated metrics.
 
-    # Caching setup
+    Returns columns:
+      ['date', 'close', 'returns', 'vol_20', 'MA', 'ticker']
+    """
+
+    # --- Cache file selection (via helpers) ---
     if data_source == "yfinance":
-        yf_ticker = to_vendor_ticker(ticker, vendor="yfinance")
-        cache_file = get_yf_price_cache_file(yf_ticker)
+        yf_ticker = to_vendor_ticker(ticker, "yfinance")
+        cache_file = yf_price_cache_file(yf_ticker)
     elif data_source == "polygon":
-        cache_file = get_polygon_price_cache_file(ticker)
+        cache_file = polygon_price_cache_file(ticker)
     else:
         raise ValueError("Invalid data_source. Choose 'yfinance' or 'polygon'.")
 
-    ensure_dir(cache_file.parent)
-
-    # Parse requested range
+    # --- Date parsing & effective end (weekend guard) ---
     today = date.today()
     requested_start = datetime.strptime(start_date, "%Y-%m-%d").date()
     requested_end = datetime.strptime(end_date, "%Y-%m-%d").date()
 
-    # Define last weekday (if weekend, roll back to last Friday)
-    if today.weekday() >= 5:  # Sat=5, Sun=6
+    # If today is weekend, roll back to last Friday
+    if today.weekday() >= 5:  # 5=Sat, 6=Sun
         last_weekday = today - timedelta(days=(today.weekday() - 4))
     else:
         last_weekday = today
 
-    # If requested end is weekend, cap at last_weekday
+    # If end date is weekend, treat as last_weekday
     effective_end = min(requested_end, last_weekday)
 
-    # Try loading cache if it sufficiently covers the requested range
+    # --- Try to use cache if it covers the window ---
     use_cache = False
-    if cache_file.exists():
+    if os.path.exists(cache_file):
+        file_mod_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         try:
-            file_mod_date = date.fromtimestamp(cache_file.stat().st_mtime)
-            cached_df = pd.read_csv(cache_file, parse_dates=["date"])  # 'date' as Timestamp
-            cached_start = cached_df["date"].min().date()
-            cached_end = cached_df["date"].max().date()
-            days_gap = (cached_start - requested_start).days
+            cached_df = pd.read_csv(cache_file, parse_dates=["date"])
+            cached_start = cached_df["date"].min().date() if not cached_df.empty else None
+            cached_end = cached_df["date"].max().date() if not cached_df.empty else None
 
-            use_cache = (
-                days_gap <= 7
-                and cached_end >= effective_end
-                and (file_mod_date >= last_weekday or requested_end < last_weekday)
-            )
-        except Exception as e:
-            print(f"Warning: cache read error for {ticker}: {e}")
+            if cached_start and cached_end:
+                days_gap = (cached_start - requested_start).days
+                use_cache = (
+                    days_gap <= 7
+                    and cached_end >= effective_end
+                    and (file_mod_date >= last_weekday or requested_end < last_weekday)
+                )
+        except Exception:
             use_cache = False
 
-    df: pd.DataFrame | None = None
-
+    df: Optional[pd.DataFrame] = None
     if use_cache:
         try:
-            cached_df = pd.read_csv(cache_file, parse_dates=["date"])  # 'date' as Timestamp
-            mask = (
+            cached_df = pd.read_csv(cache_file, parse_dates=["date"])
+            df = cached_df.loc[
                 (cached_df["date"].dt.date >= requested_start)
                 & (cached_df["date"].dt.date <= requested_end)
-            )
-            df = cached_df.loc[mask].copy()
-        except Exception as e:
-            print(f"Warning: cache processing error for {ticker}: {e}")
+            ].copy()
+        except Exception:
             df = None
+            use_cache = False
 
-    # Fetch fresh data if cache is unusable
-    if df is None or df.empty:
+    # --- Fetch if cache is unusable ---
+    if not use_cache or df is None or df.empty:
         if data_source == "yfinance":
-            print(f"Fetching price data from yfinance for {ticker}")
-            fetched = fetch_yfinance_data(
-                ticker,
-                datetime.combine(requested_start, datetime.min.time()),
-                datetime.combine(requested_end, datetime.min.time()),
+            # Fetch from Yahoo; save to cache
+            df = fetch_yfinance_data(
+                to_vendor_ticker(ticker, "yfinance"),
+                requested_start,
+                requested_end,
+                interval="1d",
+                auto_adjust=False,
             )
-            fetched.to_csv(cache_file, index=False)
-            df = fetched
+            # Ensure parent directory exists (helpers did it, but guard again)
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            df.to_csv(cache_file, index=False)
 
         elif data_source == "polygon":
-            # Polygon aggregates endpoint with ≤500-bar chunks
-            from .config import get_settings  # local import to avoid cycles
-            api_key = get_settings().polygon_api_key
+            # Chunked Polygon fetch (<= 500 bars per call)
+            s = get_settings()  # only used here for API key
+            api_key = s.polygon_api_key
             max_bars = 500
             chunk_start = requested_start
-            all_chunks: list[pd.DataFrame] = []
+            chunks: List[pd.DataFrame] = []
 
             while chunk_start <= requested_end:
                 chunk_end = min(requested_end, chunk_start + timedelta(days=max_bars - 1))
                 s_str = chunk_start.strftime("%Y-%m-%d")
                 e_str = chunk_end.strftime("%Y-%m-%d")
+
                 url = (
                     f"https://api.polygon.io/v2/aggs/ticker/{ticker}"
                     f"/range/1/day/{s_str}/{e_str}"
                     f"?adjusted=false&sort=asc&limit={max_bars}&apiKey={api_key}"
                 )
 
-                print(f"Fetching Polygon data for {ticker}: {s_str} → {e_str}")
                 try:
-                    resp = requests.get(url, timeout=15)
+                    resp = requests.get(url, timeout=20)
                     resp.raise_for_status()
                     data = resp.json()
                     if "results" in data and data["results"]:
-                        tmp = pd.DataFrame(data["results"])  # expects 't' (ms ts) and 'c' (close)
-                        tmp["date"] = pd.to_datetime(tmp["t"], unit="ms")
+                        tmp = pd.DataFrame(data["results"])
+                        tmp["date"] = pd.to_datetime(tmp["t"], unit="ms").dt.date
                         tmp = tmp[["date", "c"]].rename(columns={"c": "close"})
-                        all_chunks.append(tmp)
-                    else:
-                        print(f"  ⚠️  No data for {ticker} {s_str}–{e_str}")
-                except Exception as e:
-                    print(f"Polygon error {ticker} {s_str}–{e_str}: {e}")
+                        chunks.append(tmp)
+                except Exception:
+                    # gentle on the API / transient failures
+                    pass
 
-                # advance
                 chunk_start = chunk_end + timedelta(days=1)
-                time.sleep(0.2)  # be gentle on API
+                time.sleep(0.2)  # be nice to API
 
-            if all_chunks:
+            if chunks:
                 df = (
-                    pd.concat(all_chunks, ignore_index=True)
+                    pd.concat(chunks, ignore_index=True)
                     .drop_duplicates(subset=["date"], keep="first")
                     .sort_values("date")
                     .reset_index(drop=True)
                 )
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
                 df.to_csv(cache_file, index=False)
             else:
-                df = pd.DataFrame(columns=["date", "close"])  # empty
+                df = pd.DataFrame(columns=["date", "close"])
 
-    # Post-processing (returns/vol/MA)
+    # --- Post-processing (same as original) ---
     if df is None or df.empty:
-        return pd.DataFrame(
-            columns=["date", "close", "returns", "vol_20", "MA", "ticker"]
-        )
+        return pd.DataFrame(columns=["date", "close", "returns", "vol_20", "MA", "ticker"])
 
-    # Ensure 'date' is of date type (not Timestamp)
-    if pd.api.types.is_datetime64_any_dtype(df["date"]):
-        df["date"] = df["date"].dt.date
+    # Ensure dtypes
+    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+        df["date"] = pd.to_datetime(df["date"]).dt.date
 
-    df["returns"] = df["close"].pct_change()
+    df["returns"] = pd.Series(df["close"]).pct_change()
     df["vol_20"] = df["returns"].rolling(window=vol_lookback).std()
-    df["MA"] = df["close"].rolling(window=vol_lookback).mean()
+    df["MA"] = pd.Series(df["close"]).rolling(window=vol_lookback).mean()
     df["ticker"] = ticker
 
     return df
-

@@ -5,7 +5,7 @@ from typing import Set
 import pandas as pd
 import yfinance as yf
 
-from .paths import get_earnings_cache_file, ensure_dir
+from .paths import yf_earnings_cache_file, ensure_dir
 from .symbols import to_vendor_ticker
 
 
@@ -26,7 +26,7 @@ def get_earnings_dates(ticker: str, start_date: str, end_date: str) -> Set[date]
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
     yf_ticker = to_vendor_ticker(ticker, vendor="yfinance")
 
-    cache_file = get_earnings_cache_file(yf_ticker)
+    cache_file = yf_earnings_cache_file(yf_ticker)
     ensure_dir(cache_file.parent)
 
     today = date.today()
