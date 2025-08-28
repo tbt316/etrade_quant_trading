@@ -1,0 +1,22 @@
+*** a/polygonio/recursive_backtest.py
+--- b/polygonio/recursive_backtest.py
+@@
+-import pandas as pd
++import pandas as pd
++from datetime import date, datetime
+@@
+-    close_by_date: Dict[date, float] = {
+-        pd_dt.date(): float(px) for pd_dt, px in zip(hist["date"], hist["close"])
+-    }
++    # Normalize dates: accept datetime, date, np.datetime64, or string
++    def _as_date(x):
++        if isinstance(x, date) and not isinstance(x, datetime):
++            return x
++        if isinstance(x, datetime):
++            return x.date()
++        # fall back to pandas for strings/np.datetime64
++        return pd.to_datetime(x).date()
++
++    close_by_date: Dict[date, float] = {
++        _as_date(pd_dt): float(px) for pd_dt, px in zip(hist["date"], hist["close"])
++    }

@@ -4,7 +4,8 @@ from multiprocessing import Lock
 from pathlib import Path
 from typing import Any, Dict
 
-from .paths import get_price_cache_file, get_chain_cache_file, ensure_dir, DATA_ROOT, POLYGON_OPTION_CACHE_DIRNAME
+from .paths import get_price_cache_file, get_chain_cache_file, ensure_dir
+import os
 
 # ---------------------------------------------------------
 # In-memory singletons (shared process-wide)
@@ -95,7 +96,7 @@ def save_stored_option_data(ticker: str) -> None:
     chain_cache_file: Path = get_chain_cache_file(t)
 
     # Ensure parent dir exists
-    ensure_dir(DATA_ROOT / POLYGON_OPTION_CACHE_DIRNAME)
+    ensure_dir(ROOT_DIR / POLY_OPTION_DIR)
 
     # Load existing pickles (under lock) to avoid overwriting concurrent updates
     existing_price: Dict[str, Any] = {}

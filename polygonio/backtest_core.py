@@ -58,15 +58,7 @@ class BacktestConfig:
 # Calendar helpers
 # ----------------------------
 
-def trading_dates_df(start_date: str, end_date: str):
-    """Return a DataFrame with a single 'date' column of trading datetimes.
-
-    Uses NYSE by default via `TradingCalendar` and mirrors the legacy
-    behavior of adjusting to last trading day <= candidate weekday.
-    """
-    cal = TradingCalendar("NYSE")
-    return cal.trading_dates_df(start_date, end_date)
-
+from .market_calendar import trading_dates_df
 
 def list_expiries(weekday: str, start_date: str, end_date: str, expiring_wk: int, trading_df) -> List:
     """Wrapper that delegates to the calendar module's logic.
