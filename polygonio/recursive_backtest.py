@@ -589,7 +589,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
-
                 # debug: ensure chosen strikes form a valid spread
                 invalid_put = "put" in needed_sides and not (have_short_put and have_long_put)
                 invalid_call = "call" in needed_sides and not (have_short_call and have_long_call)
