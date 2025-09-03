@@ -38,23 +38,22 @@ def _pos_to_line(p: Dict[str, Any]) -> str:
     opened_at = p.get("opened_at", "")
     return f"{und} {ttype} x{qty}  [{legs}]  open:{opened_at}  exp:{exp}"
 
-def _normalize_positions(obj: Any):
-    """Return (positions, per_day_map, debug) from varied inputs.
+def _normalize_positions(
+    obj: Any,
+) -> tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    """Return ``(positions, per_day_map, debug)`` from varied inputs.
 
-    The caller may pass in a raw list of positions, a mapping that includes
-    a ``debug`` section, or an object with ``positions``/``debug`` attributes.
-    Previously the debug information was only returned when the input was a
-    dict.  This made engine summaries unavailable when there were no positions
-    or when the result object wasn't a plain dictionary.  We now always
-    propagate the debug information when present so callers can surface engine
-    summaries even for empty result sets.
+    Accepts a raw list of positions, a mapping containing ``positions`` and
+    optional ``debug`` metadata, or an object with matching attributes.  Any
+    available debug data is always returned so callers can surface engine
+    summaries even when the result set is empty.
     """
 
     debug: Dict[str, Any] = {}
     per_day: Dict[str, List[Dict[str, Any]]] = {}
 
     if obj is None:
-        pos = []
+        pos: Any = []
     elif isinstance(obj, dict):
         debug = obj.get("debug", {})
         pos = obj.get("positions", [])
@@ -70,6 +69,17 @@ def _normalize_positions(obj: Any):
         return all_pos, per_day, debug
     return pos or [], per_day, debug
 
+
+def _fmt_engine_summary(debug: Dict[str, Any]) -> str:
+    return (
+        f"{DIM}[hint] Engine summary — days={debug.get('days_total')} "
+        f"no_price={debug.get('days_no_price')} "
+        f"earnings_skips={debug.get('days_skipped_earnings')} "
+        f"expiries={debug.get('expiries_considered')} "
+        f"positions_built={debug.get('positions_built')} "
+        f"exceptions={debug.get('exceptions')}{RESET}"
+    )
+
 def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -> None:
     all_pos, per_day, debug = _normalize_positions(results_or_positions)
     todays = per_day.get(date_str, []) if per_day else [
@@ -80,14 +90,7 @@ def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -
     if not all_pos and not todays:
         print(f"{YELLOW}No positions found to report for {date_str}.{RESET}")
         if debug:
-            print(
-                f"{DIM}[hint] Engine summary — days={debug.get('days_total')} "
-                f"no_price={debug.get('days_no_price')} "
-                f"earnings_skips={debug.get('days_skipped_earnings')} "
-                f"expiries={debug.get('expiries_considered')} "
-                f"positions_built={debug.get('positions_built')} "
-                f"exceptions={debug.get('exceptions')}{RESET}"
-            )
+            print(_fmt_engine_summary(debug))
         return
 
     opened: List[Dict[str, Any]] = []
@@ -127,6 +130,4 @@ def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -
         print(f"{DIM}Closed Positions: (none){RESET}")
 
     if not (opened or closed) and debug:
-        print(f"{DIM}[hint] Engine summary — days={debug.get('days_total')} no_price={debug.get('days_no_price')} "
-              f"earnings_skips={debug.get('days_skipped_earnings')} expiries={debug.get('expiries_considered')} "
-              f"positions_built={debug.get('positions_built')} exceptions={debug.get('exceptions')}{RESET}")
+        print(_fmt_engine_summary(debug))
