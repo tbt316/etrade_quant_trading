@@ -641,6 +641,22 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     )
                     continue
 
+                # debug: ensure chosen strikes form a valid spread
+                invalid_put = "put" in needed_sides and not (have_short_put and have_long_put)
+                invalid_call = "call" in needed_sides and not (have_short_call and have_long_call)
+                if invalid_put or invalid_call:
+                    dbg.expiries_skipped_no_strikes += 1
+                    run_dt = date.today().isoformat()
+                    reasons = []
+                    if invalid_put:
+                        reasons.append("put spread incomplete")
+                    if invalid_call:
+                        reasons.append("call spread incomplete")
+                    print(
+                        f"[DEBUG-SKIP] {run_dt} as_of={as_of_str} exp={expiration_str}: {', '.join(reasons)}"
+                    )
+                    continue
+
                 # 3c) Build the position using strategies (no logic change to shape/margin)
                 strat = get_strategy(cfg.trade_type)
                 build_kwargs: Dict[str, Any] = dict(
