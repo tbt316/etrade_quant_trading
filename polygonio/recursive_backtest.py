@@ -435,148 +435,148 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 #
                 # === BEGIN PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
                 try:
-                        # settings decide which premium field to read from the data array
-                        s = get_settings()
-                        premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
+                    # settings decide which premium field to read from the data array
+                    s = get_settings()
+                    premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
 
-                        # Build candidates by zipping meta (put_opts) with data (put_data)
-                        candidates = []
-                        _metas = put_opts or []      # meta rows: {'strike_price', 'expiration_date', 'option_ticker', ...}
-                        _datas = put_data or []      # price rows aligned by index: {'trade_price'/'mid_price'/...}
-                        if not _metas:
-                            print(f"[DBG] no put_opts for {cfg.ticker} {as_of_str}->{expiration_str} (strike_range={strike_range})")
+                    # Build candidates by zipping meta (put_opts) with data (put_data)
+                    candidates = []
+                    _metas = put_opts or []      # meta rows: {'strike_price', 'expiration_date', 'option_ticker', ...}
+                    _datas = put_data or []      # price rows aligned by index: {'trade_price'/'mid_price'/...}
+                    if not _metas:
+                        print(f"[DBG] no put_opts for {cfg.ticker} {as_of_str}->{expiration_str} (strike_range={strike_range})")
 
-                        for i, meta in enumerate(_metas):
+                    for i, meta in enumerate(_metas):
+                        try:
+                            k = float(meta.get("strike_price"))
+                        except Exception:
+                            continue
+                        d = _datas[i] if i < len(_datas) else {}
+                        price = _price_from_data(d, premium_field)
+                        candidates.append({"strike": k, "price": price, "meta": meta, "data": d})
+
+                    if candidates:
+                        kmin = min(x["strike"] for x in candidates)
+                        kmax = max(x["strike"] for x in candidates)
+                        priced = sum(1 for x in candidates if x["price"] is not None)
+                        print(f"[DBG] put candidates: n={len(candidates)} priced={priced} strikes=[{kmin},{kmax}] spot={spot} mode={s.premium_price_mode}")
+
+                    # OTM only with a usable price
+                    otm_puts = [r for r in candidates if r["strike"] < spot and (r["price"] is not None)]
+                    if not otm_puts:
+                        print(f"[DBG] no OTM put candidates w/ price for {cfg.ticker} {as_of_str}->{expiration_str} (spot={spot})")
+                    else:
+                        # knobs
+                        width = float(getattr(cfg, "iron_condor_width", 10.0) or 10.0)
+
+                        # 1) PRICE target (target_prem_otm == desired option price)
+                        target_price = None
+                        if getattr(cfg, "target_premium_otm", None) is not None:
                             try:
-                                k = float(meta.get("strike_price"))
+                                target_price = float(cfg.target_premium_otm)
                             except Exception:
-                                continue
-                            d = _datas[i] if i < len(_datas) else {}
-                            price = _price_from_data(d, premium_field)
-                            candidates.append({"strike": k, "price": price, "meta": meta, "data": d})
+                                target_price = None
 
-                        if candidates:
-                            kmin = min(x["strike"] for x in candidates)
-                            kmax = max(x["strike"] for x in candidates)
-                            priced = sum(1 for x in candidates if x["price"] is not None)
-                            print(f"[DBG] put candidates: n={len(candidates)} priced={priced} strikes=[{kmin},{kmax}] spot={spot} mode={s.premium_price_mode}")
-
-                        # OTM only with a usable price
-                        otm_puts = [r for r in candidates if r["strike"] < spot and (r["price"] is not None)]
-                        if not otm_puts:
-                            print(f"[DBG] no OTM put candidates w/ price for {cfg.ticker} {as_of_str}->{expiration_str} (spot={spot})")
-                        else:
-                            # knobs
-                            width = float(getattr(cfg, "iron_condor_width", 10.0) or 10.0)
-
-                            # 1) PRICE target (target_prem_otm == desired option price)
-                            target_price = None
-                            if getattr(cfg, "target_premium_otm", None) is not None:
-                                try:
-                                    target_price = float(cfg.target_premium_otm)
-                                except Exception:
-                                    target_price = None
-
-                            # 2) DELTA target (optionally steered)
-                            target_delta = None
-                            if getattr(cfg, "target_delta", None) is not None:
-                                try:
-                                    target_delta = float(cfg.target_delta)
-                                except Exception:
-                                    target_delta = None
-                            if target_delta is not None and getattr(cfg, "target_steer", None):
-                                try:
-                                    target_delta *= float(cfg.target_steer)
-                                except Exception:
-                                    pass
-                            if target_delta is not None:
-                                target_delta = max(0.01, min(0.49, abs(target_delta)))
-                                # get per-strike delta (map by strike_price)
-                                try:
-                                    delta_map = calculate_delta(cfg.ticker, as_of_str, expiration_str, "put", force_delta_update=False)
-                                except Exception:
-                                    delta_map = {}
-                            else:
+                        # 2) DELTA target (optionally steered)
+                        target_delta = None
+                        if getattr(cfg, "target_delta", None) is not None:
+                            try:
+                                target_delta = float(cfg.target_delta)
+                            except Exception:
+                                target_delta = None
+                        if target_delta is not None and getattr(cfg, "target_steer", None):
+                            try:
+                                target_delta *= float(cfg.target_steer)
+                            except Exception:
+                                pass
+                        if target_delta is not None:
+                            target_delta = max(0.01, min(0.49, abs(target_delta)))
+                            # get per-strike delta (map by strike_price)
+                            try:
+                                delta_map = calculate_delta(cfg.ticker, as_of_str, expiration_str, "put", force_delta_update=False)
+                            except Exception:
                                 delta_map = {}
+                        else:
+                            delta_map = {}
 
-                            # Build scored list
-                            scored = []
-                            for r in otm_puts:
-                                k = r["strike"]; price = r["price"]
-                                otm_pct = (spot - k) / spot if spot else 0.0
-                                d = None
-                                if delta_map:
-                                    d = delta_map.get(round(k, 2)) or delta_map.get(k)
-                                    try:
-                                        d = abs(float(d)) if d is not None else None
-                                    except Exception:
-                                        d = None
-                                scored.append({"strike": k, "price": price, "otm_pct": otm_pct, "delta": d})
+                        # Build scored list
+                        scored = []
+                        for r in otm_puts:
+                            k = r["strike"]; price = r["price"]
+                            otm_pct = (spot - k) / spot if spot else 0.0
+                            d = None
+                            if delta_map:
+                                d = delta_map.get(round(k, 2)) or delta_map.get(k)
+                                try:
+                                    d = abs(float(d)) if d is not None else None
+                                except Exception:
+                                    d = None
+                            scored.append({"strike": k, "price": price, "otm_pct": otm_pct, "delta": d})
 
-                            # Choose short put
-                            sp = None
-                            reason = ""
-                            if target_price is not None:
-                                cands = [x for x in scored if x["price"] is not None]
-                                if cands:
-                                    sp = min(cands, key=lambda x: abs(x["price"] - target_price))
-                                    reason = f"price≈{sp['price']:.3f} vs target {target_price:.3f}"
+                        # Choose short put
+                        sp = None
+                        reason = ""
+                        if target_price is not None:
+                            cands = [x for x in scored if x["price"] is not None]
+                            if cands:
+                                sp = min(cands, key=lambda x: abs(x["price"] - target_price))
+                                reason = f"price≈{sp['price']:.3f} vs target {target_price:.3f}"
 
-                            if sp is None and target_delta is not None:
-                                cands = [x for x in scored if x["delta"] is not None]
-                                if cands:
-                                    sp = min(cands, key=lambda x: abs(x["delta"] - target_delta))
-                                    reason = f"delta≈{sp['delta']:.3f} vs target {target_delta:.3f}"
+                        if sp is None and target_delta is not None:
+                            cands = [x for x in scored if x["delta"] is not None]
+                            if cands:
+                                sp = min(cands, key=lambda x: abs(x["delta"] - target_delta))
+                                reason = f"delta≈{sp['delta']:.3f} vs target {target_delta:.3f}"
 
-                            if sp is None:
-                                # fallback ~10% OTM
-                                sp = min(scored, key=lambda x: abs(x["otm_pct"] - 0.10))
-                                reason = f"fallback OTM≈{sp['otm_pct']:.2%}"
+                        if sp is None:
+                            # fallback ~10% OTM
+                            sp = min(scored, key=lambda x: abs(x["otm_pct"] - 0.10))
+                            reason = f"fallback OTM≈{sp['otm_pct']:.2%}"
 
-                            sp_k, sp_p = sp["strike"], sp["price"]
+                        sp_k, sp_p = sp["strike"], sp["price"]
 
-                            # Long put: aim width lower; nearest available ≤ target with price
-                            lp_target = sp_k - width
-                            under = [x for x in scored if x["strike"] <= lp_target and x["price"] is not None]
+                        # Long put: aim width lower; nearest available ≤ target with price
+                        lp_target = sp_k - width
+                        under = [x for x in scored if x["strike"] <= lp_target and x["price"] is not None]
 
-                            # If nothing at/below target, pick the CLOSEST strike strictly BELOW the short
-                            if not under:
-                                under = [x for x in scored if x["strike"] < sp_k and x["price"] is not None]
+                        # If nothing at/below target, pick the CLOSEST strike strictly BELOW the short
+                        if not under:
+                            under = [x for x in scored if x["strike"] < sp_k and x["price"] is not None]
 
-                            lp_k = lp_p = None
-                            if under:
-                                lp = min(under, key=lambda x: abs(x["strike"] - lp_target))
-                                lp_k, lp_p = lp["strike"], lp["price"]
+                        lp_k = lp_p = None
+                        if under:
+                            lp = min(under, key=lambda x: abs(x["strike"] - lp_target))
+                            lp_k, lp_p = lp["strike"], lp["price"]
 
-                            # FINAL sanity: long must be strictly below short; otherwise try the best available below short
-                            if lp_k is None or lp_k >= sp_k:
-                                lower = [x for x in scored if x["strike"] < sp_k and x["price"] is not None]
-                                if lower:
-                                    # choose the highest strike below short (closest, ensures positive width)
-                                    best = max(lower, key=lambda x: x["strike"])
-                                    lp_k, lp_p = best["strike"], best["price"]
-                                else:
-                                    # no valid long; skip building the spread for this day
-                                    have_long_put = False
-                                    have_short_put = sp_k is not None and sp_p is not None
-                                    print(f"[DBG] PCS skip: no long put below SP {sp_k} available; strikes range min={min(x['strike'] for x in scored):g}")
-                                # only set have_long_put if we ended up with a valid one
-                            if lp_k is not None and lp_k < sp_k:
-                                have_long_put = True
+                        # FINAL sanity: long must be strictly below short; otherwise try the best available below short
+                        if lp_k is None or lp_k >= sp_k:
+                            lower = [x for x in scored if x["strike"] < sp_k and x["price"] is not None]
+                            if lower:
+                                # choose the highest strike below short (closest, ensures positive width)
+                                best = max(lower, key=lambda x: x["strike"])
+                                lp_k, lp_p = best["strike"], best["price"]
                             else:
+                                # no valid long; skip building the spread for this day
                                 have_long_put = False
+                                have_short_put = sp_k is not None and sp_p is not None
+                                print(f"[DBG] PCS skip: no long put below SP {sp_k} available; strikes range min={min(x['strike'] for x in scored):g}")
+                            # only set have_long_put if we ended up with a valid one
+                        if lp_k is not None and lp_k < sp_k:
+                            have_long_put = True
+                        else:
+                            have_long_put = False
 
-                            have_short_put = (sp_k is not None and sp_p is not None)
+                        have_short_put = (sp_k is not None and sp_p is not None)
 
-                            print(
-                                f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
-                                f"SP {sp_k} @ {sp_p} ({reason}); "
-                                f"LP target {lp_target} → {lp_k} @ {lp_p}; "
-                                f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
-                            )
+                        print(
+                            f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
+                            f"SP {sp_k} @ {sp_p} ({reason}); "
+                            f"LP target {lp_target} → {lp_k} @ {lp_p}; "
+                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
+                        )
 
-                    except Exception as e:
-                        print(f"[DBG] PCS selection exception: {e}")
+                except Exception as e:
+                    print(f"[DBG] PCS selection exception: {e}")
                     # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
 
                     # 3c) Build the position using strategies (no logic change to shape/margin)
