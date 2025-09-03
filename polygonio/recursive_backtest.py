@@ -259,30 +259,21 @@ def _target_expiry_compat(*, weekday: str, as_of: date, weeks: int) -> Optional[
     try:
         import pandas_market_calendars as mcal
         cal = mcal.get_calendar('NYSE')
-        sched = cal.schedule(start_date=as_of, end_date=as_of + timedelta(days=80))
-        df = sched.reset_index().rename(columns={'index':'date'})
-        dates = pd.to_datetime(df['date']).dt.tz_localize(None).dt.date.tolist()
-        trading_days = sorted(dates)
+        horizon = as_of + timedelta(days=weeks * 7 + 20)
+        sched = cal.schedule(start_date=as_of, end_date=horizon)
+        trading_days = (
+            pd.to_datetime(sched.index).tz_localize(None).date.tolist()
+        )
     except Exception:
-        trading_days = pd.date_range(start=as_of, periods=80, freq='B').date.tolist()
+        trading_days = pd.bdate_range(start=as_of, end=as_of + timedelta(days=weeks * 7 + 20)).date.tolist()
 
     weekday_map = {"Monday":0, "Tuesday":1, "Wednesday":2, "Thursday":3, "Friday":4}
     w = weekday_map.get(weekday, 4)
-    cur = as_of
-    count = 0
-    while True:
-        if cur.weekday() == w:
-            count += 1
-            if count == weeks:
-                import bisect
-                idx = bisect.bisect_right(trading_days, cur) - 1
-                if idx >= 0:
-                    d = trading_days[idx]
-                    return datetime.combine(d, datetime.min.time())
-                return None
-        cur += timedelta(days=1)
-        if (cur - as_of).days > 80:
-            return None
+    probe = as_of + timedelta(weeks=weeks)
+    for d in trading_days:
+        if d >= probe and d.weekday() == w:
+            return datetime.combine(d, datetime.min.time())
+    return None
 # Daily loop (async) — main worker
 # -------------------------------
 
@@ -336,7 +327,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         dbg = _DebugCounters()
         # Collect results
         daily_positions: List[Dict[str, Any]] = []
-        active_expiries: set[datetime] = set()
         daily_pnls: List[Dict[str, Any]] = []
         open_positions: List[Dict[str, Any]] = []
 
@@ -371,78 +361,80 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             as_of_str = cur.strftime("%Y-%m-%d")
 
-            # 3a) Choose expirations like your original (Friday/Wed cadence)
+            # 3a) Choose a single target expiration (Friday/Wed cadence)
             print(f"[DEBUG] computing expiries for as_of={as_of_str}")
-            target_dt = _target_expiry_compat(weekday=cfg.expiring_weekday, as_of=cur, weeks=cfg.expiring_wks)
-            expiries: List[datetime] = []
-            if target_dt:
-                expiries.append(target_dt)
-            # keep active expiries not yet passed
-            active_expiries = {e for e in active_expiries if e.date() >= cur}
-            expiries.extend(sorted(active_expiries))
-            # dedupe preserve order
-            seen=set(); expiries=[x for x in expiries if not (x in seen or seen.add(x))]
-            print(f"[DEBUG] considering expiries: {[e.strftime('%Y-%m-%d') for e in expiries]}")
-            for exp_dt in expiries:
-                expiration_str = exp_dt.strftime("%Y-%m-%d")
+            target_dt = _target_expiry_compat(
+                weekday=cfg.expiring_weekday, as_of=cur, weeks=cfg.expiring_wks
+            )
+            if not target_dt:
+                cur += timedelta(days=1)
+                continue
+            expiration_str = target_dt.strftime("%Y-%m-%d")
 
-                # Determine whether this expiry should open a new position
-                is_target = target_dt and exp_dt == target_dt
-                already_open = any(p.get("expiration") == expiration_str for p in open_positions)
+            # Determine whether a spread for this expiration already exists
+            already_open = any(p.get("expiration") == expiration_str for p in open_positions)
 
-                # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
-                print(f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}")
-                call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
-                    ticker=cfg.ticker,
-                    call_put=call_put_flag,
-                    expiration_str=expiration_str,
-                    as_of_str=as_of_str,
-                    close_price=spot,
-                    client=client,
-                    force_otm=False,
-                    force_update=False,
-                )
-                print(f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}")
+            # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
+            print(
+                f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
+            )
+            call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+                ticker=cfg.ticker,
+                call_put=call_put_flag,
+                expiration_str=expiration_str,
+                as_of_str=as_of_str,
+                close_price=spot,
+                client=client,
+                force_otm=False,
+                force_update=False,
+            )
+            print(
+                f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}"
+            )
+            dbg.expiries_considered += 1
+            if not call_data and not put_data:
+                dbg.expiries_skipped_no_chain += 1
+                continue
 
-                position = None
-                if is_target and not already_open:
-                    sc_k = lc_k = sp_k = lp_k = None
-                    dbg_sel = {'puts_total': 0, 'puts_below_spot': 0, 'meets_premium': 0, 'chosen_short_put': None, 'chosen_long_put': None}   # float
-                    sc_p = lc_p = sp_p = lp_p = None   # float
-                    have_short_call = have_long_call = False
-                    have_short_put = have_long_put = False
+            position = None
+            if not already_open:
+                sc_k = lc_k = sp_k = lp_k = None
+                dbg_sel = {'puts_total': 0, 'puts_below_spot': 0, 'meets_premium': 0, 'chosen_short_put': None, 'chosen_long_put': None}   # float
+                sc_p = lc_p = sp_p = lp_p = None   # float
+                have_short_call = have_long_call = False
+                have_short_put = have_long_put = False
 
-                    # ========== PASTE BLOCK 1: STRIKE SELECTION (unchanged) ==========
-                    # Use your existing strike selection logic here to compute:
-                    #   sc_k, sc_p  (short call strike/premium)
-                    #   lc_k, lc_p  (long  call strike/premium)
-                    #   sp_k, sp_p  (short put  strike/premium)
-                    #   lp_k, lp_p  (long  put  strike/premium)
-                    #
-                    # Notes:
-                    # - If your chosen premium is missing (0 or None), call interpolate_option_price()
-                    #   to estimate (same guards/flags as your old code).
-                    # - Examples for interpolation:
-                    #
-                    # sc_p = sc_p or (await interpolate_option_price(
-                    #     ticker=cfg.ticker,
-                    #     close_price_today=spot,
-                    #     strike_price_to_interpolate=sc_k,
-                    #     option_type="call",
-                    #     expiration_date=expiration_str,
-                    #     pricing_date=as_of_str,
-                    #     stored_option_price=stored_option_price,
-                    #     premium_field=premium_field,
-                    #     price_interpolate_flag=s.price_interpolate,
-                    #     client=client,
-                    # ))
-                    #
-                    # Compute deltas if you need them for filters:
-                    # calculate_delta(cfg.ticker, as_of_str, expiration_str, "call", force_delta_update=False)
-                    # calculate_delta(cfg.ticker, as_of_str, expiration_str, "put",  force_delta_update=False)
-                    #
-                    # === BEGIN PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
-                    try:
+                # ========== PASTE BLOCK 1: STRIKE SELECTION (unchanged) ==========
+                # Use your existing strike selection logic here to compute:
+                #   sc_k, sc_p  (short call strike/premium)
+                #   lc_k, lc_p  (long  call strike/premium)
+                #   sp_k, sp_p  (short put  strike/premium)
+                #   lp_k, lp_p  (long  put  strike/premium)
+                #
+                # Notes:
+                # - If your chosen premium is missing (0 or None), call interpolate_option_price()
+                #   to estimate (same guards/flags as your old code).
+                # - Examples for interpolation:
+                #
+                # sc_p = sc_p or (await interpolate_option_price(
+                #     ticker=cfg.ticker,
+                #     close_price_today=spot,
+                #     strike_price_to_interpolate=sc_k,
+                #     option_type="call",
+                #     expiration_date=expiration_str,
+                #     pricing_date=as_of_str,
+                #     stored_option_price=stored_option_price,
+                #     premium_field=premium_field,
+                #     price_interpolate_flag=s.price_interpolate,
+                #     client=client,
+                # ))
+                #
+                # Compute deltas if you need them for filters:
+                # calculate_delta(cfg.ticker, as_of_str, expiration_str, "call", force_delta_update=False)
+                # calculate_delta(cfg.ticker, as_of_str, expiration_str, "put",  force_delta_update=False)
+                #
+                # === BEGIN PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
+                try:
                         # settings decide which premium field to read from the data array
                         s = get_settings()
                         premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
@@ -609,11 +601,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     # Strategy may raise if a required leg is missing; guard as you did before
                     try:
                         position = strat.build_position(**build_kwargs).to_dict()
-                        try:
-                            ed = datetime.strptime(position.get('expiration',''), '%Y-%m-%d')
-                            active_expiries.add(ed)
-                        except Exception:
-                            pass
                     except Exception as e:
                         # skip this date/expiry if legs incomplete
                         position = None
