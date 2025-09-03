@@ -39,15 +39,32 @@ def _pos_to_line(p: Dict[str, Any]) -> str:
     return f"{und} {ttype} x{qty}  [{legs}]  open:{opened_at}  exp:{exp}"
 
 def _normalize_positions(obj: Any):
-    debug = {}; per_day = {}
-    if isinstance(obj, dict):
+    """Return (positions, per_day_map, debug) from varied inputs.
+
+    The caller may pass in a raw list of positions, a mapping that includes
+    a ``debug`` section, or an object with ``positions``/``debug`` attributes.
+    Previously the debug information was only returned when the input was a
+    dict.  This made engine summaries unavailable when there were no positions
+    or when the result object wasn't a plain dictionary.  We now always
+    propagate the debug information when present so callers can surface engine
+    summaries even for empty result sets.
+    """
+
+    debug: Dict[str, Any] = {}
+    per_day: Dict[str, List[Dict[str, Any]]] = {}
+
+    if obj is None:
+        pos = []
+    elif isinstance(obj, dict):
         debug = obj.get("debug", {})
         pos = obj.get("positions", [])
     else:
-        pos = obj
+        debug = getattr(obj, "debug", {})
+        pos = getattr(obj, "positions", obj)
+
     if isinstance(pos, dict):
         per_day = pos
-        all_pos = []
+        all_pos: List[Dict[str, Any]] = []
         for _d, _lst in pos.items():
             all_pos.extend(_lst or [])
         return all_pos, per_day, debug
@@ -62,6 +79,15 @@ def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -
     ]
     if not all_pos and not todays:
         print(f"{YELLOW}No positions found to report for {date_str}.{RESET}")
+        if debug:
+            print(
+                f"{DIM}[hint] Engine summary — days={debug.get('days_total')} "
+                f"no_price={debug.get('days_no_price')} "
+                f"earnings_skips={debug.get('days_skipped_earnings')} "
+                f"expiries={debug.get('expiries_considered')} "
+                f"positions_built={debug.get('positions_built')} "
+                f"exceptions={debug.get('exceptions')}{RESET}"
+            )
         return
 
     opened: List[Dict[str, Any]] = []
