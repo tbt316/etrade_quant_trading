@@ -399,6 +399,15 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     force_update=False,
                 )
                 print(f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}")
+
+                # debug: report missing chain data
+                if ("call" in call_put_flag and not call_data) or ("put" in call_put_flag and not put_data):
+                    dbg.expiries_skipped_no_chain += 1
+                    run_dt = date.today().isoformat()
+                    print(
+                        f"[DEBUG-SKIP] {run_dt} as_of={as_of_str} exp={expiration_str}: no option chain data"
+                    )
+                    continue
     
                 sc_k = lc_k = sp_k = lp_k = None
                 dbg_sel = {'puts_total': 0, 'puts_below_spot': 0, 'meets_premium': 0, 'chosen_short_put': None, 'chosen_long_put': None}   # float
@@ -580,6 +589,22 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
+
+                # debug: ensure chosen strikes form a valid spread
+                invalid_put = "put" in needed_sides and not (have_short_put and have_long_put)
+                invalid_call = "call" in needed_sides and not (have_short_call and have_long_call)
+                if invalid_put or invalid_call:
+                    dbg.expiries_skipped_no_strikes += 1
+                    run_dt = date.today().isoformat()
+                    reasons = []
+                    if invalid_put:
+                        reasons.append("put spread incomplete")
+                    if invalid_call:
+                        reasons.append("call spread incomplete")
+                    print(
+                        f"[DEBUG-SKIP] {run_dt} as_of={as_of_str} exp={expiration_str}: {', '.join(reasons)}"
+                    )
+                    continue
 
                 # 3c) Build the position using strategies (no logic change to shape/margin)
                 strat = get_strategy(cfg.trade_type)
