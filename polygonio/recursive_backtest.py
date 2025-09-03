@@ -371,6 +371,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 continue
             expiration_str = target_dt.strftime("%Y-%m-%d")
 
+<<<<<<< HEAD
             # Determine whether a spread for this expiration already exists
             already_open = any(p.get("expiration") == expiration_str for p in open_positions)
 
@@ -398,6 +399,31 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             position = None
             if not already_open:
+=======
+                # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
+                print(f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}")
+                call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+                    ticker=cfg.ticker,
+                    call_put=call_put_flag,
+                    expiration_str=expiration_str,
+                    as_of_str=as_of_str,
+                    close_price=spot,
+                    client=client,
+                    force_otm=False,
+                    force_update=False,
+                )
+                print(f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}")
+
+                # debug: report missing chain data
+                if ("call" in call_put_flag and not call_data) or ("put" in call_put_flag and not put_data):
+                    dbg.expiries_skipped_no_chain += 1
+                    run_dt = date.today().isoformat()
+                    print(
+                        f"[DEBUG-SKIP] {run_dt} as_of={as_of_str} exp={expiration_str}: no option chain data"
+                    )
+                    continue
+    
+>>>>>>> fac98b9 (Add debug logs for missing chains and invalid spreads)
                 sc_k = lc_k = sp_k = lp_k = None
                 dbg_sel = {'puts_total': 0, 'puts_below_spot': 0, 'meets_premium': 0, 'chosen_short_put': None, 'chosen_long_put': None}   # float
                 sc_p = lc_p = sp_p = lp_p = None   # float
@@ -579,6 +605,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     print(f"[DBG] PCS selection exception: {e}")
                     # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
 
+<<<<<<< HEAD
                     # 3c) Build the position using strategies (no logic change to shape/margin)
                     strat = get_strategy(cfg.trade_type)
                     build_kwargs: Dict[str, Any] = dict(
@@ -597,6 +624,42 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             build_kwargs["short_put"] = (float(sp_k), float(sp_p))
                         if have_long_put and lp_k is not None and lp_p:
                             build_kwargs["long_put"] = (float(lp_k), float(lp_p))
+=======
+                # debug: ensure chosen strikes form a valid spread
+                invalid_put = "put" in needed_sides and not (have_short_put and have_long_put)
+                invalid_call = "call" in needed_sides and not (have_short_call and have_long_call)
+                if invalid_put or invalid_call:
+                    dbg.expiries_skipped_no_strikes += 1
+                    run_dt = date.today().isoformat()
+                    reasons = []
+                    if invalid_put:
+                        reasons.append("put spread incomplete")
+                    if invalid_call:
+                        reasons.append("call spread incomplete")
+                    print(
+                        f"[DEBUG-SKIP] {run_dt} as_of={as_of_str} exp={expiration_str}: {', '.join(reasons)}"
+                    )
+                    continue
+
+                # 3c) Build the position using strategies (no logic change to shape/margin)
+                strat = get_strategy(cfg.trade_type)
+                build_kwargs: Dict[str, Any] = dict(
+                    underlying=cfg.ticker,
+                    expiration=expiration_str,
+                    opened_at=as_of_str,
+                    qty=int(cfg.contract_qty),
+                )
+                if "call" in needed_sides:
+                    if have_short_call and sc_k is not None and sc_p:
+                        build_kwargs["short_call"] = (float(sc_k), float(sc_p))
+                    if have_long_call and lc_k is not None and lc_p:
+                        build_kwargs["long_call"] = (float(lc_k), float(lc_p))
+                if "put" in needed_sides:
+                    if have_short_put and sp_k is not None and sp_p:
+                        build_kwargs["short_put"] = (float(sp_k), float(sp_p))
+                    if have_long_put and lp_k is not None and lp_p:
+                        build_kwargs["long_put"] = (float(lp_k), float(lp_p))
+>>>>>>> fac98b9 (Add debug logs for missing chains and invalid spreads)
 
                     # Strategy may raise if a required leg is missing; guard as you did before
                     try:
