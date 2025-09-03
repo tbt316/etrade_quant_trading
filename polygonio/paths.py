@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 # Cache and output directories
-CACHE_DIR = ROOT_DIR / "polygon_api_option_data"
+CACHE_DIR = (ROOT_DIR.parent / "polygon_api_option_data").resolve()
 MONTHLY_BACKTEST_DIR = ROOT_DIR / "monthly_backtest_data"
 YF_PRICE_DIR = ROOT_DIR / "yfinance" / "prices"
 POLY_PRICE_DIR = ROOT_DIR / "polygon" / "prices"

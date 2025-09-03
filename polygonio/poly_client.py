@@ -1,6 +1,9 @@
 from __future__ import annotations
 import asyncio
 import logging
+import os
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -11,8 +14,25 @@ import ssl
 
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import stored_option_chain, stored_option_price, merge_nested_dicts
+import polygonio_config
+
 
 log = logging.getLogger(__name__)
+
+def _load_polygon_key_from_config() -> str:
+    """Load POLYGON_API_KEY from env or ~/.etrade_quant/config.json.
+    Env var wins. Returns empty string if not found or on error.
+    """
+    key = os.getenv("POLYGON_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        key = polygonio_config.API_KEY
+        if key:
+            return key
+    except Exception as e:
+        log.warning("Failed to read Polygon key from")
+    return ""
 
 
 @dataclass(frozen=True)
@@ -41,7 +61,8 @@ class PolygonAPIClient:
         backoff_factor: float = _Retry.backoff_factor,
     ) -> None:
         s = get_settings()
-        self.api_key = api_key or s.polygon_api_key
+        # prefer explicit arg -> settings -> config/env fallback
+        self.api_key = api_key or getattr(s, "polygon_api_key", "") or _load_polygon_key_from_config()
         if not self.api_key:
             log.warning("Polygon API key is empty")
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -256,6 +277,7 @@ class PolygonAPIClient:
                 payload = parse(data)
                 if payload:
                     self._write_option_payload(ticker, strike_price, call_put, expiration_date, pricing_date, payload)
+                    print(f"Stored {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}:{payload}")
                     return payload
                 # No valid data → write invalid marker
                 self._write_invalid_option(ticker, strike_price, call_put, expiration_date, pricing_date, premium_field)
@@ -349,4 +371,3 @@ class PolygonAPIClient:
         else:
             invalid = {"ask_price": 0.0, "bid_price": 0.0, "ask_size": 0, "bid_size": 0, "mid_price": 0.0}
         stored_option_price.setdefault(t, {}).setdefault(pricing_date, {}).setdefault(strike_key, {}).setdefault(expiration_date, {}).setdefault(call_put, {}).update(invalid)
-

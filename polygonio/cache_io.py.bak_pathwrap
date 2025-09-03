@@ -40,21 +40,6 @@ def merge_nested_dicts(dst: Dict, src: Dict) -> None:
         else:
             dst[k] = v
 
-def merge_nested_dicts_with_change(dst: dict, src: dict) -> bool:
-    """
-    Like merge_nested_dicts, but returns True if *dst* changed as a result of the merge.
-    Used to avoid unnecessary pickle writes when nothing is new.
-    """
-    changed = False
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            if merge_nested_dicts_with_change(dst[k], v):
-                changed = True
-        else:
-            if k not in dst or dst.get(k) != v:
-                dst[k] = v
-                changed = True
-    return changed
 
 # ---------------------------------------------------------
 # Load / Save with merge semantics
@@ -67,8 +52,8 @@ def load_stored_option_data(ticker: str) -> Dict[str, Any]:
     _ensure_ticker_slots(ticker)
     t = ticker.upper()
 
-    price_cache_file: Path = Path(get_price_cache_file(t))
-    chain_cache_file: Path = Path(get_chain_cache_file(t))
+    price_cache_file: Path = get_price_cache_file(t)
+    chain_cache_file: Path = get_chain_cache_file(t)
 
     # Price cache
     if price_cache_file.exists():
@@ -77,7 +62,6 @@ def load_stored_option_data(ticker: str) -> Dict[str, Any]:
                 with price_cache_file.open("rb") as f:
                     on_disk: Dict[str, Any] = pickle.load(f)
                 merge_nested_dicts(stored_option_price[t], on_disk)
-                print(f"[DEBUG] Loaded price data from: {price_cache_file}")
             else:
                 print(f"Warning: {price_cache_file} is empty; skipping.")
         except (EOFError, pickle.UnpicklingError) as e:
@@ -90,8 +74,6 @@ def load_stored_option_data(ticker: str) -> Dict[str, Any]:
                 with chain_cache_file.open("rb") as f:
                     on_disk_chain: Dict[str, Any] = pickle.load(f)
                 merge_nested_dicts(stored_option_chain[t], on_disk_chain)
-                print(f"[DEBUG] Loaded option data from: {chain_cache_file}")
-
             else:
                 print(f"Warning: {chain_cache_file} is empty; skipping.")
         except (EOFError, pickle.UnpicklingError) as e:
@@ -104,30 +86,29 @@ def load_stored_option_data(ticker: str) -> Dict[str, Any]:
         return price_by_date.get(last_date, {})
     return {}
 
+
 def save_stored_option_data(ticker: str) -> None:
-    """Merge in-memory dicts with any existing on-disk pickles and write back only if changed."""
+    """Merge in-memory dicts with any existing on-disk pickles and write back atomically."""
     _ensure_ticker_slots(ticker)
     t = ticker.upper()
 
-    price_cache_file: Path = Path(get_price_cache_file(t))
-    chain_cache_file: Path = Path(get_chain_cache_file(t))
+    price_cache_file: Path = get_price_cache_file(t)
+    chain_cache_file: Path = get_chain_cache_file(t)
 
-    # Ensure parent dirs exist (more robust than relying on a global)
-    ensure_dir(price_cache_file.parent)
-    ensure_dir(chain_cache_file.parent)
+    # Ensure parent dir exists
+    ensure_dir(ROOT_DIR / POLY_OPTION_DIR)
 
+    # Load existing pickles (under lock) to avoid overwriting concurrent updates
     existing_price: Dict[str, Any] = {}
     existing_chain: Dict[str, Any] = {}
 
     with file_lock:
-        # Load existing on-disk
         if price_cache_file.exists() and price_cache_file.stat().st_size > 0:
             try:
                 with price_cache_file.open("rb") as f:
                     existing_price = pickle.load(f)
             except (EOFError, pickle.UnpicklingError) as e:
                 print(f"Warning: Failed to load {price_cache_file} ({e}); using empty dict.")
-
         if chain_cache_file.exists() and chain_cache_file.stat().st_size > 0:
             try:
                 with chain_cache_file.open("rb") as f:
@@ -135,37 +116,19 @@ def save_stored_option_data(ticker: str) -> None:
             except (EOFError, pickle.UnpicklingError) as e:
                 print(f"Warning: Failed to load {chain_cache_file} ({e}); using empty dict.")
 
-        print(f"[DEBUG] start merge_nested_dicts_with_change")
-        # Merge in-memory → existing, detect if anything actually changed
-        price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
-        chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
-
-        # Conditionally write back
-        if price_changed:
-            print(f"[DEBUG] Price changed, writing into pkl file")
-            with price_cache_file.open("wb") as f:
-                pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
-            if price_cache_file.stat().st_size == 0:
-                print(f"Error: {price_cache_file} is empty after write!")
-        # else: print(f"[DEBUG] save_stored_option_data: no price changes for {t}, skip write")
-
-        if chain_changed:
-            print(f"[DEBUG] Option chain changed, writing into pkl file")
-            with chain_cache_file.open("wb") as f:
-                pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
-            if chain_cache_file.stat().st_size == 0:
-                print(f"Error: {chain_cache_file} is empty after write!")
-        # else: print(f"[DEBUG] save_stored_option_data: no chain changes for {t}, skip write")
-
         # Merge memory → existing
-            
-    price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
-    chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
+        merge_nested_dicts(existing_price, stored_option_price[t])
+        merge_nested_dicts(existing_chain, stored_option_chain[t])
 
-    if price_changed:
-                # Sanity checks
-            if price_cache_file.stat().st_size == 0:
-                print(f"Error: {price_cache_file} is empty after write!")
-            if chain_cache_file.stat().st_size == 0:
-                print(f"Error: {chain_cache_file} is empty after write!")
+        # Write back (highest protocol)
+        with price_cache_file.open("wb") as f:
+            pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with chain_cache_file.open("wb") as f:
+            pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # Sanity checks
+        if price_cache_file.stat().st_size == 0:
+            print(f"Error: {price_cache_file} is empty after write!")
+        if chain_cache_file.stat().st_size == 0:
+            print(f"Error: {chain_cache_file} is empty after write!")
 

@@ -92,5 +92,4 @@ def list_expiries(
                 result.append(datetime.combine(last_trading_day, datetime.min.time()))
         current += timedelta(days=7)
 
-    print(f"[DEBUG] list_expiries: produced {len(result)} adjusted expiries; first={result[0] if result else None}, last={result[-1] if result else None}")
     return result

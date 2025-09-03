@@ -234,13 +234,11 @@ def get_historical_prices(
     if df is None or df.empty:
         return pd.DataFrame(columns=["date", "close", "returns", "vol_20", "MA", "ticker"])
 
-    # Ensure dtypes
-    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+    # Always normalize to plain date (avoids Timestamp vs date mismatches)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
 
     df["returns"] = pd.Series(df["close"]).pct_change()
     df["vol_20"] = df["returns"].rolling(window=vol_lookback).std()
     df["MA"] = pd.Series(df["close"]).rolling(window=vol_lookback).mean()
     df["ticker"] = ticker
-
     return df

@@ -1,0 +1,315 @@
+# polygonio/recursive_backtest.py
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from .config import get_settings, PREMIUM_FIELD_MAP
+from .prices import get_historical_prices
+from .earnings import get_earnings_dates
+from .market_calendar import list_expiries  # maps your old get_all_weekdays
+from .poly_client import PolygonAPIClient
+from .chains import pull_option_chain_data
+from .pricing import interpolate_option_price, calculate_delta
+from .cache_io import stored_option_price, save_stored_option_data
+from .symbols import convert_polygon_to_etrade_ticker
+
+from strategies.strategies import sides_for_trade_type, get_strategy
+
+
+# -------------------------------
+# Public orchestration API
+# -------------------------------
+
+@dataclass
+class RecursionConfig:
+    """
+    Mirrors your original high-level controls. Add fields here to pass through
+    knobs you used to keep in module-level constants (e.g., SKIP_EARNINGS, etc.).
+    """
+    ticker: str
+    global_start_date: str  # "YYYY-MM-DD"
+    global_end_date: str    # "YYYY-MM-DD"
+    trade_type: str
+    # optional knobs (add as needed)
+    expiring_weekday: str = "Friday"     # or "Wednesday"
+    expiring_wks: int = 1                # spacing between expiries you consider
+    contract_qty: int = 1                # default 1 lot unless you sweep elsewhere
+
+
+def monthly_recursive_backtest(
+    ticker: str,
+    global_start_date: str,
+    global_end_date: str,
+    *,
+    trade_type: str,
+    expiring_weekday: str = "Friday",
+    expiring_wks: int = 1,
+    contract_qty: int = 1,
+) -> Dict[str, Any]:
+    """
+    Replacement for your old monthly_recursive_backtest(...).
+    Splits the global window and for each slice runs the per-day engine.
+
+    NOTE: Adjust the slicing policy below to match your original:
+          (lookback windows, validation hops, etc). For now we run one pass
+          over the whole range to keep behavior simple and identical to your
+          daily engine.
+    """
+    s = get_settings()
+
+    # ---- If you previously used lookback + validation hops, rebuild that here.
+    # For now: single call covering the entire [start, end] range.
+    cfg = RecursionConfig(
+        ticker=ticker,
+        global_start_date=global_start_date,
+        global_end_date=global_end_date,
+        trade_type=trade_type,
+        expiring_weekday=expiring_weekday,
+        expiring_wks=expiring_wks,
+        contract_qty=contract_qty,
+    )
+
+    # Run the async per-day engine
+    results = asyncio.run(
+        backtest_options_sync_or_async(cfg)  # identical role to your old function
+    )
+
+    # If you used to persist monthly results to a PKL, do it here.
+    # from .paths import get_monthly_backtest_file
+    # out_file = get_monthly_backtest_file(ticker, global_start_date, global_end_date)
+    # with open(out_file, "wb") as f:
+    #     pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return results
+
+# Compatibility wrapper for list_expiries signature drift
+def _list_expiries_compat(*, weekday, start_date, end_date):
+    """Build a trading_dates_df compatible with market_calendar.list_expiries().
+    We avoid depending on any helper methods that may not exist on TradingCalendar
+    by constructing the schedule directly with pandas_market_calendars.
+    """
+    import pandas as pd
+    try:
+        import pandas_market_calendars as mcal
+        cal = mcal.get_calendar('NYSE')  # default
+        sched = cal.schedule(start_date=start_date, end_date=end_date)
+        df = sched.reset_index().rename(columns={'index': 'date'})
+        # Normalize to naive datetimes/dates as expected
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+        if 'market_open' in df.columns:
+            df['market_open'] = pd.to_datetime(df['market_open']).dt.tz_localize(None)
+        if 'market_close' in df.columns:
+            df['market_close'] = pd.to_datetime(df['market_close']).dt.tz_localize(None)
+        trading_dates_df = df
+    except Exception:
+        # Fallback: business days only; not as precise as the official schedule
+        trading_dates_df = pd.DataFrame({'date': pd.date_range(start=start_date, end=end_date, freq='B')})
+
+    return list_expiries(
+        weekday=weekday,
+        start_date=start_date,
+        end_date=end_date,
+        trading_dates_df=trading_dates_df,
+    )
+# -------------------------------
+# Daily loop (async) — main worker
+# -------------------------------
+
+async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]:
+    """
+    Mirrors your original inner engine:
+      - iterate pricing dates
+      - enumerate target expirations
+      - fetch chains/quotes
+      - select strikes (PASTE YOUR LOGIC)
+      - compute premiums (interpolate if needed)
+      - assemble positions via strategies layer (no logic change)
+      - simulate PnL / exit (PASTE YOUR LOGIC)
+    Returns whatever aggregate structure you expect downstream (dict here).
+    """
+    s = get_settings()
+    premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
+
+    # 0) Prep: underlying history (for spot/MA/vol, same as your original)
+    hist = get_historical_prices(
+        cfg.ticker, cfg.global_start_date, cfg.global_end_date,
+        vol_lookback=5, data_source="yfinance"  # matches your default path
+    )
+    if hist.empty:
+        return {"error": "no_price_data", "ticker": cfg.ticker}
+
+    # Convert to a dict keyed by date for quick lookup
+    close_by_date: Dict[date, float] = {
+        pd_dt: float(px) for pd_dt, px in zip(hist["date"], hist["close"])
+    }
+
+    # 1) Earnings filter if desired
+    earnings_dates: Optional[set[date]] = None
+    if s.skip_earnings:
+        earnings_dates = get_earnings_dates(cfg.ticker, cfg.global_start_date, cfg.global_end_date)
+
+    # 2) Async client
+    async with PolygonAPIClient(api_key=s.polygon_api_key) as client:
+        # Collect results
+        daily_positions: List[Dict[str, Any]] = []
+        daily_pnls: List[Dict[str, Any]] = []
+
+        # 3) Iterate every pricing day in the window
+        start_dt = datetime.strptime(cfg.global_start_date, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(cfg.global_end_date, "%Y-%m-%d").date()
+        cur = start_dt
+
+        # Strategy -> which sides (call/put/both)
+        needed_sides = sides_for_trade_type(cfg.trade_type)
+        call_put_flag = "call_put_both" if set(needed_sides) == {"call", "put"} else needed_sides[0]
+
+        # Cache of trading calendar dates (if you have one already, reuse)
+        # Otherwise, we'll derive expiries per pricing day via list_expiries(...)
+        while cur <= end_dt:
+            # skip non-price days
+            spot = close_by_date.get(cur)
+            if spot is None:
+                cur += timedelta(days=1)
+                continue
+
+            # skip earnings if configured
+            if earnings_dates and cur in earnings_dates:
+                cur += timedelta(days=1)
+                continue
+
+            as_of_str = cur.strftime("%Y-%m-%d")
+
+            # 3a) Choose expirations like your original (Friday/Wed cadence)
+            expiries: List[datetime] = _list_expiries_compat(
+                weekday=cfg.expiring_weekday,
+                start_date=cur,
+                end_date=end_dt,
+            )
+            # If list_expiries returns only expiries <= cur, you may want the *next* future expiry.
+            # Adjust as you did before; for now we use whatever the helper returns.
+            for exp_dt in expiries:
+                expiration_str = exp_dt.strftime("%Y-%m-%d")
+
+                # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
+                call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+                    ticker=cfg.ticker,
+                    call_put=call_put_flag,
+                    expiration_str=expiration_str,
+                    as_of_str=as_of_str,
+                    close_price=spot,
+                    client=client,
+                    force_otm=False,
+                    force_update=False,
+                )
+
+                # ========== PASTE BLOCK 1: STRIKE SELECTION (unchanged) ==========
+                # Use your existing strike selection logic here to compute:
+                #   sc_k, sc_p  (short call strike/premium)
+                #   lc_k, lc_p  (long  call strike/premium)
+                #   sp_k, sp_p  (short put  strike/premium)
+                #   lp_k, lp_p  (long  put  strike/premium)
+                #
+                # Notes:
+                # - If your chosen premium is missing (0 or None), call interpolate_option_price()
+                #   to estimate (same guards/flags as your old code).
+                # - Examples for interpolation:
+                #
+                # sc_p = sc_p or (await interpolate_option_price(
+                #     ticker=cfg.ticker,
+                #     close_price_today=spot,
+                #     strike_price_to_interpolate=sc_k,
+                #     option_type="call",
+                #     expiration_date=expiration_str,
+                #     pricing_date=as_of_str,
+                #     stored_option_price=stored_option_price,
+                #     premium_field=premium_field,
+                #     price_interpolate_flag=s.price_interpolate,
+                #     client=client,
+                # ))
+                #
+                # Compute deltas if you need them for filters:
+                # calculate_delta(cfg.ticker, as_of_str, expiration_str, "call", force_delta_update=False)
+                # calculate_delta(cfg.ticker, as_of_str, expiration_str, "put",  force_delta_update=False)
+                #
+                # ---> BEGIN YOUR STRIKE SELECTION CODE
+                sc_k = lc_k = sp_k = lp_k = None   # float
+                sc_p = lc_p = sp_p = lp_p = None   # float
+                have_short_call = have_long_call = False
+                have_short_put = have_long_put = False
+                # (paste your selection logic here; set the variables above)
+                # <--- END YOUR STRIKE SELECTION CODE
+                # =================================================================
+
+                # 3c) Build the position using strategies (no logic change to shape/margin)
+                strat = get_strategy(cfg.trade_type)
+                build_kwargs: Dict[str, Any] = dict(
+                    underlying=cfg.ticker,
+                    expiration=expiration_str,
+                    opened_at=as_of_str,
+                    qty=int(cfg.contract_qty),
+                )
+                if "call" in needed_sides:
+                    if have_short_call and sc_k is not None and sc_p:
+                        build_kwargs["short_call"] = (float(sc_k), float(sc_p))
+                    if have_long_call and lc_k is not None and lc_p:
+                        build_kwargs["long_call"] = (float(lc_k), float(lc_p))
+                if "put" in needed_sides:
+                    if have_short_put and sp_k is not None and sp_p:
+                        build_kwargs["short_put"] = (float(sp_k), float(sp_p))
+                    if have_long_put and lp_k is not None and lp_p:
+                        build_kwargs["long_put"] = (float(lp_k), float(lp_p))
+
+                # Strategy may raise if a required leg is missing; guard as you did before
+                try:
+                    position = strat.build_position(**build_kwargs).to_dict()
+                except Exception as e:
+                    # skip this date/expiry if legs incomplete
+                    continue
+
+                daily_positions.append(position)
+
+                # ========== PASTE BLOCK 2: P&L / EXIT / ACCOUNTING (unchanged) ==========
+                # Here paste your existing code that:
+                #   - computes cashflows (credit/debit)
+                #   - tracks margin requirements
+                #   - exits early if profit target / stop is hit
+                #   - realizes P&L at expiration or at exit date
+                #
+                # Append a summary dict to daily_pnls (or however you used to record it).
+                #
+                # ---> BEGIN YOUR P&L / EXIT LOGIC
+                pnl_row = {
+                    "as_of": as_of_str,
+                    "expiration": expiration_str,
+                    "trade_type": cfg.trade_type,
+                    "underlying": cfg.ticker,
+                    "qty": cfg.contract_qty,
+                    "spot": spot,
+                    # "realized_pnl": ...,
+                    # "exit_date": ...,
+                    # "exit_reason": ...,
+                }
+                daily_pnls.append(pnl_row)
+                # <--- END YOUR P&L / EXIT LOGIC
+                # =================================================================
+
+            # Optionally persist caches as you go (same as before)
+            try:
+                save_stored_option_data(cfg.ticker)
+            except Exception:
+                pass
+
+            cur += timedelta(days=1)
+
+    # Return whatever structure you expect downstream
+    return {
+        "ticker": cfg.ticker,
+        "start": cfg.global_start_date,
+        "end": cfg.global_end_date,
+        "trade_type": cfg.trade_type,
+        "positions": daily_positions,
+        "pnl": daily_pnls,
+    }

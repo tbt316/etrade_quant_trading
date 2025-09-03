@@ -1,0 +1,71 @@
+From 85a2c2c5e8f61e3a6d6f1aa49c07b9d3f1b24f10 Mon Sep 17 00:00:00 2001
+From: BoTian <you@example.com>
+Date: Sun, 31 Aug 2025 20:50:00 -0700
+Subject: [PATCH] save_stored_option_data: only write pickle if changed
+
+---
+ etrade_quant_trading/polygonio/cache_io.py | 47 +++++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/etrade_quant_trading/polygonio/cache_io.py b/etrade_quant_trading/polygonio/cache_io.py
+index 4fd1234..a6f1b21 100644
+--- a/etrade_quant_trading/polygonio/cache_io.py
++++ b/etrade_quant_trading/polygonio/cache_io.py
+@@
+ def merge_nested_dicts(dst: Dict, src: Dict) -> None:
+     """Recursively merge *src* into *dst* without losing existing sub-dicts.
+     If both sides are dicts, merge recursively; otherwise *src* overwrites *dst*.
+     """
+     for k, v in src.items():
+         if isinstance(v, dict) and isinstance(dst.get(k), dict):
+             merge_nested_dicts(dst[k], v)
+         else:
+             dst[k] = v
++
++
++def merge_nested_dicts_with_change(dst: Dict, src: Dict) -> bool:
++    """
++    Like merge_nested_dicts, but returns True if *dst* changed as a result of the merge.
++    Used to avoid unnecessary pickle writes when nothing is new.
++    """
++    changed = False
++    for k, v in src.items():
++        if isinstance(v, dict) and isinstance(dst.get(k), dict):
++            if merge_nested_dicts_with_change(dst[k], v):
++                changed = True
++        else:
++            if k not in dst or dst.get(k) != v:
++                dst[k] = v
++                changed = True
++    return changed
+@@ def save_stored_option_data(ticker: str) -> None:
+-        merge_nested_dicts(existing_price, stored_option_price[t])
+-        merge_nested_dicts(existing_chain, stored_option_chain[t])
+-
+-        # Write back (highest protocol)
+-        with price_cache_file.open("wb") as f:
+-            pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
+-        with chain_cache_file.open("wb") as f:
+-            pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
+-
+-        # Sanity checks
+-        if price_cache_file.stat().st_size == 0:
+-            print(f"Error: {price_cache_file} is empty after write!")
+-        if chain_cache_file.stat().st_size == 0:
+-            print(f"Error: {chain_cache_file} is empty after write!")
++        price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
++        chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
++
++        if price_changed:
++            with price_cache_file.open("wb") as f:
++                pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
++            if price_cache_file.stat().st_size == 0:
++                print(f"Error: {price_cache_file} is empty after write!")
++
++        if chain_changed:
++            with chain_cache_file.open("wb") as f:
++                pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
++            if chain_cache_file.stat().st_size == 0:
++                print(f"Error: {chain_cache_file} is empty after write!")
+-- 
+2.39.3

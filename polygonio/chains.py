@@ -1,253 +1,302 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date
+from functools import lru_cache
+from typing import Dict, Any, Optional, Tuple, Iterable
 
 from .config import get_settings, PREMIUM_FIELD_MAP
-from .cache_io import stored_option_price
-from .poly_client import PolygonAPIClient
-from .option_lookup import get_option_quote
+from .cache_io import load_stored_option_data, stored_option_chain, stored_option_price
+
+
+def _to_date(d: str | date | None) -> Optional[date]:
+    if d is None:
+        return None
+    if isinstance(d, date):
+        return d
+    return datetime.strptime(d, "%Y-%m-%d").date()
+
+
+def _ds(d: str | date | None) -> Optional[str]:
+    if d is None:
+        return None
+    if isinstance(d, str):
+        return d
+    return d.strftime("%Y-%m-%d")
+
+
+def _price_field() -> str:
+    mode = (get_settings().premium_price_mode or "mid").lower()
+    return PREMIUM_FIELD_MAP.get(mode, "mid_price")
+
+
+FALLBACK_MAX_WEEKS = 5
+
+
+def _has_chain_for(ticker: str, as_of_s: str, exp_s: str) -> Tuple[bool, Dict[float, Any], Dict[float, Any]]:
+    bucket = stored_option_chain.get(ticker, {}).get(exp_s, {}).get(as_of_s, {})
+    calls = bucket.get("call") or {}
+    puts = bucket.get("put") or {}
+    return (len(calls) > 0 and len(puts) > 0, calls, puts)
+
+
+def find_available_expiration(
+    ticker: str,
+    as_of: str | date,
+    target_expiration: str | date,
+    max_weeks: int = FALLBACK_MAX_WEEKS,
+) -> Tuple[Optional[str], Optional[Dict[float, Any]], Optional[Dict[float, Any]]]:
+    as_of_s = _ds(as_of)
+    target_d = _to_date(target_expiration)
+    if as_of_s is None or target_d is None:
+        return None, None, None
+
+    # exact
+    ok, calls, puts = _has_chain_for(ticker, as_of_s, _ds(target_d))
+    if ok:
+        return _ds(target_d), calls, puts
+
+    # forward
+    for k in range(1, max_weeks + 1):
+        cand = target_d + timedelta(days=7 * k)
+        ok, calls, puts = _has_chain_for(ticker, as_of_s, _ds(cand))
+        if ok:
+            return _ds(cand), calls, puts
+
+    # backward
+    for k in range(1, max_weeks + 1):
+        cand = target_d - timedelta(days=7 * k)
+        ok, calls, puts = _has_chain_for(ticker, as_of_s, _ds(cand))
+        if ok:
+            return _ds(cand), calls, puts
+
+    return None, None, None
+
+
+@lru_cache(maxsize=2048)
+def _get_price_bucket(ticker: str, as_of_s: str) -> Dict[float, Dict[str, Dict[str, Dict[str, float]]]]:
+    return stored_option_price.get(ticker, {}).get(as_of_s, {})
+
+
+def _extract_chain_for_expiration(
+    *,
+    ticker: str,
+    as_of_s: str,
+    expiration_s: str,
+) -> Tuple[Dict[float, str], Dict[float, str]]:
+    bucket = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {})
+    call_symbols = bucket.get("call") or {}
+    put_symbols = bucket.get("put") or {}
+    return call_symbols, put_symbols
+
+
+def _extract_premiums_for_strikes(
+    *,
+    ticker: str,
+    as_of_s: str,
+    expiration_s: str,
+    strikes: Iterable[float],
+    opt_type: str,
+) -> Dict[float, float]:
+    pf = _price_field()
+    price_bucket = _get_price_bucket(ticker, as_of_s)
+    out: Dict[float, float] = {}
+    for k in strikes:
+        exp_map = price_bucket.get(k, {})
+        type_map = exp_map.get(expiration_s, {}).get(opt_type, {})
+        val = type_map.get(pf)
+        if val is not None:
+            try:
+                out[float(k)] = float(val)
+            except Exception:
+                pass
+    return out
+
+
+def _window_strikes(
+    *,
+    strikes: Iterable[float],
+    spot: Optional[float],
+    option_range: float,
+    force_otm: bool,
+    is_call: bool,
+) -> Iterable[float]:
+    if spot is None or spot <= 0:
+        return sorted(set(float(k) for k in strikes))
+
+    lo = spot * (1.0 - option_range)
+    hi = spot * (1.0 + option_range)
+
+    filt = []
+    for k in strikes:
+        try:
+            kf = float(k)
+        except Exception:
+            continue
+        if lo <= kf <= hi:
+            if not force_otm:
+                filt.append(kf)
+            else:
+                if is_call and kf >= spot:
+                    filt.append(kf)
+                elif (not is_call) and kf <= spot:
+                    filt.append(kf)
+    return sorted(set(filt))
 
 
 @dataclass(frozen=True)
-class StrikeRange:
-    min_strike: Optional[float]
-    max_strike: Optional[float]
+class ChainResult:
+    ticker: str
+    as_of: str
+    expiration: str
+    call_options: Dict[float, Dict[str, Any]]
+    put_options: Dict[float, Dict[str, Any]]
 
 
-def _scaling_for_ticker(ticker: str) -> float:
-    """Match legacy scaling logic for index/ETF products.
+def get_option_chain_for_date(
+    *,
+    ticker: str,
+    as_of_str: Optional[str] = None,
+    expiration_str: Optional[str] = None,
+    as_of: Optional[str | date] = None,
+    expiration: Optional[str | date] = None,
+    spot: Optional[float] = None,
+    option_range: Optional[float] = None,
+    force_otm: Optional[bool] = None,
+) -> Optional[ChainResult]:
+    settings = get_settings()
+    option_range = settings.option_range if option_range is None else option_range
+    force_otm = settings.force_otm if force_otm is None else force_otm
 
-    - SPY/QQQ/TQQQ/SQQQ => 1
-    - SPX/NDX           => 0.5 (wider dollar strikes; narrow percentage window)
-    - else              => 1
-    """
-    t = ticker.upper()
-    if t in {"SPY", "QQQ", "TQQQ", "SQQQ"}:
-        return 1.0
-    if t in {"SPX", "NDX"}:
-        return 0.5
-    return 1.0
+    as_of_s = _ds(as_of_str) or _ds(as_of)
+    expiration_s = _ds(expiration_str) or _ds(expiration)
+    if as_of_s is None or expiration_s is None:
+        return None
 
+    call_syms = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("call") or {}
+    put_syms  = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("put") or {}
 
-def _price_window(close_price: float, *, scale: float, force_otm: bool) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """Compute (call_low, call_high), (put_low, put_high) strike windows around spot.
+    if not call_syms or not put_syms:
+        chosen_exp, calls_fallback, puts_fallback = find_available_expiration(
+            ticker=ticker, as_of=as_of_s, target_expiration=expiration_s
+        )
+        if not chosen_exp:
+            return None
+        expiration_s = chosen_exp
+        call_syms = calls_fallback or {}
+        put_syms  = puts_fallback or {}
 
-    Mirrors the original behavior:
-    - If force_otm is False → allow slight ITM (price_limit_percent = -0.5)
-    - If force_otm is True  → strictly OTM (price_limit_percent = 0)
-    - Calls:   (spot * (1+limit*scale), spot * (1 + 0.5*scale))
-    - Puts:    (spot * (1 - 0.5*scale), spot * (1 - limit*scale))
-    """
-    limit = 0.0 if force_otm else -0.5
-    call_low = close_price * (1 + limit * scale)
-    call_high = close_price * (1 + 0.5 * scale)
-    put_low = close_price * (1 - 0.5 * scale)
-    put_high = close_price * (1 - limit * scale)
-    return (call_low, call_high), (put_low, put_high)
+    all_call_strikes = list(call_syms.keys())
+    all_put_strikes = list(put_syms.keys())
 
+    win_call_strikes = _window_strikes(
+        strikes=all_call_strikes, spot=spot, option_range=option_range, force_otm=force_otm, is_call=True
+    )
+    win_put_strikes = _window_strikes(
+        strikes=all_put_strikes, spot=spot, option_range=option_range, force_otm=force_otm, is_call=False
+    )
 
+    call_prem = _extract_premiums_for_strikes(
+        ticker=ticker, as_of_s=as_of_s, expiration_s=expiration_s, strikes=win_call_strikes, opt_type="call"
+    )
+    put_prem = _extract_premiums_for_strikes(
+        ticker=ticker, as_of_s=as_of_s, expiration_s=expiration_s, strikes=win_put_strikes, opt_type="put"
+    )
+
+    call_options: Dict[float, Dict[str, Any]] = {}
+    for k in win_call_strikes:
+        sym = call_syms.get(k)
+        prem = call_prem.get(k)
+        if sym is not None and prem is not None:
+            call_options[float(k)] = {"symbol": sym, "premium": float(prem)}
+
+    put_options: Dict[float, Dict[str, Any]] = {}
+    for k in win_put_strikes:
+        sym = put_syms.get(k)
+        prem = put_prem.get(k)
+        if sym is not None and prem is not None:
+            put_options[float(k)] = {"symbol": sym, "premium": float(prem)}
+
+    return ChainResult(
+        ticker=ticker,
+        as_of=as_of_s,
+        expiration=expiration_s,
+        call_options=call_options,
+        put_options=put_options,
+    )
+
+# -----------------------------------------------------------------------------
+# Legacy-compatible async API
+# -----------------------------------------------------------------------------
 async def pull_option_chain_data(
     ticker: str,
     call_put: str,
     expiration_str: str,
     as_of_str: str,
-    close_price: float,
+    close_price: float | None = None,
     *,
-    client: PolygonAPIClient,
+    client=None,
     force_otm: bool = False,
     force_update: bool = False,
-) -> Tuple[
-    Optional[List[Dict[str, Any]]],
-    Optional[List[Dict[str, Any]]],
-    Optional[List[Dict[str, Any]]],
-    Optional[List[Dict[str, Any]]],
-    Optional[Dict[str, Dict[str, Optional[float]]]],
-]:
-    """Assemble chains and premiums around spot for both calls and puts.
-
-    Returns
-    -------
-    (all_call_data, all_put_data, call_options, put_options, strike_range_dict)
-
-    Notes
-    -----
-    - Matches legacy semantics (window construction, cache reuse, batch fetching)
-    - Only fetches missing legs unless `force_update=True` or global chain update forced
-    - Respects `PREMIUM_PRICE_MODE` for which premium field is considered valid
+):
     """
-    s = get_settings()
-    premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
+    Legacy-compatible wrapper used by pricing/recursive_backtest.
 
-    # Ensure we have both call & put chains for the (expiry, as_of)
-    unique_chain_requests = [
-        (expiration_str, as_of_str, "call"),
-        (expiration_str, as_of_str, "put"),
-    ]
-    chain_data = await client.get_option_chains_batch_async(
-        ticker, unique_chain_requests, force_update=force_update
-    )
+    Returns a 5-tuple:
+        (all_call_data, all_put_data, call_opts, put_opts, strike_range)
 
-    call_strike_dict: Dict[float, str] = chain_data[ticker][expiration_str][as_of_str].get("call", {}) or {}
-    put_strike_dict: Dict[float, str] = chain_data[ticker][expiration_str][as_of_str].get("put", {}) or {}
+    - *_opts* are lists of meta dicts aligned by index with *_data* lists.
+    - *_data* rows are the stored price dicts containing fields like
+      'ask_price','bid_price','mid_price','close_price','trade_price', etc.
 
-    if not call_strike_dict and not put_strike_dict:
-        return None, None, None, None, None
+    We will try the requested expiration; if either side is missing, we walk
+    expirations (forward weeks, then backward) to find one with BOTH sides,
+    mirroring dailytrade.py.
+    """
+    # Step 1: check/request chain at desired expiration
+    # (We do not use `call_put` to filter returns; both sides are provided.)
 
-    # Build strike windows
-    scale = _scaling_for_ticker(ticker)
-    (call_low, call_high), (put_low, put_high) = _price_window(close_price, scale=scale, force_otm=force_otm)
+    # Attempt direct
+    call_syms = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("call") or {}
+    put_syms  = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("put") or {}
 
-    # Assemble candidate option dicts within the window
-    call_options: List[Dict[str, Any]] = []
-    for strike, sym in call_strike_dict.items():
-        if call_low < strike < call_high:
-            call_options.append(
-                {
-                    "strike_price": strike,
-                    "call_put": "call",
-                    "expiration_date": expiration_str,
-                    "quote_timestamp": as_of_str,
-                    "option_ticker": sym,
-                }
-            )
-
-    put_options: List[Dict[str, Any]] = []
-    for strike, sym in put_strike_dict.items():
-        if put_low < strike < put_high:
-            put_options.append(
-                {
-                    "strike_price": strike,
-                    "call_put": "put",
-                    "expiration_date": expiration_str,
-                    "quote_timestamp": as_of_str,
-                    "option_ticker": sym,
-                }
-            )
-
-    # Pre-compute min/max ranges
-    def _range(arr: List[Dict[str, Any]]) -> StrikeRange:
-        if not arr:
-            return StrikeRange(None, None)
-        strikes = [o["strike_price"] for o in arr]
-        return StrikeRange(min(strikes), max(strikes))
-
-    call_rng = _range(call_options)
-    put_rng = _range(put_options)
-
-    strike_range_dict: Optional[Dict[str, Dict[str, Optional[float]]]]
-    if call_rng.min_strike is not None and put_rng.min_strike is not None:
-        strike_range_dict = {
-            "call": {"min_strike": call_rng.min_strike, "max_strike": call_rng.max_strike},
-            "put": {"min_strike": put_rng.min_strike, "max_strike": put_rng.max_strike},
-        }
-    else:
-        strike_range_dict = None
-
-    # Decide whether range is sufficient (OPTION_RANGE check) — legacy behavior
-    range_ok = False
-    if strike_range_dict is not None:
-        range_ok = (
-            (call_rng.max_strike or 0) > close_price * (1 + s.option_range)
-            and (put_rng.min_strike or 1e12) < close_price * (1 - s.option_range)
+    exp_chosen = expiration_str
+    if not call_syms or not put_syms:
+        chosen_exp, calls_fb, puts_fb = find_available_expiration(
+            ticker=ticker, as_of=as_of_str, target_expiration=expiration_str
         )
+        if not chosen_exp:
+            # return empty shapes
+            return [], [], [], [], None
+        exp_chosen = chosen_exp
+        call_syms = calls_fb or {}
+        put_syms  = puts_fb or {}
 
-    # Gather existing cached premiums
-    t = ticker.upper()
-    all_call_data: List[Optional[Dict[str, Any]]] = []
-    all_put_data: List[Optional[Dict[str, Any]]] = []
-    call_to_fetch: List[Dict[str, Any]] = []
-    put_to_fetch: List[Dict[str, Any]] = []
+    # Pull aligned price rows from stored_option_price
+    pf_bucket = stored_option_price.get(ticker, {}).get(as_of_str, {})  # strike -> exp -> type -> fields
 
-    # Threshold: if forcing update we demand strictly fresh data, otherwise accept any positive premium
-    threshold = 1 if (force_update or s.option_chain_force_update) else 0
+    # Sort strikes as in legacy: calls asc, puts desc
+    call_strikes = sorted(call_syms.keys())
+    put_strikes  = sorted(put_syms.keys(), reverse=True)
 
-    for opt in call_options:
-        strike = round(float(opt["strike_price"]), 2)
-        data = (
-            stored_option_price.get(t, {})
-            .get(as_of_str, {})
-            .get(strike, {})
-            .get(expiration_str, {})
-            .get("call", {})
-        )
-        if data and ((data.get(premium_field, -1) >= threshold)) and not s.option_chain_force_update:
-            all_call_data.append(data)
-        else:
-            if "call" in call_put:
-                call_to_fetch.append(opt)
-            all_call_data.append(None)
+    def _row_for(strike: float, opt_type: str) -> dict:
+        return (pf_bucket.get(strike, {}).get(exp_chosen, {}).get(opt_type, {}) or {}).copy()
 
-    for opt in put_options:
-        strike = round(float(opt["strike_price"]), 2)
-        data = (
-            stored_option_price.get(t, {})
-            .get(as_of_str, {})
-            .get(strike, {})
-            .get(expiration_str, {})
-            .get("put", {})
-        )
-        if data and ((data.get(premium_field, -1) >= threshold)) and not s.option_chain_force_update:
-            all_put_data.append(data)
-        else:
-            if "put" in call_put:
-                put_to_fetch.append(opt)
-            all_put_data.append(None)
+    # Build meta lists (aligned) and data lists
+    call_opts = [{"strike_price": float(k), "expiration_date": exp_chosen, "option_ticker": call_syms[k]} for k in call_strikes]
+    put_opts  = [{"strike_price": float(k), "expiration_date": exp_chosen, "option_ticker": put_syms[k]}  for k in put_strikes]
 
-    # Heuristic from legacy: only batch-fetch if >10% missing or force_update
-    need_fetch = (
-        (len(call_to_fetch) > 0.1 * max(1, len(call_options)))
-        or (len(put_to_fetch) > 0.1 * max(1, len(put_options)))
-        or force_update
-    )
+    all_call_data = [_row_for(k, "call") for k in call_strikes]
+    all_put_data  = [_row_for(k, "put")  for k in put_strikes]
 
-    if need_fetch and (call_to_fetch or put_to_fetch):
-        fetched = await client.get_option_prices_batch_async(ticker, call_to_fetch + put_to_fetch)
-        fetched_call = fetched[: len(call_to_fetch)]
-        fetched_put = fetched[len(call_to_fetch) :]
+    # Optional: filter/window by range/OTM (legacy call sites usually filter later, so we keep full set)
+    # But we can compute strike_range for debug
+    smin = None
+    smax = None
+    all_strikes = list(call_syms.keys()) + list(put_syms.keys())
+    if all_strikes:
+        smin = float(min(all_strikes))
+        smax = float(max(all_strikes))
+    strike_range = (smin, smax) if smin is not None else None
 
-        # Fill back the placeholders in order
-        if "call" in call_put:
-            idx = 0
-            for i in range(len(all_call_data)):
-                if all_call_data[i] is None:
-                    all_call_data[i] = fetched_call[idx] if idx < len(fetched_call) else {}
-                    idx += 1
-        if "put" in call_put:
-            idx = 0
-            for i in range(len(all_put_data)):
-                if all_put_data[i] is None:
-                    all_put_data[i] = fetched_put[idx] if idx < len(fetched_put) else {}
-                    idx += 1
-
-    # If we decided not to batch fetch (few gaps), fill the gaps synchronously via v3/quotes
-    elif (call_to_fetch or put_to_fetch):
-        if "call" in call_put and call_to_fetch:
-            for i, opt in enumerate(call_options):
-                if all_call_data[i] is None:
-                    q = get_option_quote(
-                        underlying_ticker=ticker,
-                        strike_price=float(opt["strike_price"]),
-                        call_put="call",
-                        expiration_date=expiration_str,
-                        quote_timestamp=as_of_str,
-                    )
-                    all_call_data[i] = q[0] if isinstance(q, list) and q else {}
-        if "put" in call_put and put_to_fetch:
-            for i, opt in enumerate(put_options):
-                if all_put_data[i] is None:
-                    q = get_option_quote(
-                        underlying_ticker=ticker,
-                        strike_price=float(opt["strike_price"]),
-                        call_put="put",
-                        expiration_date=expiration_str,
-                        quote_timestamp=as_of_str,
-                    )
-                    all_put_data[i] = q[0] if isinstance(q, list) and q else {}
-
-    return (
-        all_call_data or None,
-        all_put_data or None,
-        call_options or None,
-        put_options or None,
-        strike_range_dict,
-    )
+    return all_call_data, all_put_data, call_opts, put_opts, strike_range
