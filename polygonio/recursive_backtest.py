@@ -848,11 +848,19 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         pos["put_closed_date"] = cur
                         pos["put_closed_profit"] = entry_credit_put + realised_loss
 
-                # Keep if any leg still open
-                still_open.append(pos if (not pos.get("call_closed_by_stop", False) or not pos.get("put_closed_by_stop", False)) else pos)
+                # Keep for filtering after evaluating both legs
+                still_open.append(pos)
 
-            # Replace open_positions with filtered list (expired ones are dropped via 'continue' above)
-            open_positions = [p for p in still_open if not (p.get("call_closed_by_stop", False) and p.get("put_closed_by_stop", False))]
+            # Replace open_positions with positions that still have an open leg
+            # Treat a leg as closed if it was never opened (no corresponding short premium)
+            open_positions = [
+                p
+                for p in still_open
+                if not (
+                    (p.get("call_closed_by_stop", False) or p.get("short_call_prem_open") is None)
+                    and (p.get("put_closed_by_stop", False) or p.get("short_put_prem_open") is None)
+                )
+            ]
             for pos in open_positions:
                 print(f"[DEBUG] still open: {pos.get('underlying')} exp={pos.get('expiration')} opened={pos.get('opened_at')} pcs={pos.get('put_strike_sold')} closed_call={pos.get('call_closed_by_stop')} closed_put={pos.get('put_closed_by_stop')}")
 
