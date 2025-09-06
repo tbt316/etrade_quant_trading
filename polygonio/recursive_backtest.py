@@ -876,9 +876,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     and (p.get("put_closed_by_stop", False) or p.get("short_put_prem_open") is None)
                 )
             ]
-            for pos in open_positions:
-                print(f"[DEBUG] still open: {pos.get('underlying')} exp={pos.get('expiration')} opened={pos.get('opened_at')} pcs={pos.get('put_strike_sold')} closed_call={pos.get('call_closed_by_stop')} closed_put={pos.get('put_closed_by_stop')}")
-
+            
             # bookkeeping row
             pnl_row = {
                 "as_of": as_of_str,
