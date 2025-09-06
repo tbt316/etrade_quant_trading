@@ -2,11 +2,10 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date, timedelta
+
 import pandas as pd
 import numpy as np
-
-# Use the reference plotter exactly as requested
-from polygonio_dailytrade_reference import plot_recursive_results  # noqa: E402
+import matplotlib.pyplot as plt
 
 
 def _to_dt(x) -> Optional[datetime]:
@@ -193,6 +192,57 @@ def build_plot_inputs(res: Dict[str, Any],
         parameter_history,
         df_dict,
     )
+
+
+def plot_recursive_results(
+    ticker: str,
+    final_pnl: float,
+    daily_results: List[Dict[str, Any]],
+    pnl_cumulative_series: List[float],
+    pnl_cumulative_realized_series: List[float],
+    parameter_history: List[Dict[str, Any]],
+    global_start_date: str,
+    global_end_date: str,
+    df_dict: Dict[str, pd.DataFrame],
+):
+    """Simple matplotlib plotter for backtest results.
+
+    This lightweight replacement replicates the basic visuals of the
+    reference implementation while avoiding the heavy external
+    dependency. Two subplots are produced:
+
+    * underlying close price
+    * cumulative PnL (realized vs total)
+
+    Returns the created :class:`matplotlib.figure.Figure` instance.
+    """
+
+    # Prepare date index for plotting
+    dt_series = [pd.to_datetime(r["date"]) for r in daily_results]
+
+    price_df = df_dict.get("df", pd.DataFrame()).sort_index()
+
+    fig, (ax_price, ax_pnl) = plt.subplots(2, 1, sharex=True, figsize=(10, 6))
+
+    if not price_df.empty:
+        ax_price.plot(price_df.index, price_df["close"], label="Close")
+        ax_price.set_ylabel("Price")
+        ax_price.set_title(f"{ticker} Price")
+        ax_price.legend(loc="best")
+
+    ax_pnl.plot(dt_series, pnl_cumulative_series, label="PnL")
+    ax_pnl.plot(dt_series, pnl_cumulative_realized_series, label="Realized PnL")
+    ax_pnl.set_ylabel("PnL")
+    ax_pnl.set_title("Cumulative PnL")
+    ax_pnl.legend(loc="best")
+    ax_pnl.set_xlabel("Date")
+
+    fig.suptitle(
+        f"{ticker} {global_start_date} to {global_end_date} Final PnL: {final_pnl:.2f}"
+    )
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    return fig
 
 
 def plot_from_backtest_results(res: Dict[str, Any],
