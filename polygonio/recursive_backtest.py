@@ -371,8 +371,16 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 continue
             expiration_str = target_dt.strftime("%Y-%m-%d")
 
-            # Determine whether a spread for this expiration already exists
-            already_open = any(p.get("expiration") == expiration_str for p in open_positions)
+            # Determine whether we've already opened a spread today. We allow
+            # multiple positions sharing an expiration across different days
+            # but restrict opening more than one trade on the same date.
+            already_open = any(
+                (
+                    (p.get("position_open_date") and getattr(p["position_open_date"], "date", lambda: p["position_open_date"])() == cur)
+                    or p.get("open") == as_of_str
+                )
+                for p in open_positions
+            )
 
             # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
             print(
