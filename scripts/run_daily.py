@@ -1,91 +1,158 @@
-#!/usr/bin/env python3
+# etrade_quant_trading/scripts/run_daily.py
 from __future__ import annotations
+
 import argparse
+import sys
+from datetime import datetime, timedelta
+
 from polygonio.logging_setup import init_logging
 from polygonio.recursive_backtest import monthly_recursive_backtest
 from polygonio.daily_report import print_opened_and_closed_for_date
+from polygonio.plot_results import plot_from_backtest_results
 
-def parse_args():
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run daily backtest with parity to dailytrade.py parameters."
+        description="Run monthly_recursive_backtest and (optionally) plot results."
     )
-    # Required core args
-    p.add_argument("-t","--ticker", required=True, help="Underlying ticker, e.g. SPY")
-    p.add_argument("-s","--start", required=True, help="Start date YYYY-MM-DD")
-    p.add_argument("-e","--end", required=True, help="End date YYYY-MM-DD")
-    p.add_argument("--trade-type", required=True,
-                   choices=["iron_condor","put_credit_spread","call_credit_spread","covered_call"])
+    # Core backtest window
+    p.add_argument("-t", "--ticker", required=True, help="Underlying ticker, e.g. SPY")
+    p.add_argument("-s", "--start", required=True, help="Global start date, YYYY-MM-DD")
+    p.add_argument("-e", "--end", required=True, help="Global end date, YYYY-MM-DD")
 
-    # Existing knobs
-    p.add_argument("--weekday", default="Friday", help="Which weekday to target for expiries (e.g., Friday)")
-    p.add_argument("--expiring-wks", type=int, default=1, help="Weeks out for option expiry (1=next week)")
-    p.add_argument("--qty", type=int, default=1, help="Contracts per leg")
+    # Strategy selection and knobs (mirror your engine’s parameters)
+    p.add_argument("--trade-type", required=True, help="e.g. iron_condor, put_credit_spread, call_credit_spread")
 
-    # New parity args from dailytrade.py
-    p.add_argument("--iron-condor-width", type=float, default=5.0,
-                   help="Width for iron condor/spreads (strike distance)")
-    p.add_argument("--target-premium-otm", type=float, default=None,
-                   help="Target premium (OTM) used to set short strike(s)")
-    p.add_argument("--target-delta", type=float, default=None,
-                   help="Accepted but NOT used for strike selection (parity only)")
-    p.add_argument("--target-steer", type=float, default=0.0,
-                   help="Bias target premium between puts(+)/calls(-). "
-                        "put target = otm*(1+steer), call target = otm*(1-steer)")
-    p.add_argument("--stop-profit-percent", type=float, default=None,
-                   help="Take-profit percent of initial credit, e.g., 0.5 = 50%")
-    p.add_argument("--stop-loss-action", default=None,
-                   help="Action on loss (plumbed for parity; specify rule to enable)")
-    p.add_argument("--vix-threshold", type=float, default=None,
-                   help="VIX gating threshold (no-op unless correlation set & logic enabled)")
-    p.add_argument("--vix-correlation", choices=["gt","lt"], default=None,
-                   help="VIX gating: compare VIX to threshold (no-op unless logic enabled)")
+    p.add_argument(
+        "--weekday",
+        dest="weekday",
+        default="Friday",
+        choices=["Friday", "Wednesday"],
+        help="Which weekday expirations to target (default: Friday)",
+    )
+    p.add_argument(
+        "--expiring-wks",
+        dest="expiring_wks",
+        type=int,
+        default=1,
+        help="Spacing between expiries in weeks (default: 1)",
+    )
+    p.add_argument(
+        "--qty",
+        dest="qty",
+        type=int,
+        default=1,
+        help="Contracts per position (default: 1)",
+    )
+    p.add_argument(
+        "--iron-condor-width",
+        dest="iron_condor_width",
+        type=float,
+        default=None,
+        help="Wing width for iron condor (points). If omitted, engine default is used.",
+    )
 
-    p.add_argument("--log-level", default="INFO")
+    # Targeting / selection knobs (only applied if your engine uses them)
+    p.add_argument(
+        "--target-premium-otm",
+        dest="target_premium_otm",
+        type=float,
+        default=None,
+        help="Target premium (in $) or OTM-based premium target if your engine supports it.",
+    )
+    p.add_argument(
+        "--target-delta",
+        dest="target_delta",
+        type=float,
+        default=None,
+        help="Target short-leg delta (e.g., 0.15).",
+    )
+    p.add_argument(
+        "--target-steer",
+        dest="target_steer",
+        type=float,
+        default=None,
+        help="Optional steering factor used by your selector (engine-specific).",
+    )
+
+    # Risk management knobs
+    p.add_argument(
+        "--stop-profit-percent",
+        dest="stop_profit_percent",
+        type=float,
+        default=None,
+        help="Take-profit threshold (e.g., 0.5 = +50% profit on credit).",
+    )
+    p.add_argument(
+        "--stop-loss-action",
+        dest="stop_loss_action",
+        default=None,
+        help="Engine-specific stop-loss behavior keyword (e.g., 'close', 'hold').",
+    )
+
+    # Optional VIX gating (if enabled in engine)
+    p.add_argument(
+        "--vix-threshold",
+        dest="vix_threshold",
+        type=float,
+        default=None,
+        help="Numeric VIX threshold for gating.",
+    )
+    p.add_argument(
+        "--vix-correlation",
+        dest="vix_correlation",
+        choices=["gt", "lt"],
+        default=None,
+        help="Use 'gt' to trade only when VIX > threshold, 'lt' for VIX < threshold.",
+    )
+
+    # Plotting & logging
+    p.add_argument(
+        "--plot",
+        action="store_true",
+        help="After the backtest, render the reference-style plot using plot_recursive_results.",
+    )
+    p.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     return p.parse_args()
 
-def main():
-    a = parse_args()
-    init_logging(a.log_level)
-    print(f"[DEBUG] run_daily args: ticker={a.ticker}, start={a.start}, end={a.end}, "
-          f"trade_type={a.trade_type}, weekday={a.weekday}, expiring_wks={a.expiring_wks}, qty={a.qty}, "
-          f"ic_width={a.iron_condor_width}, tgt_prem_otm={a.target_premium_otm}, tgt_delta={a.target_delta}, "
-          f"steer={a.target_steer}, tp_pct={a.stop_profit_percent}, sl_action={a.stop_loss_action}, "
-          f"vix_thr={a.vix_threshold}, vix_corr={a.vix_correlation}")
 
-    print("[DEBUG] Invoking monthly_recursive_backtest...")
+def main() -> int:
+    args = parse_args()
+    init_logging(level=args.log_level)
+
+    # Run the backtest
     res = monthly_recursive_backtest(
-        ticker=a.ticker,
-        global_start_date=a.start,
-        global_end_date=a.end,
-        trade_type=a.trade_type,
-        expiring_weekday=a.weekday,
-        expiring_wks=a.expiring_wks,
-        contract_qty=a.qty,
-        iron_condor_width=a.iron_condor_width,
-        target_premium_otm=a.target_premium_otm,
-        target_delta=a.target_delta,
-        target_steer=a.target_steer,
-        stop_profit_percent=a.stop_profit_percent,
-        stop_loss_action=a.stop_loss_action,
-        vix_threshold=a.vix_threshold,
-        vix_correlation=a.vix_correlation,
+        ticker=args.ticker,
+        global_start_date=args.start,
+        global_end_date=args.end,
+        trade_type=args.trade_type,
+        expiring_weekday=args.weekday,
+        expiring_wks=args.expiring_wks,
+        contract_qty=args.qty,
+        iron_condor_width=args.iron_condor_width,
+        target_premium_otm=args.target_premium_otm,
+        target_delta=args.target_delta,
+        target_steer=args.target_steer,
+        stop_profit_percent=args.stop_profit_percent,
+        stop_loss_action=args.stop_loss_action,
+        vix_threshold=args.vix_threshold,
+        vix_correlation=args.vix_correlation,
     )
 
-    # === Daily Opened/Closed report ===
+    # Print opened/closed positions for each day in range
     try:
-        from datetime import datetime, timedelta
-        start_dt = datetime.strptime(a.start, "%Y-%m-%d")
-        end_dt = datetime.strptime(a.end, "%Y-%m-%d")
+        start_dt = datetime.strptime(args.start, "%Y-%m-%d")
+        end_dt = datetime.strptime(args.end, "%Y-%m-%d")
         cur = start_dt
         while cur <= end_dt:
             ds = cur.strftime("%Y-%m-%d")
             print_opened_and_closed_for_date(res, ds)
             cur += timedelta(days=1)
-    except Exception as _e:
-        print(f"[WARN] Daily report printing failed: {_e}")
-        print("[DEBUG] run_daily finished. Result type:", type(res))
-    print("Done.")
-    return 0
+    except Exception as e:
+        print(f"[WARN] Daily report printing failed: {e}")
+
+    plot_from_backtest_results(res)
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
