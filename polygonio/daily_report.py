@@ -82,11 +82,25 @@ def _fmt_engine_summary(debug: Dict[str, Any]) -> str:
 
 def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -> None:
     all_pos, per_day, debug = _normalize_positions(results_or_positions)
-    todays = per_day.get(date_str, []) if per_day else [
-        p for p in all_pos
-        if (isinstance(p, dict) and (p.get("opened_at") == date_str or p.get("expiration") == date_str or p.get("expiration_date") == date_str))
-        or (getattr(p, "opened_at", None) == date_str)
-    ]
+
+    todays = per_day.get(date_str, []) if per_day else []
+
+    if not todays:
+        todays = [
+            p for p in all_pos
+            if any(
+                _to_datestr(p.get(k)) == date_str
+                for k in (
+                    "opened_at",
+                    "expiration",
+                    "expiration_date",
+                    "closed_at",
+                    "call_closed_date",
+                    "put_closed_date",
+                )
+            )
+        ]
+
     if not all_pos and not todays:
         print(f"{YELLOW}No positions found to report for {date_str}.{RESET}")
         if debug:
@@ -131,3 +145,86 @@ def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -
 
     if not (opened or closed) and debug:
         print(_fmt_engine_summary(debug))
+
+
+def plot_recursive_results(results: Dict[str, Any], *, show: bool = True, save_path: str | None = None) -> None:
+    """Plot cumulative PnL and open position counts from backtest results.
+
+    Parameters
+    ----------
+    results : dict
+        Dictionary returned by ``monthly_recursive_backtest`` or
+        ``backtest_options_sync_or_async``.
+    show : bool, default True
+        If True, display the plot using ``matplotlib.pyplot.show``.
+    save_path : str, optional
+        If provided, save the plot image to this path.
+
+    Notes
+    -----
+    The function aggregates per-position ``*_closed_profit`` fields by their
+    closing date to build a cumulative PnL curve.  Open position counts are
+    taken from the ``pnl`` section of the results.
+    """
+
+    import matplotlib
+    if not matplotlib.get_backend().lower().startswith("agg"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from datetime import datetime
+
+    pnl_rows = results.get("pnl") or []
+    if not pnl_rows:
+        print("No PnL data to plot.")
+        return
+
+    dates = [datetime.strptime(r.get("as_of"), "%Y-%m-%d") for r in pnl_rows]
+    open_positions = [int(r.get("open_positions", 0)) for r in pnl_rows]
+
+    profit_by_date: Dict[str, float] = {}
+    for pos in results.get("positions") or []:
+        profit = 0.0
+        for k in ("call_closed_profit", "put_closed_profit"):
+            try:
+                profit += float(pos.get(k) or 0.0)
+            except Exception:
+                continue
+        if profit == 0:
+            continue
+        close_date = None
+        for k in ("call_closed_date", "put_closed_date", "closed_at", "expiration"):
+            v = pos.get(k)
+            if v:
+                close_date = v.split("T")[0] if isinstance(v, str) else v
+                break
+        if close_date is None:
+            continue
+        profit_by_date.setdefault(close_date, 0.0)
+        profit_by_date[close_date] += profit
+
+    cumulative: List[float] = []
+    running = 0.0
+    for d in [dt.strftime("%Y-%m-%d") for dt in dates]:
+        running += profit_by_date.get(d, 0.0)
+        cumulative.append(running)
+
+    fig, ax1 = plt.subplots()
+    ax1.plot(dates, cumulative, color="tab:blue", label="Cumulative PnL")
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("PnL ($)", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+
+    ax2 = ax1.twinx()
+    ax2.plot(dates, open_positions, color="tab:orange", label="Open Positions")
+    ax2.set_ylabel("Open Positions", color="tab:orange")
+    ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path)
+    if show:
+        plt.show()
+    plt.close(fig)
+
