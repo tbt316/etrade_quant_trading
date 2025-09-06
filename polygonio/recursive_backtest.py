@@ -330,6 +330,20 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         daily_pnls: List[Dict[str, Any]] = []
         open_positions: List[Dict[str, Any]] = []
 
+        def _pos_open_date(pos: Dict[str, Any]) -> Optional[date]:
+            """Return the date a position was opened, or None if unknown."""
+            od = pos.get("position_open_date") or pos.get("opened_at")
+            if isinstance(od, datetime):
+                return od.date()
+            if isinstance(od, date):
+                return od
+            if isinstance(od, str):
+                try:
+                    return datetime.strptime(od, "%Y-%m-%d").date()
+                except Exception:
+                    return None
+            return None
+
         # 3) Iterate every pricing day in the window
         start_dt = datetime.strptime(cfg.global_start_date, "%Y-%m-%d").date()
         end_dt = datetime.strptime(cfg.global_end_date, "%Y-%m-%d").date()
@@ -371,8 +385,11 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 continue
             expiration_str = target_dt.strftime("%Y-%m-%d")
 
-            # Determine whether a spread for this expiration already exists
-            already_open = any(p.get("expiration") == expiration_str for p in open_positions)
+            # Determine whether a position with a different expiration was opened today
+            already_open = any(
+                (_pos_open_date(p) == cur) and p.get("expiration") != expiration_str
+                for p in open_positions
+            )
 
             # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
             print(
