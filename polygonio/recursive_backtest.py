@@ -576,7 +576,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
                             f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
                         )
-
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
@@ -613,6 +612,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     continue
 
                 daily_positions.append(position)
+                print(f"[DEBUG] built position for {as_of_str}->{expiration_str}: {position}")
                 dbg.positions_built += 1
 
                 # ========== PASTE BLOCK 2: P&L / EXIT / ACCOUNTING (unchanged) ==========
@@ -834,9 +834,11 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                     # Keep if any leg still open
                     still_open.append(pos if (not pos.get("call_closed_by_stop", False) or not pos.get("put_closed_by_stop", False)) else pos)
-
+                # end for pos in open_positions
                 # Replace open_positions with filtered list (expired ones are dropped via 'continue' above)
                 open_positions = [p for p in still_open if not (p.get("call_closed_by_stop", False) and p.get("put_closed_by_stop", False))]
+                for pos in open_positions:
+                    print(f"[DEBUG] still open: {pos.get('underlying','')} exp {pos.get('expiration','')} opened {pos.get('position_open_date','')}, legs {len(pos.get('legs',[]))} call_closed {pos.get('call_closed_by_stop',False)} put_closed {pos.get('put_closed_by_stop',False)}")
 
                 # bookkeeping row
                 pnl_row = {
@@ -848,6 +850,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     "spot": spot,
                     "open_positions": len(open_positions),
                 }
+                print(f"[DEBUG] PnL bookkeeping: {pnl_row}")
+                breakpoint()
                 daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
