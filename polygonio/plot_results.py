@@ -204,7 +204,7 @@ def plot_from_backtest_results(res: Dict[str, Any],
 
     Expected signature for plot_recursive_results:
       (ticker, final_pnl, daily_results, pnl_cumulative_series, pnl_cumulative_realized_series,
-       global_start_date, global_end_date, parameter_history, df_dict)
+       parameter_history, global_start_date, global_end_date, df_dict)
     """
     (ticker, final_pnl, daily_results, pnl_cum, pnl_cum_realized,
      start, end, parameter_history, df_dict) = build_plot_inputs(res, price_df=price_df, vix_df=vix_df)
@@ -215,8 +215,8 @@ def plot_from_backtest_results(res: Dict[str, Any],
         daily_results,
         pnl_cum,
         pnl_cum_realized,
+        parameter_history,
         start,
         end,
-        parameter_history,
         df_dict,
     )
