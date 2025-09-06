@@ -238,9 +238,12 @@ def plot_recursive_results(
         "xtick.labelsize",
         "ytick.labelsize",
     ]
+    # Use Matplotlib's default values as the baseline so repeated calls do not
+    # exponentially scale the fonts.
+    base_rc = plt.rcParamsDefault
     new_params: Dict[str, float] = {}
     for k in size_keys:
-        v = plt.rcParams.get(k)
+        v = base_rc.get(k, plt.rcParams.get(k))
         if isinstance(v, (int, float)):
             new_params[k] = v * _SCALE
         else:
@@ -457,7 +460,7 @@ def plot_recursive_results(
                 pb_y.append(pos["put_strike_bought"])
 
     # ----------------------------- plotting -------------------------------
-    fig, axes = plt.subplots(4, 2, figsize=(20, 16))
+    fig, axes = plt.subplots(4, 2, figsize=(70, 40))
     ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = axes.flatten()
 
     # ax1: cumulative PnL and cumulative annualised return
@@ -508,12 +511,12 @@ def plot_recursive_results(
         ax2.set_ylabel("Distance (%)", color="red")
         ax2.tick_params(axis="y", labelcolor="red")
         ax2.grid(True)
-        ax2.legend(loc="upper left")
+        ax2.legend(loc="upper left", fontsize=_fs(8))
         ax2_twin = ax2.twinx()
         ax2_twin.plot(dt_series, itm_amounts, color="red", label="Aggregate ITM Amount (Today Exp.)", linewidth=1, marker="o", markersize=10)
         ax2_twin.set_ylabel("ITM Amount ($)", color="blue")
         ax2_twin.tick_params(axis="y", labelcolor="blue")
-        ax2_twin.legend(loc="upper right")
+        ax2_twin.legend(loc="upper right", fontsize=_fs(8))
     else:
         ax2.text(0.5, 0.5, "No open option distances to plot", transform=ax2.transAxes, ha="center")
 
@@ -554,7 +557,7 @@ def plot_recursive_results(
     ax4.set_ylabel("Margin ($)", color="green")
     ax4.tick_params(axis="y", labelcolor="green")
     ax4.grid(True, linestyle="--", alpha=0.7)
-    ax4.legend(loc="upper left")
+    ax4.legend(loc="upper left", fontsize=_fs(8))
     ax4_twin = ax4.twinx()
     if itm_dates:
         ax4_twin.scatter(itm_dates, itm_days_open, color="red", marker="o", s=5, alpha=0.6, label="Days Open (ITM)", rasterized=True)
@@ -562,7 +565,7 @@ def plot_recursive_results(
         ax4_twin.scatter(otm_dates, otm_days_open, color="blue", marker="o", s=5, alpha=0.6, label="Days Open (OTM)", rasterized=True)
     ax4_twin.set_ylabel("Days Open", color="blue")
     ax4_twin.tick_params(axis="y", labelcolor="blue")
-    ax4_twin.legend(loc="upper right")
+    ax4_twin.legend(loc="upper right", fontsize=_fs(8))
 
     # ax5: open premiums & position counts
     def _flatten_lists(date_list, list_of_lists):
@@ -597,7 +600,7 @@ def plot_recursive_results(
     ax5_twin.plot(dt_series, itm_open_counts, color="green", label="Positions ITM at Open", linewidth=2)
     ax5_twin.set_ylabel("Number of Positions Opened", color="black")
     ax5_twin.tick_params(axis="y", labelcolor="black")
-    ax5_twin.legend(loc="upper right")
+    ax5_twin.legend(loc="upper right", fontsize=_fs(8))
     lines1, labels1 = ax5.get_legend_handles_labels()
     lines2, labels2 = ax5_twin.get_legend_handles_labels()
     ax5.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=_fs(8), framealpha=0.9)
@@ -635,6 +638,7 @@ def plot_recursive_results(
     sw_dates, sw_vals = _flatten_lists(dt_series, spread_width_array)
     put_profit_dates, put_profit_vals = _flatten_lists(dt_series, put_closed_profit_array)
     call_profit_dates, call_profit_vals = _flatten_lists(dt_series, call_closed_profit_array)
+    ax7_twin = None
     if sw_dates or put_profit_dates or call_profit_dates:
         if sw_dates:
             ax7.scatter(sw_dates, sw_vals, color="blue", marker="o", s=30, alpha=0.6, label="Spread Width", rasterized=True)
@@ -668,7 +672,7 @@ def plot_recursive_results(
         ax8.set_title("Days to Expiry")
         ax8.set_xlabel("Date")
         ax8.set_ylabel("Days")
-        ax8.legend()
+        ax8.legend(fontsize=_fs(8))
         ax8.grid(True)
     else:
         ax8.text(0.5, 0.5, "No days to expiry data", transform=ax8.transAxes, ha="center")
@@ -676,28 +680,35 @@ def plot_recursive_results(
     # --------------------------- x-axis formatting ------------------------
     if dt_series:
         min_date, max_date = min(dt_series), max(dt_series)
-        for a in [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]:
-            a.set_xlim(min_date, max_date)
-            a.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-            a.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-            for lbl in a.get_xticklabels():
-                lbl.set_rotation(45)
-                lbl.set_horizontalalignment("right")
+        for a in [ax1, ax2, ax3, ax4, ax5, ax5_twin, ax6, ax7, ax7_twin, ax8]:
+            if a is not None:
+                a.set_xlim(min_date, max_date)
+                a.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+                a.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+                for lbl in a.get_xticklabels():
+                    lbl.set_rotation(45)
+                    lbl.set_horizontalalignment("right")
+    else:
+        print("No dt_series available for x-axis formatting")
+
+    fig.autofmt_xdate()
+    fig.subplots_adjust(hspace=0.20, wspace=0.15, top=0.96, bottom=0.04, left=0.04, right=0.98)
 
     # Shade parameter periods
-    colors = plt.cm.viridis(np.linspace(0, 1, len(parameter_history))) if parameter_history else []
+    num_periods = len(parameter_history)
+    colors = plt.cm.viridis(np.linspace(0, 1, num_periods)) if num_periods > 0 else []
     for i, params in enumerate(parameter_history):
         try:
             p_start = datetime.strptime(params["start_date"], "%Y-%m-%d")
             p_end = datetime.strptime(params["end_date"], "%Y-%m-%d")
-            for a in [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]:
-                a.axvspan(p_start, p_end, alpha=0.15, color=colors[i % len(colors)])
+            for a in [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax7_twin, ax8]:
+                if a is not None:
+                    a.axvspan(p_start, p_end, alpha=0.15, color=colors[i % len(colors)])
         except Exception:
             pass
 
-    fig.suptitle(f"{ticker} {global_start_date} to {global_end_date} Final PnL: {final_pnl:.2f}", fontsize=_fs(12))
     fig.autofmt_xdate()
-    fig.subplots_adjust(hspace=0.20, wspace=0.15, top=0.94, bottom=0.06, left=0.06, right=0.98)
+    plt.tight_layout(pad=3.0)
 
     os.makedirs(PLOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
