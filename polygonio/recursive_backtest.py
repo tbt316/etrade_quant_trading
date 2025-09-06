@@ -664,12 +664,26 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             # Helper to append/update open_positions on open day
             def _register_open_position(position_dict: Dict[str, Any]):
-                pos = dict(position_dict)  # copy
+                """Register a newly-opened position in the open list.
+
+                ``position_dict`` is already appended to ``daily_positions`` above.
+                To ensure any later mutations (e.g. call/put closure fields) are
+                reflected in the final ``positions`` output, we must operate on
+                the same dictionary object rather than a copy.  Otherwise the
+                open/close logic below would update a separate object and the
+                caller would never see the enriched fields.
+                """
+
+                # Use the original dict so that open_positions and daily_positions
+                # share the same reference.
+                pos = position_dict
+
                 pos.setdefault("position_open_date", datetime.strptime(as_of_str, "%Y-%m-%d"))
                 pos.setdefault("call_closed_by_stop", False)
                 pos.setdefault("put_closed_by_stop", False)
                 pos.setdefault("call_closed_date", None)
                 pos.setdefault("put_closed_date", None)
+
                 # Extract per-leg info
                 for leg in position_dict.get("legs", []):
                     side = leg.get("side"); action = leg.get("action")
@@ -686,6 +700,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     if side == "put" and action == "buy":
                         pos["put_strike_bought"] = strike
                         pos["long_put_prem_open"] = prem
+
                 open_positions.append(pos)
 
             # Register this newly-opened position, if any
