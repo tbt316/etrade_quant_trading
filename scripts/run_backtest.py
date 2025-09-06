@@ -17,6 +17,8 @@ def parse_args():
     p.add_argument("--expiring-wks", type=int, default=1, help="Weeks out for option expiry (1=next week)")
     p.add_argument("--qty", type=int, default=1, help="Contracts per leg")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--plot", action="store_true", help="Display a simple plot of results")
+    p.add_argument("--save-plot", help="If provided, save plot image to this path")
     return p.parse_args()
 
 def main():
@@ -33,6 +35,9 @@ def main():
         expiring_wks=a.expiring_wks,
         contract_qty=a.qty,
     )
+    if a.plot or a.save_plot:
+        from polygonio.daily_report import plot_recursive_results
+        plot_recursive_results(res, show=a.plot, save_path=a.save_plot)
     print("Done.")
     return 0
 
