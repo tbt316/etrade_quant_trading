@@ -159,9 +159,10 @@ def build_plot_inputs(res: Dict[str, Any],
                       vix_df: pd.DataFrame | None = None):
     """
     Convert monthly_recursive_backtest(...) result -> args for plot_recursive_results(...).
-    Returns:
-      (ticker, final_pnl, daily_results, pnl_cum, pnl_cum_realized,
-       start, end, parameter_history, df_dict)
+    Returns a tuple ordered exactly as ``plot_recursive_results`` expects:
+
+    ``(ticker, final_pnl, daily_results, pnl_cum, pnl_cum_realized,
+    parameter_history, start, end, df_dict)``
     """
     ticker = res.get("ticker")
     start = res.get("start")
@@ -187,9 +188,9 @@ def build_plot_inputs(res: Dict[str, Any],
         daily_results,
         pnl_cum,
         pnl_cum_realized,
+        parameter_history,
         start,
         end,
-        parameter_history,
         df_dict,
     )
 
@@ -256,17 +257,5 @@ def plot_from_backtest_results(res: Dict[str, Any],
       (ticker, final_pnl, daily_results, pnl_cumulative_series, pnl_cumulative_realized_series,
        parameter_history, global_start_date, global_end_date, df_dict)
     """
-    (ticker, final_pnl, daily_results, pnl_cum, pnl_cum_realized,
-     start, end, parameter_history, df_dict) = build_plot_inputs(res, price_df=price_df, vix_df=vix_df)
-
-    return plot_recursive_results(
-        ticker,
-        final_pnl,
-        daily_results,
-        pnl_cum,
-        pnl_cum_realized,
-        parameter_history,
-        start,
-        end,
-        df_dict,
-    )
+    args = build_plot_inputs(res, price_df=price_df, vix_df=vix_df)
+    return plot_recursive_results(*args)
