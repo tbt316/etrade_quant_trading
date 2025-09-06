@@ -82,11 +82,25 @@ def _fmt_engine_summary(debug: Dict[str, Any]) -> str:
 
 def print_opened_and_closed_for_date(results_or_positions: Any, date_str: str) -> None:
     all_pos, per_day, debug = _normalize_positions(results_or_positions)
-    todays = per_day.get(date_str, []) if per_day else [
-        p for p in all_pos
-        if (isinstance(p, dict) and (p.get("opened_at") == date_str or p.get("expiration") == date_str or p.get("expiration_date") == date_str))
-        or (getattr(p, "opened_at", None) == date_str)
-    ]
+
+    todays = per_day.get(date_str, []) if per_day else []
+
+    if not todays:
+        todays = [
+            p for p in all_pos
+            if any(
+                _to_datestr(p.get(k)) == date_str
+                for k in (
+                    "opened_at",
+                    "expiration",
+                    "expiration_date",
+                    "closed_at",
+                    "call_closed_date",
+                    "put_closed_date",
+                )
+            )
+        ]
+
     if not all_pos and not todays:
         print(f"{YELLOW}No positions found to report for {date_str}.{RESET}")
         if debug:
