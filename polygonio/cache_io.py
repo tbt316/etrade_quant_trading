@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .paths import get_price_cache_file, get_chain_cache_file, ensure_dir
-import os
 
 # ---------------------------------------------------------
 # In-memory singletons (shared process-wide)
@@ -13,6 +12,8 @@ import os
 
 stored_option_price: Dict[str, Dict[str, Any]] = {}
 stored_option_chain: Dict[str, Dict[str, Any]] = {}
+# Track how many option records have been added or changed since the last save
+unsaved_option_entries: Dict[str, int] = {}
 
 # Global file lock for cross-process safety (for ProcessPoolExecutor)
 file_lock: Lock = Lock()
@@ -28,6 +29,8 @@ def _ensure_ticker_slots(ticker: str) -> None:
         stored_option_price[t] = {}
     if t not in stored_option_chain:
         stored_option_chain[t] = {}
+    if t not in unsaved_option_entries:
+        unsaved_option_entries[t] = 0
 
 
 def merge_nested_dicts(dst: Dict, src: Dict) -> None:
@@ -40,21 +43,40 @@ def merge_nested_dicts(dst: Dict, src: Dict) -> None:
         else:
             dst[k] = v
 
-def merge_nested_dicts_with_change(dst: dict, src: dict) -> bool:
-    """
-    Like merge_nested_dicts, but returns True if *dst* changed as a result of the merge.
-    Used to avoid unnecessary pickle writes when nothing is new.
-    """
-    changed = False
+
+def _count_leaves(d: Dict) -> int:
+    """Count the number of non-dict leaf nodes in *d*."""
+    total = 0
+    for v in d.values():
+        if isinstance(v, dict):
+            total += _count_leaves(v)
+        else:
+            total += 1
+    return total
+
+
+def merge_nested_dicts_with_count(dst: Dict, src: Dict) -> int:
+    """Merge *src* into *dst* and return number of leaf entries added or changed."""
+    count = 0
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            if merge_nested_dicts_with_change(dst[k], v):
-                changed = True
+            count += merge_nested_dicts_with_count(dst[k], v)
         else:
             if k not in dst or dst.get(k) != v:
                 dst[k] = v
-                changed = True
-    return changed
+                if isinstance(v, dict):
+                    count += _count_leaves(v)
+                else:
+                    count += 1
+    return count
+
+
+def record_unsaved_option_entries(ticker: str, count: int) -> None:
+    """Increment unsaved entry counter for *ticker* by *count*."""
+    if count <= 0:
+        return
+    t = ticker.upper()
+    unsaved_option_entries[t] = unsaved_option_entries.get(t, 0) + count
 
 # ---------------------------------------------------------
 # Load / Save with merge semantics
@@ -110,8 +132,15 @@ def load_stored_option_data(ticker: str, cache_dir: Path | None = None) -> Dict[
         return price_by_date.get(last_date, {})
     return {}
 
+
+def option_data_unsaved_count(ticker: str, cache_dir: Path | None = None) -> int:  # cache_dir unused
+    """Return number of option entries added/updated since last save."""
+    _ensure_ticker_slots(ticker)
+    return unsaved_option_entries.get(ticker.upper(), 0)
+
+
 def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
-    """Merge in-memory dicts with any existing on-disk pickles and write back only if changed."""
+    """Persist in-memory option data to disk."""
     _ensure_ticker_slots(ticker)
     t = ticker.upper()
 
@@ -120,10 +149,9 @@ def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
         price_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_price.pkl"
         chain_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_chain.pkl"
     else:
-        price_cache_file: Path = Path(get_price_cache_file(t))
-        chain_cache_file: Path = Path(get_chain_cache_file(t))
+        price_cache_file = Path(get_price_cache_file(t))
+        chain_cache_file = Path(get_chain_cache_file(t))
 
-    # Ensure parent dirs exist (more robust than relying on a global)
     ensure_dir(price_cache_file.parent)
     ensure_dir(chain_cache_file.parent)
 
@@ -131,7 +159,6 @@ def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
     existing_chain: Dict[str, Any] = {}
 
     with file_lock:
-        # Load existing on-disk
         if price_cache_file.exists() and price_cache_file.stat().st_size > 0:
             try:
                 with price_cache_file.open("rb") as f:
@@ -146,37 +173,13 @@ def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
             except (EOFError, pickle.UnpicklingError) as e:
                 print(f"Warning: Failed to load {chain_cache_file} ({e}); using empty dict.")
 
-        print(f"[DEBUG] start merge_nested_dicts_with_change")
-        # Merge in-memory → existing, detect if anything actually changed
-        price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
-        chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
+        # Merge memory into existing and write back
+        merge_nested_dicts(existing_price, stored_option_price[t])
+        merge_nested_dicts(existing_chain, stored_option_chain[t])
 
-        # Conditionally write back
-        if price_changed:
-            print(f"[DEBUG] Price changed, writing into pkl file")
-            with price_cache_file.open("wb") as f:
-                pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
-            if price_cache_file.stat().st_size == 0:
-                print(f"Error: {price_cache_file} is empty after write!")
-        # else: print(f"[DEBUG] save_stored_option_data: no price changes for {t}, skip write")
-
-        if chain_changed:
-            print(f"[DEBUG] Option chain changed, writing into pkl file")
-            with chain_cache_file.open("wb") as f:
-                pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
-            if chain_cache_file.stat().st_size == 0:
-                print(f"Error: {chain_cache_file} is empty after write!")
-        # else: print(f"[DEBUG] save_stored_option_data: no chain changes for {t}, skip write")
-
-        # Merge memory → existing
-            
-    price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
-    chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
-
-    if price_changed:
-                # Sanity checks
-            if price_cache_file.stat().st_size == 0:
-                print(f"Error: {price_cache_file} is empty after write!")
-            if chain_cache_file.stat().st_size == 0:
-                print(f"Error: {chain_cache_file} is empty after write!")
+        with price_cache_file.open("wb") as f:
+            pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with chain_cache_file.open("wb") as f:
+            pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
+        unsaved_option_entries[t] = 0
 

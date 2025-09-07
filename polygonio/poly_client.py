@@ -13,10 +13,14 @@ import certifi
 import ssl
 
 from .config import get_settings, PREMIUM_FIELD_MAP
-from .cache_io import stored_option_chain, stored_option_price, merge_nested_dicts
+from .cache_io import (
+    stored_option_chain,
+    stored_option_price,
+    merge_nested_dicts_with_count,
+    record_unsaved_option_entries,
+)
 
 import requests
-from typing import Optional
 
 def _resolve_api_key() -> str:
     """
@@ -139,8 +143,16 @@ class PolygonAPIClient:
         # Otherwise query Polygon
         strike_dict = await self._query_polygon_for_option_chain_async(t, exp_key, cp_key, asof_key)
 
-        # Persist into nested cache
-        stored_option_chain.setdefault(t, {}).setdefault(exp_key, {}).setdefault(asof_key, {})[cp_key] = strike_dict or {}
+        # Persist into nested cache and track unsaved entries
+        leaf = (
+            stored_option_chain
+            .setdefault(t, {})
+            .setdefault(exp_key, {})
+            .setdefault(asof_key, {})
+            .setdefault(cp_key, {})
+        )
+        added = merge_nested_dicts_with_count(leaf, strike_dict or {})
+        record_unsaved_option_entries(t, added)
         return strike_dict or {}
 
     async def _query_polygon_for_option_chain_async(
@@ -379,8 +391,19 @@ class PolygonAPIClient:
     ) -> None:
         t = ticker.upper()
         strike_key = round(float(strike_price), 2)
-        stored_option_price.setdefault(t, {}).setdefault(pricing_date, {}).setdefault(strike_key, {}).setdefault(expiration_date, {}).setdefault(call_put, {}).update(payload)
-        log.debug("Stored %s %s K=%s exp=%s on %s: %s", t, call_put, strike_key, expiration_date, pricing_date, payload)
+        leaf = (
+            stored_option_price
+            .setdefault(t, {})
+            .setdefault(pricing_date, {})
+            .setdefault(strike_key, {})
+            .setdefault(expiration_date, {})
+            .setdefault(call_put, {})
+        )
+        added = merge_nested_dicts_with_count(leaf, payload)
+        record_unsaved_option_entries(t, added)
+        log.debug(
+            "Stored %s %s K=%s exp=%s on %s: %s", t, call_put, strike_key, expiration_date, pricing_date, payload
+        )
 
     @staticmethod
     def _write_invalid_option(
@@ -398,5 +421,20 @@ class PolygonAPIClient:
         elif premium_field == "close_price":
             invalid = {"close_price": 0.0, "close_volume": 0}
         else:
-            invalid = {"ask_price": 0.0, "bid_price": 0.0, "ask_size": 0, "bid_size": 0, "mid_price": 0.0}
-        stored_option_price.setdefault(t, {}).setdefault(pricing_date, {}).setdefault(strike_key, {}).setdefault(expiration_date, {}).setdefault(call_put, {}).update(invalid)
+            invalid = {
+                "ask_price": 0.0,
+                "bid_price": 0.0,
+                "ask_size": 0,
+                "bid_size": 0,
+                "mid_price": 0.0,
+            }
+        leaf = (
+            stored_option_price
+            .setdefault(t, {})
+            .setdefault(pricing_date, {})
+            .setdefault(strike_key, {})
+            .setdefault(expiration_date, {})
+            .setdefault(call_put, {})
+        )
+        added = merge_nested_dicts_with_count(leaf, invalid)
+        record_unsaved_option_entries(t, added)
