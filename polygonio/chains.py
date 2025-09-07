@@ -5,8 +5,11 @@ from datetime import datetime, timedelta, date
 from functools import lru_cache
 from typing import Dict, Any, Optional, Tuple, Iterable
 
+import asyncio
+
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import load_stored_option_data, stored_option_chain, stored_option_price
+from .poly_client import PolygonAPIClient
 
 
 def _to_date(d: str | date | None) -> Optional[date]:
@@ -175,6 +178,37 @@ def get_option_chain_for_date(
 
     call_syms = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("call") or {}
     put_syms  = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("put") or {}
+    if not call_syms or not put_syms:
+        # Attempt to fetch missing chain data from Polygon
+        async def _fetch() -> None:
+            async with PolygonAPIClient() as client:
+                reqs = [(expiration_s, as_of_s, "call"), (expiration_s, as_of_s, "put")]
+                await client.get_option_chains_batch_async(ticker, reqs)
+
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if loop.is_running():
+                new_loop = asyncio.new_event_loop()
+                new_loop.run_until_complete(_fetch())
+                new_loop.close()
+            else:
+                loop.run_until_complete(_fetch())
+        except Exception:
+            pass
+
+        call_syms = (
+            stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("call")
+            or call_syms
+        )
+        put_syms = (
+            stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("put")
+            or put_syms
+        )
 
     if not call_syms or not put_syms:
         chosen_exp, calls_fallback, puts_fallback = find_available_expiration(
@@ -259,6 +293,31 @@ async def pull_option_chain_data(
     # Attempt direct
     call_syms = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("call") or {}
     put_syms  = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("put") or {}
+
+    # If either side is missing, attempt to fetch from Polygon via the provided client
+    if (not call_syms or not put_syms) and client is not None:
+        try:
+            reqs = [(expiration_str, as_of_str, "call"), (expiration_str, as_of_str, "put")]
+            chain_data = await client.get_option_chains_batch_async(
+                ticker, reqs, force_update=force_update
+            )
+            call_syms = (
+                chain_data.get(ticker, {})
+                .get(expiration_str, {})
+                .get(as_of_str, {})
+                .get("call")
+                or call_syms
+            )
+            put_syms = (
+                chain_data.get(ticker, {})
+                .get(expiration_str, {})
+                .get(as_of_str, {})
+                .get("put")
+                or put_syms
+            )
+        except Exception:
+            # Swallow network/client errors and fall back to stored data
+            pass
 
     exp_chosen = expiration_str
     if not call_syms or not put_syms:
