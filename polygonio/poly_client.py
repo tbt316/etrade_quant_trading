@@ -168,6 +168,7 @@ class PolygonAPIClient:
                     async with self.session.get(url, params=params) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
+                        print(f"Fetched option chain: {ticker} {call_put} exp={expiration_date} as_of={as_of} order={order}")
                 for item in data.get("results", []) or []:
                     sp = item.get("strike_price")
                     sym = item.get("ticker")
