@@ -1,5 +1,4 @@
 aiohttp==3.11.11
-certifi==2024.2.2
 certifi==2024.12.14
 etrade_quant_trading==0.0.0
 matplotlib==3.6.3
