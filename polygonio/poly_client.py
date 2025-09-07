@@ -307,6 +307,7 @@ class PolygonAPIClient:
                     return payload
                 # No valid data → write invalid marker
                 self._write_invalid_option(ticker, strike_price, call_put, expiration_date, pricing_date, premium_field)
+                print(f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}")
                 return {}
             except Exception as e:
                 if attempt >= self.retries:

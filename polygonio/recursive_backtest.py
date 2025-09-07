@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -362,6 +363,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         # Otherwise, we'll derive expiries per pricing day via list_expiries(...)
         while cur <= end_dt:
             dbg.days_total += 1
+            pcs_ts = None
             # skip non-price days
             spot = close_by_date.get(cur)
             if (cur.toordinal() - start_dt.toordinal()) % 20 == 0:
@@ -395,25 +397,44 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 for p in open_positions
             )
 
-            # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
-            print(
-                f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
-            )
-            call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
-                ticker=cfg.ticker,
-                call_put=call_put_flag,
-                expiration_str=expiration_str,
-                as_of_str=as_of_str,
-                close_price=spot,
-                client=client,
-                force_otm=False,
-                force_update=False,
-            )
-            print(
-                f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}"
-            )
-            dbg.expiries_considered += 1
-            if not call_data and not put_data:
+            # 3b) Pull chains + maybe batch fetch missing quotes
+            # _target_expiry_compat returns a datetime; convert to date for comparisons
+            this_exp = target_dt.date()
+            counter = 0
+            while True:
+                expiration_str = this_exp.strftime("%Y-%m-%d")
+                print(
+                    f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
+                )
+                call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+                    ticker=cfg.ticker,
+                    call_put=call_put_flag,
+                    expiration_str=expiration_str,
+                    as_of_str=as_of_str,
+                    close_price=spot,
+                    client=client,
+                    force_otm=False,
+                    force_update=False,
+                )
+                print(
+                    f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}"
+                )
+                dbg.expiries_considered += 1
+                need_call = "call" in call_put_flag
+                need_put = "put" in call_put_flag
+                have_call = bool(call_data) or not need_call
+                have_put = bool(put_data) or not need_put
+                if have_call and have_put:
+                    break
+                counter += 1
+                # Compare dates to avoid type mismatch when loop index is a `date`
+                if this_exp <= cur or counter > 30:
+                    break
+                this_exp -= timedelta(days=1)
+                if counter > 1 and this_exp.weekday() != 4:
+                    continue
+
+            if ("call" in call_put_flag and not call_data) or ("put" in call_put_flag and not put_data):
                 dbg.expiries_skipped_no_chain += 1
                 cur += timedelta(days=1)
                 print(f"[DEBUG] skipping expiry {expiration_str}: no chain data")
@@ -592,12 +613,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                         have_short_put = (sp_k is not None and sp_p is not None)
 
+                        ts_now = datetime.utcnow().isoformat()
                         print(
                             f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
                             f"SP {sp_k} @ {sp_p} ({reason}); "
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
-                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
+                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'} @ {ts_now}"
                         )
+                        pcs_ts = time.perf_counter()
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
@@ -890,7 +913,17 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "spot": spot,
                 "open_positions": len(open_positions),
             }
-            print(f"pnl_row init: {pnl_row} open_positions={len(open_positions)}")
+            ts_now = datetime.utcnow().isoformat()
+            if pcs_ts is not None:
+                elapsed = time.perf_counter() - pcs_ts
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} "
+                    f"dt={elapsed:.2f}s @ {ts_now}"
+                )
+            else:
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
+                )
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC

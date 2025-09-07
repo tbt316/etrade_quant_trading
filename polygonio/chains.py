@@ -283,175 +283,128 @@ async def pull_option_chain_data(
     - *_data* rows are the stored price dicts containing fields like
       'ask_price','bid_price','mid_price','close_price','trade_price', etc.
 
-    We will try the requested expiration; if either side is missing, we walk
-    expirations (forward weeks, then backward) to find one with BOTH sides,
-    mirroring dailytrade.py.
+    This function now fetches data only for the requested option type(s) and
+    makes a single attempt for the provided expiration date.  Callers are
+    responsible for trying alternate expirations if needed.
     """
-    # Step 1: check/request chain at desired expiration
-    # (We do not use `call_put` to filter returns; both sides are provided.)
+    cp = (call_put or "call_put_both").lower()
+    need_calls = cp in {"call", "call_put_both", "call_put", "both"}
+    need_puts = cp in {"put", "call_put_both", "call_put", "both"}
 
-    # Attempt direct
-    call_syms = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("call") or {}
-    put_syms  = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("put") or {}
+    bucket = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
+    call_syms = bucket.get("call") or {}
+    put_syms  = bucket.get("put") or {}
 
-    # If either side is missing, attempt to fetch from Polygon via the provided client
-    if (not call_syms or not put_syms) and client is not None:
-        try:
-            reqs = [(expiration_str, as_of_str, "call"), (expiration_str, as_of_str, "put")]
-            chain_data = await client.get_option_chains_batch_async(
-                ticker, reqs, force_update=force_update
-            )
-            call_syms = (
-                chain_data.get(ticker, {})
-                .get(expiration_str, {})
-                .get(as_of_str, {})
-                .get("call")
-                or call_syms
-            )
-            put_syms = (
-                chain_data.get(ticker, {})
-                .get(expiration_str, {})
-                .get(as_of_str, {})
-                .get("put")
-                or put_syms
-            )
-        except Exception:
-            # Swallow network/client errors and fall back to stored data
-            pass
+    if client is not None:
+        reqs = []
+        if need_calls and not call_syms:
+            reqs.append((expiration_str, as_of_str, "call"))
+        if need_puts and not put_syms:
+            reqs.append((expiration_str, as_of_str, "put"))
+        if reqs:
+            try:
+                await client.get_option_chains_batch_async(ticker, reqs, force_update=force_update)
+                bucket = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
+                call_syms = bucket.get("call") or call_syms
+                put_syms  = bucket.get("put")  or put_syms
+            except Exception:
+                pass
 
-    # If still missing, walk backward day-by-day (preferring Fridays) and
-    # attempt to pull chains for nearby expirations, mirroring the reference
-    # dailytrade logic.
-    if not call_syms or not put_syms:
-        try:
-            exp_date = datetime.strptime(expiration_str, "%Y-%m-%d").date()
-            as_of_date = datetime.strptime(as_of_str, "%Y-%m-%d").date()
-        except Exception:
-            exp_date = None
-            as_of_date = None
+    if (need_calls and not call_syms) or (need_puts and not put_syms):
+        return [], [], [], [], None
 
-        counter = 0
-        current = exp_date
-        while (
-            current is not None
-            and as_of_date is not None
-            and (not call_syms or not put_syms)
-            and current > as_of_date
-            and counter < 30
-        ):
-            counter += 1
-            current -= timedelta(days=1)
-            # After the first shift, only consider Friday expirations
-            if counter > 1 and current.weekday() != 4:
-                continue
-            exp_cand = current.strftime("%Y-%m-%d")
-            call_syms = (
-                stored_option_chain.get(ticker, {})
-                .get(exp_cand, {})
-                .get(as_of_str, {})
-                .get("call")
-                or {}
-            )
-            put_syms = (
-                stored_option_chain.get(ticker, {})
-                .get(exp_cand, {})
-                .get(as_of_str, {})
-                .get("put")
-                or {}
-            )
-            if (not call_syms or not put_syms) and client is not None:
-                try:
-                    reqs = [(exp_cand, as_of_str, "call"), (exp_cand, as_of_str, "put")]
-                    await client.get_option_chains_batch_async(
-                        ticker, reqs, force_update=force_update
-                    )
-                    call_syms = (
-                        stored_option_chain.get(ticker, {})
-                        .get(exp_cand, {})
-                        .get(as_of_str, {})
-                        .get("call")
-                        or {}
-                    )
-                    put_syms = (
-                        stored_option_chain.get(ticker, {})
-                        .get(exp_cand, {})
-                        .get(as_of_str, {})
-                        .get("put")
-                        or {}
-                    )
-                except Exception:
-                    pass
-            if call_syms and put_syms:
-                expiration_str = exp_cand
-                break
+    settings = get_settings()
+    option_range = settings.option_range
 
-    exp_chosen = expiration_str
-    if not call_syms or not put_syms:
-        chosen_exp, calls_fb, puts_fb = find_available_expiration(
-            ticker=ticker, as_of=as_of_str, target_expiration=expiration_str
+    win_call_strikes = (
+        _window_strikes(
+            strikes=call_syms.keys(),
+            spot=close_price,
+            option_range=option_range,
+            force_otm=force_otm,
+            is_call=True,
         )
-        if not chosen_exp:
-            # return empty shapes
-            return [], [], [], [], None
-        exp_chosen = chosen_exp
-        call_syms = calls_fb or {}
-        put_syms  = puts_fb or {}
+        if need_calls else []
+    )
+    win_put_strikes = (
+        _window_strikes(
+            strikes=put_syms.keys(),
+            spot=close_price,
+            option_range=option_range,
+            force_otm=force_otm,
+            is_call=False,
+        )
+        if need_puts else []
+    )
 
-    # Pull aligned price rows from stored_option_price
-    pf_bucket = stored_option_price.get(ticker, {}).get(as_of_str, {})  # strike -> exp -> type -> fields
-
-    # Sort strikes as in legacy: calls asc, puts desc
-    call_strikes = sorted(call_syms.keys())
-    put_strikes  = sorted(put_syms.keys(), reverse=True)
-
-    def _row_for(strike: float, opt_type: str) -> dict:
-        return (pf_bucket.get(strike, {}).get(exp_chosen, {}).get(opt_type, {}) or {}).copy()
-
-    # Build meta lists (aligned) and data lists
-    call_opts = [{"strike_price": float(k), "expiration_date": exp_chosen, "option_ticker": call_syms[k]} for k in call_strikes]
-    put_opts  = [{"strike_price": float(k), "expiration_date": exp_chosen, "option_ticker": put_syms[k]}  for k in put_strikes]
-
-    all_call_data = [_row_for(k, "call") for k in call_strikes]
-    all_put_data  = [_row_for(k, "put")  for k in put_strikes]
-
-    # ------------------------------------------------------------------
-    # Ensure each option has pricing; fetch missing premiums from Polygon
-    # ------------------------------------------------------------------
+    pf_bucket = stored_option_price.get(ticker, {}).get(as_of_str, {})
     pf = _price_field()
+
+    call_opts = [
+        {"strike_price": float(k), "expiration_date": expiration_str, "option_ticker": call_syms[k]}
+        for k in win_call_strikes
+    ] if need_calls else []
+    put_opts = [
+        {"strike_price": float(k), "expiration_date": expiration_str, "option_ticker": put_syms[k]}
+        for k in win_put_strikes
+    ] if need_puts else []
+
+    all_call_data: list[dict] = []
+    all_put_data: list[dict] = []
     reqs: list[dict[str, Any]] = []
     call_missing_idx: list[int] = []
     put_missing_idx: list[int] = []
 
-    for i, (opt, data) in enumerate(zip(call_opts, all_call_data)):
+    for i, opt in enumerate(call_opts):
+        strike = opt["strike_price"]
+        data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("call", {})
         val = data.get(pf) if isinstance(data, dict) else None
-        if force_update or not val or float(val) <= 0.0:
-            reqs.append({
-                "strike_price": opt["strike_price"],
-                "call_put": "call",
-                "expiration_date": opt["expiration_date"],
-                "quote_timestamp": as_of_str,
-                "option_ticker": opt["option_ticker"],
-            })
-            call_missing_idx.append(i)
+        if not force_update and val and float(val) > 0.0:
+            all_call_data.append(data)
+        else:
+            all_call_data.append(None)
+            if need_calls:
+                reqs.append({
+                    "strike_price": strike,
+                    "call_put": "call",
+                    "expiration_date": expiration_str,
+                    "quote_timestamp": as_of_str,
+                    "option_ticker": opt["option_ticker"],
+                })
+                call_missing_idx.append(i)
 
-    for i, (opt, data) in enumerate(zip(put_opts, all_put_data)):
+    for i, opt in enumerate(put_opts):
+        strike = opt["strike_price"]
+        data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("put", {})
         val = data.get(pf) if isinstance(data, dict) else None
-        if force_update or not val or float(val) <= 0.0:
-            reqs.append({
-                "strike_price": opt["strike_price"],
-                "call_put": "put",
-                "expiration_date": opt["expiration_date"],
-                "quote_timestamp": as_of_str,
-                "option_ticker": opt["option_ticker"],
-            })
-            put_missing_idx.append(i)
+        if not force_update and val and float(val) > 0.0:
+            all_put_data.append(data)
+        else:
+            all_put_data.append(None)
+            if need_puts:
+                reqs.append({
+                    "strike_price": strike,
+                    "call_put": "put",
+                    "expiration_date": expiration_str,
+                    "quote_timestamp": as_of_str,
+                    "option_ticker": opt["option_ticker"],
+                })
+                put_missing_idx.append(i)
 
-    if reqs and client is not None:
+    fetch_needed = False
+    if force_update:
+        fetch_needed = bool(reqs)
+    else:
+        if call_opts and len(call_missing_idx) > 0.1 * len(call_opts):
+            fetch_needed = True
+        if put_opts and len(put_missing_idx) > 0.1 * len(put_opts):
+            fetch_needed = True
+
+    if fetch_needed and reqs and client is not None:
         try:
             fetched = await client.get_option_prices_batch_async(ticker, reqs)
         except Exception:
             fetched = []
-        # Map results back to placeholders
         j = 0
         for idx in call_missing_idx:
             all_call_data[idx] = fetched[j] if j < len(fetched) else {}
@@ -460,7 +413,6 @@ async def pull_option_chain_data(
             all_put_data[idx] = fetched[j] if j < len(fetched) else {}
             j += 1
 
-    # Drop options still lacking the required premium
     def _valid(prem: dict) -> bool:
         try:
             return float(prem.get(pf, 0.0)) > 0.0
@@ -468,19 +420,18 @@ async def pull_option_chain_data(
             return False
 
     call_filtered = [(opt, prem) for opt, prem in zip(call_opts, all_call_data) if _valid(prem)]
-    put_filtered  = [(opt, prem) for opt, prem in zip(put_opts,  all_put_data)  if _valid(prem)]
+    put_filtered = [(opt, prem) for opt, prem in zip(put_opts, all_put_data) if _valid(prem)]
 
     call_opts, all_call_data = zip(*call_filtered) if call_filtered else ([], [])
-    put_opts,  all_put_data  = zip(*put_filtered)  if put_filtered  else ([], [])
+    put_opts, all_put_data = zip(*put_filtered) if put_filtered else ([], [])
     call_opts, all_call_data = list(call_opts), list(all_call_data)
-    put_opts,  all_put_data  = list(put_opts),  list(all_put_data)
+    put_opts, all_put_data = list(put_opts), list(all_put_data)
 
-    # Compute strike range for debugging
     smin = smax = None
-    all_strikes = [opt["strike_price"] for opt in call_opts] + [opt["strike_price"] for opt in put_opts]
-    if all_strikes:
-        smin = float(min(all_strikes))
-        smax = float(max(all_strikes))
+    strikes = [opt["strike_price"] for opt in call_opts] + [opt["strike_price"] for opt in put_opts]
+    if strikes:
+        smin = float(min(strikes))
+        smax = float(max(strikes))
     strike_range = (smin, smax) if smin is not None else None
 
     return all_call_data, all_put_data, call_opts, put_opts, strike_range
