@@ -120,15 +120,15 @@ def _window_strikes(
     *,
     strikes: Iterable[float],
     spot: Optional[float],
-    option_range: float,
     force_otm: bool,
     is_call: bool,
 ) -> Iterable[float]:
-    if spot is None or spot <= 0:
-        return sorted(set(float(k) for k in strikes))
-
-    lo = spot * (1.0 - option_range)
-    hi = spot * (1.0 + option_range)
+    """
+    Return all provided strikes, optionally enforcing out-of-the-money
+    filtering. The previous implementation trimmed strikes using
+    ``option_range``; this function now intentionally ignores any range
+    constraint so the caller receives the full chain for coverage checks.
+    """
 
     filt = []
     for k in strikes:
@@ -136,14 +136,15 @@ def _window_strikes(
             kf = float(k)
         except Exception:
             continue
-        if lo <= kf <= hi:
-            if not force_otm:
-                filt.append(kf)
-            else:
-                if is_call and kf >= spot:
-                    filt.append(kf)
-                elif (not is_call) and kf <= spot:
-                    filt.append(kf)
+
+        if force_otm and spot is not None and spot > 0:
+            if is_call and kf < spot:
+                continue
+            if not is_call and kf > spot:
+                continue
+
+        filt.append(kf)
+
     return sorted(set(filt))
 
 
@@ -167,8 +168,10 @@ def get_option_chain_for_date(
     option_range: Optional[float] = None,
     force_otm: Optional[bool] = None,
 ) -> Optional[ChainResult]:
+    # `option_range` is accepted for legacy callers but intentionally ignored
+    # so that the full strike chain is returned. Range checks are performed by
+    # upstream consumers.
     settings = get_settings()
-    option_range = settings.option_range if option_range is None else option_range
     force_otm = settings.force_otm if force_otm is None else force_otm
 
     as_of_s = _ds(as_of_str) or _ds(as_of)
@@ -224,10 +227,10 @@ def get_option_chain_for_date(
     all_put_strikes = list(put_syms.keys())
 
     win_call_strikes = _window_strikes(
-        strikes=all_call_strikes, spot=spot, option_range=option_range, force_otm=force_otm, is_call=True
+        strikes=all_call_strikes, spot=spot, force_otm=force_otm, is_call=True
     )
     win_put_strikes = _window_strikes(
-        strikes=all_put_strikes, spot=spot, option_range=option_range, force_otm=force_otm, is_call=False
+        strikes=all_put_strikes, spot=spot, force_otm=force_otm, is_call=False
     )
 
     call_prem = _extract_premiums_for_strikes(
@@ -321,9 +324,6 @@ async def pull_option_chain_data(
     if (need_calls and not call_syms) or (need_puts and not put_syms):
         return [], [], [], [], None
 
-    settings = get_settings()
-    option_range = settings.option_range
-
     all_call_strikes = (
         sorted(float(k) for k in call_syms.keys()) if need_calls else []
     )
@@ -335,7 +335,6 @@ async def pull_option_chain_data(
         _window_strikes(
             strikes=call_syms.keys(),
             spot=close_price,
-            option_range=option_range,
             force_otm=force_otm,
             is_call=True,
         )
@@ -345,7 +344,6 @@ async def pull_option_chain_data(
         _window_strikes(
             strikes=put_syms.keys(),
             spot=close_price,
-            option_range=option_range,
             force_otm=force_otm,
             is_call=False,
         )
