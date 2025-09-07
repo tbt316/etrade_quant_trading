@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -362,6 +363,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         # Otherwise, we'll derive expiries per pricing day via list_expiries(...)
         while cur <= end_dt:
             dbg.days_total += 1
+            pcs_ts = None
             # skip non-price days
             spot = close_by_date.get(cur)
             if (cur.toordinal() - start_dt.toordinal()) % 20 == 0:
@@ -592,12 +594,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                         have_short_put = (sp_k is not None and sp_p is not None)
 
+                        ts_now = datetime.utcnow().isoformat()
                         print(
                             f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
                             f"SP {sp_k} @ {sp_p} ({reason}); "
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
-                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
+                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'} @ {ts_now}"
                         )
+                        pcs_ts = time.perf_counter()
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
@@ -890,7 +894,17 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "spot": spot,
                 "open_positions": len(open_positions),
             }
-            print(f"pnl_row init: {pnl_row} open_positions={len(open_positions)}")
+            ts_now = datetime.utcnow().isoformat()
+            if pcs_ts is not None:
+                elapsed = time.perf_counter() - pcs_ts
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} "
+                    f"dt={elapsed:.2f}s @ {ts_now}"
+                )
+            else:
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
+                )
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
