@@ -398,7 +398,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             )
 
             # 3b) Pull chains + maybe batch fetch missing quotes
-            this_exp = target_dt
+            # _target_expiry_compat returns a datetime; convert to date for comparisons
+            this_exp = target_dt.date()
             counter = 0
             while True:
                 expiration_str = this_exp.strftime("%Y-%m-%d")
@@ -426,6 +427,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 if have_call and have_put:
                     break
                 counter += 1
+                # Compare dates to avoid type mismatch when loop index is a `date`
                 if this_exp <= cur or counter > 30:
                     break
                 this_exp -= timedelta(days=1)
