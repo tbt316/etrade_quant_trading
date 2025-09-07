@@ -594,7 +594,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
                             f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
                         )
-
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
