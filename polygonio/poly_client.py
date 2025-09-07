@@ -166,18 +166,19 @@ class PolygonAPIClient:
             try:
                 async with self.semaphore:
                     async with self.session.get(url, params=params) as resp:
+                        print(f"[DEBUG] Querying Polygon for option chain: {url}?{urlencode(params)}")
                         resp.raise_for_status()
                         data = await resp.json()
-                        print(f"[DEBUG] Fetched option chain {ticker} {call_put} exp={expiration_date} as_of={as_of} order={order} status={resp.status}")
                 for item in data.get("results", []) or []:
                     sp = item.get("strike_price")
                     sym = item.get("ticker")
                     if sp is not None and sym:
                         results[sp] = sym
+                        print(f"[DEBUG] Fetched option: {ticker} {call_put} exp={expiration_date} as_of={as_of} strike={sp} symbol={sym}")
             except aiohttp.ClientResponseError as e:
-                log.error("Polygon chain error (%s %s %s %s): %s", ticker, expiration_date, call_put, as_of, e)
+                print(f"Polygon chain error ({ticker} {expiration_date} {call_put} {as_of}): {e}")
             except Exception as e:
-                log.error("Unexpected chain error: %s", e)
+                print(f"Unexpected chain error: {e}")
         return results
 
     async def get_option_chains_batch_async(
@@ -188,6 +189,7 @@ class PolygonAPIClient:
         force_update: bool = False,
     ) -> Dict[str, Dict[str, Dict[str, Dict[str, Dict[float, str]]]]]:
         """Batch fetch chains for [(expiration_date, as_of_date, call_put), ...]."""
+        print(f"[DEBUG] Fetching {len(unique_chain_requests)} unique chains for {ticker} (get_option_chains_batch_async)")
         tasks = [
             asyncio.create_task(
                 self.get_option_chain_async(ticker, exp, cp, as_of, force_update=force_update)

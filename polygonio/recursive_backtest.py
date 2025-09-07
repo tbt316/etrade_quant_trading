@@ -403,9 +403,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             counter = 0
             while True:
                 expiration_str = this_exp.strftime("%Y-%m-%d")
-                print(
-                    f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
-                )
                 call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
                     ticker=cfg.ticker,
                     call_put=call_put_flag,
@@ -924,6 +921,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 print(
                     f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
                 )
+            breakpoint()
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
