@@ -291,24 +291,29 @@ async def pull_option_chain_data(
     need_calls = cp in {"call", "call_put_both", "call_put", "both"}
     need_puts = cp in {"put", "call_put_both", "call_put", "both"}
 
-    bucket = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
-    call_syms = bucket.get("call") or {}
-    put_syms  = bucket.get("put") or {}
+    call_syms: Dict[float, str] = {}
+    put_syms: Dict[float, str] = {}
+    bucket: Dict[str, Any] = {}
 
     if client is not None:
         reqs = []
-        if need_calls and not call_syms:
+        if need_calls:
             reqs.append((expiration_str, as_of_str, "call"))
-        if need_puts and not put_syms:
+        if need_puts:
             reqs.append((expiration_str, as_of_str, "put"))
-        if reqs:
-            try:
-                await client.get_option_chains_batch_async(ticker, reqs, force_update=force_update)
-                bucket = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
-                call_syms = bucket.get("call") or call_syms
-                put_syms  = bucket.get("put")  or put_syms
-            except Exception:
-                pass
+        try:
+            chain_data = await client.get_option_chains_batch_async(
+                ticker, reqs, force_update=force_update
+            )
+        except Exception:
+            chain_data = {}
+        bucket = chain_data.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
+
+    if not bucket:
+        bucket = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {})
+
+    call_syms = bucket.get("call") or {}
+    put_syms  = bucket.get("put") or {}
 
     if (need_calls and not call_syms) or (need_puts and not put_syms):
         return [], [], [], [], None
