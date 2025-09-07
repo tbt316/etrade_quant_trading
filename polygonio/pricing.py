@@ -209,7 +209,7 @@ async def interpolate_option_price(
     option_opts = call_opts if cp == "call" else put_opts
     option_data = all_call_data if cp == "call" else all_put_data
 
-    if option_opts is None or option_data is None:
+    if not option_opts or not option_data:
         log.debug("No chain data for %s %s exp=%s asof=%s", t, cp, expiration_date, pricing_date)
         return 0.0
 
