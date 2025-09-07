@@ -93,20 +93,20 @@ def parse_args() -> argparse.Namespace:
         help="Engine-specific stop-loss behavior keyword (e.g., 'close', 'hold').",
     )
 
-    # Optional VIX gating (if enabled in engine)
+    # Optional VIX adjustments
     p.add_argument(
         "--vix-threshold",
         dest="vix_threshold",
         type=float,
         default=None,
-        help="Numeric VIX threshold for gating.",
+        help="Baseline VIX level used for premium adjustments.",
     )
     p.add_argument(
         "--vix-correlation",
         dest="vix_correlation",
-        choices=["gt", "lt"],
+        type=float,
         default=None,
-        help="Use 'gt' to trade only when VIX > threshold, 'lt' for VIX < threshold.",
+        help="Correlation factor applied to premium targets when VIX deviates from the threshold (e.g., 0.05).",
     )
 
     # Plotting & logging

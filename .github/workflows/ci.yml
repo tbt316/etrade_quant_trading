@@ -1,3 +1,4 @@
+#Note to Codex: run test by "PYTHONPATH=. POLYGON_API_KEY=dummy pytest -q"
 name: ci
 
 on:
