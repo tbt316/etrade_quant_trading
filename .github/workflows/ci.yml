@@ -5,11 +5,12 @@ on:
   push:
     branches: [ main ]
 
+env:
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+
 jobs:
   integration:
     runs-on: ubuntu-latest
-    env:
-      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
