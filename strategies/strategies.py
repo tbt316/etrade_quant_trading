@@ -250,6 +250,10 @@ class CoveredCallStrategy(Strategy):
 
 def get_strategy(trade_type: str) -> Strategy:
     t = (trade_type or "").lower()
+    # strip `_lite` suffix if present
+    if t.endswith("_lite"):
+        t = t.replace("_lite", "")
+
     if t == "iron_condor":
         return IronCondorStrategy()
     if t in {"pcs", "put_credit_spread"}:
@@ -259,6 +263,7 @@ def get_strategy(trade_type: str) -> Strategy:
     if t in {"cc", "covered_call"}:
         return CoveredCallStrategy()
     raise ValueError(f"Unknown trade_type: {trade_type}")
+
 
 
 # -------------------------
@@ -271,5 +276,6 @@ def sides_for_trade_type(trade_type: str) -> List[Side]:
     - put_credit_spread -> [put]
     - call_credit_spread / covered_call -> [call]
     """
+
     return get_strategy(trade_type).sides_needed()
 

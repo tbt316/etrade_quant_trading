@@ -25,7 +25,6 @@ Thumbs.db
 
 # Project-specific cache/data
 data/
-polygon_api_option_data/
 monthly_backtest_data/
 backtest_debug.log
 polygonio_config.py

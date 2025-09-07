@@ -46,7 +46,7 @@ def test_backtest_smoke_online():
         ticker="SPY",
         global_start_date="2025-07-10",
         global_end_date="2025-07-21",
-        trade_type="put_credit_spread",
+        trade_type="put_credit_spread_lite",
         expiring_weekday="Friday",
         expiring_wks=6,
         contract_qty=1,
