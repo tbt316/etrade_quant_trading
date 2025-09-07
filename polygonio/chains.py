@@ -414,11 +414,70 @@ async def pull_option_chain_data(
     all_call_data = [_row_for(k, "call") for k in call_strikes]
     all_put_data  = [_row_for(k, "put")  for k in put_strikes]
 
-    # Optional: filter/window by range/OTM (legacy call sites usually filter later, so we keep full set)
-    # But we can compute strike_range for debug
-    smin = None
-    smax = None
-    all_strikes = list(call_syms.keys()) + list(put_syms.keys())
+    # ------------------------------------------------------------------
+    # Ensure each option has pricing; fetch missing premiums from Polygon
+    # ------------------------------------------------------------------
+    pf = _price_field()
+    reqs: list[dict[str, Any]] = []
+    call_missing_idx: list[int] = []
+    put_missing_idx: list[int] = []
+
+    for i, (opt, data) in enumerate(zip(call_opts, all_call_data)):
+        val = data.get(pf) if isinstance(data, dict) else None
+        if force_update or not val or float(val) <= 0.0:
+            reqs.append({
+                "strike_price": opt["strike_price"],
+                "call_put": "call",
+                "expiration_date": opt["expiration_date"],
+                "quote_timestamp": as_of_str,
+                "option_ticker": opt["option_ticker"],
+            })
+            call_missing_idx.append(i)
+
+    for i, (opt, data) in enumerate(zip(put_opts, all_put_data)):
+        val = data.get(pf) if isinstance(data, dict) else None
+        if force_update or not val or float(val) <= 0.0:
+            reqs.append({
+                "strike_price": opt["strike_price"],
+                "call_put": "put",
+                "expiration_date": opt["expiration_date"],
+                "quote_timestamp": as_of_str,
+                "option_ticker": opt["option_ticker"],
+            })
+            put_missing_idx.append(i)
+
+    if reqs and client is not None:
+        try:
+            fetched = await client.get_option_prices_batch_async(ticker, reqs)
+        except Exception:
+            fetched = []
+        # Map results back to placeholders
+        j = 0
+        for idx in call_missing_idx:
+            all_call_data[idx] = fetched[j] if j < len(fetched) else {}
+            j += 1
+        for idx in put_missing_idx:
+            all_put_data[idx] = fetched[j] if j < len(fetched) else {}
+            j += 1
+
+    # Drop options still lacking the required premium
+    def _valid(prem: dict) -> bool:
+        try:
+            return float(prem.get(pf, 0.0)) > 0.0
+        except Exception:
+            return False
+
+    call_filtered = [(opt, prem) for opt, prem in zip(call_opts, all_call_data) if _valid(prem)]
+    put_filtered  = [(opt, prem) for opt, prem in zip(put_opts,  all_put_data)  if _valid(prem)]
+
+    call_opts, all_call_data = zip(*call_filtered) if call_filtered else ([], [])
+    put_opts,  all_put_data  = zip(*put_filtered)  if put_filtered  else ([], [])
+    call_opts, all_call_data = list(call_opts), list(all_call_data)
+    put_opts,  all_put_data  = list(put_opts),  list(all_put_data)
+
+    # Compute strike range for debugging
+    smin = smax = None
+    all_strikes = [opt["strike_price"] for opt in call_opts] + [opt["strike_price"] for opt in put_opts]
     if all_strikes:
         smin = float(min(all_strikes))
         smax = float(max(all_strikes))
