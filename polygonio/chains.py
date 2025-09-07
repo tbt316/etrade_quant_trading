@@ -358,8 +358,7 @@ async def pull_option_chain_data(
     for i, opt in enumerate(call_opts):
         strike = opt["strike_price"]
         data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("call", {})
-        val = data.get(pf) if isinstance(data, dict) else None
-        if not force_update and val and float(val) > 0.0:
+        if not force_update and data and pf in data:
             all_call_data.append(data)
         else:
             all_call_data.append(None)
@@ -376,8 +375,7 @@ async def pull_option_chain_data(
     for i, opt in enumerate(put_opts):
         strike = opt["strike_price"]
         data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("put", {})
-        val = data.get(pf) if isinstance(data, dict) else None
-        if not force_update and val and float(val) > 0.0:
+        if not force_update and data and pf in data:
             all_put_data.append(data)
         else:
             all_put_data.append(None)
