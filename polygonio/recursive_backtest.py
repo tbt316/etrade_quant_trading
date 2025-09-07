@@ -35,6 +35,7 @@ from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
 from .cache_io import stored_option_price, save_stored_option_data
 from .symbols import convert_polygon_to_etrade_ticker
+from .paths import ROOT_DIR
 
 # --- helpers for PCS selection ---
 def _mid_from_quotes(d: dict) -> float | None:
@@ -293,7 +294,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
     # Preload on-disk buffered caches into memory so we fetch only true misses
     try:
-        load_stored_option_data(cfg.ticker)
+        cache_dir = None
+        if "_lite" in (cfg.trade_type or ""):
+            cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
+        load_stored_option_data(cfg.ticker, cache_dir=cache_dir)
         print(f"[DEBUG] preloaded cached PKLs for {cfg.ticker}")
     except Exception as e:
         print(f"[DEBUG] preload skipped for {cfg.ticker}: {e}")
@@ -897,7 +901,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
     # Optionally persist caches as you go (same as before)
     # try:
     #     print("[DEBUG] saving cached option data...")
-    #     save_stored_option_data(cfg.ticker)
+    #     cache_dir = None
+    #     if "_lite" in (cfg.trade_type or ""):
+    #         cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
+    #     save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
     #     print("[DEBUG] saved.")
     # except Exception:
     #     pass
