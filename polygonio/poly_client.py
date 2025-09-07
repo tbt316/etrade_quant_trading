@@ -24,8 +24,6 @@ def _resolve_api_key() -> str:
     Fall back to legacy polygonio_config.py if present.
     """
     key = os.getenv("POLYGON_API_KEY")
-    assert key, "POLYGON_API_KEY must be set"
-    print(f"POLYGON_API_KEY loaded, length={len(key)}")
     if key:
         return key
 

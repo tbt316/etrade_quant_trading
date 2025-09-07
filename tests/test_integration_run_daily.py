@@ -40,7 +40,8 @@ def _pick_positions(res: dict):
 
 def test_backtest_smoke_online():
     assert os.getenv("POLYGON_API_KEY"), "POLYGON_API_KEY must be set"
-
+    print(f"KEY length: {len(os.getenv('POLYGON_API_KEY'))}")
+    
     cfg = RecursionConfig(
         ticker="SPY",
         global_start_date="2025-07-10",
