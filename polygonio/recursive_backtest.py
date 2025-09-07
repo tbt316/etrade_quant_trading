@@ -550,8 +550,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             # _target_expiry_compat returns a datetime; convert to date for comparisons
             nyse = mcal.get_calendar("NYSE")
             this_exp = target_dt.date()
+            target_wd = this_exp.weekday()
             counter = 0
             range_ok = False
+            shifted_one_day = False
             while True:
                 expiration_str = this_exp.strftime("%Y-%m-%d")
                 print(
@@ -603,14 +605,18 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 # Compare dates to avoid type mismatch when loop index is a `date`
                 if this_exp <= cur or counter > 30:
                     break
-                prev_exp = this_exp
-                this_exp -= timedelta(days=1)  # Move by one day if it's missed because of non-trading day
-                if (
-                    counter > 1
-                    and this_exp.weekday() != 4
-                    and len(nyse.valid_days(prev_exp, prev_exp)) > 0
-                ):
+                is_trading = len(nyse.valid_days(this_exp, this_exp)) > 0
+                if not shifted_one_day and not is_trading:
+                    # initial expiration was a non-trading day; shift back one day
+                    this_exp -= timedelta(days=1)
+                    shifted_one_day = True
                     continue
+                shifted_one_day = True
+                # after the initial adjustment, jump to the previous week's target weekday
+                delta_days = (this_exp.weekday() - target_wd) % 7
+                if delta_days == 0:
+                    delta_days = 7
+                this_exp -= timedelta(days=delta_days)
 
             if (
                 ("call" in call_put_flag and not call_data)

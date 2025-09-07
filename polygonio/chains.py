@@ -324,6 +324,13 @@ async def pull_option_chain_data(
     settings = get_settings()
     option_range = settings.option_range
 
+    all_call_strikes = (
+        sorted(float(k) for k in call_syms.keys()) if need_calls else []
+    )
+    all_put_strikes = (
+        sorted(float(k) for k in put_syms.keys()) if need_puts else []
+    )
+
     win_call_strikes = (
         _window_strikes(
             strikes=call_syms.keys(),
@@ -346,15 +353,15 @@ async def pull_option_chain_data(
     )
 
     strike_range: Optional[Dict[str, Dict[str, float]]] = {}
-    if need_calls and win_call_strikes:
+    if need_calls and all_call_strikes:
         strike_range["call"] = {
-            "min_strike": float(min(win_call_strikes)),
-            "max_strike": float(max(win_call_strikes)),
+            "min_strike": float(min(all_call_strikes)),
+            "max_strike": float(max(all_call_strikes)),
         }
-    if need_puts and win_put_strikes:
+    if need_puts and all_put_strikes:
         strike_range["put"] = {
-            "min_strike": float(min(win_put_strikes)),
-            "max_strike": float(max(win_put_strikes)),
+            "min_strike": float(min(all_put_strikes)),
+            "max_strike": float(max(all_put_strikes)),
         }
     if not strike_range:
         strike_range = None
