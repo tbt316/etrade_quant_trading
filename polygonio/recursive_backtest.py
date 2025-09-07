@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import pandas_market_calendars as mcal
 
 
 class _DebugCounters:
@@ -43,6 +44,7 @@ from .paths import ROOT_DIR
 
 
 OPTION_DATA_SAVE_THRESHOLD = 50  # minimum new entries before persisting caches
+OPTION_RANGE = 0.1  # strike range requirement for option chains
 
 # --- helpers for PCS selection ---
 def _mid_from_quotes(d: dict) -> float | None:
@@ -546,8 +548,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             # 3b) Pull chains + maybe batch fetch missing quotes
             # _target_expiry_compat returns a datetime; convert to date for comparisons
+            nyse = mcal.get_calendar("NYSE")
             this_exp = target_dt.date()
             counter = 0
+            range_ok = False
             while True:
                 expiration_str = this_exp.strftime("%Y-%m-%d")
                 print(
@@ -573,22 +577,35 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 need_put = "put" in call_put_flag
                 have_call = bool(call_data) or not need_call
                 have_put = bool(put_data) or not need_put
-                if have_call and have_put:
+                range_ok = False
+                if strike_range is not None and spot is not None:
+                    smin, smax = strike_range
+                    if smin is not None and smax is not None:
+                        range_ok = smax > spot * (1 + OPTION_RANGE) and smin < spot * (1 - OPTION_RANGE)
+                if have_call and have_put and range_ok:
                     break
                 counter += 1
                 # Compare dates to avoid type mismatch when loop index is a `date`
                 if this_exp <= cur or counter > 30:
                     break
-                this_exp -= timedelta(days=1)
-                if counter > 1 and this_exp.weekday() != 4:
+                prev_exp = this_exp
+                this_exp -= timedelta(days=1)  # Move by one day if it's missed because of non-trading day
+                if (
+                    counter > 1
+                    and this_exp.weekday() != 4
+                    and len(nyse.valid_days(prev_exp, prev_exp)) > 0
+                ):
                     continue
 
-            if ("call" in call_put_flag and not call_data) or (
-                "put" in call_put_flag and not put_data
+            if (
+                ("call" in call_put_flag and not call_data)
+                or ("put" in call_put_flag and not put_data)
+                or not range_ok
             ):
                 dbg.expiries_skipped_no_chain += 1
                 cur += timedelta(days=1)
-                print(f"[DEBUG] skipping expiry {expiration_str}: no chain data")
+                reason = "no chain data" if not (call_data and put_data) else "insufficient strike range"
+                print(f"[DEBUG] skipping expiry {expiration_str}: {reason}")
                 continue
 
             position = None
