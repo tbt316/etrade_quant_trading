@@ -12,6 +12,8 @@ from .paths import get_price_cache_file, get_chain_cache_file, ensure_dir
 
 stored_option_price: Dict[str, Dict[str, Any]] = {}
 stored_option_chain: Dict[str, Dict[str, Any]] = {}
+# Track how many option records have been added or changed since the last save
+unsaved_option_entries: Dict[str, int] = {}
 
 # Global file lock for cross-process safety (for ProcessPoolExecutor)
 file_lock: Lock = Lock()
@@ -27,6 +29,8 @@ def _ensure_ticker_slots(ticker: str) -> None:
         stored_option_price[t] = {}
     if t not in stored_option_chain:
         stored_option_chain[t] = {}
+    if t not in unsaved_option_entries:
+        unsaved_option_entries[t] = 0
 
 
 def merge_nested_dicts(dst: Dict, src: Dict) -> None:
@@ -65,6 +69,14 @@ def merge_nested_dicts_with_count(dst: Dict, src: Dict) -> int:
                 else:
                     count += 1
     return count
+
+
+def record_unsaved_option_entries(ticker: str, count: int) -> None:
+    """Increment unsaved entry counter for *ticker* by *count*."""
+    if count <= 0:
+        return
+    t = ticker.upper()
+    unsaved_option_entries[t] = unsaved_option_entries.get(t, 0) + count
 
 # ---------------------------------------------------------
 # Load / Save with merge semantics
@@ -121,44 +133,10 @@ def load_stored_option_data(ticker: str, cache_dir: Path | None = None) -> Dict[
     return {}
 
 
-def option_data_unsaved_count(ticker: str, cache_dir: Path | None = None) -> int:
-    """Return number of new or updated option entries not yet on disk."""
+def option_data_unsaved_count(ticker: str, cache_dir: Path | None = None) -> int:  # cache_dir unused
+    """Return number of option entries added/updated since last save."""
     _ensure_ticker_slots(ticker)
-    t = ticker.upper()
-
-    if cache_dir is not None:
-        price_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_price.pkl"
-        chain_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_chain.pkl"
-    else:
-        price_cache_file = Path(get_price_cache_file(t))
-        chain_cache_file = Path(get_chain_cache_file(t))
-
-    existing_price: Dict[str, Any] = {}
-    existing_chain: Dict[str, Any] = {}
-
-    if price_cache_file.exists() and price_cache_file.stat().st_size > 0:
-        try:
-            with price_cache_file.open("rb") as f:
-                existing_price = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError) as e:
-            print(f"Warning: Failed to load {price_cache_file} ({e}); using empty dict.")
-
-    if chain_cache_file.exists() and chain_cache_file.stat().st_size > 0:
-        try:
-            with chain_cache_file.open("rb") as f:
-                existing_chain = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError) as e:
-            print(f"Warning: Failed to load {chain_cache_file} ({e}); using empty dict.")
-
-    price_new = merge_nested_dicts_with_count(existing_price, stored_option_price[t])
-    chain_new = merge_nested_dicts_with_count(existing_chain, stored_option_chain[t])
-
-    return price_new + chain_new
-
-
-def option_data_needs_update(ticker: str, cache_dir: Path | None = None) -> bool:
-    """Return True if there are any unsaved option entries for *ticker*."""
-    return option_data_unsaved_count(ticker, cache_dir) > 0
+    return unsaved_option_entries.get(ticker.upper(), 0)
 
 
 def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
@@ -203,4 +181,5 @@ def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:
             pickle.dump(existing_price, f, protocol=pickle.HIGHEST_PROTOCOL)
         with chain_cache_file.open("wb") as f:
             pickle.dump(existing_chain, f, protocol=pickle.HIGHEST_PROTOCOL)
+        unsaved_option_entries[t] = 0
 
