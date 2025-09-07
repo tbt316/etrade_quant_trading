@@ -50,11 +50,13 @@ def test_backtest_smoke_online():
         expiring_weekday="Friday",
         expiring_wks=6,
         contract_qty=1,
-        target_premium_otm=2.5,
+        target_premium_otm=0.25,
         iron_condor_width=20,
         target_steer=0.9,
-        stop_profit_percent=0.2
-    )
+        stop_profit_percent=0.2,
+        vix_threshold=20,
+        vix_correlation=0.05
+        )
 
     try:
         loop = asyncio.get_event_loop()

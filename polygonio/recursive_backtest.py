@@ -1223,7 +1223,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 print(
                     f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
                 )
-            breakpoint()
             daily_pnls.append(pnl_row)
             # <--- END YOUR P&L / EXIT LOGIC
             # <--- END YOUR P&L / EXIT LOGIC
