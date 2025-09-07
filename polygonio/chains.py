@@ -319,6 +319,72 @@ async def pull_option_chain_data(
             # Swallow network/client errors and fall back to stored data
             pass
 
+    # If still missing, walk backward day-by-day (preferring Fridays) and
+    # attempt to pull chains for nearby expirations, mirroring the reference
+    # dailytrade logic.
+    if not call_syms or not put_syms:
+        try:
+            exp_date = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+            as_of_date = datetime.strptime(as_of_str, "%Y-%m-%d").date()
+        except Exception:
+            exp_date = None
+            as_of_date = None
+
+        counter = 0
+        current = exp_date
+        while (
+            current is not None
+            and as_of_date is not None
+            and (not call_syms or not put_syms)
+            and current > as_of_date
+            and counter < 30
+        ):
+            counter += 1
+            current -= timedelta(days=1)
+            # After the first shift, only consider Friday expirations
+            if counter > 1 and current.weekday() != 4:
+                continue
+            exp_cand = current.strftime("%Y-%m-%d")
+            call_syms = (
+                stored_option_chain.get(ticker, {})
+                .get(exp_cand, {})
+                .get(as_of_str, {})
+                .get("call")
+                or {}
+            )
+            put_syms = (
+                stored_option_chain.get(ticker, {})
+                .get(exp_cand, {})
+                .get(as_of_str, {})
+                .get("put")
+                or {}
+            )
+            if (not call_syms or not put_syms) and client is not None:
+                try:
+                    reqs = [(exp_cand, as_of_str, "call"), (exp_cand, as_of_str, "put")]
+                    await client.get_option_chains_batch_async(
+                        ticker, reqs, force_update=force_update
+                    )
+                    call_syms = (
+                        stored_option_chain.get(ticker, {})
+                        .get(exp_cand, {})
+                        .get(as_of_str, {})
+                        .get("call")
+                        or {}
+                    )
+                    put_syms = (
+                        stored_option_chain.get(ticker, {})
+                        .get(exp_cand, {})
+                        .get(as_of_str, {})
+                        .get("put")
+                        or {}
+                    )
+                except Exception:
+                    pass
+            if call_syms and put_syms:
+                expiration_str = exp_cand
+                break
+
     exp_chosen = expiration_str
     if not call_syms or not put_syms:
         chosen_exp, calls_fb, puts_fb = find_available_expiration(
