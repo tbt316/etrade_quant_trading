@@ -258,7 +258,7 @@ class RecursionConfig:
     stop_profit_percent: Optional[float] = None
     stop_loss_action: Optional[str] = None
     vix_threshold: Optional[float] = None
-    vix_correlation: Optional[str] = None
+    vix_correlation: Optional[float] = None
 
 
 def monthly_recursive_backtest(
@@ -277,7 +277,7 @@ def monthly_recursive_backtest(
     stop_profit_percent: float | None = None,
     stop_loss_action: str | None = None,
     vix_threshold: float | None = None,
-    vix_correlation: str | None = None,
+    vix_correlation: float | None = None,
 ) -> Dict[str, Any]:
     """
     Replacement for your old monthly_recursive_backtest(...).
