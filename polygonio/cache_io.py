@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .paths import get_price_cache_file, get_chain_cache_file, ensure_dir
-import os
 
 # ---------------------------------------------------------
 # In-memory singletons (shared process-wide)
@@ -40,21 +39,32 @@ def merge_nested_dicts(dst: Dict, src: Dict) -> None:
         else:
             dst[k] = v
 
-def merge_nested_dicts_with_change(dst: dict, src: dict) -> bool:
-    """
-    Like merge_nested_dicts, but returns True if *dst* changed as a result of the merge.
-    Used to avoid unnecessary pickle writes when nothing is new.
-    """
-    changed = False
+
+def _count_leaves(d: Dict) -> int:
+    """Count the number of non-dict leaf nodes in *d*."""
+    total = 0
+    for v in d.values():
+        if isinstance(v, dict):
+            total += _count_leaves(v)
+        else:
+            total += 1
+    return total
+
+
+def merge_nested_dicts_with_count(dst: Dict, src: Dict) -> int:
+    """Merge *src* into *dst* and return number of leaf entries added or changed."""
+    count = 0
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            if merge_nested_dicts_with_change(dst[k], v):
-                changed = True
+            count += merge_nested_dicts_with_count(dst[k], v)
         else:
             if k not in dst or dst.get(k) != v:
                 dst[k] = v
-                changed = True
-    return changed
+                if isinstance(v, dict):
+                    count += _count_leaves(v)
+                else:
+                    count += 1
+    return count
 
 # ---------------------------------------------------------
 # Load / Save with merge semantics
@@ -110,12 +120,9 @@ def load_stored_option_data(ticker: str, cache_dir: Path | None = None) -> Dict[
         return price_by_date.get(last_date, {})
     return {}
 
-def option_data_needs_update(ticker: str, cache_dir: Path | None = None) -> bool:
-    """
-    Determine whether in-memory option data differs from what is stored on disk.
-    This allows callers to decide if saving is necessary without performing the
-    costly save operation.
-    """
+
+def option_data_unsaved_count(ticker: str, cache_dir: Path | None = None) -> int:
+    """Return number of new or updated option entries not yet on disk."""
     _ensure_ticker_slots(ticker)
     t = ticker.upper()
 
@@ -143,10 +150,15 @@ def option_data_needs_update(ticker: str, cache_dir: Path | None = None) -> bool
         except (EOFError, pickle.UnpicklingError) as e:
             print(f"Warning: Failed to load {chain_cache_file} ({e}); using empty dict.")
 
-    price_changed = merge_nested_dicts_with_change(existing_price, stored_option_price[t])
-    chain_changed = merge_nested_dicts_with_change(existing_chain, stored_option_chain[t])
+    price_new = merge_nested_dicts_with_count(existing_price, stored_option_price[t])
+    chain_new = merge_nested_dicts_with_count(existing_chain, stored_option_chain[t])
 
-    return price_changed or chain_changed
+    return price_new + chain_new
+
+
+def option_data_needs_update(ticker: str, cache_dir: Path | None = None) -> bool:
+    """Return True if there are any unsaved option entries for *ticker*."""
+    return option_data_unsaved_count(ticker, cache_dir) > 0
 
 
 def save_stored_option_data(ticker: str, cache_dir: Path | None = None) -> None:

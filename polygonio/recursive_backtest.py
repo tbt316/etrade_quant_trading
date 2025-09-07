@@ -34,9 +34,12 @@ from .market_calendar import list_expiries  # maps your old get_all_weekdays
 from .poly_client import PolygonAPIClient
 from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
-from .cache_io import stored_option_price, save_stored_option_data, option_data_needs_update
+from .cache_io import stored_option_price, save_stored_option_data, option_data_unsaved_count
 from .symbols import convert_polygon_to_etrade_ticker
 from .paths import ROOT_DIR
+
+
+OPTION_DATA_SAVE_THRESHOLD = 50  # minimum new entries before persisting caches
 
 # --- helpers for PCS selection ---
 def _mid_from_quotes(d: dict) -> float | None:
@@ -937,11 +940,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         cache_dir = None
         if "_lite" in (cfg.trade_type or ""):
             cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
-        if option_data_needs_update(cfg.ticker, cache_dir=cache_dir):
+        unsaved = option_data_unsaved_count(cfg.ticker, cache_dir=cache_dir)
+        if unsaved > OPTION_DATA_SAVE_THRESHOLD:
             save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
             print("[DEBUG] saved.")
         else:
-            print("[DEBUG] no changes detected; skip saving.")
+            print(
+                f"[DEBUG] unsaved entries ({unsaved}) below threshold; skip saving."
+            )
     except Exception:
         pass
     
