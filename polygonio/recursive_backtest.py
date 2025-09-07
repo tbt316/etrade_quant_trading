@@ -577,11 +577,26 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 need_put = "put" in call_put_flag
                 have_call = bool(call_data) or not need_call
                 have_put = bool(put_data) or not need_put
-                range_ok = False
-                if strike_range is not None and spot is not None:
-                    smin, smax = strike_range
-                    if smin is not None and smax is not None:
-                        range_ok = smax > spot * (1 + OPTION_RANGE) and smin < spot * (1 - OPTION_RANGE)
+                range_ok = True
+                if strike_range is None or spot is None:
+                    range_ok = False
+                else:
+                    if need_call:
+                        cr = strike_range.get("call") if isinstance(strike_range, dict) else None
+                        if (
+                            not cr
+                            or cr.get("max_strike") is None
+                            or cr["max_strike"] <= spot * (1 + OPTION_RANGE)
+                        ):
+                            range_ok = False
+                    if range_ok and need_put:
+                        pr = strike_range.get("put") if isinstance(strike_range, dict) else None
+                        if (
+                            not pr
+                            or pr.get("min_strike") is None
+                            or pr["min_strike"] >= spot * (1 - OPTION_RANGE)
+                        ):
+                            range_ok = False
                 if have_call and have_put and range_ok:
                     break
                 counter += 1
