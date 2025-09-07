@@ -60,15 +60,21 @@ def merge_nested_dicts_with_change(dst: dict, src: dict) -> bool:
 # Load / Save with merge semantics
 # ---------------------------------------------------------
 
-def load_stored_option_data(ticker: str) -> Dict[str, Any]:
+def load_stored_option_data(ticker: str, cache_dir: Path | None = None) -> Dict[str, Any]:
     """Load cached price/chain pickles for *ticker* (if present) and merge into memory.
+    If *cache_dir* is provided, use that directory instead of the default cache path.
     Returns the most recent pricing-date dict for convenience (or empty dict).
     """
     _ensure_ticker_slots(ticker)
     t = ticker.upper()
 
-    price_cache_file: Path = Path(get_price_cache_file(t))
-    chain_cache_file: Path = Path(get_chain_cache_file(t))
+    if cache_dir is not None:
+        ensure_dir(cache_dir)
+        price_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_price.pkl"
+        chain_cache_file: Path = Path(cache_dir) / f"{t}_stored_option_chain.pkl"
+    else:
+        price_cache_file: Path = Path(get_price_cache_file(t))
+        chain_cache_file: Path = Path(get_chain_cache_file(t))
 
     # Price cache
     if price_cache_file.exists():
