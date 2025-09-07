@@ -35,6 +35,7 @@ from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
 from .cache_io import stored_option_price, save_stored_option_data
 from .symbols import convert_polygon_to_etrade_ticker
+from .paths import ROOT_DIR
 
 # --- helpers for PCS selection ---
 def _mid_from_quotes(d: dict) -> float | None:
@@ -293,7 +294,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
     # Preload on-disk buffered caches into memory so we fetch only true misses
     try:
-        load_stored_option_data(cfg.ticker)
+        cache_dir = None
+        if "_lite" in (cfg.trade_type or ""):
+            cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
+        load_stored_option_data(cfg.ticker, cache_dir=cache_dir)
         print(f"[DEBUG] preloaded cached PKLs for {cfg.ticker}")
     except Exception as e:
         print(f"[DEBUG] preload skipped for {cfg.ticker}: {e}")
@@ -594,7 +598,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
                             f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
                         )
-
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
@@ -664,12 +667,26 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             # Helper to append/update open_positions on open day
             def _register_open_position(position_dict: Dict[str, Any]):
-                pos = dict(position_dict)  # copy
+                """Register a newly-opened position in the open list.
+
+                ``position_dict`` is already appended to ``daily_positions`` above.
+                To ensure any later mutations (e.g. call/put closure fields) are
+                reflected in the final ``positions`` output, we must operate on
+                the same dictionary object rather than a copy.  Otherwise the
+                open/close logic below would update a separate object and the
+                caller would never see the enriched fields.
+                """
+
+                # Use the original dict so that open_positions and daily_positions
+                # share the same reference.
+                pos = position_dict
+
                 pos.setdefault("position_open_date", datetime.strptime(as_of_str, "%Y-%m-%d"))
                 pos.setdefault("call_closed_by_stop", False)
                 pos.setdefault("put_closed_by_stop", False)
                 pos.setdefault("call_closed_date", None)
                 pos.setdefault("put_closed_date", None)
+
                 # Extract per-leg info
                 for leg in position_dict.get("legs", []):
                     side = leg.get("side"); action = leg.get("action")
@@ -686,6 +703,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     if side == "put" and action == "buy":
                         pos["put_strike_bought"] = strike
                         pos["long_put_prem_open"] = prem
+
                 open_positions.append(pos)
 
             # Register this newly-opened position, if any
@@ -861,9 +879,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     and (p.get("put_closed_by_stop", False) or p.get("short_put_prem_open") is None)
                 )
             ]
-            for pos in open_positions:
-                print(f"[DEBUG] still open: {pos.get('underlying')} exp={pos.get('expiration')} opened={pos.get('opened_at')} pcs={pos.get('put_strike_sold')} closed_call={pos.get('call_closed_by_stop')} closed_put={pos.get('put_closed_by_stop')}")
-
+            
             # bookkeeping row
             pnl_row = {
                 "as_of": as_of_str,
@@ -875,7 +891,6 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "open_positions": len(open_positions),
             }
             print(f"pnl_row init: {pnl_row} open_positions={len(open_positions)}")
-            breakpoint()
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
@@ -886,7 +901,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
     # Optionally persist caches as you go (same as before)
     # try:
     #     print("[DEBUG] saving cached option data...")
-    #     save_stored_option_data(cfg.ticker)
+    #     cache_dir = None
+    #     if "_lite" in (cfg.trade_type or ""):
+    #         cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
+    #     save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
     #     print("[DEBUG] saved.")
     # except Exception:
     #     pass

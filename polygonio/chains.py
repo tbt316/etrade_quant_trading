@@ -5,8 +5,11 @@ from datetime import datetime, timedelta, date
 from functools import lru_cache
 from typing import Dict, Any, Optional, Tuple, Iterable
 
+import asyncio
+
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import load_stored_option_data, stored_option_chain, stored_option_price
+from .poly_client import PolygonAPIClient
 
 
 def _to_date(d: str | date | None) -> Optional[date]:
@@ -175,6 +178,37 @@ def get_option_chain_for_date(
 
     call_syms = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("call") or {}
     put_syms  = stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("put") or {}
+    if not call_syms or not put_syms:
+        # Attempt to fetch missing chain data from Polygon
+        async def _fetch() -> None:
+            async with PolygonAPIClient() as client:
+                reqs = [(expiration_s, as_of_s, "call"), (expiration_s, as_of_s, "put")]
+                await client.get_option_chains_batch_async(ticker, reqs)
+
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if loop.is_running():
+                new_loop = asyncio.new_event_loop()
+                new_loop.run_until_complete(_fetch())
+                new_loop.close()
+            else:
+                loop.run_until_complete(_fetch())
+        except Exception:
+            pass
+
+        call_syms = (
+            stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("call")
+            or call_syms
+        )
+        put_syms = (
+            stored_option_chain.get(ticker, {}).get(expiration_s, {}).get(as_of_s, {}).get("put")
+            or put_syms
+        )
 
     if not call_syms or not put_syms:
         chosen_exp, calls_fallback, puts_fallback = find_available_expiration(
@@ -260,6 +294,97 @@ async def pull_option_chain_data(
     call_syms = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("call") or {}
     put_syms  = stored_option_chain.get(ticker, {}).get(expiration_str, {}).get(as_of_str, {}).get("put") or {}
 
+    # If either side is missing, attempt to fetch from Polygon via the provided client
+    if (not call_syms or not put_syms) and client is not None:
+        try:
+            reqs = [(expiration_str, as_of_str, "call"), (expiration_str, as_of_str, "put")]
+            chain_data = await client.get_option_chains_batch_async(
+                ticker, reqs, force_update=force_update
+            )
+            call_syms = (
+                chain_data.get(ticker, {})
+                .get(expiration_str, {})
+                .get(as_of_str, {})
+                .get("call")
+                or call_syms
+            )
+            put_syms = (
+                chain_data.get(ticker, {})
+                .get(expiration_str, {})
+                .get(as_of_str, {})
+                .get("put")
+                or put_syms
+            )
+        except Exception:
+            # Swallow network/client errors and fall back to stored data
+            pass
+
+    # If still missing, walk backward day-by-day (preferring Fridays) and
+    # attempt to pull chains for nearby expirations, mirroring the reference
+    # dailytrade logic.
+    if not call_syms or not put_syms:
+        try:
+            exp_date = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+            as_of_date = datetime.strptime(as_of_str, "%Y-%m-%d").date()
+        except Exception:
+            exp_date = None
+            as_of_date = None
+
+        counter = 0
+        current = exp_date
+        while (
+            current is not None
+            and as_of_date is not None
+            and (not call_syms or not put_syms)
+            and current > as_of_date
+            and counter < 30
+        ):
+            counter += 1
+            current -= timedelta(days=1)
+            # After the first shift, only consider Friday expirations
+            if counter > 1 and current.weekday() != 4:
+                continue
+            exp_cand = current.strftime("%Y-%m-%d")
+            call_syms = (
+                stored_option_chain.get(ticker, {})
+                .get(exp_cand, {})
+                .get(as_of_str, {})
+                .get("call")
+                or {}
+            )
+            put_syms = (
+                stored_option_chain.get(ticker, {})
+                .get(exp_cand, {})
+                .get(as_of_str, {})
+                .get("put")
+                or {}
+            )
+            if (not call_syms or not put_syms) and client is not None:
+                try:
+                    reqs = [(exp_cand, as_of_str, "call"), (exp_cand, as_of_str, "put")]
+                    await client.get_option_chains_batch_async(
+                        ticker, reqs, force_update=force_update
+                    )
+                    call_syms = (
+                        stored_option_chain.get(ticker, {})
+                        .get(exp_cand, {})
+                        .get(as_of_str, {})
+                        .get("call")
+                        or {}
+                    )
+                    put_syms = (
+                        stored_option_chain.get(ticker, {})
+                        .get(exp_cand, {})
+                        .get(as_of_str, {})
+                        .get("put")
+                        or {}
+                    )
+                except Exception:
+                    pass
+            if call_syms and put_syms:
+                expiration_str = exp_cand
+                break
+
     exp_chosen = expiration_str
     if not call_syms or not put_syms:
         chosen_exp, calls_fb, puts_fb = find_available_expiration(
@@ -289,11 +414,70 @@ async def pull_option_chain_data(
     all_call_data = [_row_for(k, "call") for k in call_strikes]
     all_put_data  = [_row_for(k, "put")  for k in put_strikes]
 
-    # Optional: filter/window by range/OTM (legacy call sites usually filter later, so we keep full set)
-    # But we can compute strike_range for debug
-    smin = None
-    smax = None
-    all_strikes = list(call_syms.keys()) + list(put_syms.keys())
+    # ------------------------------------------------------------------
+    # Ensure each option has pricing; fetch missing premiums from Polygon
+    # ------------------------------------------------------------------
+    pf = _price_field()
+    reqs: list[dict[str, Any]] = []
+    call_missing_idx: list[int] = []
+    put_missing_idx: list[int] = []
+
+    for i, (opt, data) in enumerate(zip(call_opts, all_call_data)):
+        val = data.get(pf) if isinstance(data, dict) else None
+        if force_update or not val or float(val) <= 0.0:
+            reqs.append({
+                "strike_price": opt["strike_price"],
+                "call_put": "call",
+                "expiration_date": opt["expiration_date"],
+                "quote_timestamp": as_of_str,
+                "option_ticker": opt["option_ticker"],
+            })
+            call_missing_idx.append(i)
+
+    for i, (opt, data) in enumerate(zip(put_opts, all_put_data)):
+        val = data.get(pf) if isinstance(data, dict) else None
+        if force_update or not val or float(val) <= 0.0:
+            reqs.append({
+                "strike_price": opt["strike_price"],
+                "call_put": "put",
+                "expiration_date": opt["expiration_date"],
+                "quote_timestamp": as_of_str,
+                "option_ticker": opt["option_ticker"],
+            })
+            put_missing_idx.append(i)
+
+    if reqs and client is not None:
+        try:
+            fetched = await client.get_option_prices_batch_async(ticker, reqs)
+        except Exception:
+            fetched = []
+        # Map results back to placeholders
+        j = 0
+        for idx in call_missing_idx:
+            all_call_data[idx] = fetched[j] if j < len(fetched) else {}
+            j += 1
+        for idx in put_missing_idx:
+            all_put_data[idx] = fetched[j] if j < len(fetched) else {}
+            j += 1
+
+    # Drop options still lacking the required premium
+    def _valid(prem: dict) -> bool:
+        try:
+            return float(prem.get(pf, 0.0)) > 0.0
+        except Exception:
+            return False
+
+    call_filtered = [(opt, prem) for opt, prem in zip(call_opts, all_call_data) if _valid(prem)]
+    put_filtered  = [(opt, prem) for opt, prem in zip(put_opts,  all_put_data)  if _valid(prem)]
+
+    call_opts, all_call_data = zip(*call_filtered) if call_filtered else ([], [])
+    put_opts,  all_put_data  = zip(*put_filtered)  if put_filtered  else ([], [])
+    call_opts, all_call_data = list(call_opts), list(all_call_data)
+    put_opts,  all_put_data  = list(put_opts),  list(all_put_data)
+
+    # Compute strike range for debugging
+    smin = smax = None
+    all_strikes = [opt["strike_price"] for opt in call_opts] + [opt["strike_price"] for opt in put_opts]
     if all_strikes:
         smin = float(min(all_strikes))
         smax = float(max(all_strikes))
