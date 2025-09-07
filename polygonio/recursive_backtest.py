@@ -631,7 +631,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     except Exception as e:
                         # skip this date/expiry if legs incomplete
                         position = None
-
+                print(f"[DEBUG] built position: {position} @ {datetime.utcnow().isoformat()}")
                 if position is not None:
                     daily_positions.append(position)
                     dbg.positions_built += 1
@@ -817,6 +817,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             from .pricing import interpolate_option_price as _interp
                             exp_s = exp_dt.strftime("%Y-%m-%d")
                             if sp_p is None:
+                                print(f"[DEBUG] interpolating missing PUT price for {t} {as_of_str} exp {exp_s} strike {sp} @ {datetime.utcnow().isoformat()}")
                                 sp_p = await _interp(
                                     t, float(spot or 0.0), float(sp), "put",
                                     exp_s, as_of_str,
@@ -824,6 +825,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                                     price_interpolate_flag=get_settings().price_interpolate,
                                     client=client
                                 )
+                                print(f"[DEBUG] interpolated PUT price: {sp_p} @ {datetime.utcnow().isoformat()}")
                             if lp is not None and lp_p is None:
                                 lp_p = await _interp(
                                     t, float(spot or 0.0), float(lp), "put",
@@ -845,6 +847,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 tp = float(cfg.stop_profit_percent) if (cfg.stop_profit_percent not in (None, 0, "0")) else None
                 # For now we don't implement hold_to_expiration toggles; always use tp if provided.
                 commission = 2 * 0.5  # $1 round trip placeholder
+
+                print(f"[DEBUG] close cost calculated: {position} @ {datetime.utcnow().isoformat()}")
 
                 # CALL leg decision
                 if close_call_cost is not None and entry_credit_call > 0 and not pos.get("call_closed_by_stop", False):
@@ -905,6 +909,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 print(
                     f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
                 )
+            breakpoint()
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
