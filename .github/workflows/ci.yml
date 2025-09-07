@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install project & test deps
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+          # minimal runtime libs your path is using
+          # pip install pytest pandas numpy matplotlib requests python-dateutil pytz pandas_market_calendars aiohttp
+          pip install -r requirements.txt
+          
+      - name: Run integration tests
+        run: pytest -q -m "integration"

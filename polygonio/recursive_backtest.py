@@ -259,30 +259,21 @@ def _target_expiry_compat(*, weekday: str, as_of: date, weeks: int) -> Optional[
     try:
         import pandas_market_calendars as mcal
         cal = mcal.get_calendar('NYSE')
-        sched = cal.schedule(start_date=as_of, end_date=as_of + timedelta(days=80))
-        df = sched.reset_index().rename(columns={'index':'date'})
-        dates = pd.to_datetime(df['date']).dt.tz_localize(None).dt.date.tolist()
-        trading_days = sorted(dates)
+        horizon = as_of + timedelta(days=weeks * 7 + 20)
+        sched = cal.schedule(start_date=as_of, end_date=horizon)
+        trading_days = (
+            pd.to_datetime(sched.index).tz_localize(None).date.tolist()
+        )
     except Exception:
-        trading_days = pd.date_range(start=as_of, periods=80, freq='B').date.tolist()
+        trading_days = pd.bdate_range(start=as_of, end=as_of + timedelta(days=weeks * 7 + 20)).date.tolist()
 
     weekday_map = {"Monday":0, "Tuesday":1, "Wednesday":2, "Thursday":3, "Friday":4}
     w = weekday_map.get(weekday, 4)
-    cur = as_of
-    count = 0
-    while True:
-        if cur.weekday() == w:
-            count += 1
-            if count == weeks:
-                import bisect
-                idx = bisect.bisect_right(trading_days, cur) - 1
-                if idx >= 0:
-                    d = trading_days[idx]
-                    return datetime.combine(d, datetime.min.time())
-                return None
-        cur += timedelta(days=1)
-        if (cur - as_of).days > 80:
-            return None
+    probe = as_of + timedelta(weeks=weeks)
+    for d in trading_days:
+        if d >= probe and d.weekday() == w:
+            return datetime.combine(d, datetime.min.time())
+    return None
 # Daily loop (async) — main worker
 # -------------------------------
 
@@ -336,9 +327,22 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         dbg = _DebugCounters()
         # Collect results
         daily_positions: List[Dict[str, Any]] = []
-        active_expiries: set[datetime] = set()
         daily_pnls: List[Dict[str, Any]] = []
         open_positions: List[Dict[str, Any]] = []
+
+        def _pos_open_date(pos: Dict[str, Any]) -> Optional[date]:
+            """Return the date a position was opened, or None if unknown."""
+            od = pos.get("position_open_date") or pos.get("opened_at")
+            if isinstance(od, datetime):
+                return od.date()
+            if isinstance(od, date):
+                return od
+            if isinstance(od, str):
+                try:
+                    return datetime.strptime(od, "%Y-%m-%d").date()
+                except Exception:
+                    return None
+            return None
 
         # 3) Iterate every pricing day in the window
         start_dt = datetime.strptime(cfg.global_start_date, "%Y-%m-%d").date()
@@ -371,35 +375,48 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
             as_of_str = cur.strftime("%Y-%m-%d")
 
-            # 3a) Choose expirations like your original (Friday/Wed cadence)
+            # 3a) Choose a single target expiration (Friday/Wed cadence)
             print(f"[DEBUG] computing expiries for as_of={as_of_str}")
-            target_dt = _target_expiry_compat(weekday=cfg.expiring_weekday, as_of=cur, weeks=cfg.expiring_wks)
-            expiries: List[datetime] = []
-            if target_dt:
-                expiries.append(target_dt)
-            # keep active expiries not yet passed
-            active_expiries = {e for e in active_expiries if e.date() >= cur}
-            expiries.extend(sorted(active_expiries))
-            # dedupe preserve order
-            seen=set(); expiries=[x for x in expiries if not (x in seen or seen.add(x))]
-            print(f"[DEBUG] considering expiries: {[e.strftime('%Y-%m-%d') for e in expiries]}")
-            for exp_dt in expiries:
-                expiration_str = exp_dt.strftime("%Y-%m-%d")
+            target_dt = _target_expiry_compat(
+                weekday=cfg.expiring_weekday, as_of=cur, weeks=cfg.expiring_wks
+            )
+            if not target_dt:
+                cur += timedelta(days=1)
+                continue
+            expiration_str = target_dt.strftime("%Y-%m-%d")
 
-                # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
-                print(f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}")
-                call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
-                    ticker=cfg.ticker,
-                    call_put=call_put_flag,
-                    expiration_str=expiration_str,
-                    as_of_str=as_of_str,
-                    close_price=spot,
-                    client=client,
-                    force_otm=False,
-                    force_update=False,
-                )
-                print(f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}")
-    
+            # Determine whether a position with a different expiration was opened today
+            already_open = any(
+                (_pos_open_date(p) == cur) and p.get("expiration") != expiration_str
+                for p in open_positions
+            )
+
+            # 3b) Pull chains + maybe batch fetch missing quotes (unchanged behavior)
+            print(
+                f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
+            )
+            call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+                ticker=cfg.ticker,
+                call_put=call_put_flag,
+                expiration_str=expiration_str,
+                as_of_str=as_of_str,
+                close_price=spot,
+                client=client,
+                force_otm=False,
+                force_update=False,
+            )
+            print(
+                f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}"
+            )
+            dbg.expiries_considered += 1
+            if not call_data and not put_data:
+                dbg.expiries_skipped_no_chain += 1
+                cur += timedelta(days=1)
+                print(f"[DEBUG] skipping expiry {expiration_str}: no chain data")
+                continue
+
+            position = None
+            if not already_open:
                 sc_k = lc_k = sp_k = lp_k = None
                 dbg_sel = {'puts_total': 0, 'puts_below_spot': 0, 'meets_premium': 0, 'chosen_short_put': None, 'chosen_long_put': None}   # float
                 sc_p = lc_p = sp_p = lp_p = None   # float
@@ -434,7 +451,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 # Compute deltas if you need them for filters:
                 # calculate_delta(cfg.ticker, as_of_str, expiration_str, "call", force_delta_update=False)
                 # calculate_delta(cfg.ticker, as_of_str, expiration_str, "put",  force_delta_update=False)
-                #                                
+                #
                 # === BEGIN PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
                 try:
                     # settings decide which premium field to read from the data array
@@ -452,6 +469,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         try:
                             k = float(meta.get("strike_price"))
                         except Exception:
+                            print("[DBG] skipping put meta with invalid strike_price:", meta)
                             continue
                         d = _datas[i] if i < len(_datas) else {}
                         price = _price_from_data(d, premium_field)
@@ -599,263 +617,280 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     if have_long_put and lp_k is not None and lp_p:
                         build_kwargs["long_put"] = (float(lp_k), float(lp_p))
 
-                # Strategy may raise if a required leg is missing; guard as you did before
-                try:
-                    position = strat.build_position(**build_kwargs).to_dict()
+                    # Strategy may raise if a required leg is missing; guard as you did before
                     try:
-                        ed = datetime.strptime(position.get('expiration',''), '%Y-%m-%d')
-                        active_expiries.add(ed)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    # skip this date/expiry if legs incomplete
-                    continue
+                        position = strat.build_position(**build_kwargs).to_dict()
+                    except Exception as e:
+                        # skip this date/expiry if legs incomplete
+                        position = None
 
-                daily_positions.append(position)
-                print(f"[DEBUG] built position for {as_of_str}->{expiration_str}: {position}")
-                dbg.positions_built += 1
+                if position is not None:
+                    daily_positions.append(position)
+                    dbg.positions_built += 1
 
-                # ========== PASTE BLOCK 2: P&L / EXIT / ACCOUNTING (unchanged) ==========
-                # Here paste your existing code that:
-                #   - computes cashflows (credit/debit)
-                #   - tracks margin requirements
-                #   - exits early if profit target / stop is hit
-                #   - realizes P&L at expiration or at exit date
-                #
-                # Append a summary dict to daily_pnls (or however you used to record it).
-                #
-                
+            # ========== PASTE BLOCK 2: P&L / EXIT / ACCOUNTING (unchanged) ==========
+            # Here paste your existing code that:
+            #   - computes cashflows (credit/debit)
+            #   - tracks margin requirements
+            #   - exits early if profit target / stop is hit
+            #   - realizes P&L at expiration or at exit date
+            #
+            # Append a summary dict to daily_pnls (or however you used to record it).
+            #
+            else:
+                print(f"[DEBUG] day={cur} skipped: already have open position for expiry {expiration_str}")
 # ---> BEGIN YOUR P&L / EXIT LOGIC
-                # --- Early exit & MTM logic (inspired by polygonio_dailytrade.py) ---
-                # Normalize convenience
-                t = cfg.ticker.upper()
-                premium_field = PREMIUM_FIELD_MAP.get(get_settings().premium_price_mode, "trade_price")
+            # --- Early exit & MTM logic (inspired by polygonio_dailytrade.py) ---
+            # Normalize convenience
+            t = cfg.ticker.upper()
+            premium_field = PREMIUM_FIELD_MAP.get(get_settings().premium_price_mode, "trade_price")
 
-                def _get_price_from_store(side: str, strike: float) -> float | None:
-                    try:
-                        d1 = stored_option_price.get(t, {}).get(as_of_str, {})
-                        d2 = d1.get(round(float(strike), 2), {})
-                        d3 = d2.get(expiration_str, {})
-                        leaf = d3.get(side, {}) if isinstance(d3, dict) else {}
-                        v = leaf.get(premium_field)
-                        if v is not None:
-                            return float(v)
-                        bid = leaf.get("bid_price"); ask = leaf.get("ask_price")
-                        if bid is not None and ask is not None:
-                            return (float(bid) + float(ask)) / 2.0
-                    except Exception:
-                        return None
+            def _get_price_from_store(side: str, strike: float) -> float | None:
+                try:
+                    d1 = stored_option_price.get(t, {}).get(as_of_str, {})
+                    d2 = d1.get(round(float(strike), 2), {})
+                    d3 = d2.get(expiration_str, {})
+                    leaf = d3.get(side, {}) if isinstance(d3, dict) else {}
+                    v = leaf.get(premium_field)
+                    if v is not None:
+                        return float(v)
+                    bid = leaf.get("bid_price"); ask = leaf.get("ask_price")
+                    if bid is not None and ask is not None:
+                        return (float(bid) + float(ask)) / 2.0
+                except Exception:
                     return None
+                return None
 
-                # Helper to append/update open_positions on open day
-                def _register_open_position(position_dict: Dict[str, Any]):
-                    pos = dict(position_dict)  # copy
-                    pos.setdefault("position_open_date", datetime.strptime(as_of_str, "%Y-%m-%d"))
-                    pos.setdefault("call_closed_by_stop", False)
-                    pos.setdefault("put_closed_by_stop", False)
-                    pos.setdefault("call_closed_date", None)
-                    pos.setdefault("put_closed_date", None)
-                    # Extract per-leg info
-                    for leg in position_dict.get("legs", []):
-                        side = leg.get("side"); action = leg.get("action")
-                        strike = float(leg.get("strike", 0.0)); prem = float(leg.get("premium", 0.0))
-                        if side == "call" and action == "sell":
-                            pos["call_strike_sold"] = strike
-                            pos["short_call_prem_open"] = prem
-                        if side == "call" and action == "buy":
-                            pos["call_strike_bought"] = strike
-                            pos["long_call_prem_open"] = prem
-                        if side == "put" and action == "sell":
-                            pos["put_strike_sold"] = strike
-                            pos["short_put_prem_open"] = prem
-                        if side == "put" and action == "buy":
-                            pos["put_strike_bought"] = strike
-                            pos["long_put_prem_open"] = prem
-                    open_positions.append(pos)
+            # Helper to append/update open_positions on open day
+            def _register_open_position(position_dict: Dict[str, Any]):
+                """Register a newly-opened position in the open list.
 
-                # Register this newly-opened position
+                ``position_dict`` is already appended to ``daily_positions`` above.
+                To ensure any later mutations (e.g. call/put closure fields) are
+                reflected in the final ``positions`` output, we must operate on
+                the same dictionary object rather than a copy.  Otherwise the
+                open/close logic below would update a separate object and the
+                caller would never see the enriched fields.
+                """
+
+                # Use the original dict so that open_positions and daily_positions
+                # share the same reference.
+                pos = position_dict
+
+                pos.setdefault("position_open_date", datetime.strptime(as_of_str, "%Y-%m-%d"))
+                pos.setdefault("call_closed_by_stop", False)
+                pos.setdefault("put_closed_by_stop", False)
+                pos.setdefault("call_closed_date", None)
+                pos.setdefault("put_closed_date", None)
+
+                # Extract per-leg info
+                for leg in position_dict.get("legs", []):
+                    side = leg.get("side"); action = leg.get("action")
+                    strike = float(leg.get("strike", 0.0)); prem = float(leg.get("premium", 0.0))
+                    if side == "call" and action == "sell":
+                        pos["call_strike_sold"] = strike
+                        pos["short_call_prem_open"] = prem
+                    if side == "call" and action == "buy":
+                        pos["call_strike_bought"] = strike
+                        pos["long_call_prem_open"] = prem
+                    if side == "put" and action == "sell":
+                        pos["put_strike_sold"] = strike
+                        pos["short_put_prem_open"] = prem
+                    if side == "put" and action == "buy":
+                        pos["put_strike_bought"] = strike
+                        pos["long_put_prem_open"] = prem
+
+                open_positions.append(pos)
+
+            # Register this newly-opened position, if any
+            if position is not None:
                 _register_open_position(position)
 
-                # Evaluate ALL open positions (including the one we just opened) for early exits or expiration
-                # DTE window: 'expiring soon' = half of configured expiring_wks
-                dte_soon_days = int((cfg.expiring_wks or 1) * 7 / 2)
+            # Evaluate ALL open positions (including the one we just opened) for early exits or expiration
+            # DTE window: 'expiring soon' = half of configured expiring_wks
+            dte_soon_days = int((cfg.expiring_wks or 1) * 7 / 2)
 
-                still_open: List[Dict[str, Any]] = []
-                for pos in open_positions:
+            still_open: List[Dict[str, Any]] = []
+            for pos in open_positions:
+                try:
+                    exp_dt = datetime.strptime(pos.get("expiration"), "%Y-%m-%d").date()
+                except Exception:
+                    # if expiration is already a date object
+                    exp_dt = pos.get("expiration")
+                    if isinstance(exp_dt, str):
+                        try:
+                            exp_dt = datetime.strptime(exp_dt, "%Y-%m-%d").date()
+                        except Exception:
+                            continue
+                # Skip invalid
+                if exp_dt is None:
+                    continue
+
+                # Entry credits (dollars)
+                entry_credit_call = 0.0
+                if pos.get("short_call_prem_open") and pos.get("long_call_prem_open") is not None:
+                    entry_credit_call = (float(pos.get("short_call_prem_open", 0.0)) - float(pos.get("long_call_prem_open", 0.0))) * 100.0
+                entry_credit_put = 0.0
+                if pos.get("short_put_prem_open") and pos.get("long_put_prem_open") is not None:
+                    entry_credit_put = (float(pos.get("short_put_prem_open", 0.0)) - float(pos.get("long_put_prem_open", 0.0))) * 100.0
+
+                # If expired today or earlier: settle at intrinsic
+                if exp_dt <= cur:
+                    close_price = spot if spot is not None else 0.0
+                    # CALL vertical payoff (loss positive in points)
+                    if pos.get("short_call_prem_open", 0) and pos.get("call_closed_date") is None:
+                        sc_loss = max(close_price - pos.get("call_strike_sold", 0.0), 0.0)
+                        lc_gain = max(close_price - pos.get("call_strike_bought", 0.0), 0.0)
+                        call_loss_final = sc_loss - lc_gain  # points
+                        pos["call_closed_date"] = cur
+                        pos["call_closed_by_stop"] = True
+                        pos["call_closed_profit"] = entry_credit_call - (call_loss_final * 100.0)
+                    if pos.get("short_put_prem_open", 0) and pos.get("put_closed_date") is None:
+                        sp_loss = max(pos.get("put_strike_sold", 0.0) - close_price, 0.0)
+                        lp_gain = max(pos.get("put_strike_bought", 0.0) - close_price, 0.0)
+                        put_loss_final = sp_loss - lp_gain  # points
+                        pos["put_closed_date"] = cur
+                        pos["put_closed_by_stop"] = True
+                        pos["put_closed_profit"] = entry_credit_put - (put_loss_final * 100.0)
+                    # drop from open list
+                    continue
+
+                # Otherwise, try an early exit
+                dte = (exp_dt - cur).days
+                expiring_soon = dte <= dte_soon_days
+
+                # CALL leg close cost (points)
+                close_call_cost = None
+                if pos.get("short_call_prem_open", 0) and not pos.get("call_closed_by_stop", False):
+                    sc = pos.get("call_strike_sold"); lc = pos.get("call_strike_bought")
+                    sc_p = _get_price_from_store("call", sc)
+                    lc_p = _get_price_from_store("call", lc) if lc is not None else 0.0
+
+                    if sc_p is None or lc_p is None:
+                        try:
+                            from .pricing import interpolate_option_price as _interp
+                            exp_s = exp_dt.strftime("%Y-%m-%d")  # exp_dt is a date
+                            # IMPORTANT: await the coroutine in this async function
+                            if sc_p is None:
+                                sc_p = await _interp(
+                                    t, float(spot or 0.0), float(sc), "call",
+                                    exp_s, as_of_str,
+                                    premium_field=premium_field,
+                                    price_interpolate_flag=get_settings().price_interpolate,
+                                    client=client
+                                )
+                            if lc is not None and lc_p is None:
+                                lc_p = await _interp(
+                                    t, float(spot or 0.0), float(lc), "call",
+                                    exp_s, as_of_str,
+                                    premium_field=premium_field,
+                                    price_interpolate_flag=get_settings().price_interpolate,
+                                    client=client
+                                )
+                        except Exception:
+                            pass
+
+                    # Only compute if both legs have numbers
                     try:
-                        exp_dt = datetime.strptime(pos.get("expiration"), "%Y-%m-%d").date()
+                        if sc_p is not None and lc_p is not None:
+                            close_call_cost = float(sc_p) - float(lc_p)
                     except Exception:
-                        # if expiration is already a date object
-                        exp_dt = pos.get("expiration")
-                        if isinstance(exp_dt, str):
-                            try:
-                                exp_dt = datetime.strptime(exp_dt, "%Y-%m-%d").date()
-                            except Exception:
-                                continue
-                    # Skip invalid
-                    if exp_dt is None:
-                        continue
+                        close_call_cost = None
 
-                    # Entry credits (dollars)
-                    entry_credit_call = 0.0
-                    if pos.get("short_call_prem_open") and pos.get("long_call_prem_open") is not None:
-                        entry_credit_call = (float(pos.get("short_call_prem_open", 0.0)) - float(pos.get("long_call_prem_open", 0.0))) * 100.0
-                    entry_credit_put = 0.0
-                    if pos.get("short_put_prem_open") and pos.get("long_put_prem_open") is not None:
-                        entry_credit_put = (float(pos.get("short_put_prem_open", 0.0)) - float(pos.get("long_put_prem_open", 0.0))) * 100.0
+                # PUT leg close cost (points)
+                close_put_cost = None
+                if pos.get("short_put_prem_open", 0) and not pos.get("put_closed_by_stop", False):
+                    sp = pos.get("put_strike_sold"); lp = pos.get("put_strike_bought")
+                    sp_p = _get_price_from_store("put", sp)
+                    lp_p = _get_price_from_store("put", lp) if lp is not None else 0.0
 
-                    # If expired today or earlier: settle at intrinsic
-                    if exp_dt <= cur:
-                        close_price = spot if spot is not None else 0.0
-                        # CALL vertical payoff (loss positive in points)
-                        if pos.get("short_call_prem_open", 0) and pos.get("call_closed_date") is None:
-                            sc_loss = max(close_price - pos.get("call_strike_sold", 0.0), 0.0)
-                            lc_gain = max(close_price - pos.get("call_strike_bought", 0.0), 0.0)
-                            call_loss_final = sc_loss - lc_gain  # points
-                            pos["call_closed_date"] = cur
-                            pos["call_closed_by_stop"] = True
-                            pos["call_closed_profit"] = entry_credit_call - (call_loss_final * 100.0)
-                        if pos.get("short_put_prem_open", 0) and pos.get("put_closed_date") is None:
-                            sp_loss = max(pos.get("put_strike_sold", 0.0) - close_price, 0.0)
-                            lp_gain = max(pos.get("put_strike_bought", 0.0) - close_price, 0.0)
-                            put_loss_final = sp_loss - lp_gain  # points
-                            pos["put_closed_date"] = cur
-                            pos["put_closed_by_stop"] = True
-                            pos["put_closed_profit"] = entry_credit_put - (put_loss_final * 100.0)
-                        # drop from open list
-                        continue
-
-                    # Otherwise, try an early exit
-                    dte = (exp_dt - cur).days
-                    expiring_soon = dte <= dte_soon_days
-
-                    # CALL leg close cost (points)
-                    close_call_cost = None
-                    if pos.get("short_call_prem_open", 0) and not pos.get("call_closed_by_stop", False):
-                        sc = pos.get("call_strike_sold"); lc = pos.get("call_strike_bought")
-                        sc_p = _get_price_from_store("call", sc)
-                        lc_p = _get_price_from_store("call", lc) if lc is not None else 0.0
-
-                        if sc_p is None or lc_p is None:
-                            try:
-                                from .pricing import interpolate_option_price as _interp
-                                exp_s = exp_dt.strftime("%Y-%m-%d")  # exp_dt is a date
-                                # IMPORTANT: await the coroutine in this async function
-                                if sc_p is None:
-                                    sc_p = await _interp(
-                                        t, float(spot or 0.0), float(sc), "call",
-                                        exp_s, as_of_str,
-                                        premium_field=premium_field,
-                                        price_interpolate_flag=get_settings().price_interpolate,
-                                        client=client
-                                    )
-                                if lc is not None and lc_p is None:
-                                    lc_p = await _interp(
-                                        t, float(spot or 0.0), float(lc), "call",
-                                        exp_s, as_of_str,
-                                        premium_field=premium_field,
-                                        price_interpolate_flag=get_settings().price_interpolate,
-                                        client=client
-                                    )
-                            except Exception:
-                                pass
-
-                        # Only compute if both legs have numbers
+                    if sp_p is None or lp_p is None:
                         try:
-                            if sc_p is not None and lc_p is not None:
-                                close_call_cost = float(sc_p) - float(lc_p)
+                            from .pricing import interpolate_option_price as _interp
+                            exp_s = exp_dt.strftime("%Y-%m-%d")
+                            if sp_p is None:
+                                sp_p = await _interp(
+                                    t, float(spot or 0.0), float(sp), "put",
+                                    exp_s, as_of_str,
+                                    premium_field=premium_field,
+                                    price_interpolate_flag=get_settings().price_interpolate,
+                                    client=client
+                                )
+                            if lp is not None and lp_p is None:
+                                lp_p = await _interp(
+                                    t, float(spot or 0.0), float(lp), "put",
+                                    exp_s, as_of_str,
+                                    premium_field=premium_field,
+                                    price_interpolate_flag=get_settings().price_interpolate,
+                                    client=client
+                                )
                         except Exception:
-                            close_call_cost = None
-                                                
-                    # PUT leg close cost (points)
-                    close_put_cost = None
-                    if pos.get("short_put_prem_open", 0) and not pos.get("put_closed_by_stop", False):
-                        sp = pos.get("put_strike_sold"); lp = pos.get("put_strike_bought")
-                        sp_p = _get_price_from_store("put", sp)
-                        lp_p = _get_price_from_store("put", lp) if lp is not None else 0.0
+                            pass
 
-                        if sp_p is None or lp_p is None:
-                            try:
-                                from .pricing import interpolate_option_price as _interp
-                                exp_s = exp_dt.strftime("%Y-%m-%d")
-                                if sp_p is None:
-                                    sp_p = await _interp(
-                                        t, float(spot or 0.0), float(sp), "put",
-                                        exp_s, as_of_str,
-                                        premium_field=premium_field,
-                                        price_interpolate_flag=get_settings().price_interpolate,
-                                        client=client
-                                    )
-                                if lp is not None and lp_p is None:
-                                    lp_p = await _interp(
-                                        t, float(spot or 0.0), float(lp), "put",
-                                        exp_s, as_of_str,
-                                        premium_field=premium_field,
-                                        price_interpolate_flag=get_settings().price_interpolate,
-                                        client=client
-                                    )
-                            except Exception:
-                                pass
+                    try:
+                        if sp_p is not None and lp_p is not None:
+                            close_put_cost = float(sp_p) - float(lp_p)
+                    except Exception:
+                        close_put_cost = None
 
-                        try:
-                            if sp_p is not None and lp_p is not None:
-                                close_put_cost = float(sp_p) - float(lp_p)
-                        except Exception:
-                            close_put_cost = None
+                # Triggers per leg (mirror dailytrade.py semantics)
+                tp = float(cfg.stop_profit_percent) if (cfg.stop_profit_percent not in (None, 0, "0")) else None
+                # For now we don't implement hold_to_expiration toggles; always use tp if provided.
+                commission = 2 * 0.5  # $1 round trip placeholder
 
-                    # Triggers per leg (mirror dailytrade.py semantics)
-                    tp = float(cfg.stop_profit_percent) if (cfg.stop_profit_percent not in (None, 0, "0")) else None
-                    # For now we don't implement hold_to_expiration toggles; always use tp if provided.
-                    commission = 2 * 0.5  # $1 round trip placeholder
+                # CALL leg decision
+                if close_call_cost is not None and entry_credit_call > 0 and not pos.get("call_closed_by_stop", False):
+                    cc_dollars = close_call_cost * 100.0
+                    call_trigger_profit = (tp is not None) and (0 < cc_dollars <= tp * entry_credit_call)
+                    call_trigger_loss   = cc_dollars >= 50 * entry_credit_call
+                    call_trigger_exp    = (0 < cc_dollars <= 2 * entry_credit_call) and expiring_soon
+                    if call_trigger_profit or call_trigger_exp or call_trigger_loss:
+                        realised_loss = round(-cc_dollars, 2) - commission
+                        pos["call_closed_by_stop"] = True
+                        pos["call_closed_date"] = cur
+                        pos["call_closed_profit"] = entry_credit_call + realised_loss
 
-                    # CALL leg decision
-                    if close_call_cost is not None and entry_credit_call > 0 and not pos.get("call_closed_by_stop", False):
-                        cc_dollars = close_call_cost * 100.0
-                        call_trigger_profit = (tp is not None) and (0 < cc_dollars <= tp * entry_credit_call)
-                        call_trigger_loss   = cc_dollars >= 50 * entry_credit_call
-                        call_trigger_exp    = (0 < cc_dollars <= 2 * entry_credit_call) and expiring_soon
-                        if call_trigger_profit or call_trigger_exp or call_trigger_loss:
-                            realised_loss = round(-cc_dollars, 2) - commission
-                            pos["call_closed_by_stop"] = True
-                            pos["call_closed_date"] = cur
-                            pos["call_closed_profit"] = entry_credit_call + realised_loss
+                # PUT leg decision
+                if close_put_cost is not None and entry_credit_put > 0 and not pos.get("put_closed_by_stop", False):
+                    pc_dollars = close_put_cost * 100.0
+                    put_trigger_profit = (tp is not None) and (0 < pc_dollars <= tp * entry_credit_put)
+                    put_trigger_loss   = pc_dollars >= 50 * entry_credit_put
+                    put_trigger_exp    = (0 < pc_dollars <= 2 * entry_credit_put) and expiring_soon
+                    if put_trigger_profit or put_trigger_exp or put_trigger_loss:
+                        realised_loss = round(-pc_dollars, 2) - commission
+                        pos["put_closed_by_stop"] = True
+                        pos["put_closed_date"] = cur
+                        pos["put_closed_profit"] = entry_credit_put + realised_loss
 
-                    # PUT leg decision
-                    if close_put_cost is not None and entry_credit_put > 0 and not pos.get("put_closed_by_stop", False):
-                        pc_dollars = close_put_cost * 100.0
-                        put_trigger_profit = (tp is not None) and (0 < pc_dollars <= tp * entry_credit_put)
-                        put_trigger_loss   = pc_dollars >= 50 * entry_credit_put
-                        put_trigger_exp    = (0 < pc_dollars <= 2 * entry_credit_put) and expiring_soon
-                        if put_trigger_profit or put_trigger_exp or put_trigger_loss:
-                            realised_loss = round(-pc_dollars, 2) - commission
-                            pos["put_closed_by_stop"] = True
-                            pos["put_closed_date"] = cur
-                            pos["put_closed_profit"] = entry_credit_put + realised_loss
+                # Keep for filtering after evaluating both legs
+                still_open.append(pos)
 
-                    # Keep if any leg still open
-                    still_open.append(pos if (not pos.get("call_closed_by_stop", False) or not pos.get("put_closed_by_stop", False)) else pos)
-                # end for pos in open_positions
-                # Replace open_positions with filtered list (expired ones are dropped via 'continue' above)
-                open_positions = [p for p in still_open if not (p.get("call_closed_by_stop", False) and p.get("put_closed_by_stop", False))]
-                for pos in open_positions:
-                    print(f"[DEBUG] still open: {pos.get('underlying','')} exp {pos.get('expiration','')} opened {pos.get('position_open_date','')}, legs {len(pos.get('legs',[]))} call_closed {pos.get('call_closed_by_stop',False)} put_closed {pos.get('put_closed_by_stop',False)}")
-
-                # bookkeeping row
-                pnl_row = {
-                    "as_of": as_of_str,
-                    "expiration": expiration_str,
-                    "trade_type": cfg.trade_type,
-                    "underlying": cfg.ticker,
-                    "qty": cfg.contract_qty,
-                    "spot": spot,
-                    "open_positions": len(open_positions),
-                }
-                print(f"[DEBUG] PnL bookkeeping: {pnl_row}")
-                breakpoint()
-                daily_pnls.append(pnl_row)
+            # Replace open_positions with positions that still have an open leg
+            # Treat a leg as closed if it was never opened (no corresponding short premium)
+            open_positions = [
+                p
+                for p in still_open
+                if not (
+                    (p.get("call_closed_by_stop", False) or p.get("short_call_prem_open") is None)
+                    and (p.get("put_closed_by_stop", False) or p.get("short_put_prem_open") is None)
+                )
+            ]
+            
+            # bookkeeping row
+            pnl_row = {
+                "as_of": as_of_str,
+                "expiration": expiration_str,
+                "trade_type": cfg.trade_type,
+                "underlying": cfg.ticker,
+                "qty": cfg.contract_qty,
+                "spot": spot,
+                "open_positions": len(open_positions),
+            }
+            print(f"pnl_row init: {pnl_row} open_positions={len(open_positions)}")
+            daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC
-                # =================================================================
+            # =================================================================
 
             cur += timedelta(days=1)
 
@@ -878,4 +913,3 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         "pnl": daily_pnls,
         "debug": dbg.__dict__,
     }
-

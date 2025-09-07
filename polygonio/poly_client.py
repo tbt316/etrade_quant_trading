@@ -14,8 +14,33 @@ import ssl
 
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import stored_option_chain, stored_option_price, merge_nested_dicts
-import polygonio_config
 
+import requests
+from typing import Optional
+
+def _resolve_api_key() -> str:
+    """
+    Prefer env var POLYGON_API_KEY.
+    Fall back to legacy polygonio_config.py if present.
+    """
+    key = os.getenv("POLYGON_API_KEY")
+    if key:
+        return key
+
+    # Legacy fallback (not recommended): polygonio_config.py in repo root
+    try:
+        import importlib
+        cfg = importlib.import_module("polygonio_config")
+        key = getattr(cfg, "POLYGON_API_KEY", None) or getattr(cfg, "API_KEY", None)
+    except Exception:
+        key = None
+
+    if not key:
+        raise RuntimeError(
+            "Missing Polygon API key. Set POLYGON_API_KEY in your environment "
+            "(preferred), or provide polygonio_config.py with POLYGON_API_KEY."
+        )
+    return key
 
 log = logging.getLogger(__name__)
 
