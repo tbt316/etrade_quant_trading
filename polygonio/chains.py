@@ -364,9 +364,11 @@ async def pull_option_chain_data(
             if (not call_syms or not put_syms) and client is not None:
                 try:
                     reqs = [(exp_cand, as_of_str, "call"), (exp_cand, as_of_str, "put")]
+                    print(f"[DEBUG] Fetching missing chain data for {ticker} exp {exp_cand} asof {as_of_str} @ {datetime.utcnow().isoformat()}")
                     await client.get_option_chains_batch_async(
                         ticker, reqs, force_update=force_update
                     )
+                    print(f"[DEBUG] Fetched missing chain data for {ticker} exp {exp_cand} asof {as_of_str} @ {datetime.utcnow().isoformat()}")
                     call_syms = (
                         stored_option_chain.get(ticker, {})
                         .get(exp_cand, {})
@@ -450,7 +452,9 @@ async def pull_option_chain_data(
 
     if reqs and client is not None:
         try:
+            print(f"[DEBUG] Fetching missing option prices for {ticker} exp {exp_chosen} asof {as_of_str} count={len(reqs)} @ {datetime.utcnow().isoformat()}")
             fetched = await client.get_option_prices_batch_async(ticker, reqs)
+            print(f"[DEBUG] Fetched missing option prices for {ticker} exp {exp_chosen} asof {as_of_str} count={len(reqs)} @ {datetime.utcnow().isoformat()}")
         except Exception:
             fetched = []
         # Map results back to placeholders

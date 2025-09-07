@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import datetime
 import logging
 import os
 import json
@@ -17,6 +18,7 @@ from .cache_io import stored_option_chain, stored_option_price, merge_nested_dic
 
 import requests
 from typing import Optional
+import datetime
 
 def _resolve_api_key() -> str:
     """
@@ -289,6 +291,7 @@ class PolygonAPIClient:
             params = {"apiKey": self.api_key}
             parse = self._parse_open_close
 
+        print(f"[DEBUG] Fetching option price from API: {ticker} {call_put} K={strike_price} {self.api_key} exp={expiration_date} as_of={pricing_date} field={premium_field} @ {datetime.datetime.utcnow().isoformat()}")
         # Retry loop
         for attempt in range(1, self.retries + 1):
             try:
@@ -298,6 +301,7 @@ class PolygonAPIClient:
                             full = f"{url}?{urlencode(params)}"
                             log.warning("Non-200 from Polygon: %s -> %s", full, resp.status)
                             self._write_invalid_option(ticker, strike_price, call_put, expiration_date, pricing_date, premium_field)
+                            print(f"[DEBUG] Non-200 response for option price: {ticker} {call_put} K={strike_price} exp={expiration_date} as_of={pricing_date} field={premium_field} status={resp.status} @ {datetime.datetime.utcnow().isoformat()}")
                             return {}
                         data = await resp.json()
                 payload = parse(data)
@@ -307,6 +311,8 @@ class PolygonAPIClient:
                     return payload
                 # No valid data → write invalid marker
                 self._write_invalid_option(ticker, strike_price, call_put, expiration_date, pricing_date, premium_field)
+                print(f"[DEBUG] No valid data for option price: {ticker} {call_put} K={strike_price} exp={expiration_date} as_of={pricing_date} field={premium_field} @ {datetime.datetime.utcnow().isoformat()}")
+                print(payload)
                 return {}
             except Exception as e:
                 if attempt >= self.retries:
@@ -315,6 +321,7 @@ class PolygonAPIClient:
                 wait = self.backoff_factor * (2 ** (attempt - 1))
                 log.warning("Attempt %d failed (%s). Retrying in %.2fs", attempt, e, wait)
                 await asyncio.sleep(wait)
+        print(f"[DEBUG] Failed to fetch option price: {ticker} {call_put} K={strike_price} exp={expiration_date} as_of={pricing_date} field={premium_field} @ {datetime.datetime.utcnow().isoformat()}")
 
         return {}
 
