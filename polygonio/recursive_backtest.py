@@ -941,6 +941,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         if "_lite" in (cfg.trade_type or ""):
             cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
         unsaved = option_data_unsaved_count(cfg.ticker, cache_dir=cache_dir)
+        print(f"[DEBUG] unsaved entries: {unsaved}")
         if unsaved > OPTION_DATA_SAVE_THRESHOLD:
             save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
             print("[DEBUG] saved.")
