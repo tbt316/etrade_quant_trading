@@ -50,6 +50,10 @@ def test_backtest_smoke_online():
         expiring_weekday="Friday",
         expiring_wks=6,
         contract_qty=1,
+        target_premium_otm=2.5,
+        iron_condor_width=20,
+        target_steer=0.9,
+        stop_profit_percent=0.2
     )
 
     try:

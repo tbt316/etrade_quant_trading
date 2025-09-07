@@ -932,15 +932,15 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             cur += timedelta(days=1)
 
     # Optionally persist caches as you go (same as before)
-    # try:
-    #     print("[DEBUG] saving cached option data...")
-    #     cache_dir = None
-    #     if "_lite" in (cfg.trade_type or ""):
-    #         cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
-    #     save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
-    #     print("[DEBUG] saved.")
-    # except Exception:
-    #     pass
+    try:
+        print("[DEBUG] saving cached option data...")
+        cache_dir = None
+        if "_lite" in (cfg.trade_type or ""):
+            cache_dir = (ROOT_DIR / "polygon_api_option_data").resolve()
+        save_stored_option_data(cfg.ticker, cache_dir=cache_dir)
+        print("[DEBUG] saved.")
+    except Exception:
+        pass
     
     print(dbg.summary())
     # Return whatever structure you expect downstream

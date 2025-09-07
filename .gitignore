@@ -28,3 +28,6 @@ data/
 monthly_backtest_data/
 backtest_debug.log
 polygonio_config.py
+cover_call_plots/
+yfinance/
+

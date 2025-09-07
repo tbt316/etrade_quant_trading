@@ -1,4 +1,7 @@
 # etrade_quant_trading/scripts/run_daily.py
+# Note for Codex: install prerequisite packages specified in requirements.txt before running this script.
+# Note for Codex: Use test_integration_run_daily.py for testing the changes, which will avoid calling 3rd part API. Do not use run_daily.py for testing.
+
 from __future__ import annotations
 
 import argparse
