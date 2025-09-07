@@ -168,6 +168,7 @@ class PolygonAPIClient:
                     async with self.session.get(url, params=params) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
+                        print(f"[DEBUG] Fetched option chain: {ticker} {call_put} exp={expiration_date} as_of={as_of} order={order}")
                 for item in data.get("results", []) or []:
                     sp = item.get("strike_price")
                     sym = item.get("ticker")
@@ -306,6 +307,7 @@ class PolygonAPIClient:
                     return payload
                 # No valid data → write invalid marker
                 self._write_invalid_option(ticker, strike_price, call_put, expiration_date, pricing_date, premium_field)
+                print(f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}")
                 return {}
             except Exception as e:
                 if attempt >= self.retries:
