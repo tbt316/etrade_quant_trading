@@ -298,9 +298,11 @@ async def pull_option_chain_data(
     if (not call_syms or not put_syms) and client is not None:
         try:
             reqs = [(expiration_str, as_of_str, "call"), (expiration_str, as_of_str, "put")]
+            print(f"[DEBUG] Fetching missing chain data for {ticker} exp {expiration_str} asof {as_of_str} @ {datetime.utcnow().isoformat()}")
             chain_data = await client.get_option_chains_batch_async(
                 ticker, reqs, force_update=force_update
             )
+            print(f"[DEBUG] Fetched missing chain data for {ticker} exp {expiration_str} asof {as_of_str} @ {datetime.utcnow().isoformat()}")
             call_syms = (
                 chain_data.get(ticker, {})
                 .get(expiration_str, {})

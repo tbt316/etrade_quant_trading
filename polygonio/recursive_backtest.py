@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -362,6 +363,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         # Otherwise, we'll derive expiries per pricing day via list_expiries(...)
         while cur <= end_dt:
             dbg.days_total += 1
+            pcs_ts = None
             # skip non-price days
             spot = close_by_date.get(cur)
             if (cur.toordinal() - start_dt.toordinal()) % 20 == 0:
@@ -592,12 +594,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                         have_short_put = (sp_k is not None and sp_p is not None)
 
+                        ts_now = datetime.utcnow().isoformat()
                         print(
                             f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
                             f"SP {sp_k} @ {sp_p} ({reason}); "
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
-                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
+                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'} @ {ts_now}"
                         )
+                        pcs_ts = time.perf_counter()
                 except Exception as e:
                     print(f"[DBG] PCS selection exception: {e}")
                 # === END PCS selection using (put_opts, put_data); target_prem_otm = target PRICE ===
@@ -627,7 +631,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     except Exception as e:
                         # skip this date/expiry if legs incomplete
                         position = None
-
+                print(f"[DEBUG] built position: {position} @ {datetime.utcnow().isoformat()}")
                 if position is not None:
                     daily_positions.append(position)
                     dbg.positions_built += 1
@@ -813,6 +817,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             from .pricing import interpolate_option_price as _interp
                             exp_s = exp_dt.strftime("%Y-%m-%d")
                             if sp_p is None:
+                                print(f"[DEBUG] interpolating missing PUT price for {t} {as_of_str} exp {exp_s} strike {sp} @ {datetime.utcnow().isoformat()}")
                                 sp_p = await _interp(
                                     t, float(spot or 0.0), float(sp), "put",
                                     exp_s, as_of_str,
@@ -820,6 +825,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                                     price_interpolate_flag=get_settings().price_interpolate,
                                     client=client
                                 )
+                                print(f"[DEBUG] interpolated PUT price: {sp_p} @ {datetime.utcnow().isoformat()}")
                             if lp is not None and lp_p is None:
                                 lp_p = await _interp(
                                     t, float(spot or 0.0), float(lp), "put",
@@ -841,6 +847,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 tp = float(cfg.stop_profit_percent) if (cfg.stop_profit_percent not in (None, 0, "0")) else None
                 # For now we don't implement hold_to_expiration toggles; always use tp if provided.
                 commission = 2 * 0.5  # $1 round trip placeholder
+
+                print(f"[DEBUG] close cost calculated: {position} @ {datetime.utcnow().isoformat()}")
 
                 # CALL leg decision
                 if close_call_cost is not None and entry_credit_call > 0 and not pos.get("call_closed_by_stop", False):
@@ -890,7 +898,18 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "spot": spot,
                 "open_positions": len(open_positions),
             }
-            print(f"pnl_row init: {pnl_row} open_positions={len(open_positions)}")
+            ts_now = datetime.utcnow().isoformat()
+            if pcs_ts is not None:
+                elapsed = time.perf_counter() - pcs_ts
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} "
+                    f"dt={elapsed:.2f}s @ {ts_now}"
+                )
+            else:
+                print(
+                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
+                )
+            breakpoint()
             daily_pnls.append(pnl_row)
 # <--- END YOUR P&L / EXIT LOGIC
 # <--- END YOUR P&L / EXIT LOGIC

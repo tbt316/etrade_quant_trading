@@ -8,7 +8,7 @@ from scipy.interpolate import PchipInterpolator
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import stored_option_price
 from .chains import pull_option_chain_data
-
+import datetime
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
@@ -145,6 +145,7 @@ async def interpolate_option_price(
     - Enforce intrinsic value floor; preserve monotonicity for puts
     - On failure, return 0.0
     """
+
     s = get_settings()
     premium_field = premium_field or PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
 
@@ -197,6 +198,7 @@ async def interpolate_option_price(
         log.warning("interpolate_option_price called without client; cannot fetch chain data")
         return 0.0
 
+    print(f"[DEBUG] Starting pull option chain data for {t} {cp} exp {expiration_date} asof {pricing_date} @ {datetime.datetime.utcnow().isoformat()}")
     all_call_data, all_put_data, call_opts, put_opts, _ = await pull_option_chain_data(
         t,
         cp,
@@ -205,7 +207,8 @@ async def interpolate_option_price(
         close_price_today,
         client=client,
     )
-
+    print(f"[DEBUG] Completed pull option chain data for {t} {cp} exp {expiration_date} asof {pricing_date} @ {datetime.datetime.utcnow().isoformat()}")
+    
     option_opts = call_opts if cp == "call" else put_opts
     option_data = all_call_data if cp == "call" else all_put_data
 
