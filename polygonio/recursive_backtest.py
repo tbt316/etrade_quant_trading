@@ -236,7 +236,11 @@ def _probe_put_credit_spread(
         )
 
 
-from strategies.strategies import sides_for_trade_type, get_strategy
+# Allow both package-root and in-package execution
+try:
+    from etrade_quant_trading.strategies.strategies import sides_for_trade_type, get_strategy
+except Exception:
+    from strategies.strategies import sides_for_trade_type, get_strategy
 
 
 # -------------------------------
@@ -462,6 +466,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         }
     except Exception:
         vix_by_date = {}
+        vix_hist = None
 
     # 1) Earnings filter if desired
     earnings_dates: Optional[set[date]] = None
@@ -480,6 +485,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         daily_positions: List[Dict[str, Any]] = []
         daily_pnls: List[Dict[str, Any]] = []
         open_positions: List[Dict[str, Any]] = []
+        realized_total: float = 0.0
 
         def _pos_open_date(pos: Dict[str, Any]) -> Optional[date]:
             """Return the date a position was opened, or None if unknown."""
@@ -995,6 +1001,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             dte_soon_days = int((cfg.expiring_wks or 1) * 7 / 2)
 
             still_open: List[Dict[str, Any]] = []
+            unrealized_total: float = 0.0
+            required_margin: float = 0.0
             for pos in open_positions:
                 try:
                     exp_dt = datetime.strptime(pos.get("expiration"), "%Y-%m-%d").date()
@@ -1030,6 +1038,15 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         - float(pos.get("long_put_prem_open", 0.0))
                     ) * 100.0
 
+                # Realize initial credit on the open day (once)
+                try:
+                    od = _pos_open_date(pos)
+                except Exception:
+                    od = None
+                if od == cur and not pos.get("_open_credit_realized", False):
+                    realized_total += entry_credit_call + entry_credit_put
+                    pos["_open_credit_realized"] = True
+
                 # If expired today or earlier: settle at intrinsic
                 if exp_dt <= cur:
                     close_price = spot if spot is not None else 0.0
@@ -1050,6 +1067,8 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         pos["call_closed_profit"] = entry_credit_call - (
                             call_loss_final * 100.0
                         )
+                        # realize only the payoff here (entry credit already realized)
+                        realized_total += -(call_loss_final * 100.0)
                     if (
                         pos.get("short_put_prem_open", 0)
                         and pos.get("put_closed_date") is None
@@ -1066,6 +1085,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         pos["put_closed_profit"] = entry_credit_put - (
                             put_loss_final * 100.0
                         )
+                        realized_total += -(put_loss_final * 100.0)
                     # drop from open list
                     continue
 
@@ -1199,6 +1219,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         pos["call_closed_by_stop"] = True
                         pos["call_closed_date"] = cur
                         pos["call_closed_profit"] = entry_credit_call + realised_loss
+                        realized_total += realised_loss
 
                 # PUT leg decision
                 if (
@@ -1219,9 +1240,31 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         pos["put_closed_by_stop"] = True
                         pos["put_closed_date"] = cur
                         pos["put_closed_profit"] = entry_credit_put + realised_loss
+                        realized_total += realised_loss
 
                 # Keep for filtering after evaluating both legs
                 still_open.append(pos)
+
+                # Unrealized mark-to-market: negative of close costs for still-open legs
+                pos_unreal = 0.0
+                if 'close_call_cost' in locals() and close_call_cost is not None and not pos.get("call_closed_by_stop", False):
+                    pos_unreal += -(close_call_cost * 100.0)
+                if 'close_put_cost' in locals() and close_put_cost is not None and not pos.get("put_closed_by_stop", False):
+                    pos_unreal += -(close_put_cost * 100.0)
+                pos["position_value"] = round(pos_unreal, 2)
+                unrealized_total += pos_unreal
+
+                # Required margin approximation
+                try:
+                    if not pos.get("call_closed_by_stop", False) and pos.get("call_strike_sold") is not None and pos.get("call_strike_bought") is not None:
+                        required_margin += 100.0 * (float(pos["call_strike_bought"]) - float(pos["call_strike_sold"]))
+                except Exception:
+                    pass
+                try:
+                    if not pos.get("put_closed_by_stop", False) and pos.get("put_strike_sold") is not None and pos.get("put_strike_bought") is not None:
+                        required_margin += 100.0 * (float(pos["put_strike_sold"]) - float(pos["put_strike_bought"]))
+                except Exception:
+                    pass
 
             # Replace open_positions with positions that still have an open leg
             # Treat a leg as closed if it was never opened (no corresponding short premium)
@@ -1249,6 +1292,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "qty": cfg.contract_qty,
                 "spot": spot,
                 "open_positions": len(open_positions),
+                "cumulative_pnl_realized": round(realized_total, 2),
+                "unrealized_total": round(unrealized_total, 2),
+                "cumulative_pnl": round(realized_total + unrealized_total, 2),
+                "required_margin": round(required_margin, 2),
             }
             ts_now = datetime.utcnow().isoformat()
             if pcs_ts is not None:
@@ -1296,4 +1343,12 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
         "positions": daily_positions,
         "pnl": daily_pnls,
         "debug": dbg.__dict__,
+        # Include simple price history for the underlying and VIX for plotting convenience
+        # Shape: list of {"date": date, "close": float}
+        "price": (
+            hist[["date", "close"]].to_dict("records") if hasattr(hist, "to_dict") else []
+        ),
+        "vix": (
+            vix_hist[["date", "close"]].to_dict("records") if hasattr(vix_hist, "to_dict") else []
+        ),
     }

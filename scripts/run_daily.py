@@ -8,10 +8,18 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 
-from polygonio.logging_setup import init_logging
-from polygonio.recursive_backtest import monthly_recursive_backtest
-from polygonio.daily_report import print_opened_and_closed_for_date
-from polygonio.plot_results import plot_from_backtest_results
+# Support running as a top-level package (etrade_quant_trading.scripts.run_daily)
+# or from within the package directory (scripts.run_daily)
+try:  # package-style imports from repo root or installed package
+    from etrade_quant_trading.polygonio.logging_setup import init_logging
+    from etrade_quant_trading.polygonio.recursive_backtest import monthly_recursive_backtest
+    from etrade_quant_trading.polygonio.daily_report import print_opened_and_closed_for_date
+    from etrade_quant_trading.polygonio.plot_results import plot_from_backtest_results
+except Exception:  # fallback for running from inside etrade_quant_trading folder
+    from polygonio.logging_setup import init_logging
+    from polygonio.recursive_backtest import monthly_recursive_backtest
+    from polygonio.daily_report import print_opened_and_closed_for_date
+    from polygonio.plot_results import plot_from_backtest_results
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,5 +1,8 @@
 from __future__ import annotations
-from strategies.strategies import sides_for_trade_type, get_strategy
+try:
+    from etrade_quant_trading.strategies.strategies import sides_for_trade_type, get_strategy
+except Exception:
+    from strategies.strategies import sides_for_trade_type, get_strategy
 
 """
 Backtest orchestration primitives (no strategy changes).
@@ -200,4 +203,3 @@ def run_monthly_backtest_cpu_bound(
 
     kwargs = kwargs or {}
     return _run(ticker, global_start_date, global_end_date, **kwargs)
-
