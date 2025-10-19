@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 import aiohttp
 import certifi
 import ssl
+import polygonio_config
 
 from .config import get_settings, PREMIUM_FIELD_MAP
 from .cache_io import (
@@ -94,6 +95,8 @@ class PolygonAPIClient:
         self.api_key = api_key or getattr(s, "polygon_api_key", "") or _load_polygon_key_from_config()
         if not self.api_key:
             log.warning("Polygon API key is empty")
+            print(f"[WARNING] Polygon API key is empty")
+            breakpoint()
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.retries = retries
         self.backoff_factor = backoff_factor

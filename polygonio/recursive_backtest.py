@@ -38,6 +38,8 @@ from .market_calendar import list_expiries  # maps your old get_all_weekdays
 from .poly_client import PolygonAPIClient
 from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
+from .option_math import calculate_implied_volatility
+from .prices import get_historical_prices
 from .cache_io import stored_option_price, save_stored_option_data, option_data_unsaved_count
 from .symbols import convert_polygon_to_etrade_ticker
 from .paths import ROOT_DIR
@@ -110,6 +112,80 @@ def _safe_premium(d: dict, preferred_key: str) -> float | None:
         except Exception:
             continue
     return None
+
+
+def _compute_leg_iv(
+    *,
+    spot: float,
+    strike: float,
+    premium: float,
+    days_to_expire: int,
+    option_type: str,
+) -> Optional[float]:
+    if spot is None:
+        return None
+    try:
+        spot = float(spot)
+        strike = float(strike)
+        premium = float(premium)
+        if premium <= 0 or strike <= 0 or spot <= 0 or days_to_expire <= 0:
+            return None
+    except Exception:
+        return None
+
+
+def _daily_iv_from_close(
+    *,
+    ticker: str,
+    as_of: str,
+    expiration: str,
+    option_type: str,
+    spot: Optional[float],
+    days_to_expire: int,
+) -> Optional[float]:
+    if spot is None or days_to_expire <= 0:
+        return None
+    t = ticker.upper()
+    chain_by_date = stored_option_price.get(t, {}).get(as_of, {})
+    if not chain_by_date:
+        return None
+    best = None
+    spot_f = float(spot)
+    for strike, expiries in chain_by_date.items():
+        try:
+            data = expiries.get(expiration, {}).get(option_type, {})
+            price = data.get("close_price")
+            if price is None or price <= 0:
+                continue
+            strike_f = float(strike)
+            dist = abs(strike_f - spot_f)
+            if best is None or dist < best[0]:
+                best = (dist, strike_f, float(price))
+        except Exception:
+            continue
+    if not best:
+        return None
+    _, strike_val, premium_val = best
+    return _compute_leg_iv(
+        spot=spot_f,
+        strike=strike_val,
+        premium=premium_val,
+        days_to_expire=days_to_expire,
+        option_type=option_type,
+    )
+    try:
+        iv_val = calculate_implied_volatility(
+            close_price=spot,
+            strike_price=strike,
+            option_price=premium,
+            days_to_expire=float(days_to_expire),
+            risk_free_rate=0.0,
+            dividend_yield=0.0,
+            option_type=option_type,
+        )
+        return float(iv_val) if iv_val is not None else None
+    except Exception:
+        return None
 
 
 def _compute_premium_targets(
@@ -567,6 +643,18 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     ) * 100.0
                     p["call_closed_profit"] = entry_credit_call - (call_loss_final * 100.0)
                     realized_total += -(call_loss_final * 100.0)
+                    if get_settings().debug_closure:
+                        od = p.get("position_open_date") or p.get("opened_at")
+                        try:
+                            ods = od.strftime("%Y-%m-%d") if hasattr(od, 'strftime') else str(od)
+                        except Exception:
+                            ods = str(od)
+                        print(
+                            f"[DBG-EXPIRE] CALL settle {cfg.ticker} open={ods} exp={cur} "
+                            f"Kshort={p.get('call_strike_sold')} Klong={p.get('call_strike_bought')} "
+                            f"spot={close_price:.2f} entry_credit={entry_credit_call:.2f} payoff_pts={call_loss_final:.2f} "
+                            f"closed_profit={p.get('call_closed_profit'):.2f}"
+                        )
 
                 if p.get("short_put_prem_open", 0) and p.get("put_closed_date") is None:
                     sp_loss = max(p.get("put_strike_sold", 0.0) - close_price, 0.0)
@@ -582,6 +670,18 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     realized_total += -(put_loss_final * 100.0)
                     if put_loss_final > 0:
                         aggregated_put_loss_pts += float(put_loss_final)
+                    if get_settings().debug_closure:
+                        od = p.get("position_open_date") or p.get("opened_at")
+                        try:
+                            ods = od.strftime("%Y-%m-%d") if hasattr(od, 'strftime') else str(od)
+                        except Exception:
+                            ods = str(od)
+                        print(
+                            f"[DBG-EXPIRE] PUT settle {cfg.ticker} open={ods} exp={cur} "
+                            f"Kshort={p.get('put_strike_sold')} Klong={p.get('put_strike_bought')} "
+                            f"spot={close_price:.2f} entry_credit={entry_credit_put:.2f} payoff_pts={put_loss_final:.2f} "
+                            f"closed_profit={p.get('put_closed_profit'):.2f}"
+                        )
 
             # Replace open list with positions that did not expire today
             open_positions = still_open_pre
@@ -709,6 +809,15 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 continue
 
             position = None
+            # Collect per-day IV samples even if we don't open a position
+            iv_put_samples: List[float] = []
+            iv_call_samples: List[float] = []
+            daily_iv_put: Optional[float] = None
+            daily_iv_call: Optional[float] = None
+            try:
+                days_to_expire_int = max(1, (this_exp - cur).days)
+            except Exception:
+                days_to_expire_int = 1
             if not already_open:
                 sc_k = lc_k = sp_k = lp_k = None
                 dbg_sel = {
@@ -759,20 +868,33 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         s.premium_price_mode, "trade_price"
                     )
 
-                    # Build candidates by zipping meta (put_opts) with data (put_data)
-                    candidates = []
-                    _metas = (
-                        put_opts or []
-                    )  # meta rows: {'strike_price', 'expiration_date', 'option_ticker', ...}
-                    _datas = (
-                        put_data or []
-                    )  # price rows aligned by index: {'trade_price'/'mid_price'/...}
-                    if not _metas:
+                    # Build call candidates (used for strategies needing calls)
+                    call_candidates: List[Dict[str, Any]] = []
+                    call_metas = call_opts or []
+                    call_datas = call_data or []
+                    for i, meta in enumerate(call_metas):
+                        try:
+                            k = float(meta.get("strike_price"))
+                        except Exception:
+                            print("[DBG] skipping call meta with invalid strike_price:", meta)
+                            continue
+                        d = call_datas[i] if i < len(call_datas) else {}
+                        price = _price_from_data(d, premium_field)
+                        call_candidates.append(
+                            {"strike": k, "price": price, "meta": meta, "data": d}
+                        )
+                    priced_calls = [x for x in call_candidates if x["price"] is not None]
+
+                    # Build put candidates by zipping meta (put_opts) with data (put_data)
+                    put_candidates: List[Dict[str, Any]] = []
+                    put_metas = put_opts or []
+                    put_datas = put_data or []
+                    if not put_metas:
                         print(
                             f"[DBG] no put_opts for {cfg.ticker} {as_of_str}->{expiration_str} (strike_range={strike_range})"
                         )
 
-                    for i, meta in enumerate(_metas):
+                    for i, meta in enumerate(put_metas):
                         try:
                             k = float(meta.get("strike_price"))
                         except Exception:
@@ -781,23 +903,23 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                                 meta,
                             )
                             continue
-                        d = _datas[i] if i < len(_datas) else {}
+                        d = put_datas[i] if i < len(put_datas) else {}
                         price = _price_from_data(d, premium_field)
-                        candidates.append(
+                        put_candidates.append(
                             {"strike": k, "price": price, "meta": meta, "data": d}
                         )
 
-                    if candidates:
-                        kmin = min(x["strike"] for x in candidates)
-                        kmax = max(x["strike"] for x in candidates)
-                        priced = sum(1 for x in candidates if x["price"] is not None)
+                    priced_puts = [x for x in put_candidates if x["price"] is not None]
+                    if priced_puts:
+                        kmin = min(x["strike"] for x in put_candidates)
+                        kmax = max(x["strike"] for x in put_candidates)
                         print(
-                            f"[DBG] put candidates: n={len(candidates)} priced={priced} strikes=[{kmin},{kmax}] spot={spot} mode={s.premium_price_mode}"
+                            f"[DBG] put candidates: n={len(put_candidates)} priced={len(priced_puts)} strikes=[{kmin},{kmax}] spot={spot} mode={s.premium_price_mode}"
                         )
 
                     # OTM and ITM lists with usable prices
-                    otm_puts = [r for r in candidates if r["strike"] < spot and (r["price"] is not None)]
-                    itm_puts = [r for r in candidates if r["strike"] > spot and (r["price"] is not None)]
+                    otm_puts = [r for r in put_candidates if r["strike"] < spot and (r["price"] is not None)]
+                    itm_puts = [r for r in put_candidates if r["strike"] > spot and (r["price"] is not None)]
                     if not otm_puts and not itm_puts:
                         print(f"[DBG] no put candidates w/ price for {cfg.ticker} {as_of_str}->{expiration_str} (spot={spot})")
                     else:
@@ -816,6 +938,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             try:
                                 target_delta = float(cfg.target_delta)
                             except Exception:
+                                print(f"[DBG] invalid cfg.target_delta: {cfg.target_delta}")
                                 target_delta = None
                         if target_delta is not None and getattr(
                             cfg, "target_steer", None
@@ -823,6 +946,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             try:
                                 target_delta *= float(cfg.target_steer)
                             except Exception:
+                                print(f"[DBG] invalid cfg.target_steer: {cfg.target_steer}")
                                 pass
                         if target_delta is not None:
                             target_delta = max(0.01, min(0.49, abs(target_delta)))
@@ -865,6 +989,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         # Choose short/long put with make-up mode support
                         sp = None
                         reason = ""
+                        sp_k = sp_p = None
+                        lp_k = lp_p = None
+                        lp_target = None
+
                         if make_up_mode and itm_puts:
                             # Deeper ITM short to collect larger credit; long near ATM (≤ spot)
                             sp_target = float(spot or 0.0) + 1.5 * float(width)
@@ -885,20 +1013,17 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             sp = min(scored, key=lambda x: abs(x["otm_pct"] - 0.10))
                             reason = f"fallback OTM≈{sp['otm_pct']:.2%}"
 
-                        sp_k = sp_p = None
-                        lp_k = lp_p = None
-                        lp_target = None
-                        if sp:
+                        if sp is not None:
                             sp_k, sp_p = sp["strike"], sp["price"]
 
                         if make_up_mode and itm_puts and sp_k is not None:
                             # Long near ATM (closest ≤ spot)
-                            under_all = [x for x in candidates if x["strike"] <= spot and x["price"] is not None]
+                            under_all = [x for x in put_candidates if x["strike"] <= spot and x["price"] is not None]
                             if under_all:
                                 best = max(under_all, key=lambda x: x["strike"])
                                 lp_k, lp_p = best["strike"], best["price"]
                             else:
-                                lower = [x for x in candidates if x["strike"] < sp_k and x["price"] is not None]
+                                lower = [x for x in put_candidates if x["strike"] < sp_k and x["price"] is not None]
                                 if lower:
                                     best = max(lower, key=lambda x: x["strike"])
                                     lp_k, lp_p = best["strike"], best["price"]
@@ -916,7 +1041,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                         # FINAL sanity: long must be strictly below short; otherwise try the best available below short
                         if lp_k is None or (sp_k is not None and lp_k >= sp_k):
-                            lower = [x for x in candidates if x["strike"] < (sp_k or 0) and x["price"] is not None]
+                            lower = [x for x in put_candidates if x["strike"] < (sp_k or 0) and x["price"] is not None]
                             if lower:
                                 best = max(lower, key=lambda x: x["strike"])
                                 lp_k, lp_p = best["strike"], best["price"]
@@ -927,13 +1052,12 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             # only set have_long_put if we ended up with a valid one
                         have_long_put = (lp_k is not None) and (sp_k is not None) and (lp_k < sp_k)
                         have_short_put = (sp_k is not None) and (sp_p is not None)
-
-                        ts_now = datetime.utcnow().isoformat()
+                        
                         print(
                             f"[DBG] PCS {cfg.ticker} {as_of_str}->{expiration_str}: "
                             f"SP {sp_k} @ {sp_p} ({reason}); "
                             f"LP target {lp_target} → {lp_k} @ {lp_p}; "
-                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'} @ {ts_now}"
+                            f"width={(sp_k - lp_k) if (lp_k is not None and sp_k is not None) else 'NA'}"
                         )
                         pcs_ts = time.perf_counter()
                 except Exception as e:
@@ -975,6 +1099,11 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                                 margin_one = max(0.0, (float(sp_k) - float(lp_k)) * 100.0)
                         except Exception:
                             margin_one = 0.0
+                        # Include per-position quantity in margin sizing
+                        try:
+                            margin_one *= max(1, int(build_kwargs.get("qty", 1)))
+                        except Exception:
+                            pass
 
                         # Capital-aware: open enough to pursue recovery if in make-up mode
                         opens_to_make = int(counter_max) if counter_max is not None else 1
@@ -985,7 +1114,12 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         for p0 in open_positions:
                             try:
                                 if p0.get("put_strike_sold") is not None and p0.get("put_strike_bought") is not None and not p0.get("put_closed_by_stop", False):
-                                    cur_used_margin += 100.0 * (float(p0["put_strike_sold"]) - float(p0["put_strike_bought"]))
+                                    q = 1
+                                    try:
+                                        q = max(1, int(p0.get("qty", 1)))
+                                    except Exception:
+                                        q = 1
+                                    cur_used_margin += 100.0 * (float(p0["put_strike_sold"]) - float(p0["put_strike_bought"])) * q
                             except Exception:
                                 pass
 
@@ -999,12 +1133,62 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                             if opens_to_make <= 0 and cur_used_margin < available_capital * 0.25:
                                 opens_to_make = 1
                             opens_to_make = max(0, opens_to_make)
+                            # Always respect the 50% capital cap even in normal mode
+                            if margin_one > 0:
+                                max_by_cap_n = int(max(0.0, (0.5 * available_capital - cur_used_margin)) // margin_one)
+                                opens_to_make = min(opens_to_make, max_by_cap_n)
 
                         for _ in range(opens_to_make):
                             position = strat.build_position(**build_kwargs).to_dict()
+                            # Enrich with open-distance and target info for plotting/debug parity
+                            try:
+                                if spot is not None:
+                                    if have_short_put and sp_k is not None:
+                                        position["open_distance_put"] = round((float(spot) - float(sp_k)) / float(spot), 4)
+                                    if 'sc_k' in locals() and have_short_call and sc_k is not None:
+                                        position["open_distance_call"] = round((float(sc_k) - float(spot)) / float(spot), 4)
+                            except Exception:
+                                pass
+                            try:
+                                # store target info if available (used by plot for target premiums)
+                                put_tgt_val = target_price if 'target_price' in locals() else None
+                                if put_tgt_val is not None:
+                                    position["strike_target_put"] = {"premium_target": float(put_tgt_val)}
+                            except Exception:
+                                pass
+
+                            # Capture leg-level IVs for plotting diagnostics
+                            try:
+                                if have_short_put and sp_k is not None and sp_p is not None:
+                                    iv_put_leg = _compute_leg_iv(
+                                        spot=spot,
+                                        strike=sp_k,
+                                        premium=sp_p,
+                                        days_to_expire=days_to_expire_int,
+                                        option_type="put",
+                                    )
+                                    if iv_put_leg is not None:
+                                        position["iv_put"] = iv_put_leg
+                                        iv_put_samples.append(iv_put_leg)
+                                if have_short_call and sc_k is not None and sc_p is not None:
+                                    iv_call_leg = _compute_leg_iv(
+                                        spot=spot,
+                                        strike=sc_k,
+                                        premium=sc_p,
+                                        days_to_expire=days_to_expire_int,
+                                        option_type="call",
+                                    )
+                                    if iv_call_leg is not None:
+                                        position["iv_call"] = iv_call_leg
+                                        iv_call_samples.append(iv_call_leg)
+                            except Exception:
+                                pass
+
                             daily_positions.append(position)
                             positions_built_now.append(position)
                             dbg.positions_built += 1
+                            # Track cumulative used margin within this open pass
+                            cur_used_margin += margin_one
                     except Exception as e:
                         # skip this date/expiry if legs incomplete
                         position = None
@@ -1092,16 +1276,57 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
 
                 open_positions.append(pos)
 
+            def _debug_iv_calculation(pos_dict: Dict[str, Any]) -> None:
+                if spot is None:
+                    return
+                try:
+                    as_of_dt = datetime.strptime(as_of_str, "%Y-%m-%d")
+                    exp_dt = datetime.strptime(pos_dict.get("expiration"), "%Y-%m-%d")
+                except Exception:
+                    return
+                days_to_expire = max(1, (exp_dt.date() - as_of_dt.date()).days)
+                spot_val = float(spot)
+                for leg in pos_dict.get("legs", []):
+                    try:
+                        side = leg.get("side")
+                        action = leg.get("action")
+                        strike = float(leg.get("strike"))
+                        premium = float(leg.get("premium"))
+                    except Exception:
+                        continue
+                    if action != "sell" or side not in {"put", "call"}:
+                        continue
+                    try:
+                        iv_val = calculate_implied_volatility(
+                            close_price=spot_val,
+                            strike_price=strike,
+                            option_price=premium,
+                            days_to_expire=days_to_expire,
+                            risk_free_rate=0.0,
+                            dividend_yield=0.0,
+                            option_type=side,
+                        )
+                        print(
+                            f"[DEBUG] Computed {side.upper()} IV={iv_val} for {cfg.ticker} as_of={as_of_str} exp={pos_dict.get('expiration')} strike={strike} premium={premium}"
+                        )
+                        if iv_val is not None:
+                            key = "iv_put" if side == "put" else "iv_call"
+                            pos_dict[key] = float(iv_val)
+                    except Exception as exc:
+                        print(f"[DEBUG] IV calc error for {side} leg: {exc}")
+
             # Register any newly-opened positions (ensure open_positions sees them)
             try:
                 for _pos_new in positions_built_now:
                     _register_open_position(_pos_new)
+                    _debug_iv_calculation(_pos_new)
             except Exception:
                 # Fallback for legacy single-position path
                 if 'position' in locals() and position is not None:
                     _register_open_position(position)
+                    _debug_iv_calculation(position)
 
-            # Evaluate ALL open positions (including the one we just opened) for early exits or expiration
+            # Evaluate ALL open positions (including the one we just opened) for early exits
             still_open: List[Dict[str, Any]] = []
             unrealized_total: float = 0.0
             required_margin: float = 0.0
@@ -1166,6 +1391,13 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 else:
                     # fallback to config if missing dates
                     expiring_soon = dte <= int((cfg.expiring_wks or 1) * 7 / 2)
+
+                if get_settings().debug_closure:
+                    print(
+                        f"[DBG-CLOSE] {cfg.ticker} {as_of_str} opened={od} exp={exp_dt} "
+                        f"dte={dte} init_dte={(initial_dte if isinstance(od, date) else 'NA')} "
+                        f"expiring_soon={expiring_soon}"
+                    )
 
                 # CALL leg close cost (points)
                 close_call_cost = None
@@ -1290,6 +1522,16 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     call_trigger_exp = (
                         0 < cc_dollars <= 2 * entry_credit_call
                     ) and expiring_soon
+                    if get_settings().debug_closure:
+                        if get_settings().debug_closure_verbose:
+                            print(
+                                f"[DBG-CLOSE] CALL Kshort={sc} Klong={lc} sc_p={sc_p} lc_p={lc_p} "
+                                f"close_cost={close_call_cost} entry_credit={entry_credit_call}"
+                            )
+                        print(
+                            f"[DBG-CLOSE] CALL triggers: profit={call_trigger_profit} exp_style={call_trigger_exp} "
+                            f"loss_guard={call_trigger_loss} tp={tp} expSoon={expiring_soon}"
+                        )
                     if call_trigger_profit or call_trigger_exp or call_trigger_loss:
                         realised_loss = round(-cc_dollars, 2) - commission
                         pos["call_closed_by_stop"] = True
@@ -1311,6 +1553,16 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                     put_trigger_exp = (
                         0 < pc_dollars <= 2 * entry_credit_put
                     ) and expiring_soon
+                    if get_settings().debug_closure:
+                        if get_settings().debug_closure_verbose:
+                            print(
+                                f"[DBG-CLOSE] PUT Kshort={sp} Klong={lp} sp_p={sp_p} lp_p={lp_p} "
+                                f"close_cost={close_put_cost} entry_credit={entry_credit_put}"
+                            )
+                        print(
+                            f"[DBG-CLOSE] PUT triggers: profit={put_trigger_profit} exp_style={put_trigger_exp} "
+                            f"loss_guard={put_trigger_loss} tp={tp} expSoon={expiring_soon}"
+                        )
                     if put_trigger_profit or put_trigger_exp or put_trigger_loss:
                         realised_loss = round(-pc_dollars, 2) - commission
                         pos["put_closed_by_stop"] = True
@@ -1333,12 +1585,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 # Required margin approximation
                 try:
                     if not pos.get("call_closed_by_stop", False) and pos.get("call_strike_sold") is not None and pos.get("call_strike_bought") is not None:
-                        required_margin += 100.0 * (float(pos["call_strike_bought"]) - float(pos["call_strike_sold"]))
+                        q = max(1, int(pos.get("qty", 1)))
+                        required_margin += 100.0 * (float(pos["call_strike_bought"]) - float(pos["call_strike_sold"])) * q
                 except Exception:
                     pass
                 try:
                     if not pos.get("put_closed_by_stop", False) and pos.get("put_strike_sold") is not None and pos.get("put_strike_bought") is not None:
-                        required_margin += 100.0 * (float(pos["put_strike_sold"]) - float(pos["put_strike_bought"]))
+                        q = max(1, int(pos.get("qty", 1)))
+                        required_margin += 100.0 * (float(pos["put_strike_sold"]) - float(pos["put_strike_bought"])) * q
                 except Exception:
                     pass
 
@@ -1359,6 +1613,31 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 )
             ]
 
+            # fallback daily IVs if no per-position samples were recorded
+            if iv_put_samples:
+                daily_iv_put = sum(iv_put_samples) / max(1, len(iv_put_samples))
+            elif daily_iv_put is None:
+                daily_iv_put = _daily_iv_from_close(
+                    ticker=cfg.ticker,
+                    as_of=as_of_str,
+                    expiration=expiration_str,
+                    option_type="put",
+                    spot=spot,
+                    days_to_expire=days_to_expire_int,
+                )
+
+            if iv_call_samples:
+                daily_iv_call = sum(iv_call_samples) / max(1, len(iv_call_samples))
+            elif daily_iv_call is None:
+                daily_iv_call = _daily_iv_from_close(
+                    ticker=cfg.ticker,
+                    as_of=as_of_str,
+                    expiration=expiration_str,
+                    option_type="call",
+                    spot=spot,
+                    days_to_expire=days_to_expire_int,
+                )
+
             # bookkeeping row
             pnl_row = {
                 "as_of": as_of_str,
@@ -1373,17 +1652,9 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 "cumulative_pnl": round(realized_total + unrealized_total, 2),
                 "required_margin": round(required_margin, 2),
             }
-            ts_now = datetime.utcnow().isoformat()
-            if pcs_ts is not None:
-                elapsed = time.perf_counter() - pcs_ts
-                print(
-                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} "
-                    f"dt={elapsed:.2f}s @ {ts_now}"
-                )
-            else:
-                print(
-                    f"pnl_row init: {pnl_row} open_positions={len(open_positions)} @ {ts_now}"
-                )
+
+            print(f"[DEBUG] PnL {pnl_row}")
+
             daily_pnls.append(pnl_row)
             # <--- END YOUR P&L / EXIT LOGIC
             # <--- END YOUR P&L / EXIT LOGIC

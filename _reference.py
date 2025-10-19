@@ -4106,18 +4106,23 @@ def plot_recursive_results(
     # ── Extract IV data from positions ──────────────────────────────────────
     iv_call_data, iv_put_data = [], []
     for date, day in zip(dt_series, daily_results):
-        call_ivs = [
-            pos["iv_call"]
-            for pos in day.get("active_positions", [])
-            if pos["position_open_date"] == date
-            and isinstance(pos.get("iv_call"), (int, float))
-        ]
-        put_ivs = [
-            pos["iv_put"]
-            for pos in day.get("active_positions", [])
-            if pos["position_open_date"] == date
-            and isinstance(pos.get("iv_put"), (int, float))
-        ]
+        ref_date = _normalize_date(date)
+        call_ivs = []
+        put_ivs = []
+        if ref_date is None:
+            iv_call_data.append(np.nan)
+            iv_put_data.append(np.nan)
+            continue
+        for pos in day.get("active_positions", []):
+            open_date = _normalize_date(pos.get("position_open_date"))
+            if open_date is None:
+                open_date = _normalize_date(pos.get("opened_at"))
+            if open_date is None or open_date != ref_date:
+                continue
+            if isinstance(pos.get("iv_call"), (int, float)):
+                call_ivs.append(pos["iv_call"])
+            if isinstance(pos.get("iv_put"), (int, float)):
+                put_ivs.append(pos["iv_put"])
         iv_call_data.append(np.mean(call_ivs) if call_ivs else np.nan)
         iv_put_data.append(np.mean(put_ivs) if put_ivs else np.nan)
 
@@ -4933,3 +4938,26 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+# ------------------------------------------------------------------
+# Date normalization helper
+# ------------------------------------------------------------------
+
+def _normalize_date(value) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return None
+    if ts is None or pd.isna(ts):
+        return None
+    if isinstance(ts, datetime):
+        return ts.date()
+    try:
+        return ts.to_pydatetime().date()
+    except Exception:
+        return None

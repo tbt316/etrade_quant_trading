@@ -38,6 +38,13 @@ class Settings:
     # External API Keys
     polygon_api_key: str = os.getenv("POLYGON_API_KEY", "")
 
+    # Debug flags (tweak at runtime if needed)
+    debug_closure: bool = False            # print per-position close/trigger details
+    debug_closure_verbose: bool = False    # include per-leg quotes used for close-cost
+    debug_open_sizing: bool = False        # print capital/margin sizing decisions for opens
+    debug_plot: bool = False               # print plot input diagnostics
+    debug_plot_verbose: bool = False       # more detailed plot diagnostics
+
 
 # ---------------------------------------------------------
 # Field Maps
