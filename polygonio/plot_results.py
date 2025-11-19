@@ -30,26 +30,6 @@ def _to_dt(x) -> Optional[datetime]:
     return None
 
 
-def _to_date_only(x) -> Optional[date]:
-    dt = _to_dt(x)
-    if dt is not None:
-        return dt.date()
-    if isinstance(x, date):
-        return x
-    try:
-        ts = pd.to_datetime(x)
-    except Exception:
-        return None
-    if ts is None or pd.isna(ts):
-        return None
-    if isinstance(ts, datetime):
-        return ts.date()
-    try:
-        return ts.to_pydatetime().date()
-    except Exception:
-        return None
-
-
 def _collect_positions(res: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(res.get("positions") or [])
 
@@ -78,22 +58,7 @@ def _build_price_df_from_result(res: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame({"close": np.nan}, index=pd.to_datetime(idx))
     rows.sort(key=lambda t: t[0])
     df = pd.DataFrame(rows, columns=["date", "close"]).set_index("date")
-    # Normalize to date-only index to ensure alignment with dt_series
-    try:
-        df.index = pd.to_datetime(df.index).normalize()
-        # In case of duplicate intraday timestamps, keep the last close for the day
-        df = df[~df.index.duplicated(keep="last")]
-    except Exception:
-        pass
     return df
-
-
-def _pad_or_trim(data: List[Any], target_len: int, fill: Any = np.nan) -> List[Any]:
-    if len(data) < target_len:
-        data = data + [fill] * (target_len - len(data))
-    elif len(data) > target_len:
-        data = data[:target_len]
-    return data
 
 
 def _cumulative_realized_series(positions: List[Dict[str, Any]], dt_series: List[datetime]) -> List[float]:
@@ -117,38 +82,6 @@ def _cumulative_realized_series(positions: List[Dict[str, Any]], dt_series: List
     for d in dt_series:
         running += by_day.get(datetime(d.year, d.month, d.day), 0.0)
         out.append(running)
-    return out
-
-
-def _series_from_pnl_rows(res: Dict[str, Any], key: str, dt_series: List[datetime]) -> Optional[List[float]]:
-    rows = res.get("pnl")
-    if not isinstance(rows, list) or not rows:
-        return None
-    # Build date->value map from provided key
-    by_day: Dict[datetime, float] = {}
-    for r in rows:
-        ds = r.get("as_of")
-        dt = _to_dt(ds)
-        if dt is None:
-            continue
-        val = r.get(key)
-        try:
-            if val is None:
-                continue
-            by_day[datetime(dt.year, dt.month, dt.day)] = float(val)
-        except Exception:
-            continue
-    if not by_day:
-        return None
-    out: List[float] = []
-    last = 0.0
-    for d in dt_series:
-        v = by_day.get(datetime(d.year, d.month, d.day))
-        if v is None:
-            out.append(last)
-        else:
-            out.append(v)
-            last = v
     return out
 
 
@@ -252,162 +185,14 @@ def build_plot_inputs(res: Dict[str, Any],
     dt_series = _date_range(start, end)
     positions = _collect_positions(res)
 
-    # Prefer cumulative series from daily pnl rows if present
-    pnl_cum_realized = _series_from_pnl_rows(res, "cumulative_pnl_realized", dt_series)
-    if pnl_cum_realized is None:
-        pnl_cum_realized = _cumulative_realized_series(positions, dt_series)
-    pnl_cum = _series_from_pnl_rows(res, "cumulative_pnl", dt_series)
-    if pnl_cum is None:
-        pnl_cum = _cumulative_unrealized_fallback(pnl_cum_realized)
+    pnl_cum_realized = _cumulative_realized_series(positions, dt_series)
+    pnl_cum = _cumulative_unrealized_fallback(pnl_cum_realized)
 
     daily_results = _build_daily_results(positions, dt_series)
-
-    # Attach daily IV values from pnl rows if present
-    pnl_rows = res.get("pnl") or []
-    iv_call_map: Dict[str, float] = {}
-    iv_put_map: Dict[str, float] = {}
-    for row in pnl_rows:
-        ds = row.get("as_of") or row.get("date")
-        if not ds:
-            continue
-        try:
-            if row.get("iv_call") is not None:
-                iv_call_map[str(ds)] = float(row.get("iv_call"))
-        except Exception:
-            pass
-        try:
-            if row.get("iv_put") is not None:
-                iv_put_map[str(ds)] = float(row.get("iv_put"))
-        except Exception:
-            pass
-
-    for day in daily_results:
-        ds = day.get("date")
-        if ds in iv_call_map:
-            day["iv_call"] = iv_call_map[ds]
-        if ds in iv_put_map:
-            day["iv_put"] = iv_put_map[ds]
-
-    # ---------- Diagnostics (optional) ----------
-    try:
-        from .config import get_settings
-        _dbg = getattr(get_settings(), 'debug_plot', False)
-        _dbg_v = getattr(get_settings(), 'debug_plot_verbose', False)
-    except Exception:
-        _dbg = _dbg_v = False
-    if _dbg:
-        try:
-            opens = []
-            for p in positions:
-                od = _to_dt(p.get('position_open_date') or p.get('opened_at'))
-                if od: opens.append(od)
-            first_open = min(opens) if opens else None
-            active_counts = [(d['date'], len(d.get('active_positions', []))) for d in daily_results[:20]]
-            print(f"[PLOT-DBG] Window: {start} -> {end}; first_open={first_open}")
-            print(f"[PLOT-DBG] First 20 active-counts: {active_counts}")
-            if _dbg_v:
-                # Show a sample of positions that should be active on the first open date
-                if first_open:
-                    sample = [p for p in positions if _to_dt(p.get('position_open_date') or p.get('opened_at')) == first_open]
-                    print(f"[PLOT-DBG] Sample positions on first_open ({len(sample)}):")
-                    for p in sample[:5]:
-                        print({
-                            'open': _to_dt(p.get('position_open_date') or p.get('opened_at')),
-                            'exp': _to_dt(p.get('expiration') or p.get('expiration_date')),
-                            'put_closed': _to_dt(p.get('put_closed_date')),
-                            'call_closed': _to_dt(p.get('call_closed_date')),
-                            'short_put': p.get('short_put_prem_open'),
-                            'long_put': p.get('long_put_prem_open')
-                        })
-        except Exception as _e:
-            print(f"[PLOT-DBG] diagnostics failed: {_e}")
-
-    # If caller provided a PnL timeline with daily required_margin, capture it for plotting/FFILL
-    rm_by_day: Dict[datetime, float] = {}
-    # Prefer engine-computed daily required_margin over ad‑hoc reconstruction
-    try:
-        pnl_rows = res.get("pnl") or []
-        if isinstance(pnl_rows, list) and pnl_rows:
-            for r in pnl_rows:
-                ds = r.get("as_of") or r.get("date")
-                dt = _to_dt(ds)
-                if dt is None:
-                    continue
-                try:
-                    rm = r.get("required_margin")
-                    if rm is None:
-                        continue
-                    rm_by_day[datetime(dt.year, dt.month, dt.day)] = float(rm)
-                except Exception:
-                    continue
-
-            if rm_by_day:
-                # Build a forward-filled series across the entire plotting date range
-                # so weekends/holidays do not regress to ad-hoc reconstructed values.
-                series_ffill: List[float] = []
-                last = 0.0
-                for dt in dt_series:
-                    key = datetime(dt.year, dt.month, dt.day)
-                    if key in rm_by_day:
-                        last = rm_by_day[key]
-                    series_ffill.append(last)
-
-                # Overwrite daily_results[i]['required_margin'] for every day
-                patched: List[Dict[str, Any]] = []
-                for d, v in zip(daily_results, series_ffill):
-                    q = dict(d)
-                    q["required_margin"] = float(v)
-                    patched.append(q)
-                daily_results = patched
-    except Exception:
-        pass
     parameter_history = _single_parameter_block_from_result(res)
 
-    # Prefer explicit price_df; otherwise, try to build from result['price'] if present,
-    # else fall back to constructing from result['pnl'] spots.
-    if price_df is None:
-        price_records = res.get("price")
-        if isinstance(price_records, list) and price_records:
-            try:
-                tmp = pd.DataFrame(price_records)
-                if "date" in tmp.columns and "close" in tmp.columns:
-                    tmp["date"] = pd.to_datetime(tmp["date"]).dt.tz_localize(None).dt.normalize()
-                    df = tmp[["date", "close"]].copy().set_index("date").sort_index()
-                else:
-                    df = _build_price_df_from_result(res)
-            except Exception:
-                df = _build_price_df_from_result(res)
-        else:
-            df = _build_price_df_from_result(res)
-    else:
-        # Ensure provided df uses date-only index for robust daily alignment
-        df = price_df.copy()
-        try:
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df = df.set_index(pd.to_datetime(df.index))
-            df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-            df = df.sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-        except Exception:
-            pass
-
-    # VIX: prefer explicit vix_df; otherwise, try result['vix'] if included by backtest
-    if vix_df is None:
-        vix_records = res.get("vix")
-        if isinstance(vix_records, list) and vix_records:
-            try:
-                vix_tmp = pd.DataFrame(vix_records)
-                if "date" in vix_tmp.columns and "close" in vix_tmp.columns:
-                    vix_tmp["date"] = pd.to_datetime(vix_tmp["date"]).dt.tz_localize(None).dt.normalize()
-                    vix_df = vix_tmp[["date", "close"]].copy().set_index("date").sort_index()
-                else:
-                    vix_df = pd.DataFrame()
-            except Exception:
-                vix_df = pd.DataFrame()
-        else:
-            vix_df = pd.DataFrame()
-
-    df_dict = {"df": df, "vix_df": vix_df}
+    df = price_df if price_df is not None else _build_price_df_from_result(res)
+    df_dict = {"df": df, "vix_df": (vix_df if vix_df is not None else pd.DataFrame())}
 
     final_pnl = float(pnl_cum_realized[-1]) if pnl_cum_realized else 0.0
 
@@ -470,41 +255,10 @@ def plot_recursive_results(
 
     # --------------------------- basic series -----------------------------
     dt_series = [pd.to_datetime(r["date"]) for r in daily_results]
-
-    # Local default for optional engine-provided required_margin map used by
-    # build_plot_inputs to patch daily_results. plot_recursive_results itself
-    # does not reconstruct this map, so keep an empty dict to satisfy guards.
-    rm_by_day: Dict[datetime, float] = {}
-    # Align lengths defensively in case callers provide mismatched arrays
-    # If PnL series are shorter than dt_series, left-pad with zeros to match length;
-    # if longer, trim to dt_series.
-    if dt_series:
-        L = len(dt_series)
-        if len(pnl_cumulative_series) < L:
-            pad = [0.0] * (L - len(pnl_cumulative_series))
-            pnl_cumulative_series = pad + list(pnl_cumulative_series)
-        elif len(pnl_cumulative_series) > L:
-            pnl_cumulative_series = list(pnl_cumulative_series)[:L]
-
-        if len(pnl_cumulative_realized_series) < L:
-            pad = [0.0] * (L - len(pnl_cumulative_realized_series))
-            pnl_cumulative_realized_series = pad + list(pnl_cumulative_realized_series)
-        elif len(pnl_cumulative_realized_series) > L:
-            pnl_cumulative_realized_series = list(pnl_cumulative_realized_series)[:L]
     price_df = df_dict.get("df", pd.DataFrame()).sort_index()
     vix_df = df_dict.get("vix_df", pd.DataFrame())
 
-    # Build required margin series; if engine-provided timeline exists, forward-fill it over dt_series
-    if rm_by_day:
-        required_margins: List[float] = []
-        last = 0.0
-        for d in dt_series:
-            key = datetime(d.year, d.month, d.day)
-            if key in rm_by_day:
-                last = rm_by_day[key]
-            required_margins.append(last)
-    else:
-        required_margins = [r.get("required_margin", 0.0) for r in daily_results]
+    required_margins = [r.get("required_margin", 0.0) for r in daily_results]
     req_series = pd.Series(required_margins, dtype="float64")
     cum_max_margin = req_series.expanding().max()
 
@@ -545,38 +299,14 @@ def plot_recursive_results(
     itm_days_open: List[int] = []
     otm_dates: List[datetime] = []
     otm_days_open: List[int] = []
-    # For visibility from day 1 regardless of ITM/OTM classification
-    all_days_open_dates: List[datetime] = []
-    all_days_open_vals: List[int] = []
     otm_open_counts = [0] * n
     itm_now_otm_open_counts = [0] * n
     itm_open_counts = [0] * n
     iv_call_data: List[float] = []
     iv_put_data: List[float] = []
 
-    # Build a robust date-aligned close lookup using forward/back fill
-    if not price_df.empty and "close" in price_df.columns:
-        try:
-            close_s = price_df["close"].copy()
-            # Normalize index to date; keep last per day
-            if not isinstance(close_s.index, pd.DatetimeIndex):
-                close_s.index = pd.to_datetime(close_s.index)
-            close_s.index = pd.to_datetime(close_s.index).tz_localize(None).normalize()
-            close_s = close_s[~close_s.index.duplicated(keep="last")]
-            # Align to the full calendar of dt_series so non-trading days have values
-            cal_index = pd.DatetimeIndex(pd.to_datetime([pd.to_datetime(d).normalize() for d in dt_series]))
-            cal_index = cal_index.drop_duplicates()
-            aligned = close_s.reindex(cal_index).ffill().bfill()
-            close_map = aligned.to_dict()
-            def get_close(d: datetime):
-                return close_map.get(pd.to_datetime(d).normalize(), np.nan)
-        except Exception:
-            # Fallback to naive dict lookup (may miss non-normalized keys)
-            close_lookup = price_df.get("close", pd.Series()).to_dict()
-            get_close = close_lookup.get
-    else:
-        close_lookup = price_df.get("close", pd.Series()).to_dict()
-        get_close = close_lookup.get
+    close_lookup = price_df.get("close", pd.Series()).to_dict()
+    get_close = close_lookup.get
 
     for idx, (date_dt, day) in enumerate(zip(dt_series, daily_results)):
         close_price = get_close(date_dt)
@@ -590,46 +320,34 @@ def plot_recursive_results(
         opened_iv_puts: List[float] = []
 
         for pos in active_positions:
-            # Use either explicit open date or fallback 'opened_at'
-            open_date = _to_dt(pos.get("position_open_date") or pos.get("opened_at"))
+            open_date = _to_dt(pos.get("position_open_date"))
             exp_date = _to_dt(pos.get("expiration"))
             call_closed = _to_dt(pos.get("call_closed_date"))
             put_closed = _to_dt(pos.get("put_closed_date"))
 
             short_call = pos.get("short_call_prem_open", 0) > 0
             short_put = pos.get("short_put_prem_open", 0) > 0
-            long_call  = pos.get("long_call_prem_open", 0) > 0
-            long_put   = pos.get("long_put_prem_open", 0) > 0
 
-            # Helper: is a leg still open as of this date?
-            def _open_after(d_closed: Optional[datetime]) -> bool:
-                return (d_closed is None) or (isinstance(d_closed, datetime) and d_closed.date() > date_dt.date())
-
-            if short_call and pos.get("call_strike_sold") is not None and _open_after(call_closed) and not np.isnan(close_price):
+            if short_call and pos.get("call_strike_sold") is not None and call_closed is None and not np.isnan(close_price):
                 strike = pos["call_strike_sold"]
                 dist = (strike - close_price) / close_price * 100
                 distances_today.append(dist)
                 call_dates.append(date_dt)
                 call_instance_distances.append(dist)
-                # distance at open/premiums etc. handled below regardless of close price
-
-            if short_put and pos.get("put_strike_sold") is not None and _open_after(put_closed) and not np.isnan(close_price):
-                strike = pos["put_strike_sold"]
-                dist = -((strike - close_price) / close_price) * 100
-                distances_today.append(dist)
-                put_dates.append(date_dt)
-                put_instance_distances.append(dist)
-                # distance at open/premiums etc. handled below regardless of close price
-
-            # Record open-day metrics even if we lack a price for that date
-            if open_date and open_date.date() == date_dt.date():
-                if short_call:
+                if open_date and open_date.date() == date_dt.date():
                     open_distance_calls[idx].append((pos.get("open_distance_call") or 0) * 100)
                     open_premium_calls[idx].append(pos.get("short_call_prem_open", 0) - pos.get("long_call_prem_open", 0))
                     target_premium_calls[idx].append((pos.get("strike_target_call") or {}).get("premium_target"))
                     days_to_expiry_array[idx].append(exp_date - open_date if exp_date and open_date else None)
                     spread_width_array[idx].append(pos.get("call_strike_bought", 0) - pos.get("call_strike_sold", 0))
-                if short_put:
+
+            if short_put and pos.get("put_strike_sold") is not None and put_closed is None and not np.isnan(close_price):
+                strike = pos["put_strike_sold"]
+                dist = -((strike - close_price) / close_price) * 100
+                distances_today.append(dist)
+                put_dates.append(date_dt)
+                put_instance_distances.append(dist)
+                if open_date and open_date.date() == date_dt.date():
                     open_distance_puts[idx].append((pos.get("open_distance_put") or 0) * 100)
                     open_premium_puts[idx].append(pos.get("short_put_prem_open", 0) - pos.get("long_put_prem_open", 0))
                     target_premium_puts[idx].append((pos.get("strike_target_put") or {}).get("premium_target"))
@@ -641,61 +359,34 @@ def plot_recursive_results(
             if short_put and put_closed is not None and put_closed.date() == date_dt.date():
                 put_closed_profit_array[idx].append(pos.get("put_closed_profit"))
 
-            # Consider the position "open for days-open plotting" if any leg is still open
-            any_leg_still_open = (
-                (short_call and _open_after(call_closed))
-                or (short_put and _open_after(put_closed))
-                or (long_call and _open_after(call_closed))
-                or (long_put and _open_after(put_closed))
-            )
-            if open_date and any_leg_still_open:
+            if open_date and ((short_call and call_closed is None) or (short_put and put_closed is None)):
                 days_open = (date_dt.date() - open_date.date()).days
                 is_itm = False
-                if not np.isnan(close_price):
-                    # Match reference: flag ITM if ANY relevant leg is ITM today
-                    if short_call and isinstance(pos.get("call_strike_sold"), (int, float)):
-                        is_itm |= ((pos["call_strike_sold"] - close_price) / close_price * 100) < 0
-                    if long_call and isinstance(pos.get("call_strike_bought"), (int, float)):
-                        is_itm |= ((pos["call_strike_bought"] - close_price) / close_price * 100) < 0
-                    if short_put and isinstance(pos.get("put_strike_sold"), (int, float)):
-                        is_itm |= (-((pos["put_strike_sold"] - close_price) / close_price) * 100) < 0
-                    if long_put and isinstance(pos.get("put_strike_bought"), (int, float)):
-                        is_itm |= (-((pos["put_strike_bought"] - close_price) / close_price) * 100) < 0
+                if short_call and pos.get("call_strike_sold") is not None and not np.isnan(close_price):
+                    if (pos["call_strike_sold"] - close_price) / close_price * 100 < 0:
+                        is_itm = True
+                if short_put and pos.get("put_strike_sold") is not None and not np.isnan(close_price):
+                    if -((pos["put_strike_sold"] - close_price) / close_price) * 100 < 0:
+                        is_itm = True
                 (itm_dates if is_itm else otm_dates).append(date_dt)
                 (itm_days_open if is_itm else otm_days_open).append(days_open)
-                # Always record all-day-open points for visibility even when price/strike missing
-                all_days_open_dates.append(date_dt)
-                all_days_open_vals.append(days_open)
 
-            # Count positions CURRENTLY OPEN on this day, grouped by moneyness at open vs now
-            if any_leg_still_open and not np.isnan(close_price):
-                # Choose the relevant side for classification: prefer short legs.
-                open_dist_val = None
-                if short_put:
-                    odv = pos.get("open_distance_put")
-                    if isinstance(odv, (int, float)):
-                        open_dist_val = float(odv)
-                elif short_call:
-                    odv = pos.get("open_distance_call")
-                    if isinstance(odv, (int, float)):
-                        open_dist_val = float(odv)
-                # If we have an open-distance, categorize
-                if open_dist_val is not None:
-                    if open_dist_val > 0:
-                        # OTM at open; split by whether it's ITM now
-                        if is_itm:
-                            itm_now_otm_open_counts[idx] += 1
-                        else:
-                            otm_open_counts[idx] += 1
-                    elif open_dist_val < 0:
-                        # ITM at open and still open today
-                        itm_open_counts[idx] += 1
+            if short_call and pos.get("call_strike_sold") is not None and not np.isnan(close_price):
+                open_dist = (pos.get("open_distance_call") or 0) * 100
+                current_dist = (pos["call_strike_sold"] - close_price) / close_price * 100
+                if open_dist > 0:
+                    (otm_open_counts if current_dist >= 0 else itm_now_otm_open_counts)[idx] += 1
+                elif open_dist < 0:
+                    itm_open_counts[idx] += 1
+            if short_put and pos.get("put_strike_sold") is not None and not np.isnan(close_price):
+                open_dist = (pos.get("open_distance_put") or 0) * 100
+                current_dist = -((pos["put_strike_sold"] - close_price) / close_price) * 100
+                if open_dist > 0:
+                    (otm_open_counts if current_dist >= 0 else itm_now_otm_open_counts)[idx] += 1
+                elif open_dist < 0:
+                    itm_open_counts[idx] += 1
 
-            open_date_norm = _to_date_only(open_date)
-            if open_date_norm is None:
-                open_date_norm = _to_date_only(pos.get("position_open_date"))
-
-            if open_date_norm and open_date_norm == _to_date_only(date_dt):
+            if open_date and open_date.date() == date_dt.date():
                 if isinstance(pos.get("iv_call"), (int, float)):
                     opened_iv_calls.append(pos["iv_call"])
                 if isinstance(pos.get("iv_put"), (int, float)):
@@ -711,38 +402,13 @@ def plot_recursive_results(
                     if distp < 0:
                         itm_amount += max(pos["put_strike_sold"] - close_price, 0) * 100
 
-        call_val = float(np.mean(opened_iv_calls)) if opened_iv_calls else np.nan
-        if (not opened_iv_calls or np.isnan(call_val)) and day.get("iv_call") is not None:
-            try:
-                call_val = float(day.get("iv_call"))
-            except Exception:
-                pass
-        iv_call_data.append(call_val)
-
-        put_val = float(np.mean(opened_iv_puts)) if opened_iv_puts else np.nan
-        if (not opened_iv_puts or np.isnan(put_val)) and day.get("iv_put") is not None:
-            try:
-                put_val = float(day.get("iv_put"))
-            except Exception:
-                pass
-        iv_put_data.append(put_val)
-
-    if dt_series:
-        iv_call_data = _pad_or_trim(iv_call_data, len(dt_series))
-        iv_put_data = _pad_or_trim(iv_put_data, len(dt_series))
-        index = pd.to_datetime(dt_series)
-        iv_call_series = pd.Series(iv_call_data, index=index)
-        iv_put_series = pd.Series(iv_put_data, index=index)
-        iv_call_series = iv_call_series.interpolate(method="time", limit_direction="both")
-        iv_put_series = iv_put_series.interpolate(method="time", limit_direction="both")
-        iv_call_data = iv_call_series.tolist()
-        iv_put_data = iv_put_series.tolist()
+        iv_call_data.append(np.mean(opened_iv_calls) if opened_iv_calls else np.nan)
+        iv_put_data.append(np.mean(opened_iv_puts) if opened_iv_puts else np.nan)
 
         if distances_today:
             md = min(distances_today, key=abs)
             min_distances.append(md)
-            # Highlight when there is an ITM option expiring today
-            if md < 0 and (itm_amount > 0):
+            if md < 0 and exp_date and exp_date.date() == date_dt.date():
                 highlight_dates.append(date_dt)
                 highlight_distances.append(md)
         else:
@@ -773,7 +439,7 @@ def plot_recursive_results(
     }
 
     for pos in unique_positions.values():
-        open_date = _to_dt(pos.get("position_open_date") or pos.get("opened_at"))
+        open_date = _to_dt(pos.get("position_open_date"))
         if open_date is None:
             continue
         if pos.get("call_closed_date") is not None and pos.get("call_strike_sold") is not None:
@@ -816,8 +482,6 @@ def plot_recursive_results(
         ax1.text(0.5, 0.5, "No PnL data to plot", transform=ax1.transAxes, ha="center")
 
     # ax2: closest strike distance & ITM amount
-    min_distances = _pad_or_trim(min_distances, len(dt_series))
-
     if dt_series and min_distances and any(not np.isnan(d) for d in min_distances):
         ax2.plot(dt_series, min_distances, color="green", label="Min Distance to Open Options (OTM:+ / ITM:-)", linewidth=1, marker="o", markersize=1)
         ax2.axhline(0, color="black", linestyle="--", linewidth=1)
@@ -849,7 +513,6 @@ def plot_recursive_results(
         ax2.grid(True)
         ax2.legend(loc="upper left", fontsize=_fs(8))
         ax2_twin = ax2.twinx()
-        itm_amounts = _pad_or_trim(itm_amounts, len(dt_series))
         ax2_twin.plot(dt_series, itm_amounts, color="red", label="Aggregate ITM Amount (Today Exp.)", linewidth=1, marker="o", markersize=10)
         ax2_twin.set_ylabel("ITM Amount ($)", color="blue")
         ax2_twin.tick_params(axis="y", labelcolor="blue")
@@ -873,8 +536,8 @@ def plot_recursive_results(
             ax3.scatter([o for o, _, _ in put_open_close_strikes], [s for _, _, s in put_open_close_strikes], color="red", marker="o", s=10, label="Short Put Open", rasterized=True)
             ax3.scatter(call_dates_close, call_strikes, color="purple", marker="s", s=10, label="Short Call Close", rasterized=True)
             ax3.scatter(put_dates_close, put_strikes, color="blue", marker="s", s=10, label="Short Put Close", rasterized=True)
-            # Omit long-leg close markers to reduce clutter
-            # (Long Call/Put closes are not shown in this view.)
+            ax3.scatter(sb_x, sb_y, color="green", marker="^", s=5, label="Long Call Close", rasterized=True)
+            ax3.scatter(pb_x, pb_y, color="red", marker="^", s=5, label="Long Put Close", rasterized=True)
             ax3.legend(loc="upper left", fontsize=_fs(8), framealpha=0.9)
             ax3.set_title("Option Strikes at Open and Close vs. Underlying Price")
             ax3.set_xlabel("Date")
@@ -896,23 +559,13 @@ def plot_recursive_results(
     ax4.grid(True, linestyle="--", alpha=0.7)
     ax4.legend(loc="upper left", fontsize=_fs(8))
     ax4_twin = ax4.twinx()
-    # Plot a faint background layer of all points so dots appear from day 1
-    if all_days_open_dates:
-        ax4_twin.scatter(all_days_open_dates, all_days_open_vals, color="gray", marker="o", s=18, alpha=0.35, label="Days Open (All)", rasterized=True, zorder=1)
     if itm_dates:
-        ax4_twin.scatter(itm_dates, itm_days_open, color="red", marker="o", s=10, alpha=0.7, label="Days Open (ITM)", rasterized=True, zorder=2)
+        ax4_twin.scatter(itm_dates, itm_days_open, color="red", marker="o", s=5, alpha=0.6, label="Days Open (ITM)", rasterized=True)
     if otm_dates:
-        ax4_twin.scatter(otm_dates, otm_days_open, color="blue", marker="o", s=10, alpha=0.7, label="Days Open (OTM)", rasterized=True, zorder=2)
+        ax4_twin.scatter(otm_dates, otm_days_open, color="blue", marker="o", s=5, alpha=0.6, label="Days Open (OTM)", rasterized=True)
     ax4_twin.set_ylabel("Days Open", color="blue")
     ax4_twin.tick_params(axis="y", labelcolor="blue")
     ax4_twin.legend(loc="upper right", fontsize=_fs(8))
-    # Ensure day 0 points are visible at the bottom edge
-    try:
-        ymin, ymax = ax4_twin.get_ylim()
-        if ymin > -0.5:
-            ax4_twin.set_ylim(bottom=-0.5)
-    except Exception:
-        pass
 
     # ax5: open premiums & position counts
     def _flatten_lists(date_list, list_of_lists):

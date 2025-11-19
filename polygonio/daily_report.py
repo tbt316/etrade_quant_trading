@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from datetime import date, datetime
 
-from .config import get_settings, PREMIUM_FIELD_MAP
+from .config import get_settings, resolve_premium_field
 from .cache_io import stored_option_price
 
 def _to_datestr(x) -> str | None:
@@ -139,7 +139,7 @@ def _lookup_leg_price(
         return None
 
     settings = get_settings()
-    preferred = PREMIUM_FIELD_MAP.get(settings.premium_price_mode, "trade_price")
+    preferred = resolve_premium_field(settings)
     for key in (preferred, "trade_price", "close_price", "mid_price", "price"):
         val = leg_data.get(key)
         if isinstance(val, (int, float)):

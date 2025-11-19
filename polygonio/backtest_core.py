@@ -71,7 +71,7 @@ def list_expiries(weekday: str, start_date: str, end_date: str, expiring_wk: int
     """
     from .market_calendar import list_expiries as _list
 
-    return _list(weekday, start_date, end_date, expiring_wk, trading_df)
+    return _list(weekday, start_date, end_date, trading_df)
 
 
 # ----------------------------

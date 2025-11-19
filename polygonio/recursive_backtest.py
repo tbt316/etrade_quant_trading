@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import time
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import pandas as pd
 import pandas_market_calendars as mcal
 
 
@@ -30,11 +32,169 @@ class _DebugCounters:
         )
 
 
+def _calendar_debug_enabled() -> bool:
+    try:
+        return bool(getattr(get_settings(), "debug_calendar_timing", False))
+    except Exception:
+        return False
+
+
+def _calendar_debug_print(msg: str) -> None:
+    if not _calendar_debug_enabled():
+        return
+    try:
+        stamp = time.perf_counter()
+        print(f"[CAL-TIME] {stamp:.6f} {msg}")
+    except Exception:
+        pass
+
+
+@contextmanager
+def _calendar_timing(section: str, *, extra: str | None = None):
+    if not _calendar_debug_enabled():
+        yield
+        return
+    label = section if extra is None else f"{section} {extra}"
+    _calendar_debug_print(f"start {label}")
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        _calendar_debug_print(f"done {label} {elapsed_ms:.1f}ms")
+
+
+def _backtest_timing_enabled() -> bool:
+    try:
+        return bool(getattr(get_settings(), "debug_backtest_timing", False))
+    except Exception:
+        return False
+
+
+def _backtest_timing_print(msg: str) -> None:
+    if not _backtest_timing_enabled():
+        return
+    try:
+        stamp = time.perf_counter()
+        print(f"[BT-TIME] {stamp:.6f} {msg}")
+    except Exception:
+        pass
+
+
+@contextmanager
+def _backtest_timing(section: str, *, extra: str | None = None):
+    if not _backtest_timing_enabled():
+        yield
+        return
+    label = section if extra is None else f"{section} {extra}"
+    _backtest_timing_print(f"start {label}")
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        _backtest_timing_print(f"done {label} {elapsed_ms:.1f}ms")
+
+
+def _get_trading_calendar() -> TradingCalendar:
+    global _trading_calendar
+    if _trading_calendar is None:
+        _trading_calendar = TradingCalendar("NYSE")
+    return _trading_calendar
+
+
+def _normalize_datetime(value: date | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    raise TypeError(f"Unsupported date type: {type(value)!r}")
+
+
+def _build_trading_dates_df(start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    try:
+        return _get_trading_calendar().trading_dates_df(start_dt, end_dt)
+    except Exception:
+        bdays = pd.bdate_range(start=start_dt.date(), end=end_dt.date())
+        return pd.DataFrame(
+            {"date": [datetime.combine(d.date(), datetime.min.time()) for d in bdays]}
+        )
+
+
+def _ensure_calendar_cache(start_dt: datetime, end_dt: datetime) -> None:
+    """Ensure the in-memory trading calendar covers [start_dt, end_dt].
+
+    The initial build preloads several years ahead so repeated per-day calls
+    reuse the same slice without constantly extending the cache by a single day.
+    """
+    global _calendar_dates_cache, _calendar_cache_start, _calendar_cache_end
+
+    padded_start = start_dt - timedelta(days=_CALENDAR_CACHE_PADDING_DAYS)
+    padded_end = end_dt + timedelta(days=_CALENDAR_CACHE_PADDING_DAYS)
+
+    if _calendar_dates_cache is None:
+        initial_end = max(
+            padded_end,
+            padded_start + timedelta(days=_CALENDAR_CACHE_PRELOAD_DAYS),
+        )
+        _calendar_dates_cache = _build_trading_dates_df(padded_start, initial_end)
+        _calendar_cache_start = padded_start
+        _calendar_cache_end = initial_end
+        return
+
+    cache_start = _calendar_cache_start or padded_start
+    cache_end = _calendar_cache_end or padded_end
+
+    if padded_start < cache_start:
+        grow_end = cache_start - timedelta(days=1)
+        grow_start = padded_start
+        if grow_start <= grow_end:
+            extra = _build_trading_dates_df(grow_start, grow_end)
+            if not extra.empty:
+                _calendar_dates_cache = pd.concat(
+                    [extra, _calendar_dates_cache], ignore_index=True
+                )
+            _calendar_cache_start = grow_start
+            cache_start = grow_start
+
+    if padded_end > cache_end:
+        extra_start = cache_end + timedelta(days=1)
+        grow_target = max(
+            padded_end,
+            cache_end + timedelta(days=_CALENDAR_CACHE_GROW_CHUNK_DAYS),
+        )
+        if extra_start <= grow_target:
+            extra = _build_trading_dates_df(extra_start, grow_target)
+            if not extra.empty:
+                _calendar_dates_cache = pd.concat(
+                    [_calendar_dates_cache, extra], ignore_index=True
+                )
+            _calendar_cache_end = grow_target
+
+
+def _calendar_dates_slice(start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    _ensure_calendar_cache(start_dt, end_dt)
+    assert _calendar_dates_cache is not None
+    mask = (_calendar_dates_cache["date"] >= start_dt) & (
+        _calendar_dates_cache["date"] <= end_dt
+    )
+    return _calendar_dates_cache.loc[mask].reset_index(drop=True)
+
+
+def prime_calendar_cache(start_date: str, end_date: str) -> None:
+    """Preload the trading calendar cache for the full backtest window."""
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        return
+    _ensure_calendar_cache(start_dt, end_dt)
+
 from .cache_io import load_stored_option_data
-from .config import get_settings, PREMIUM_FIELD_MAP
+from .config import get_settings, resolve_premium_field
 from .prices import get_historical_prices
 from .earnings import get_earnings_dates
-from .market_calendar import list_expiries  # maps your old get_all_weekdays
+from .market_calendar import list_expiries, TradingCalendar  # maps your old get_all_weekdays
 from .poly_client import PolygonAPIClient
 from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
@@ -48,6 +208,52 @@ from .paths import ROOT_DIR
 OPTION_DATA_SAVE_THRESHOLD = 50  # minimum new entries before persisting caches
 OPTION_RANGE = 0.1  # strike range requirement for option chains
 MAKEUP_LOSS_THRESHOLD_PTS = 2.0  # points threshold to trigger loss-recovery (≈$200)
+_CALENDAR_CACHE_PADDING_DAYS = 365
+_CALENDAR_CACHE_PRELOAD_DAYS = 365 * 5
+_CALENDAR_CACHE_GROW_CHUNK_DAYS = 365
+_calendar_dates_cache: Optional[pd.DataFrame] = None
+_calendar_cache_start: Optional[datetime] = None
+_calendar_cache_end: Optional[datetime] = None
+_trading_calendar: Optional[TradingCalendar] = None
+
+
+@dataclass
+class ChainSlice:
+    """Normalized view of an option chain snapshot for a single expiration."""
+
+    expiration: str
+    expiration_date: date
+    days_to_expire: int
+    call_data: List[Dict[str, Any]]
+    put_data: List[Dict[str, Any]]
+    call_options: List[Dict[str, Any]]
+    put_options: List[Dict[str, Any]]
+    strike_range: Optional[Dict[str, Dict[str, float]]]
+
+    @property
+    def has_calls(self) -> bool:
+        return bool(self.call_data)
+
+    @property
+    def has_puts(self) -> bool:
+        return bool(self.put_data)
+
+
+@dataclass
+class CalendarChainBundle:
+    """Container for the front/back expirations needed by a calendar strategy."""
+
+    ticker: str
+    as_of: str
+    as_of_date: date
+    spot: float
+    targets: Tuple[int, int]
+    weekday: str
+    front: ChainSlice
+    back: ChainSlice
+
+    def expirations(self) -> Tuple[ChainSlice, ChainSlice]:
+        return self.front, self.back
 
 # --- helpers for PCS selection ---
 def _mid_from_quotes(d: dict) -> float | None:
@@ -344,6 +550,8 @@ class RecursionConfig:
     stop_loss_action: Optional[str] = None
     vix_threshold: Optional[float] = None
     vix_correlation: Optional[float] = None
+    calendar_front_dte: Optional[int] = None
+    calendar_back_dte: Optional[int] = None
 
 
 def monthly_recursive_backtest(
@@ -394,6 +602,7 @@ def monthly_recursive_backtest(
         expiring_wks=expiring_wks,
         contract_qty=contract_qty,
     )
+    prime_calendar_cache(global_start_date, global_end_date)
 
     # Run the async per-day engine
     print("[DEBUG] Launching async backtest...")
@@ -417,38 +626,31 @@ def monthly_recursive_backtest(
 
 
 # Compatibility wrapper for list_expiries signature drift
-def _list_expiries_compat(*, weekday, start_date, end_date):
+def _list_expiries_compat(
+    *,
+    weekday,
+    start_date,
+    end_date,
+    ticker: str | None = None,
+):
     """Build a trading_dates_df compatible with market_calendar.list_expiries().
     We avoid depending on any helper methods that may not exist on TradingCalendar
     by constructing the schedule directly with pandas_market_calendars.
     """
-    import pandas as pd
+    start_dt = _normalize_datetime(start_date)
+    end_dt = _normalize_datetime(end_date)
+    trading_dates_df = _calendar_dates_slice(start_dt, end_dt)
 
-    try:
-        import pandas_market_calendars as mcal
-
-        cal = mcal.get_calendar("NYSE")  # default
-        sched = cal.schedule(start_date=start_date, end_date=end_date)
-        df = sched.reset_index().rename(columns={"index": "date"})
-        # Normalize to naive datetimes/dates as expected
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-        if "market_open" in df.columns:
-            df["market_open"] = pd.to_datetime(df["market_open"]).dt.tz_localize(None)
-        if "market_close" in df.columns:
-            df["market_close"] = pd.to_datetime(df["market_close"]).dt.tz_localize(None)
-        trading_dates_df = df
-    except Exception:
-        # Fallback: business days only; not as precise as the official schedule
-        trading_dates_df = pd.DataFrame(
-            {"date": pd.date_range(start=start_date, end=end_date, freq="B")}
+    extra = f"{weekday} start={start_date} end={end_date}"
+    with _calendar_timing("list_expiries", extra=extra):
+        return list_expiries(
+            weekday=weekday,
+            start_date=start_date,
+            end_date=end_date,
+            trading_dates_df=trading_dates_df,
+            ticker=ticker,
+            as_of=start_date,
         )
-
-    return list_expiries(
-        weekday=weekday,
-        start_date=start_date,
-        end_date=end_date,
-        trading_dates_df=trading_dates_df,
-    )
 
 
 # -------------------------------
@@ -486,6 +688,488 @@ def _target_expiry_compat(
     return None
 
 
+def _calendar_dte_targets(cfg: "RecursionConfig") -> Tuple[int, int]:
+    settings = get_settings()
+    front_default = int(getattr(settings, "calendar_front_dte_default", 60))
+    back_default = int(getattr(settings, "calendar_back_dte_default", 90))
+    try:
+        front = int(getattr(cfg, "calendar_front_dte", None) or front_default)
+    except Exception:
+        front = front_default
+    try:
+        back = int(getattr(cfg, "calendar_back_dte", None) or back_default)
+    except Exception:
+        back = back_default
+    if back <= front:
+        back = max(front + 5, back_default)
+    return max(front, 1), max(back, front + 1)
+
+
+def _calendar_expiry_candidates(
+    *,
+    as_of: date,
+    weekday: str,
+    front_target: int,
+    back_target: int,
+    ticker: str | None = None,
+) -> Optional[Tuple[date, date]]:
+    parts = [
+        f"ticker={ticker}" if ticker else None,
+        f"as_of={as_of}",
+        f"weekday={weekday}",
+        f"targets={front_target}/{back_target}",
+    ]
+    extra = " ".join(part for part in parts if part)
+    with _calendar_timing("calendar_expiry_candidates", extra=extra):
+        horizon_days = max(back_target + 15, 120)
+        expiries = _list_expiries_compat(
+            weekday=weekday,
+            start_date=as_of,
+            end_date=as_of + timedelta(days=horizon_days),
+            ticker=ticker,
+        )
+        future_dates = sorted({dt.date() for dt in expiries if dt.date() > as_of})
+        if not future_dates:
+            _calendar_debug_print("calendar_expiry_candidates no future_dates")
+            return None
+
+        settings = get_settings()
+        raw_gap_penalty = getattr(settings, "calendar_expiry_gap_penalty", 0.5)
+        try:
+            gap_penalty = max(0.0, float(raw_gap_penalty))
+        except Exception:
+            gap_penalty = 0.5
+        gap_tol_pct = max(
+            0.0, float(getattr(settings, "calendar_gap_tolerance_pct", 0.3) or 0.0)
+        )
+        gap_target = max(back_target - front_target, 1)
+        gap_min = max(1, gap_target * (1.0 - gap_tol_pct))
+        gap_max = max(gap_min, gap_target * (1.0 + gap_tol_pct))
+
+        best_pair: Tuple[date, date] | None = None
+        best_score = float("inf")
+        best_valid_pair: Tuple[date, date] | None = None
+        best_valid_score = float("inf")
+        for idx, front_candidate in enumerate(future_dates[:-1]):
+            dte_front = (front_candidate - as_of).days
+            if dte_front <= 0:
+                continue
+            for back_candidate in future_dates[idx + 1 :]:
+                dte_back = (back_candidate - as_of).days
+                if dte_back <= dte_front:
+                    continue
+                front_err = abs(dte_front - front_target)
+                back_err = abs(dte_back - back_target)
+                gap = dte_back - dte_front
+                gap_err = abs(gap - gap_target)
+                score = front_err + back_err + gap_err * gap_penalty
+                if (
+                    score < best_score
+                    or (
+                        score == best_score
+                        and best_pair
+                        and (back_candidate, front_candidate)
+                        > (best_pair[1], best_pair[0])
+                    )
+                ):
+                    best_pair = (front_candidate, back_candidate)
+                    best_score = score
+                if gap_min <= gap <= gap_max:
+                    if (
+                        score < best_valid_score
+                        or (
+                            score == best_valid_score
+                            and best_valid_pair
+                            and (back_candidate, front_candidate)
+                            > (best_valid_pair[1], best_valid_pair[0])
+                        )
+                    ):
+                        best_valid_pair = (front_candidate, back_candidate)
+                        best_valid_score = score
+
+        if best_valid_pair is not None:
+            front_date, back_date = best_valid_pair
+        elif best_pair is not None:
+            front_date, back_date = best_pair
+        else:
+            _calendar_debug_print(
+                "calendar_expiry_candidates no remaining candidates for back leg"
+            )
+            return None
+
+        _calendar_debug_print(
+            f"calendar_expiry_candidates selected front={front_date} back={back_date}"
+        )
+        return front_date, back_date
+
+
+async def _fetch_chain_slice(
+    *,
+    cfg: "RecursionConfig",
+    client,
+    as_of_date: date,
+    as_of_str: str,
+    expiration_date: date,
+    spot: Optional[float],
+    call_put_flag: str,
+    force_otm: bool = False,
+    ) -> Optional[ChainSlice]:
+    expiration_str = expiration_date.strftime("%Y-%m-%d")
+    extra = f"{cfg.ticker} exp={expiration_str} as_of={as_of_str} call_put={call_put_flag}"
+    with _calendar_timing("pull_option_chain_data", extra=extra):
+        call_data, put_data, call_opts, put_opts, strike_range = await pull_option_chain_data(
+            ticker=cfg.ticker,
+            call_put=call_put_flag,
+            expiration_str=expiration_str,
+            as_of_str=as_of_str,
+            close_price=spot,
+            client=client,
+            force_otm=force_otm,
+            force_update=False,
+            fetch_prices=True,
+            expiry_window_days=14,
+        )
+    # Determine effective expiration selected by pull_option_chain_data (may differ from requested)
+    eff_exp_debug = None
+    try:
+        if call_opts:
+            eff_exp_debug = str(call_opts[0].get("expiration_date") or "")
+        elif put_opts:
+            eff_exp_debug = str(put_opts[0].get("expiration_date") or "")
+    except Exception:
+        eff_exp_debug = None
+    try:
+        print(
+            f"[CAL-DEBUG] slice {cfg.ticker} exp={eff_exp_debug or expiration_str} as_of={as_of_str} "
+            f"calls_valid={len(call_data) if call_data else 0} calls_total={len(call_opts) if call_opts else 0} "
+            f"puts_valid={len(put_data) if put_data else 0} puts_total={len(put_opts) if put_opts else 0}"
+        )
+    except Exception:
+        pass
+
+    if not call_data and not put_data:
+        print(f"[WARN] No option pricing data for {cfg.ticker} on {as_of_str} exp={expiration_str}")
+        print(f"Option contracts fetched: calls={len(call_opts) if call_opts else 0}, puts={len(put_opts) if put_opts else 0}")
+        return None
+    # Use effective expiration actually returned by the chain (range fallback may adjust it)
+    effective_exp_s = expiration_str
+    try:
+        if call_opts:
+            es = call_opts[0].get("expiration_date")
+            if es:
+                effective_exp_s = str(es)
+        elif put_opts:
+            es = put_opts[0].get("expiration_date")
+            if es:
+                effective_exp_s = str(es)
+    except Exception:
+        pass
+    try:
+        effective_exp_d = datetime.strptime(effective_exp_s, "%Y-%m-%d").date()
+    except Exception:
+        effective_exp_d = expiration_date
+
+    dte = max(0, (effective_exp_d - as_of_date).days)
+    return ChainSlice(
+        expiration=effective_exp_s,
+        expiration_date=effective_exp_d,
+        days_to_expire=dte,
+        call_data=list(call_data or []),
+        put_data=list(put_data or []),
+        call_options=list(call_opts or []),
+        put_options=list(put_opts or []),
+        strike_range=strike_range,
+    )
+
+
+def _slice_has_needed_data(slice_obj: Optional[ChainSlice], call_put_flag: str) -> bool:
+    if not slice_obj:
+        return False
+    need_call = "call" in (call_put_flag or "")
+    need_put = "put" in (call_put_flag or "")
+    if need_call and not slice_obj.has_calls:
+        return False
+    if need_put and not slice_obj.has_puts:
+        return False
+    return True
+
+
+async def _find_chain_slice_near(
+    *,
+    cfg: "RecursionConfig",
+    client,
+    as_of_date: date,
+    as_of_str: str,
+    spot: float,
+    call_put_flag: str,
+    target_date: date,
+    min_expiration_date: Optional[date] = None,
+    max_horizon_days: int = 365,
+    neighbor_window_days: int = 10,
+    dte_ratio_low: float = 0.7,
+    dte_ratio_high: float = 1.3,
+    dte_tolerance_days: int = 5,
+) -> Optional[ChainSlice]:
+    """Search nearby target_date for the closest expiration that has chain data.
+
+    We enumerate calendar expiries (target weekday) out to ``max_horizon_days`` and
+    try candidates in order of increasing |candidate - target_date| distance,
+    honoring ``min_expiration_date`` when provided (e.g., back leg after front).
+    """
+    extra = (
+        f"{cfg.ticker} as_of={as_of_date} target={target_date} "
+        f"call_put={call_put_flag} min_exp={min_expiration_date}"
+    )
+    with _calendar_timing("find_chain_slice_near", extra=extra):
+        # 1) Start with scheduled expiries (Friday/Wed cadence)
+        expiries = _list_expiries_compat(
+            weekday=cfg.expiring_weekday,
+            start_date=as_of_date,
+            end_date=as_of_date + timedelta(days=max_horizon_days),
+            ticker=cfg.ticker,
+        )
+        cal_candidates = [dt.date() for dt in expiries if dt.date() > as_of_date]
+
+        # 2) Add a local neighborhood around the target date (to catch non-standard expiries
+        #    like end-of-month Wednesday expirations such as 2025-12-31)
+        neighbors: List[date] = []
+        for offset in range(-neighbor_window_days, neighbor_window_days + 1):
+            cand = target_date + timedelta(days=offset)
+            if cand <= as_of_date:
+                continue
+            neighbors.append(cand)
+
+        # Merge and filter
+        merged: List[date] = []
+        seen = set()
+        for d in cal_candidates + neighbors:
+            if min_expiration_date is not None and d <= min_expiration_date:
+                continue
+            if d not in seen:
+                seen.add(d)
+                merged.append(d)
+
+        if not merged:
+            _calendar_debug_print("find_chain_slice_near no merged expiries")
+            return None
+
+        # Sort by distance from the requested target_date, earlier gets tie-break
+        def _key(d: date):
+            return (abs((d - target_date).days), (d - target_date).days)
+
+        merged.sort(key=_key)
+
+        # Target DTE used to bound acceptable candidates around the intended tenor
+        try:
+            target_dte = max(1, (target_date - as_of_date).days)
+        except Exception:
+            target_dte = 1
+
+        _calendar_debug_print(
+            f"find_chain_slice_near candidates={len(merged)} target_dte={target_dte}"
+        )
+
+        # Probe in ranked order until we find a date with usable chain data
+        for cand in merged:
+            # Enforce DTE window relative to target (avoid falling back to very short-dated expiries)
+            try:
+                dte_cand = max(0, (cand - as_of_date).days)
+            except Exception:
+                dte_cand = 0
+            low_bound = int(target_dte * dte_ratio_low)
+            high_bound = int(target_dte * dte_ratio_high)
+            if dte_cand < low_bound or dte_cand > max(high_bound, low_bound + 1):
+                continue
+            if abs(dte_cand - target_dte) > max(0, int(dte_tolerance_days)):
+                print(f"Skipping candidate {cand} due to DTE mismatch: {dte_cand} vs {target_dte}")
+                breakpoint()
+                continue
+            sl = await _fetch_chain_slice(
+                cfg=cfg,
+                client=client,
+                as_of_date=as_of_date,
+                as_of_str=as_of_str,
+                expiration_date=cand,
+                spot=spot,
+                call_put_flag=call_put_flag,
+                force_otm=False,
+            )
+            if _slice_has_needed_data(sl, call_put_flag):
+                try:
+                    if getattr(get_settings(), "debug_calendar_data", False):
+                        print(
+                            f"[DBG-CALENDAR] adjusted expiry near {target_date} -> {cand} "
+                            f"(calls={len(sl.call_data)}, puts={len(sl.put_data)}, dte={dte_cand}, "
+                            f"target_dte={target_dte})"
+                        )
+                except Exception:
+                    pass
+                return sl
+            else:
+                _calendar_debug_print(
+                    f"find_chain_slice_near rejected candidate={cand} dte={dte_cand}"
+                )
+        return None
+
+
+async def load_calendar_chain_bundle(
+    *,
+    cfg: "RecursionConfig",
+    as_of_date: date,
+    as_of_str: str,
+    spot: Optional[float],
+    client,
+    call_put_flag: str = "call_put_both",
+) -> Optional[CalendarChainBundle]:
+    if spot is None:
+        print(f"[WARN] No spot price for {cfg.ticker} on {as_of_str}")
+        return None
+    front_target, back_target = _calendar_dte_targets(cfg)
+    expiries = _calendar_expiry_candidates(
+        as_of=as_of_date,
+        weekday=cfg.expiring_weekday,
+        front_target=front_target,
+        back_target=back_target,
+        ticker=cfg.ticker,
+    )
+    if not expiries:
+        print(f"[WARN] No expiries found for {cfg.ticker} on {as_of_str}")
+        return None
+    front_date, back_date = expiries
+    print(f"[DEBUG] {cfg.ticker} {as_of_str} calendar expiries: front={front_date}, back={back_date}")
+
+    settings = get_settings()
+    dte_tolerance = max(0, int(getattr(settings, "calendar_dte_tolerance_days", 5)))
+
+    front_slice, back_slice = await asyncio.gather(
+        _fetch_chain_slice(
+            cfg=cfg,
+            client=client,
+            as_of_date=as_of_date,
+            as_of_str=as_of_str,
+            expiration_date=front_date,
+            spot=spot,
+            call_put_flag=call_put_flag,
+            force_otm=False,
+        ),
+        _fetch_chain_slice(
+            cfg=cfg,
+            client=client,
+            as_of_date=as_of_date,
+            as_of_str=as_of_str,
+            expiration_date=back_date,
+            spot=spot,
+            call_put_flag=call_put_flag,
+            force_otm=False,
+        ),
+    )
+
+    if front_slice and abs(front_slice.days_to_expire - front_target) > dte_tolerance:
+        front_slice = None
+    if back_slice and abs(back_slice.days_to_expire - back_target) > dte_tolerance:
+        back_slice = None
+    
+    if front_slice is None or back_slice is None:
+        print(f"[DEBUG] {cfg.ticker} {as_of_str} initial slices: front={'found' if front_slice else 'missing'}, back={'found' if back_slice else 'missing'}")
+        breakpoint()
+
+    # If either leg lacks data, adjust to the closest available expiration
+    need_call = "call" in (call_put_flag or "")
+    need_put = "put" in (call_put_flag or "")
+    have_front = _slice_has_needed_data(front_slice, call_put_flag)
+    if not have_front:
+        front_slice = await _find_chain_slice_near(
+            cfg=cfg,
+            client=client,
+            as_of_date=as_of_date,
+            as_of_str=as_of_str,
+            spot=float(spot),
+            call_put_flag=call_put_flag,
+            target_date=front_date,
+            min_expiration_date=None,
+            dte_tolerance_days=dte_tolerance,
+        )
+
+
+    have_back = _slice_has_needed_data(back_slice, call_put_flag)
+    # Ensure back > front if front resolved
+    min_back = (front_slice.expiration_date if front_slice else None)
+    if not have_back:
+        back_slice = await _find_chain_slice_near(
+            cfg=cfg,
+            client=client,
+            as_of_date=as_of_date,
+            as_of_str=as_of_str,
+            spot=float(spot),
+            call_put_flag=call_put_flag,
+            target_date=back_date,
+            min_expiration_date=min_back,
+            dte_tolerance_days=dte_tolerance,
+        )
+
+    if not _slice_has_needed_data(front_slice, call_put_flag) or not _slice_has_needed_data(back_slice, call_put_flag):
+        return None
+    bundle = CalendarChainBundle(
+        ticker=cfg.ticker,
+        as_of=as_of_str,
+        as_of_date=as_of_date,
+        spot=float(spot),
+        targets=(front_target, back_target),
+        weekday=cfg.expiring_weekday,
+        front=front_slice,
+        back=back_slice,
+    )
+
+    settings = get_settings()
+    if getattr(settings, "debug_calendar_data", False):
+        print(
+            f"[DBG-CALENDAR] {cfg.ticker} {as_of_str} front={front_slice.expiration} "
+            f"(dte={front_slice.days_to_expire}, calls={len(front_slice.call_data)}, puts={len(front_slice.put_data)}) "
+            f"back={back_slice.expiration} (dte={back_slice.days_to_expire}, calls={len(back_slice.call_data)}, puts={len(back_slice.put_data)})"
+        )
+
+    return bundle
+
+
+def catalog_chain_slice(slice_obj: ChainSlice) -> Dict[str, Any]:
+    """Convert a :class:`ChainSlice` into a strike-indexed lookup for quick access."""
+
+    def _catalog(options: List[Dict[str, Any]], quotes: List[Dict[str, Any]]) -> Dict[float, Dict[str, Any]]:
+        out: Dict[float, Dict[str, Any]] = {}
+        for meta, quote in zip(options or [], quotes or []):
+            if not isinstance(meta, dict) or not isinstance(quote, dict):
+                continue
+            try:
+                strike = float(meta.get("strike_price"))
+            except Exception:
+                continue
+            merged = {"meta": dict(meta), "quote": dict(quote)}
+            out[strike] = merged
+        return out
+
+    return {
+        "expiration": slice_obj.expiration,
+        "days_to_expire": slice_obj.days_to_expire,
+        "calls": _catalog(slice_obj.call_options, slice_obj.call_data),
+        "puts": _catalog(slice_obj.put_options, slice_obj.put_data),
+        "strike_range": slice_obj.strike_range,
+    }
+
+
+def catalog_calendar_bundle(bundle: CalendarChainBundle) -> Dict[str, Any]:
+    """Build a normalized dictionary of prices for front/back expirations."""
+
+    return {
+        "ticker": bundle.ticker,
+        "as_of": bundle.as_of,
+        "spot": bundle.spot,
+        "targets": bundle.targets,
+        "weekday": bundle.weekday,
+        "front": catalog_chain_slice(bundle.front),
+        "back": catalog_chain_slice(bundle.back),
+    }
+
+
 # Daily loop (async) — main worker
 # -------------------------------
 
@@ -513,7 +1197,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
     except Exception as e:
         print(f"[DEBUG] preload skipped for {cfg.ticker}: {e}")
     s = get_settings()
-    premium_field = PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
+    premium_field = resolve_premium_field(s)
 
     # 0) Prep: underlying history (for spot/MA/vol, same as your original)
     hist = get_historical_prices(
@@ -616,13 +1300,14 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             # ---- Close expirations first to free margin and measure today's loss
             aggregated_put_loss_pts: float = 0.0
             still_open_pre: List[Dict[str, Any]] = []
-            for p in list(open_positions):
-                try:
-                    exp_dt = p.get("expiration")
-                    if isinstance(exp_dt, str):
-                        exp_dt = datetime.strptime(exp_dt, "%Y-%m-%d").date()
-                except Exception:
-                    exp_dt = None
+            with _backtest_timing("close_positions", extra=as_of_str):
+                for p in list(open_positions):
+                    try:
+                        exp_dt = p.get("expiration")
+                        if isinstance(exp_dt, str):
+                            exp_dt = datetime.strptime(exp_dt, "%Y-%m-%d").date()
+                    except Exception:
+                        exp_dt = None
 
                 if exp_dt is None or exp_dt > cur:
                     still_open_pre.append(p)
@@ -711,9 +1396,10 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             # 3a) Choose a single target expiration (Friday/Wed cadence), with longer DTE in make-up mode
             print(f"[DEBUG] computing expiries for as_of={as_of_str}")
             weeks_for_new = int(cfg.expiring_wks) * (2 if make_up_mode else 1)
-            target_dt = _target_expiry_compat(
-                weekday=cfg.expiring_weekday, as_of=cur, weeks=weeks_for_new
-            )
+            with _backtest_timing("expiry_selection", extra=as_of_str):
+                target_dt = _target_expiry_compat(
+                    weekday=cfg.expiring_weekday, as_of=cur, weeks=weeks_for_new
+                )
             if not target_dt:
                 cur += timedelta(days=1)
                 continue
@@ -738,18 +1424,19 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 print(
                     f"[DEBUG] pulling option chain: expiry={expiration_str}, as_of={as_of_str}, side={call_put_flag}"
                 )
-                call_data, put_data, call_opts, put_opts, strike_range = (
-                    await pull_option_chain_data(
-                        ticker=cfg.ticker,
-                        call_put=call_put_flag,
-                        expiration_str=expiration_str,
-                        as_of_str=as_of_str,
-                        close_price=spot,
-                        client=client,
-                        force_otm=False,
-                        force_update=False,
+                with _backtest_timing("pull_chain", extra=f"{as_of_str} {expiration_str}"):
+                    call_data, put_data, call_opts, put_opts, strike_range = (
+                        await pull_option_chain_data(
+                            ticker=cfg.ticker,
+                            call_put=call_put_flag,
+                            expiration_str=expiration_str,
+                            as_of_str=as_of_str,
+                            close_price=spot,
+                            client=client,
+                            force_otm=False,
+                            force_update=False,
+                        )
                     )
-                )
                 print(
                     f"[DEBUG] chain pulled: calls={len(call_data) if call_data else 0}, puts={len(put_data) if put_data else 0}, strike_range={strike_range}"
                 )
@@ -864,9 +1551,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 try:
                     # settings decide which premium field to read from the data array
                     s = get_settings()
-                    premium_field = PREMIUM_FIELD_MAP.get(
-                        s.premium_price_mode, "trade_price"
-                    )
+                    premium_field = resolve_premium_field(s)
 
                     # Build call candidates (used for strategies needing calls)
                     call_candidates: List[Dict[str, Any]] = []
@@ -1085,113 +1770,114 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                         build_kwargs["long_put"] = (float(lp_k), float(lp_p))
 
                     # Strategy may raise if a required leg is missing; guard as you did before
-                    try:
-                        # Estimate per-position credit and margin
-                        credit_dollars = 0.0
+                    with _backtest_timing("build_positions", extra=as_of_str):
                         try:
-                            if sp_p is not None and lp_p is not None:
-                                credit_dollars = max(0.0, (float(sp_p) - float(lp_p)) * 100.0)
-                        except Exception:
+                            # Estimate per-position credit and margin
                             credit_dollars = 0.0
-                        margin_one = 0.0
-                        try:
-                            if sp_k is not None and lp_k is not None:
-                                margin_one = max(0.0, (float(sp_k) - float(lp_k)) * 100.0)
-                        except Exception:
+                            try:
+                                if sp_p is not None and lp_p is not None:
+                                    credit_dollars = max(0.0, (float(sp_p) - float(lp_p)) * 100.0)
+                            except Exception:
+                                credit_dollars = 0.0
                             margin_one = 0.0
-                        # Include per-position quantity in margin sizing
-                        try:
-                            margin_one *= max(1, int(build_kwargs.get("qty", 1)))
-                        except Exception:
-                            pass
-
-                        # Capital-aware: open enough to pursue recovery if in make-up mode
-                        opens_to_make = int(counter_max) if counter_max is not None else 1
-
-                        available_capital = float(get_settings().initial_capital) + float(realized_total)
-                        # recompute lightweight current used margin snapshot
-                        cur_used_margin = 0.0
-                        for p0 in open_positions:
                             try:
-                                if p0.get("put_strike_sold") is not None and p0.get("put_strike_bought") is not None and not p0.get("put_closed_by_stop", False):
-                                    q = 1
-                                    try:
-                                        q = max(1, int(p0.get("qty", 1)))
-                                    except Exception:
+                                if sp_k is not None and lp_k is not None:
+                                    margin_one = max(0.0, (float(sp_k) - float(lp_k)) * 100.0)
+                            except Exception:
+                                margin_one = 0.0
+                            # Include per-position quantity in margin sizing
+                            try:
+                                margin_one *= max(1, int(build_kwargs.get("qty", 1)))
+                            except Exception:
+                                pass
+
+                            # Capital-aware: open enough to pursue recovery if in make-up mode
+                            opens_to_make = int(counter_max) if counter_max is not None else 1
+
+                            available_capital = float(get_settings().initial_capital) + float(realized_total)
+                            # recompute lightweight current used margin snapshot
+                            cur_used_margin = 0.0
+                            for p0 in open_positions:
+                                try:
+                                    if p0.get("put_strike_sold") is not None and p0.get("put_strike_bought") is not None and not p0.get("put_closed_by_stop", False):
                                         q = 1
-                                    cur_used_margin += 100.0 * (float(p0["put_strike_sold"]) - float(p0["put_strike_bought"])) * q
-                            except Exception:
-                                pass
+                                        try:
+                                            q = max(1, int(p0.get("qty", 1)))
+                                        except Exception:
+                                            q = 1
+                                        cur_used_margin += 100.0 * (float(p0["put_strike_sold"]) - float(p0["put_strike_bought"])) * q
+                                except Exception:
+                                    pass
 
-                        if make_up_mode and credit_dollars > 0 and margin_one > 0:
-                            remaining_loss_dollars = max(0.0, float(aggregated_put_loss_pts) * 100.0)
-                            max_by_cap = int(max(0.0, (0.5 * available_capital - cur_used_margin)) // margin_one)
-                            needed_n = int(max(1, math.ceil(remaining_loss_dollars / credit_dollars)))
-                            opens_to_make = max(1, min(max_by_cap, needed_n))
-                        else:
-                            # If no slots determined but margin is light, open one
-                            if opens_to_make <= 0 and cur_used_margin < available_capital * 0.25:
-                                opens_to_make = 1
-                            opens_to_make = max(0, opens_to_make)
-                            # Always respect the 50% capital cap even in normal mode
-                            if margin_one > 0:
-                                max_by_cap_n = int(max(0.0, (0.5 * available_capital - cur_used_margin)) // margin_one)
-                                opens_to_make = min(opens_to_make, max_by_cap_n)
+                            if make_up_mode and credit_dollars > 0 and margin_one > 0:
+                                remaining_loss_dollars = max(0.0, float(aggregated_put_loss_pts) * 100.0)
+                                max_by_cap = int(max(0.0, (0.5 * available_capital - cur_used_margin)) // margin_one)
+                                needed_n = int(max(1, math.ceil(remaining_loss_dollars / credit_dollars)))
+                                opens_to_make = max(1, min(max_by_cap, needed_n))
+                            else:
+                                # If no slots determined but margin is light, open one
+                                if opens_to_make <= 0 and cur_used_margin < available_capital * 0.25:
+                                    opens_to_make = 1
+                                opens_to_make = max(0, opens_to_make)
+                                # Always respect the 50% capital cap even in normal mode
+                                if margin_one > 0:
+                                    max_by_cap_n = int(max(0.0, (0.5 * available_capital - cur_used_margin)) // margin_one)
+                                    opens_to_make = min(opens_to_make, max_by_cap_n)
 
-                        for _ in range(opens_to_make):
-                            position = strat.build_position(**build_kwargs).to_dict()
-                            # Enrich with open-distance and target info for plotting/debug parity
-                            try:
-                                if spot is not None:
-                                    if have_short_put and sp_k is not None:
-                                        position["open_distance_put"] = round((float(spot) - float(sp_k)) / float(spot), 4)
-                                    if 'sc_k' in locals() and have_short_call and sc_k is not None:
-                                        position["open_distance_call"] = round((float(sc_k) - float(spot)) / float(spot), 4)
-                            except Exception:
-                                pass
-                            try:
-                                # store target info if available (used by plot for target premiums)
-                                put_tgt_val = target_price if 'target_price' in locals() else None
-                                if put_tgt_val is not None:
-                                    position["strike_target_put"] = {"premium_target": float(put_tgt_val)}
-                            except Exception:
-                                pass
+                            for _ in range(opens_to_make):
+                                position = strat.build_position(**build_kwargs).to_dict()
+                                # Enrich with open-distance and target info for plotting/debug parity
+                                try:
+                                    if spot is not None:
+                                        if have_short_put and sp_k is not None:
+                                            position["open_distance_put"] = round((float(spot) - float(sp_k)) / float(spot), 4)
+                                        if 'sc_k' in locals() and have_short_call and sc_k is not None:
+                                            position["open_distance_call"] = round((float(sc_k) - float(spot)) / float(spot), 4)
+                                except Exception:
+                                    pass
+                                try:
+                                    # store target info if available (used by plot for target premiums)
+                                    put_tgt_val = target_price if 'target_price' in locals() else None
+                                    if put_tgt_val is not None:
+                                        position["strike_target_put"] = {"premium_target": float(put_tgt_val)}
+                                except Exception:
+                                    pass
 
-                            # Capture leg-level IVs for plotting diagnostics
-                            try:
-                                if have_short_put and sp_k is not None and sp_p is not None:
-                                    iv_put_leg = _compute_leg_iv(
-                                        spot=spot,
-                                        strike=sp_k,
-                                        premium=sp_p,
-                                        days_to_expire=days_to_expire_int,
-                                        option_type="put",
-                                    )
-                                    if iv_put_leg is not None:
-                                        position["iv_put"] = iv_put_leg
-                                        iv_put_samples.append(iv_put_leg)
-                                if have_short_call and sc_k is not None and sc_p is not None:
-                                    iv_call_leg = _compute_leg_iv(
-                                        spot=spot,
-                                        strike=sc_k,
-                                        premium=sc_p,
-                                        days_to_expire=days_to_expire_int,
-                                        option_type="call",
-                                    )
-                                    if iv_call_leg is not None:
-                                        position["iv_call"] = iv_call_leg
-                                        iv_call_samples.append(iv_call_leg)
-                            except Exception:
-                                pass
+                                # Capture leg-level IVs for plotting diagnostics
+                                try:
+                                    if have_short_put and sp_k is not None and sp_p is not None:
+                                        iv_put_leg = _compute_leg_iv(
+                                            spot=spot,
+                                            strike=sp_k,
+                                            premium=sp_p,
+                                            days_to_expire=days_to_expire_int,
+                                            option_type="put",
+                                        )
+                                        if iv_put_leg is not None:
+                                            position["iv_put"] = iv_put_leg
+                                            iv_put_samples.append(iv_put_leg)
+                                    if have_short_call and sc_k is not None and sc_p is not None:
+                                        iv_call_leg = _compute_leg_iv(
+                                            spot=spot,
+                                            strike=sc_k,
+                                            premium=sc_p,
+                                            days_to_expire=days_to_expire_int,
+                                            option_type="call",
+                                        )
+                                        if iv_call_leg is not None:
+                                            position["iv_call"] = iv_call_leg
+                                            iv_call_samples.append(iv_call_leg)
+                                except Exception:
+                                    pass
 
-                            daily_positions.append(position)
-                            positions_built_now.append(position)
-                            dbg.positions_built += 1
-                            # Track cumulative used margin within this open pass
-                            cur_used_margin += margin_one
-                    except Exception as e:
-                        # skip this date/expiry if legs incomplete
-                        position = None
+                                daily_positions.append(position)
+                                positions_built_now.append(position)
+                                dbg.positions_built += 1
+                                # Track cumulative used margin within this open pass
+                                cur_used_margin += margin_one
+                        except Exception as e:
+                            # skip this date/expiry if legs incomplete
+                            position = None
 
             # ========== PASTE BLOCK 2: P&L / EXIT / ACCOUNTING (unchanged) ==========
             # Here paste your existing code that:
@@ -1210,9 +1896,7 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
             # --- Early exit & MTM logic (inspired by polygonio_dailytrade.py) ---
             # Normalize convenience
             t = cfg.ticker.upper()
-            premium_field = PREMIUM_FIELD_MAP.get(
-                get_settings().premium_price_mode, "trade_price"
-            )
+            premium_field = resolve_premium_field(get_settings())
 
             def _get_price_from_store(side: str, strike: float, exp_s: str) -> float | None:
                 try:
@@ -1639,23 +2323,24 @@ async def backtest_options_sync_or_async(cfg: RecursionConfig) -> Dict[str, Any]
                 )
 
             # bookkeeping row
-            pnl_row = {
-                "as_of": as_of_str,
-                "expiration": expiration_str,
-                "trade_type": cfg.trade_type,
-                "underlying": cfg.ticker,
-                "qty": cfg.contract_qty,
-                "spot": spot,
-                "open_positions": len(open_positions),
-                "cumulative_pnl_realized": round(realized_total, 2),
-                "unrealized_total": round(unrealized_total, 2),
-                "cumulative_pnl": round(realized_total + unrealized_total, 2),
-                "required_margin": round(required_margin, 2),
-            }
+            with _backtest_timing("pnl_update", extra=as_of_str):
+                pnl_row = {
+                    "as_of": as_of_str,
+                    "expiration": expiration_str,
+                    "trade_type": cfg.trade_type,
+                    "underlying": cfg.ticker,
+                    "qty": cfg.contract_qty,
+                    "spot": spot,
+                    "open_positions": len(open_positions),
+                    "cumulative_pnl_realized": round(realized_total, 2),
+                    "unrealized_total": round(unrealized_total, 2),
+                    "cumulative_pnl": round(realized_total + unrealized_total, 2),
+                    "required_margin": round(required_margin, 2),
+                }
 
-            print(f"[DEBUG] PnL {pnl_row}")
+                print(f"[DEBUG] PnL {pnl_row}")
 
-            daily_pnls.append(pnl_row)
+                daily_pnls.append(pnl_row)
             # <--- END YOUR P&L / EXIT LOGIC
             # <--- END YOUR P&L / EXIT LOGIC
             # =================================================================

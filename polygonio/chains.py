@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from functools import lru_cache
 from typing import Dict, Any, Optional, Tuple, Iterable
 
 import asyncio
 
-from .config import get_settings, PREMIUM_FIELD_MAP
+from .config import get_settings, resolve_premium_field
 from .cache_io import load_stored_option_data, stored_option_chain, stored_option_price
 from .poly_client import PolygonAPIClient
 
@@ -29,8 +29,122 @@ def _ds(d: str | date | None) -> Optional[str]:
 
 
 def _price_field() -> str:
-    mode = (get_settings().premium_price_mode or "mid").lower()
-    return PREMIUM_FIELD_MAP.get(mode, "mid_price")
+    return resolve_premium_field(get_settings())
+
+
+def _target_timestamp_ns(as_of_str: str) -> tuple[Optional[int], Optional[int]]:
+    settings = get_settings()
+    win = max(1, int(getattr(settings, "premium_time_window_secs", 60)))
+    target_str = getattr(settings, "premium_time_target", "12:30:00") or "12:30:00"
+
+    try:
+        target_time = time.fromisoformat(target_str)
+    except ValueError:
+        parts = [int(part) for part in target_str.replace(" ", "").split(":") if part]
+        while len(parts) < 3:
+            parts.append(0)
+        try:
+            target_time = time(parts[0], parts[1], parts[2])
+        except Exception:
+            target_time = time(12, 30, 0)
+
+    try:
+        if len(as_of_str) > 10:
+            dt_target = datetime.strptime(as_of_str, "%Y-%m-%d %H:%M:%S")
+        else:
+            base_date = datetime.strptime(as_of_str, "%Y-%m-%d")
+            dt_target = datetime.combine(base_date.date(), target_time)
+    except Exception:
+        return None, None
+
+    target_ns = int(dt_target.timestamp() * 1_000_000_000)
+    window_ns = win * 1_000_000_000
+    return target_ns, window_ns
+
+
+def _timestamp_matches_window(
+    *,
+    as_of_str: str,
+    payload: Dict[str, Any],
+    premium_field: str,
+) -> bool:
+    """Return True if *payload* falls within the configured premium time window."""
+
+    if premium_field == "close_price":
+        # Close price does not have an intraday timestamp requirement
+        return premium_field in payload and payload.get(premium_field) is not None
+
+    if not isinstance(payload, dict):
+        return False
+
+    ts = payload.get("sip_timestamp")
+    if ts is None and premium_field == "trade_price":
+        ts = payload.get("target_timestamp")
+
+    try:
+        ts_val = int(ts)
+    except (TypeError, ValueError):
+        return False
+
+    if ts_val <= 0:
+        return False
+
+    target_ns, window_ns = _target_timestamp_ns(as_of_str)
+    if target_ns is None or window_ns is None:
+        return False
+
+    return target_ns - window_ns <= ts_val <= target_ns + window_ns
+
+
+def _cached_price_usable(
+    *,
+    data: Dict[str, Any] | None,
+    premium_field: str,
+    as_of_str: str,
+) -> bool:
+    if not isinstance(data, dict):
+        return False
+    value = data.get(premium_field)
+    try:
+        if value is None or float(value) <= 0.0:
+            return False
+    except Exception:
+        return False
+    return _timestamp_matches_window(as_of_str=as_of_str, payload=data, premium_field=premium_field)
+
+
+def _should_skip_fetch_due_to_invalid(
+    *,
+    data: Dict[str, Any] | None,
+    premium_field: str,
+    as_of_str: str,
+) -> bool:
+    if not isinstance(data, dict):
+        return False
+
+    target_ns, _ = _target_timestamp_ns(as_of_str)
+    if target_ns is None:
+        return False
+
+    try:
+        marker_ns = int(data.get("target_timestamp") or 0)
+    except (TypeError, ValueError):
+        marker_ns = 0
+
+    if marker_ns != target_ns:
+        return False
+
+    try:
+        val = data.get(premium_field)
+        if val is None or float(val) <= 0.0:
+            return True
+    except Exception:
+        return True
+
+    if premium_field == "trade_price" and int(data.get("trade_size") or 0) == 0:
+        return True
+
+    return False
 
 
 FALLBACK_MAX_WEEKS = 5
@@ -265,6 +379,9 @@ def get_option_chain_for_date(
 # -----------------------------------------------------------------------------
 # Legacy-compatible async API
 # -----------------------------------------------------------------------------
+from datetime import datetime, timedelta
+
+
 async def pull_option_chain_data(
     ticker: str,
     call_put: str,
@@ -275,6 +392,8 @@ async def pull_option_chain_data(
     client=None,
     force_otm: bool = False,
     force_update: bool = False,
+    fetch_prices: bool = False,
+    expiry_window_days: int = 0,
 ):
     """
     Legacy-compatible wrapper used by pricing/recursive_backtest.
@@ -300,6 +419,37 @@ async def pull_option_chain_data(
     call_syms: Dict[float, str] = {}
     put_syms: Dict[float, str] = {}
     bucket: Dict[str, Any] = {}
+    as_of_date: Optional[date] = None
+
+    def _parse_date_safe(val: Optional[str]) -> Optional[date]:
+        if not val:
+            return None
+        try:
+            return datetime.strptime(val, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    try:
+        as_of_key = as_of_str[:10] if as_of_str and len(as_of_str) >= 10 else as_of_str
+        as_of_date = _parse_date_safe(as_of_key)
+    except Exception:
+        as_of_date = None
+
+    def _expiration_before_as_of(expiration_s: Optional[str]) -> bool:
+        if not as_of_date:
+            return False
+        exp_date = _parse_date_safe(expiration_s)
+        return bool(exp_date and exp_date < as_of_date)
+
+    if _expiration_before_as_of(expiration_str):
+        try:
+            print(
+                f"[CHAINS-DEBUG] Skipping expired chain {ticker} exp={expiration_str} as_of={as_of_str} "
+                f"need_calls={need_calls} need_puts={need_puts}"
+            )
+        except Exception:
+            pass
+        return [], [], [], [], None
 
     if client is not None:
         reqs = []
@@ -321,7 +471,85 @@ async def pull_option_chain_data(
     call_syms = bucket.get("call") or {}
     put_syms  = bucket.get("put") or {}
 
+    # If exact expiry has no symbols and a window is provided, query a date range and select closest expiry
+    if ((need_calls and not call_syms) or (need_puts and not put_syms)) and client is not None and expiry_window_days > 0:
+        try:
+            dt_target = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+            start = (dt_target - timedelta(days=int(expiry_window_days))).strftime("%Y-%m-%d")
+            end = (dt_target + timedelta(days=int(expiry_window_days))).strftime("%Y-%m-%d")
+            calls_by_exp: Dict[str, Dict[float, str]] = {}
+            puts_by_exp: Dict[str, Dict[float, str]] = {}
+            if need_calls:
+                calls_by_exp = await client.get_option_contracts_in_range(
+                    ticker, call_put="call", as_of=as_of_str, exp_start=start, exp_end=end
+                )
+            if need_puts:
+                puts_by_exp = await client.get_option_contracts_in_range(
+                    ticker, call_put="put", as_of=as_of_str, exp_start=start, exp_end=end
+                )
+            # choose the nearest expiry having needed sides
+            def _to_date(s: str):
+                try:
+                    return datetime.strptime(s, "%Y-%m-%d").date()
+                except Exception:
+                    return None
+            target = dt_target
+            exp_candidates = set()
+            if need_calls:
+                exp_candidates |= set(calls_by_exp.keys())
+            if need_puts:
+                exp_candidates &= set(puts_by_exp.keys()) if exp_candidates else set(puts_by_exp.keys())
+            if exp_candidates:
+                best = None
+                chosen_exp = None
+                for exp_s in exp_candidates:
+                    d = _to_date(exp_s)
+                    if not d:
+                        continue
+                    if as_of_date and d < as_of_date:
+                        continue
+                    diff = abs((d - target).days)
+                    if best is None or diff < best:
+                        best = diff
+                        chosen_exp = exp_s
+                if chosen_exp:
+                    if _expiration_before_as_of(chosen_exp):
+                        chosen_exp = None
+                    else:
+                        expiration_str = chosen_exp  # update to chosen expiry
+                        call_syms = calls_by_exp.get(chosen_exp, {}) if need_calls else {}
+                        put_syms = puts_by_exp.get(chosen_exp, {}) if need_puts else {}
+                        # persist to cache under chosen expiry
+                        try:
+                            leaf = (
+                                stored_option_chain
+                                .setdefault(ticker, {})
+                                .setdefault(chosen_exp, {})
+                                .setdefault(as_of_str, {})
+                            )
+                            if need_calls:
+                                leaf["call"] = dict(call_syms)
+                            if need_puts:
+                                leaf["put"] = dict(put_syms)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[CHAINS-DEBUG] range selection failed: {e}")
+
     if (need_calls and not call_syms) or (need_puts and not put_syms):
+        try:
+            avail_exps = list((stored_option_chain.get(ticker, {}) or {}).keys())
+            asof_map = (stored_option_chain.get(ticker, {}).get(expiration_str, {}) or {})
+            asof_keys = list(asof_map.keys()) if isinstance(asof_map, dict) else []
+            print(
+                f"[CHAINS-DEBUG] No chain symbols for {ticker} exp={expiration_str} as_of={as_of_str} "
+                f"need_calls={need_calls} need_puts={need_puts}. "
+                f"available_expirations={len(avail_exps)} sample={avail_exps[:5]} as_of_keys={asof_keys[:5]}"
+            )
+        except Exception:
+            print(
+                f"[CHAINS-DEBUG] No chain symbols for {ticker} exp={expiration_str} as_of={as_of_str} (need_calls={need_calls}, need_puts={need_puts})"
+            )
         return [], [], [], [], None
 
     all_call_strikes = (
@@ -349,6 +577,19 @@ async def pull_option_chain_data(
         )
         if need_puts else []
     )
+
+    # Limit strikes to within +/- 5% of the spot close to avoid polling the entire chain
+    try:
+        if close_price is not None:
+            lo = float(close_price) * 0.95
+            hi = float(close_price) * 1.05
+            if win_call_strikes:
+                win_call_strikes = [float(k) for k in win_call_strikes if lo <= float(k) <= hi]
+            if win_put_strikes:
+                win_put_strikes = [float(k) for k in win_put_strikes if lo <= float(k) <= hi]
+    except Exception:
+        # If filtering fails for any reason, keep the original windows
+        pass
 
     strike_range: Optional[Dict[str, Dict[str, float]]] = {}
     if need_calls and all_call_strikes:
@@ -385,8 +626,18 @@ async def pull_option_chain_data(
     for i, opt in enumerate(call_opts):
         strike = opt["strike_price"]
         data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("call", {})
-        if not force_update and data and pf in data:
+        use_cached = (
+            not force_update
+            and _cached_price_usable(data=data, premium_field=pf, as_of_str=as_of_str)
+        )
+        skip_fetch = (
+            not force_update
+            and _should_skip_fetch_due_to_invalid(data=data, premium_field=pf, as_of_str=as_of_str)
+        )
+        if use_cached:
             all_call_data.append(data)
+        elif skip_fetch:
+            all_call_data.append(data or {})
         else:
             all_call_data.append(None)
             if need_calls:
@@ -402,8 +653,18 @@ async def pull_option_chain_data(
     for i, opt in enumerate(put_opts):
         strike = opt["strike_price"]
         data = pf_bucket.get(strike, {}).get(expiration_str, {}).get("put", {})
-        if not force_update and data and pf in data:
+        use_cached = (
+            not force_update
+            and _cached_price_usable(data=data, premium_field=pf, as_of_str=as_of_str)
+        )
+        skip_fetch = (
+            not force_update
+            and _should_skip_fetch_due_to_invalid(data=data, premium_field=pf, as_of_str=as_of_str)
+        )
+        if use_cached:
             all_put_data.append(data)
+        elif skip_fetch:
+            all_put_data.append(data or {})
         else:
             all_put_data.append(None)
             if need_puts:
@@ -417,13 +678,24 @@ async def pull_option_chain_data(
                 put_missing_idx.append(i)
 
     fetch_needed = False
-    if force_update:
-        fetch_needed = bool(reqs)
-    else:
-        if call_opts and len(call_missing_idx) > 0.1 * len(call_opts):
-            fetch_needed = True
-        if put_opts and len(put_missing_idx) > 0.1 * len(put_opts):
-            fetch_needed = True
+    if fetch_prices:
+        if force_update:
+            fetch_needed = bool(reqs)
+        else:
+            if call_opts and len(call_missing_idx) > 0.1 * len(call_opts):
+                fetch_needed = True
+            if put_opts and len(put_missing_idx) > 0.1 * len(put_opts):
+                fetch_needed = True
+
+    try:
+        print(
+            f"[CHAINS-DEBUG] Pricing cache summary exp={expiration_str} as_of={as_of_str} "
+            f"call_opts={len(call_opts)} cached_calls={len(call_opts)-len(call_missing_idx)} missing_calls={len(call_missing_idx)} "
+            f"put_opts={len(put_opts)} cached_puts={len(put_opts)-len(put_missing_idx)} missing_puts={len(put_missing_idx)} "
+            f"fetch_needed={fetch_needed}"
+        )
+    except Exception:
+        pass
 
     if fetch_needed and reqs and client is not None:
         try:
@@ -446,6 +718,20 @@ async def pull_option_chain_data(
 
     call_filtered = [(opt, prem) for opt, prem in zip(call_opts, all_call_data) if _valid(prem)]
     put_filtered = [(opt, prem) for opt, prem in zip(put_opts, all_put_data) if _valid(prem)]
+
+    if not call_filtered and not put_filtered:
+        try:
+            missing_calls = sum(1 for d in all_call_data if not _valid(d)) if all_call_data else 0
+            missing_puts = sum(1 for d in all_put_data if not _valid(d)) if all_put_data else 0
+            print(
+                f"[CHAINS-DEBUG] No valid premiums for {ticker} exp={expiration_str} as_of={as_of_str}. "
+                f"call_opts={len(call_opts)} invalid_calls={missing_calls} put_opts={len(put_opts)} invalid_puts={missing_puts} "
+                f"pf={pf}. Consider enabling force_update or checking cache."
+            )
+        except Exception:
+            print(
+                f"[CHAINS-DEBUG] No valid premiums for {ticker} exp={expiration_str} as_of={as_of_str}."
+            )
 
     call_opts, all_call_data = zip(*call_filtered) if call_filtered else ([], [])
     put_opts, all_put_data = zip(*put_filtered) if put_filtered else ([], [])

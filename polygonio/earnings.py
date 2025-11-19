@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import date, datetime
+from pathlib import Path
 from typing import Set
 
 import pandas as pd
@@ -26,7 +27,8 @@ def get_earnings_dates(ticker: str, start_date: str, end_date: str) -> Set[date]
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
     yf_ticker = to_vendor_ticker(ticker, vendor="yfinance")
 
-    cache_file = yf_earnings_cache_file(yf_ticker)
+    cache_file_str = yf_earnings_cache_file(yf_ticker)
+    cache_file = Path(cache_file_str)
     ensure_dir(cache_file.parent)
 
     today = date.today()
@@ -112,4 +114,3 @@ def get_earnings_dates(ticker: str, start_date: str, end_date: str) -> Set[date]
         err_df.to_csv(cache_file, index=False)
         print(f"Warning: Unable to fetch earnings dates for {ticker}: {e}")
         return set()
-

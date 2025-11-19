@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from .config import get_settings, PREMIUM_FIELD_MAP
+from .config import get_settings, resolve_premium_field
 from .cache_io import stored_option_price
 from .chains import pull_option_chain_data
 
@@ -146,7 +146,7 @@ async def interpolate_option_price(
     - On failure, return 0.0
     """
     s = get_settings()
-    premium_field = premium_field or PREMIUM_FIELD_MAP.get(s.premium_price_mode, "trade_price")
+    premium_field = premium_field or resolve_premium_field(s)
 
     def _is_valid_price(d: Dict[str, Any], field: str) -> bool:
         if not isinstance(d, dict) or d.get(field) is None:
@@ -306,4 +306,3 @@ async def interpolate_option_price(
         pricing_date,
     )
     return est
-

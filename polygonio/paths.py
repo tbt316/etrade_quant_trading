@@ -43,6 +43,14 @@ def get_chain_cache_file(ticker: str) -> str:
     return str(CACHE_DIR / f"{ticker.upper()}_stored_option_chain.pkl")
 
 
+def risk_free_cache_file() -> str:
+    """
+    JSON cache file for risk-free rate lookups keyed by symbol/date.
+    """
+    ensure_dir(CACHE_DIR)
+    return str(CACHE_DIR / "risk_free_rates.json")
+
+
 # -----------------------------
 # Backtest results
 # -----------------------------

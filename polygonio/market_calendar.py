@@ -1,11 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import List, Literal
 import bisect
 
 import pandas as pd
 import pandas_market_calendars as mcal
+from .config import get_settings
 
 # ---------------------------------------------------------
 # Market calendar helpers (NYSE by default)
@@ -42,6 +43,9 @@ def list_expiries(
     start_date: datetime,
     end_date: datetime,
     trading_dates_df: pd.DataFrame,
+    *,
+    ticker: str | None = None,
+    as_of: date | datetime | None = None,
 ) -> List[datetime]:
     """
     Return all target weekdays in [start_date, end_date], each adjusted to the
@@ -54,16 +58,21 @@ def list_expiries(
         start_d = start_date.date()
     else:
         start_d = start_date  # already date
-
     if isinstance(end_date, datetime):
         end_d = end_date.date()
     else:
         end_d = end_date  # already date
 
+    as_of_date = None
+    if as_of is not None:
+        as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
+    else:
+        as_of_date = start_d
+
     # --- Normalize trading days to a sorted list of date objects
     dates = pd.to_datetime(trading_dates_df["date"], errors="coerce")
     dates = dates.dt.tz_localize(None)  # strip tz if present
-    trading_days: List[date_type] = sorted(d.date() for d in dates.dropna().to_list())
+    trading_days: List[date] = sorted(d.date() for d in dates.dropna().to_list())
 
     if not trading_days:
         return []
@@ -92,5 +101,19 @@ def list_expiries(
                 result.append(datetime.combine(last_trading_day, datetime.min.time()))
         current += timedelta(days=7)
 
-    print(f"[DEBUG] list_expiries: produced {len(result)} adjusted expiries; first={result[0] if result else None}, last={result[-1] if result else None}")
+    # Only emit this when calendar timing debug is enabled
+    try:
+        if getattr(get_settings(), "debug_calendar_timing", False):
+            context_parts: List[str] = []
+            if ticker:
+                context_parts.append(f"ticker={ticker}")
+            if as_of_date:
+                context_parts.append(f"date={as_of_date.isoformat()}")
+            context = f" {' '.join(context_parts)}" if context_parts else ""
+            print(
+                f"[DEBUG] list_expiries{context}: produced {len(result)} adjusted expiries; "
+                f"first={result[0] if result else None}, last={result[-1] if result else None}"
+            )
+    except Exception:
+        pass
     return result
