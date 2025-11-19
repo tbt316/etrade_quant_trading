@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 import time as _time
+import asyncio
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .cache_io import stored_option_chain, stored_option_price
@@ -357,6 +358,7 @@ async def ensure_premium(
     as_of_str: str,
     debug: bool = False,
     force_refresh: bool = False,
+    skip_write: bool = False,
 ) -> Optional[float]:
     if debug:
         print(
@@ -406,10 +408,9 @@ async def ensure_premium(
     price = _price_from_data(quote, premium_field)
     if not samples_present:
         price = None
-    if price is not None and _timestamp_in_window(_quote_timestamp(quote)):
+    if price is not None:
+        # We accept the price even if outside window, consistent with fallback logic
         return price
-    if price is not None and debug:
-        print("[CAL-UTILS] cached quote outside window; refetching")
 
     meta = entry.get("meta", {}) if isinstance(entry, dict) else {}
     strike = meta.get("strike_price")
@@ -474,10 +475,14 @@ async def ensure_premium(
         best_payload: Optional[Dict[str, Any]] = None
         best_price: Optional[float] = None
         candidates_checked = False
+        
+        # Track best absolute sample (ignoring window) as fallback
+        fallback_key: Optional[Tuple[int, int]] = None
+        fallback_payload: Optional[Dict[str, Any]] = None
+        fallback_price: Optional[float] = None
+
         for payload in candidates:
             ts_val = _quote_timestamp(payload)
-            if ts_val is not None and not _timestamp_in_window(ts_val):
-                continue
             price_val = _price_from_data(payload, premium_field)
             if price_val is None or price_val <= 0:
                 continue
@@ -485,14 +490,32 @@ async def ensure_premium(
             liq_ok = _sample_liquidity_ok(payload)
             if not liq_ok:
                 continue
+            
             dist = abs((ts_val or 0) - (target_ns or 0)) if target_ns is not None else 0
             key: Tuple[int, int] = (dist, -(ts_val or 0))
+            
+            # Update fallback (best valid sample regardless of window)
+            if fallback_key is None or key < fallback_key:
+                fallback_key = key
+                fallback_payload = payload
+                fallback_price = price_val
+
+            if ts_val is not None and not _timestamp_in_window(ts_val):
+                continue
+
             if best_key is None or key < best_key:
                 best_key = key
                 best_payload = payload
                 best_price = price_val
+                
         if best_payload and best_price is not None:
             return (best_price, best_payload), True
+            
+        # Fallback: if we have a valid sample outside the window, use it
+        # This matches poly_client behavior which returns the closest sample
+        if fallback_payload and fallback_price is not None:
+             return (fallback_price, fallback_payload), True
+             
         return None, candidates_checked
 
     cached_leaf = None
@@ -514,6 +537,17 @@ async def ensure_premium(
         cached_quote = {
             k: v for k, v in cached_leaf.items() if k != "_invalid_targets"
         }
+        
+        # Check if cached data has validation failure marker
+        validation_failed = cached_quote.get("_validation_failed")
+        if validation_failed:
+            # Print red alert message
+            print(
+                f"\033[91m[ALERT] Cached data for {option_ticker} failed validation check: {validation_failed}. "
+                f"Skipping API fetch (data unusable for trading).\033[0m"
+            )
+            return None
+        
         best_entry, had_candidates = _select_best_cached_sample(cached_quote)
         if best_entry:
             price_candidate, payload = best_entry
@@ -598,7 +632,7 @@ async def ensure_premium(
             f"[CAL-UTILS] Fetching premium from API for {option_ticker} "
             f"(strike={strike}, exp={expiration}, type={option_type})"
         )
-    fetched = await client.get_option_prices_batch_async(underlying, req)
+    fetched = await client.get_option_prices_batch_async(underlying, req, skip_write=skip_write)
     payload = fetched[0] if fetched else {}
     price = _price_from_data(payload, premium_field)
     if price is not None:
@@ -888,6 +922,7 @@ async def _gather_calendar_pair_internal(
     window_secs = max(1, int(getattr(settings, "premium_time_window_secs", 60)))
     target_time_s = getattr(settings, "premium_time_target", "12:30:00") or "12:30:00"
     pair_delta_secs = int(getattr(settings, "premium_pair_delta_secs", 60))
+    strict_window_secs = int(getattr(settings, "premium_strict_window_secs", 0))
     backoff_minutes = max(1, int(getattr(settings, "premium_time_backoff_minutes", 30)))
     backoff_steps = max(0, int(getattr(settings, "premium_time_backoff_steps", 3)))
     try:
@@ -896,7 +931,12 @@ async def _gather_calendar_pair_internal(
         th, tm, ts = 12, 30, 0
     base_dt = datetime.combine(as_of_date, datetime.min.time()).replace(hour=th, minute=tm, second=ts)
     pair_delta_ns = pair_delta_secs * 1_000_000_000
-    backoff_offsets = [0] + [-(i * backoff_minutes * 60) for i in range(1, backoff_steps + 1)]
+    
+    # If strict window is enabled, only attempt target time once (no backoff retry)
+    if strict_window_secs > 0:
+        backoff_offsets = [0]
+    else:
+        backoff_offsets = [0] + [-(i * backoff_minutes * 60) for i in range(1, backoff_steps + 1)]
 
     async def _attempt_pair(
         target_dt: datetime,
@@ -928,6 +968,20 @@ async def _gather_calendar_pair_internal(
         attempts_list = gather_timings.setdefault("attempts", [])
         attempts_list.append(attempt_info)
         attempt_info["attempt_index"] = len(attempts_list) - 1
+
+        def _mark_invalid(meta: Dict[str, Any]) -> None:
+            try:
+                client._write_invalid_option(
+                    ticker=meta.get("option_ticker") or ticker,
+                    strike_price=float(meta.get("strike_price", 0)),
+                    call_put=option_type,
+                    expiration_date=str(meta.get("expiration_date")),
+                    pricing_date=target_str_local,
+                    premium_field=premium_field,
+                    target_timestamp=target_ns_local,
+                )
+            except Exception:
+                pass
 
         def _log_quote_failure(label: str, option_ticker: str | None, quote: Dict[str, Any]) -> None:
             if not isinstance(quote, dict):
@@ -961,17 +1015,31 @@ async def _gather_calendar_pair_internal(
         )
         if debug:
             print(f"[CAL-UTILS] Fetch premiums for {ticker} target={target_str_local} offset_index={offset_index}")
-        ensure_front_start = _time.perf_counter()
-        await ensure_premium(
-            entry=entry_front_attempt,
-            premium_field=premium_field,
-            client=client,
-            option_type=option_type,
-            underlying=ticker,
-            as_of_str=target_str_local,
-            debug=debug,
+        ensure_parallel_start = _time.perf_counter()
+        await asyncio.gather(
+            ensure_premium(
+                entry=entry_front_attempt,
+                premium_field=premium_field,
+                client=client,
+                option_type=option_type,
+                underlying=ticker,
+                as_of_str=target_str_local,
+                debug=debug,
+                skip_write=True,
+            ),
+            ensure_premium(
+                entry=entry_back_attempt,
+                premium_field=premium_field,
+                client=client,
+                option_type=option_type,
+                underlying=ticker,
+                as_of_str=target_str_local,
+                debug=debug,
+                skip_write=True,
+            ),
         )
-        attempt_info["ensure_front_ms"] = (_time.perf_counter() - ensure_front_start) * 1000.0
+        attempt_info["ensure_parallel_ms"] = (_time.perf_counter() - ensure_parallel_start) * 1000.0
+        
         front_ok, front_fail_hard = _quote_liquidity_status_sample(
             entry_front_attempt.get("quote", {}) if isinstance(entry_front_attempt, dict) else {}
         )
@@ -981,17 +1049,28 @@ async def _gather_calendar_pair_internal(
             if "liquidity_rejected" not in gather_timings:
                 gather_timings["liquidity_rejected"] = "front"
             _log_quote_failure("front", entry_front_meta.get("option_ticker"), entry_front_attempt.get("quote", {}))
-        ensure_back_start = _time.perf_counter()
-        await ensure_premium(
-            entry=entry_back_attempt,
-            premium_field=premium_field,
-            client=client,
-            option_type=option_type,
-            underlying=ticker,
-            as_of_str=target_str_local,
-            debug=debug,
-        )
-        attempt_info["ensure_back_ms"] = (_time.perf_counter() - ensure_back_start) * 1000.0
+            
+            # Write the data to cache with liquidity failure marker
+            q_front = entry_front_attempt.get("quote", {})
+            if q_front and not q_front.get("_cache_source"):
+                q_front["_validation_failed"] = "liquidity"
+                try:
+                    strike_price = float(entry_front_meta["strike_price"])
+                    expiration_date = str(entry_front_meta["expiration_date"])
+                    ts = q_front.get("sip_timestamp")
+                    write_date = target_str_local
+                    if ts:
+                        try:
+                            write_date = datetime.fromtimestamp(ts / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    client._write_option_payload(
+                        ticker, strike_price, option_type, expiration_date, write_date,
+                        dict(q_front), q_front.get("_samples", [])
+                    )
+                except Exception:
+                    pass
+            
         back_ok, back_fail_hard = _quote_liquidity_status_sample(
             entry_back_attempt.get("quote", {}) if isinstance(entry_back_attempt, dict) else {}
         )
@@ -1001,6 +1080,27 @@ async def _gather_calendar_pair_internal(
             if "liquidity_rejected" not in gather_timings:
                 gather_timings["liquidity_rejected"] = "back"
             _log_quote_failure("back", entry_back_meta.get("option_ticker"), entry_back_attempt.get("quote", {}))
+            
+            # Write the data to cache with liquidity failure marker
+            q_back = entry_back_attempt.get("quote", {})
+            if q_back and not q_back.get("_cache_source"):
+                q_back["_validation_failed"] = "liquidity"
+                try:
+                    strike_price = float(entry_back_meta["strike_price"])
+                    expiration_date = str(entry_back_meta["expiration_date"])
+                    ts = q_back.get("sip_timestamp")
+                    write_date = target_str_local
+                    if ts:
+                        try:
+                            write_date = datetime.fromtimestamp(ts / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    client._write_option_payload(
+                        ticker, strike_price, option_type, expiration_date, write_date,
+                        dict(q_back), q_back.get("_samples", [])
+                    )
+                except Exception:
+                    pass
 
         q_front_attempt = entry_front_attempt.get("quote", {}) if isinstance(entry_front_attempt, dict) else {}
         q_back_attempt = entry_back_attempt.get("quote", {}) if isinstance(entry_back_attempt, dict) else {}
@@ -1048,6 +1148,8 @@ async def _gather_calendar_pair_internal(
                     f"back={_quote_summary_line(q_back_attempt)}{_QUOTE_DEBUG_RESET}"
                 )
             attempt_info["result"] = "no_pair"
+            _mark_invalid(entry_front_meta)
+            _mark_invalid(entry_back_meta)
             return None
 
         chosen_front_local, chosen_back_local = best_pair_local
@@ -1055,7 +1157,82 @@ async def _gather_calendar_pair_internal(
         premium_back_local = chosen_back_local.get("_price") or _price_from_data(chosen_back_local, premium_field)
         if premium_front_local is None or premium_back_local is None:
             attempt_info["result"] = "no_price"
+            _mark_invalid(entry_front_meta)
+            _mark_invalid(entry_back_meta)
             return None
+
+        # Strict window enforcement for position opening
+        if strict_window_secs > 0:
+            front_ts = PolygonAPIClient._sample_timestamp(chosen_front_local)
+            back_ts = PolygonAPIClient._sample_timestamp(chosen_back_local)
+            strict_window_ns = strict_window_secs * 1_000_000_000
+            
+            front_delta = abs(front_ts - target_ns_local) if front_ts else float('inf')
+            back_delta = abs(back_ts - target_ns_local) if back_ts else float('inf')
+            
+            if front_delta > strict_window_ns or back_delta > strict_window_ns:
+                # Data is outside strict window - cache it but don't open position
+                attempt_info["result"] = "strict_window_reject"
+                attempt_info["front_delta_secs"] = front_delta / 1_000_000_000
+                attempt_info["back_delta_secs"] = back_delta / 1_000_000_000
+                
+                # Cache the data for potential use in closing positions
+                entry_front = dict(entry_front_attempt)
+                entry_back = dict(entry_back_attempt)
+                
+                def _prepare_store_samples(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                    out: List[Dict[str, Any]] = []
+                    for s in samples:
+                        if not isinstance(s, dict):
+                            continue
+                        copy = dict(s)
+                        copy.pop("_price", None)
+                        copy.setdefault("target_timestamp", target_ns_local)
+                        out.append(copy)
+                    return out
+
+                for entry, sample, samples_all in (
+                    (entry_front, chosen_front_local, front_samples_attempt),
+                    (entry_back, chosen_back_local, back_samples_attempt),
+                ):
+                    quote_dest = entry.setdefault("quote", {}) if isinstance(entry, dict) else {}
+                    cleaned_sample = dict(sample)
+                    cleaned_sample.pop("_price", None)
+                    cleaned_sample["_validation_failed"] = "strict_window"  # Mark as failed strict window check
+                    quote_dest.update(cleaned_sample)
+                    quote_dest["_samples"] = _prepare_store_samples(samples_all)
+                    try:
+                        strike_price = float(entry["meta"]["strike_price"])
+                        expiration_date = str(entry["meta"]["expiration_date"])
+                        ts = cleaned_sample.get("sip_timestamp")
+                        write_date = target_str_local
+                        if ts:
+                            try:
+                                write_date = datetime.fromtimestamp(ts / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
+
+                        client._write_option_payload(
+                            ticker,
+                            strike_price,
+                            option_type,
+                            expiration_date,
+                            write_date,
+                            dict(cleaned_sample),
+                            quote_dest["_samples"],
+                        )
+                    except Exception:
+                        pass
+                
+                if debug:
+                    print(
+                        f"{_QUOTE_DEBUG_RED}[CAL-UTILS] Strict window reject: "
+                        f"front_delta={front_delta/1_000_000_000:.1f}s, "
+                        f"back_delta={back_delta/1_000_000_000:.1f}s, "
+                        f"max={strict_window_secs}s. Data cached but position opening rejected.{_QUOTE_DEBUG_RESET}"
+                    )
+                
+                return None
 
         attempt_info["result"] = "success"
         attempt_info["success_ts_front"] = PolygonAPIClient._sample_timestamp(chosen_front_local)
@@ -1095,15 +1272,45 @@ async def _gather_calendar_pair_internal(
             try:
                 strike_price = float(entry["meta"]["strike_price"])
                 expiration_date = str(entry["meta"]["expiration_date"])
+                ts = cleaned_sample.get("sip_timestamp")
+                write_date = target_str_local
+                if ts:
+                    try:
+                        write_date = datetime.fromtimestamp(ts / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
+
                 client._write_option_payload(
                     ticker,
                     strike_price,
                     option_type,
                     expiration_date,
-                    target_str_local,
+                    write_date,
                     dict(cleaned_sample),
                     quote_dest["_samples"],
                 )
+                
+                def _fmt_ts(ns_val: Any) -> str:
+                    try:
+                        return datetime.fromtimestamp(int(ns_val) / 1_000_000_000).strftime("%H:%M:%S")
+                    except Exception:
+                        return str(ns_val)
+
+                details = {
+                    "ask_price": cleaned_sample.get("ask_price"),
+                    "bid_price": cleaned_sample.get("bid_price"),
+                    "ask_size": cleaned_sample.get("ask_size"),
+                    "bid_size": cleaned_sample.get("bid_size"),
+                    "mid_price": cleaned_sample.get("mid_price"),
+                    "sip_timestamp": _fmt_ts(cleaned_sample.get("sip_timestamp")),
+                    "target_timestamp": _fmt_ts(target_ns_local),
+                    "_samples": f"{len(quote_dest.get('_samples', []))} samples",
+                }
+                if not quote_dest.get("_cache_source"):
+                    print(
+                        f"Stored {ticker},Strike:{strike_price},{option_type},Expire:{expiration_date}, "
+                        f"Pricing:{target_str_local}:{details}"
+                    )
             except Exception:
                 pass
 
@@ -1159,6 +1366,7 @@ async def _gather_calendar_pair_internal(
             f"[CAL-UTILS] Failed to align premiums for {ticker} on {as_of_date} "
             f"(front={front_date_actual}, back={back_date_actual})"
         )
+    print(f"\033[91m[CAL-UTILS] Failed to find valid pair for {ticker} on {as_of_date}\033[0m")
     return None, "no_premium_pair"
 
 

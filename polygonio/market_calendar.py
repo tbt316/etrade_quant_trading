@@ -30,7 +30,8 @@ class TradingCalendar:
         """
         sched = self.schedule(start, end)
         # Use market_close to represent the trading day as a datetime
-        df = pd.DataFrame({"date": pd.to_datetime(sched["market_close"]).to_pydatetime()})
+        # Strip timezone to ensure compatibility with rest of codebase
+        df = pd.DataFrame({"date": pd.to_datetime(sched["market_close"]).dt.tz_localize(None)})
         return df.reset_index(drop=True)
 
 

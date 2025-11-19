@@ -8,12 +8,21 @@ from datetime import date, datetime, timedelta, time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
+import pandas as pd
+
+try:
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
 
 RESET = "\033[0m"
 GREEN = "\033[92m"
 RED = "\033[91m"
+
+# Trading calendar cache to avoid repeated queries
+_TRADING_CALENDAR_CACHE: Optional[set] = None
 
 from .calendar_utils import (
     CalendarPairResult,
@@ -603,6 +612,15 @@ async def _matched_close_prices(
         day_dt = target_dt + timedelta(days=day_offset)
         if day_dt.date() < pos.open_date:
             break
+        
+        # Skip non-trading days (weekends, holidays)
+        if day_offset != 0:  # Only check for backoff days, not the target day
+            global _TRADING_CALENDAR_CACHE
+            if _TRADING_CALENDAR_CACHE is not None and day_dt.date() not in _TRADING_CALENDAR_CACHE:
+                # Skip this non-trading day
+                print(f"[DEBUG] Skipping non-trading day: {day_dt.date()}")
+                continue
+        
         for offset in offsets:
             candidate_dt = day_dt + timedelta(seconds=offset)
             front_price, front_ts, front_entry = await _price_leg(
@@ -799,6 +817,8 @@ def _render_price_history_plot(
     histories: List[Tuple["CalendarPosition", Dict[str, List[Tuple[datetime, float]]]]],
 ) -> None:
     """Render subplots showing price history for each provided position."""
+    if not _HAS_MATPLOTLIB:
+        return
     if not histories:
         return
     count = len(histories)
@@ -953,6 +973,8 @@ def _render_single_position_history(
     *, pos: "CalendarPosition", series: Dict[str, List[Tuple[datetime, float]]]
 ) -> None:
     """Render a per-position chart showing front/back price history."""
+    if not _HAS_MATPLOTLIB:
+        return
     front_points = series.get("front", [])
     back_points = series.get("back", [])
     if not front_points and not back_points:
@@ -1133,6 +1155,21 @@ async def simulate_calendar_backtest(config: CalendarBacktestConfig) -> Dict[str
     start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").date()
     end_dt = datetime.strptime(config.end_date, "%Y-%m-%d").date()
     _prepare_risk_free_history(start_dt, end_dt)
+    
+    # Initialize trading calendar cache for the backtest period to avoid repeated queries
+    global _TRADING_CALENDAR_CACHE
+    try:
+        from .market_calendar import TradingCalendar
+        cal = TradingCalendar("NYSE")
+        # Add buffer to cover potential backoff days
+        calendar_start = datetime.combine(start_dt, datetime.min.time()) - timedelta(days=10)
+        calendar_end = datetime.combine(end_dt, datetime.min.time()) + timedelta(days=10)
+        trading_df = cal.trading_dates_df(calendar_start, calendar_end)
+        _TRADING_CALENDAR_CACHE = set(pd.to_datetime(trading_df["date"]).dt.tz_localize(None).dt.date)
+        print(f"[DEBUG] Initialized trading calendar cache with {len(_TRADING_CALENDAR_CACHE)} trading days")
+    except Exception as e:
+        print(f"[DEBUG] Failed to initialize trading calendar cache: {e}")
+        _TRADING_CALENDAR_CACHE = None
 
     ticker_list: List[str] = []
     for raw in config.tickers or [config.ticker]:

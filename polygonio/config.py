@@ -62,6 +62,9 @@ class Settings:
     premium_time_backoff_minutes: int = 60
     # Number of backward steps to try when searching for aligned premiums
     premium_time_backoff_steps: int = 3
+    # Strict time window (seconds) for position opening - if best data is older than this, reject opening but cache the data
+    # Set to 0 to disable strict checking and use backoff retry logic
+    premium_strict_window_secs: int = 600  # 10 minutes default
 
     # Close pricing tolerance multiplier (for open-position daily marks)
     premium_close_pair_delta_multiplier: float = 5.0

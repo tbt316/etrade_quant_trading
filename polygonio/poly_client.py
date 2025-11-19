@@ -293,6 +293,7 @@ class PolygonAPIClient:
         self,
         ticker: str,
         options_list: List[Dict[str, Any]],
+        skip_write: bool = False,
     ) -> List[Dict[str, Any]]:
         """Batch fetch prices for a deduplicated list of options.
 
@@ -321,6 +322,7 @@ class PolygonAPIClient:
                 expiration_date=str(opt["expiration_date"]),
                 pricing_date=str(opt["quote_timestamp"]),
                 option_ticker=str(opt.get("option_ticker")),
+                skip_write=skip_write,
             )
 
         tasks = [asyncio.create_task(_one(o)) for o in deduped]
@@ -343,6 +345,7 @@ class PolygonAPIClient:
         expiration_date: str,
         pricing_date: str,
         option_ticker: str,
+        skip_write: bool = False,
     ) -> Dict[str, Any]:
         """Fetch price using the configured premium field and write into cache."""
         premium_field = self._premium_field  # 'mid_price' | 'trade_price' | 'close_price'
@@ -353,33 +356,34 @@ class PolygonAPIClient:
         cutoff_ns = 0
         window_lo_ns: int | None = None
         window_hi_ns: int | None = None
+        
+        # Default query params
+        params = {
+            "apiKey": self.api_key,
+        }
+        
         if mode == "trade":
             url = f"https://api.polygon.io/v3/trades/{option_ticker}"
-            params = {
-                "timestamp": pricing_date,
+            params.update({
                 "order": "desc",
                 "sort": "timestamp",
                 "limit": 100,
-                "apiKey": self.api_key,
-            }
-            parse = None  # custom selection by timestamp proximity
+            })
+            parse = None
         elif mode in ("mid", "quote"):
             url = f"https://api.polygon.io/v3/quotes/{option_ticker}"
-            params = {
-                "timestamp": pricing_date,
+            params.update({
                 "order": "desc",
                 "sort": "timestamp",
                 "limit": 100,
-                "apiKey": self.api_key,
-            }
-            parse = None  # custom selection by timestamp proximity
+            })
+            parse = None
         else:  # close
             url = f"https://api.polygon.io/v1/open-close/{option_ticker}/{pricing_date}"
-            params = {"apiKey": self.api_key}
             parse = self._parse_open_close
 
-        # If we are using trades/quotes, convert pricing_date into a tight server-side window
-        # around the target time (default 12:45:00) using timestamp.gte/lte BEFORE the request.
+        # If we are using trades/quotes, convert pricing_date into a window
+        # from 9:00 AM to target time.
         query_specs: List[Tuple[str, Optional[int], Optional[int]]] = []
         if parse is None:  # trade or mid
             from datetime import datetime, time, timedelta
@@ -392,27 +396,24 @@ class PolygonAPIClient:
                     s = get_settings()
                     hh, mm, ss = [int(x) for x in (s.premium_time_target or "12:45:00").split(":")]
                     dt = datetime.combine(d0.date(), time(hh, mm, ss))
-                s = get_settings()
-                win = max(1, int(getattr(s, "premium_time_window_secs", 60)))
-                lo = dt - timedelta(seconds=win)
-                hi = dt + timedelta(seconds=win)
-                ch, cm, cs = [int(x) for x in (s.premium_time_cutoff or "13:00:00").split(":")]
-                cutoff_dt = datetime.combine(dt.date(), time(ch, cm, cs))
-                window_lo_ns = int(lo.timestamp() * 1_000_000_000)
-                window_hi_ns = int(hi.timestamp() * 1_000_000_000)
-                target_ns = int(dt.timestamp() * 1_000_000_000)
-                cutoff_ns = int(cutoff_dt.timestamp() * 1_000_000_000)
+                
+                # Start at 9:00 AM on the same day
+                start_dt = datetime.combine(dt.date(), time(9, 0, 0))
+                
+                window_lo_ns = int(start_dt.timestamp() * 1_000_000_000)
+                window_hi_ns = int(dt.timestamp() * 1_000_000_000)
+                target_ns = window_hi_ns
+                
                 # replace generic timestamp with explicit bounds
                 params.pop("timestamp", None)
                 params["timestamp.gte"] = str(window_lo_ns)
                 params["timestamp.lte"] = str(window_hi_ns)
-                if target_ns and window_lo_ns is not None and window_hi_ns is not None:
-                    query_specs = [
-                        ("asc", target_ns, window_hi_ns),
-                        ("desc", window_lo_ns, target_ns),
-                    ]
+                
+                # We only need one spec now since we are just querying the range desc
+                query_specs = [("desc", window_lo_ns, window_hi_ns)]
+                
             except Exception:
-                # if parsing fails, keep original params
+                # if parsing fails, keep original params (though this path is unlikely to work well with new requirements)
                 target_ns = 0
                 cutoff_ns = 0
 
@@ -427,14 +428,11 @@ class PolygonAPIClient:
             try:
                 samples: List[Dict[str, Any]] = []
                 if parse is not None:
-                    print("checkpoint before polygon fetch with parse")
                     async with self.semaphore:
-                        print("[DEBUG] About to fetch polygon data with parse")
                         async with session.get(url, params=params) as resp:
                             print(f"[DEBUG] Querying Polygon for option price: {url}?{urlencode(params)}")
                             resp.raise_for_status()
                             data = await resp.json()
-                    print(f"[DEBUG] Fetched payload for {option_ticker} on {pricing_date}: {data}")
                     payload = parse(data)
                     if payload:
                         samples.append(dict(payload))
@@ -456,16 +454,8 @@ class PolygonAPIClient:
                         req_params["order"] = order
                         if lower is not None:
                             req_params["timestamp.gte"] = str(lower)
-                        elif window_lo_ns is not None:
-                            req_params["timestamp.gte"] = str(window_lo_ns)
-                        else:
-                            req_params.pop("timestamp.gte", None)
                         if upper is not None:
                             req_params["timestamp.lte"] = str(upper)
-                        elif window_hi_ns is not None:
-                            req_params["timestamp.lte"] = str(window_hi_ns)
-                        else:
-                            req_params.pop("timestamp.lte", None)
                         tasks.append(asyncio.create_task(_fetch_one(idx_spec, req_params)))
 
                     fetch_results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
@@ -497,8 +487,6 @@ class PolygonAPIClient:
                                 continue
                             if ts <= 0 or price <= 0:
                                 continue
-                            if cutoff_ns and ts > cutoff_ns:
-                                continue
                             dist = abs(ts - target_ns) if target_ns else 0
                             key = (dist, -ts)
                             cand = {
@@ -523,8 +511,6 @@ class PolygonAPIClient:
                                 continue
                             if ask <= 0 or bid <= 0 or ts <= 0:
                                 continue
-                            if cutoff_ns and ts > cutoff_ns:
-                                continue
                             mid = round((ask + bid) / 2.0, 3)
                             dist = abs(ts - target_ns) if target_ns else 0
                             key = (dist, -ts)
@@ -542,88 +528,76 @@ class PolygonAPIClient:
                                 best = (key, cand)
                         payload = best[1] if best else {}
                 if payload:
-                    # Enforce client-side time window to avoid storing out-of-window records
-                    ts_ok = True
-                    try:
-                        ts_val = int(payload.get("sip_timestamp") or 0)
-                        if target_ns and window_lo_ns is not None and window_hi_ns is not None:
-                            ts_ok = window_lo_ns <= ts_val <= window_hi_ns
-                    except Exception:
-                        ts_ok = False
-                    if ts_ok:
-                        if self._premium_mode == "quote":
-                            self._debug_print_quote(
-                                option_ticker=option_ticker,
-                                target_ns=target_ns,
-                                window_lo_ns=window_lo_ns,
-                                window_hi_ns=window_hi_ns,
-                                payload=payload,
-                            )
-                        if samples:
-                            samples = sorted(
-                                [s for s in samples if isinstance(s, dict)],
-                                key=lambda x: PolygonAPIClient._sample_timestamp(x) or 0,
-                            )
-                            payload["_samples"] = samples
-                        payload_for_log = dict(payload)
-                        if "_samples" in payload_for_log:
-                            try:
-                                payload_for_log["_samples"] = f"{len(payload['_samples'])} samples"
-                            except Exception:
-                                payload_for_log["_samples"] = "samples"
-                        for ts_field in ("sip_timestamp", "participant_timestamp", "target_timestamp"):
-                            if ts_field in payload_for_log:
-                                try:
-                                    ts_val = int(payload_for_log[ts_field])
-                                    if ts_val > 0:
-                                        payload_for_log[ts_field] = datetime.fromtimestamp(
-                                            ts_val / 1_000_000_000
-                                        ).strftime("%H:%M:%S")
-                                except Exception:
-                                    continue
+                    if samples:
+                        samples = sorted(
+                            [s for s in samples if isinstance(s, dict)],
+                            key=lambda x: PolygonAPIClient._sample_timestamp(x) or 0,
+                        )
+                        payload["_samples"] = samples
+                    
+                    write_date = pricing_date
+                    # We do NOT overwrite write_date with sip_timestamp here, 
+                    # because the cache lookup expects to find data under the target date (pricing_date).
+                    # The sip_timestamp is already preserved inside the payload.
+
+                    if not skip_write:
                         self._write_option_payload(
-                            ticker, strike_price, call_put, expiration_date, pricing_date, payload, samples
+                            ticker, strike_price, call_put, expiration_date, write_date, payload, samples
                         )
+                        
+                        # Print detailed pricing information
+                        def _fmt_ts(ns_val: Any) -> str:
+                            try:
+                                return datetime.fromtimestamp(int(ns_val) / 1_000_000_000).strftime("%H:%M:%S")
+                            except Exception:
+                                return str(ns_val)
+                        
+                        details = {
+                            "ask_price": payload.get("ask_price"),
+                            "bid_price": payload.get("bid_price"),
+                            "ask_size": payload.get("ask_size"),
+                            "bid_size": payload.get("bid_size"),
+                            "mid_price": payload.get("mid_price"),
+                            "trade_price": payload.get("trade_price"),
+                            "trade_size": payload.get("trade_size"),
+                            "sip_timestamp": _fmt_ts(payload.get("sip_timestamp")),
+                            "target_timestamp": _fmt_ts(target_ns),
+                            "_samples": f"{len(samples)} samples" if samples else "0 samples",
+                        }
+                        # Remove None values for cleaner output
+                        details = {k: v for k, v in details.items() if v is not None}
+                        
                         print(
-                            f"Stored {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}:{payload_for_log}"
+                            f"Stored {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, "
+                            f"Pricing:{write_date}:{details}"
                         )
-                        return payload
                     else:
-                        self._write_invalid_option(
-                            ticker,
-                            strike_price,
-                            call_put,
-                            expiration_date,
-                            pricing_date,
-                            premium_field,
-                            target_timestamp=target_ns,
-                        )
+                        # Data fetched but not written to cache (skip_write=True)
+                        # Caller will validate and write if needed
                         print(
-                            f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date} (ts out of window)"
+                            f"[DEBUG] Skipped write (validation pending) for {ticker},Strike:{strike_price},"
+                            f"{call_put},Expire:{expiration_date}, Pricing:{write_date}"
                         )
-                        return {}
-                # 200 OK but no usable data → write invalid marker once and return
-                self._write_invalid_option(
-                    ticker,
-                    strike_price,
-                    call_put,
-                    expiration_date,
-                    pricing_date,
-                    premium_field,
-                    target_timestamp=target_ns,
-                )
-                print(
-                    f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}"
-                )
+                    return payload
+                
+                if not skip_write:
+                    self._write_invalid_option(
+                        ticker,
+                        strike_price,
+                        call_put,
+                        expiration_date,
+                        pricing_date,
+                        premium_field,
+                        target_timestamp=target_ns,
+                    )
+                    print(
+                        f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}"
+                    )
                 return {}
             except Exception as e:
                 if attempt >= self.retries:
                     print(
                         f"Max retries exceeded for {ticker} {call_put} {strike_price}@{pricing_date}: {e}"
-                    )
-                    # Helpful for troubleshooting
-                    print(
-                        f"[DEBUG] Querying Polygon for option price: {url}?{urlencode(params_for_log or params)}"
                     )
                     return {}
                 wait = self.backoff_factor * (2 ** (attempt - 1))

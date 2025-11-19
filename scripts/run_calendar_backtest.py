@@ -12,9 +12,13 @@ from typing import Any
 RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
 GREEN = "\033[92m"; RED = "\033[91m"; ORANGE = "\033[38;5;208m"; CYAN = "\033[96m"
 
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import numpy as np
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    import numpy as np
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
 
 from etrade_quant_trading.polygonio.calendar_backtest import (
     CalendarBacktestConfig,
@@ -177,6 +181,10 @@ def plot_calendar_results(
     take_profit_pct: float | None = None,
     stop_loss_pct: float | None = None,
 ) -> None:
+    if not _HAS_MATPLOTLIB:
+        print(f"{RED}Matplotlib not installed; skipping plot generation{RESET}")
+        return
+
     daily = results.get("daily_results") or []
     if not daily:
         print(f"{DIM}No daily data available for plotting{RESET}")
