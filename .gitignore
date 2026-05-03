@@ -1,33 +1,63 @@
-# Python
+# Data & cache
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.so
-
-# Virtual envs
-.venv/
-env/
 venv/
+.pytest_cache/
 
-# IDE / editor
-.vscode/
-.idea/
+# Logs
+*.log
+*.log.*
+server_log.txt
+ngrok.log
+dashboard_requests.log
+scratch/last_1000_logs.txt
 
-# OS junk
-.DS_Store
-Thumbs.db
+# Large data
+option_minute_aggregate_flat_files/
+polygon_api_option_data/
+history_option/
+historical_quote/
+backtest_cache/
+backtest_logs/
+s_and_p_data/
+yfinance/
+monthly_backtest_data/
+regime_review_2025/
+option_value_plot/
+
+# Cache files
+*.json
+!regime_review_2025/model_parameters.json
+*.csv
+*.db
+*.sqlite
 
 # Secrets
 .env
-*.ini
-*.json
+*.env
+.etrade_oauth
+config.ini
+.etrade_session.json
 
-# Project-specific cache/data
-data/
-monthly_backtest_data/
-backtest_debug.log
-polygonio_config.py
-cover_call_plots/
-yfinance/
+# Generated outputs
+cover_call_plot*/
+plot_result_overlay/
+training_results/
+get_top_results/
+regime_analysis_*.png
+dashboard_verification.png
+*.html
+*.pdf
 
+# Debug
+debug/
+debug_traces/
+
+# IDEs
+.vscode/
+.gemini/
+*.code-workspace
+.DS_Store
+
+# Archives
+*.zip
