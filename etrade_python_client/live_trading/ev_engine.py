@@ -150,16 +150,28 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     # 1. High-Dimensional Data Ingestion
     ingestor = DataIngestor()
     # Use sync wrapper for async data fetching
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
     # FETCH STATIONARY DATA WITHOUT GLOBAL SCALING
     start_date = df.index.min().strftime("%Y-%m-%d")
     end_date = df.index.max().strftime("%Y-%m-%d")
-    stationary_df = loop.run_until_complete(ingestor.build_fused_dataset(start_date, end_date, scale=False))
+    
+    def run_async(coro):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        if loop.is_running():
+            # If the loop is already running (e.g. from an async test), 
+            # we need to run this in a separate thread and wait for it.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        else:
+            return loop.run_until_complete(coro)
+
+    stationary_df = run_async(ingestor.build_fused_dataset(start_date, end_date, scale=False))
     
     # ENSURE WE ONLY USE DATA UP TO THE PROVIDED DF'S END DATE (Double check)
     stationary_df = stationary_df[stationary_df.index <= df.index.max()]
@@ -167,8 +179,8 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     # 2. CAUSAL FEATURE PREPARATION (Strictly on past data if expanding_window=True)
     if expanding_window:
         print("  [Causal] Preparing features with expanding scaling and PCA...")
-        # Use expanding scale from DataIngestor
-        scaled_df = ingestor.scale_features(stationary_df, expanding=True, warmup=min(252, len(stationary_df)-1))
+        # Use rolling scale from DataIngestor
+        scaled_df = ingestor.scale_features(stationary_df, rolling=True, window=min(252*5, len(stationary_df)-1))
         
         # Causal PCA: For each point t, we need the PCA projection based on data up to t
         pc_values = np.full((len(scaled_df), 2), np.nan)
@@ -308,11 +320,42 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     
     # Store fusion and features for later use
     best_hmm.fusion_ = fusion
-    # FIX: Dynamically save the final state of the ExpandingRobustScaler
-    best_hmm.scaler_ = ingestor.expanding_scaler if expanding_window else scaler
+    # FIX: Dynamically save the final state of the RollingRobustScaler
+    best_hmm.scaler_ = ingestor.rolling_scaler if expanding_window else scaler
     best_hmm.feature_names_ = stationary_df.columns.tolist()
     
-    # FIX: Remove Viterbi Decoding Look-Ahead Bias
+    # Mandate 10.1: Deterministic State Alignment (immediately after .fit())
+    # Map states: State 0 = Lowest Variance, State N = Highest Variance
+    if is_hmm_healthy(best_hmm):
+        # Calculate total variance for each state
+        state_vars = []
+        for i in range(best_hmm.n_components):
+            # For GMMHMM with diagonal covariance
+            w = best_hmm.weights_[i]
+            c = best_hmm.covars_[i]
+            m = best_hmm.means_[i]
+            # Combined variance: E[X^2] - (E[X])^2
+            # E[X] = sum(w*m)
+            # E[X^2] = sum(w*(c + m^2))
+            mean_state = np.sum(w[:, np.newaxis] * m, axis=0)
+            second_moment = np.sum(w[:, np.newaxis] * (c + m**2), axis=0)
+            total_var = np.sum(second_moment - mean_state**2)
+            state_vars.append(total_var)
+        
+        # New order: sorted by variance
+        new_order = np.argsort(state_vars)
+        
+        # Remap parameters
+        best_hmm.startprob_ = best_hmm.startprob_[new_order]
+        best_hmm.transmat_ = best_hmm.transmat_[np.ix_(new_order, new_order)]
+        best_hmm.means_ = best_hmm.means_[new_order]
+        best_hmm.weights_ = best_hmm.weights_[new_order]
+        best_hmm.covars_ = best_hmm.covars_[new_order]
+        print(f"  [Alignment] States remapped by variance: {new_order}")
+
+    # Mandate 10.2: Causal Viterbi Decoding
+    # During live trading or backtesting, if the agent runs .predict(), 
+    # it must only extract the final integer.
     # Use expanding window predict_proba to get causal filtered probabilities
     n_samples = len(features_input)
     causal_states = np.zeros(n_samples)
@@ -338,8 +381,6 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                         from scipy.optimize import linear_sum_assignment
                         
                         old_hmm = deepcopy(current_hmm)
-                        temp_model = deepcopy(current_hmm)
-                        
                         # 1. Manifold Stabilization 
                         # Regulation 3.1: PCA loadings for index t_abs derived from data up to t_abs - 1
                         current_window_scaled = scaled_df.iloc[:t_abs].fillna(0)
@@ -363,6 +404,22 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                             for c in range(len(stable_fusion.sparse_pca.components_)):
                                 if np.dot(stable_fusion.sparse_pca.components_[c], prev_loadings[new_idx[c]]) < 0:
                                     stable_fusion.sparse_pca.components_[c] *= -1
+                        
+                        # Mandate 10.3: Model Warm-Starting
+                        # Pass previous parameters as starting weights
+                        temp_model = hmm.GMMHMM(
+                            n_components=best_k, 
+                            n_mix=current_hmm.n_mix, 
+                            covariance_type="diag", 
+                            n_iter=50, # Fewer iterations needed for warm start
+                            init_params="", # Don't initialize from scratch
+                            random_state=42
+                        )
+                        temp_model.startprob_ = current_hmm.startprob_.copy()
+                        temp_model.transmat_ = current_hmm.transmat_.copy()
+                        temp_model.means_ = current_hmm.means_.copy()
+                        temp_model.weights_ = current_hmm.weights_.copy()
+                        temp_model.covars_ = current_hmm.covars_.copy()
                         
                         stabilized_features = stable_fusion.transform(current_window_scaled).values
                         temp_model.fit(stabilized_features)
@@ -423,12 +480,14 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                     except Exception as e:
                         print(f"  [Refit] Refit at t={t_abs} failed: {e}. Skipping remapping...")
                 
-                # Regulation 4.1: Strictly Causal Filtering (Forward Algorithm)
-                # To maintain Markovian memory, we must pass the sequence up to t_abs.
-                # All points are transformed using the CURRENT (causal) stable_fusion.
+                # Mandate 10.2: Strictly Causal Prediction
+                # If using .predict(), only take the last value.
+                # However, for filtered probabilities, we still use predict_proba causal pass.
                 current_window_scaled = scaled_df.iloc[:t_abs+1].fillna(0)
                 current_window_projected = current_hmm.fusion_.transform(current_window_scaled).values
                 current_prob = current_hmm.predict_proba(current_window_projected)[-1]
+                # If we were using .predict(X), we would do:
+                # current_state = current_hmm.predict(current_window_projected)[-1]
                 
                 # Regulation 4.2: Minimum State Sojourn Time (Debouncing)
                 # We track the 'intended' state and only switch after N consecutive days.

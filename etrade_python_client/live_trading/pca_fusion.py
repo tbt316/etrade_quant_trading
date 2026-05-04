@@ -38,7 +38,16 @@ class PCAFusion:
             std_pca.fit(df)
             self.sparse_pca = std_pca
 
-        self.loadings_baseline = self.sparse_pca.components_
+        # Mandate 9.2: Eigenvector Sign Flipping
+        if self.loadings_baseline is not None:
+            for i in range(len(self.sparse_pca.components_)):
+                # Calculate cosine similarity between current component and baseline
+                sim = 1 - cosine(self.loadings_baseline[i], self.sparse_pca.components_[i])
+                if sim < 0:
+                    self.sparse_pca.components_[i] *= -1
+                    logger.info(f"Flipped sign for PC{i+1} to maintain consistency.")
+
+        self.loadings_baseline = self.sparse_pca.components_.copy()
         return self
 
     def transform(self, df):
@@ -82,6 +91,34 @@ class PCAFusion:
         
         pc_cols = [f"PC{i+1}" for i in range(self.n_components)]
         return pd.DataFrame(pcs, index=df.index, columns=pc_cols)
+
+    def rolling_fit_transform(self, df, window=252):
+        """
+        Mandate 9.1: Sequential Subspace Fitting.
+        Strictly causal rolling-window PCA. Fits on T-window and transforms only at T.
+        """
+        self.feature_names = df.columns.tolist()
+        n_samples = len(df)
+        
+        # Determine n_components first if needed
+        if self.n_components is None:
+            pca = PCA()
+            pca.fit(df.iloc[:min(window, n_samples)])
+            cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+            self.n_components = max(2, np.argmax(cumulative_variance >= 0.90) + 1)
+            
+        pc_values = np.full((n_samples, self.n_components), np.nan)
+
+        for t in range(window, n_samples):
+            train_window = df.iloc[t-window : t]
+            self.fit(train_window)
+            
+            # Transform the single vector at time t
+            target_vector = df.iloc[t : t+1]
+            pc_values[t] = self.transform(target_vector).values[0]
+            
+        pc_cols = [f"PC{i+1}" for i in range(self.n_components)]
+        return pd.DataFrame(pc_values, index=df.index, columns=pc_cols).dropna()
 
     def get_loadings_table(self):
         """Export the Sparse PCA loadings table for interpretability."""

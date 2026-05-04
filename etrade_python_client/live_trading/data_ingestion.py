@@ -12,13 +12,13 @@ import threading
 import time
 from copy import deepcopy
 
-class ExpandingRobustScaler:
+class RollingRobustScaler:
     """
-    A strictly causal, stateful scaler that maintains historical medians and IQRs.
-    Prevents any future data leakage by only updating parameters point-by-point.
+    A strictly causal, stateful scaler that maintains a rolling window of historical medians and IQRs.
+    Prevents dilution of recent structural breaks by limiting memory to a fixed window.
     """
-    def __init__(self, warmup=252):
-        self.warmup = warmup
+    def __init__(self, window=252 * 5): # Default 5 years of trading days
+        self.window = window
         self.history = []
         self.center_ = None
         self.scale_ = None
@@ -29,8 +29,14 @@ class ExpandingRobustScaler:
         Update history with new row and return scaled value.
         x_row: pd.Series or 1D array
         """
-        self.history.append(x_row.values if hasattr(x_row, 'values') else x_row)
-        if len(self.history) < self.warmup:
+        val = x_row.values if hasattr(x_row, 'values') else x_row
+        self.history.append(val)
+        
+        # Enforce rolling window
+        if len(self.history) > self.window:
+            self.history.pop(0)
+            
+        if len(self.history) < 20: # Minimum warmup
             return x_row * np.nan
         
         hist_array = np.array(self.history)
@@ -132,7 +138,7 @@ class DataIngestor:
         if cache_path is None:
             cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backtest_cache", "option_data.db")
         self.cache = OptionDataCache(cache_path)
-        self.expanding_scaler = ExpandingRobustScaler()
+        self.rolling_scaler = RollingRobustScaler()
         self._fred_cache = None # Cache for the session
         self.cache_manager = DataCacheManager()
         self._sync_active = set()
@@ -445,42 +451,43 @@ class DataIngestor:
         
         return stationary_df.dropna()
 
-    def fit_scaler(self, df):
+    def fit_scaler(self, df, window=252*5):
         """
         Regulation 2.2: Fitting on a global block is only allowed if the block 
         is explicitly historical training data and NOT being used for causal inference.
         """
         temp_scaler = RobustScaler()
         temp_scaler.fit(df)
-        # Seed the expanding scaler history
-        self.expanding_scaler.history = df.values.tolist()
-        self.expanding_scaler.center_ = temp_scaler.center_
-        self.expanding_scaler.scale_ = temp_scaler.scale_
+        # Seed the rolling scaler history
+        self.rolling_scaler.window = window
+        self.rolling_scaler.history = df.values.tolist()[-window:]
+        self.rolling_scaler.center_ = temp_scaler.center_
+        self.rolling_scaler.scale_ = temp_scaler.scale_
 
     def transform_features(self, df):
-        """Apply the already-fitted expanding scaler to the data."""
-        if self.expanding_scaler.center_ is None:
-             raise ValueError("ExpandingRobustScaler must be fitted or warmed up before calling transform_features.")
-        return self.expanding_scaler.transform(df)
+        """Apply the already-fitted rolling scaler to the data."""
+        if self.rolling_scaler.center_ is None:
+             raise ValueError("RollingRobustScaler must be fitted or warmed up before calling transform_features.")
+        return self.rolling_scaler.transform(df)
 
-    def scale_features(self, df, expanding=False, warmup=252):
+    def scale_features(self, df, rolling=False, window=252*5):
         """
         Scale features using strictly causal logic.
         """
-        if expanding:
-            return self.expanding_scale_features(df, warmup=warmup)
+        if rolling:
+            return self.rolling_scale_features(df, window=window)
         
-        if self.expanding_scaler.center_ is None:
-            red_alert("ExpandingRobustScaler not fitted. This will cause NaNs in inference.")
+        if self.rolling_scaler.center_ is None:
+            red_alert("RollingRobustScaler not fitted. This will cause NaNs in inference.")
             return pd.DataFrame(index=df.index, columns=df.columns)
             
         return self.transform_features(df)
 
-    def expanding_scale_features(self, df, warmup=252):
+    def rolling_scale_features(self, df, window=252*5):
         """
-        Regulation 2.2: Strictly causal expanding-window scaling.
+        Regulation 8.2: Strictly causal rolling-window scaling.
         """
-        scaler = ExpandingRobustScaler(warmup=warmup)
+        scaler = RollingRobustScaler(window=window)
         scaled_data = []
         
         for i in range(len(df)):
@@ -488,8 +495,8 @@ class DataIngestor:
             scaled_row = scaler.update_and_transform(row)
             scaled_data.append(scaled_row)
             
-        # Update self.expanding_scaler with the final state
-        self.expanding_scaler = scaler
+        # Update self.rolling_scaler with the final state
+        self.rolling_scaler = scaler
         
         return pd.DataFrame(scaled_data, index=df.index, columns=df.columns)
 
@@ -510,7 +517,7 @@ class DataIngestor:
         logger.info("Verification Checkpoint 1 passed.")
         return True
 
-    async def build_fused_dataset(self, start_date, end_date, underlying="SPY", scale=True, expanding=False):
+    async def build_fused_dataset(self, start_date, end_date, underlying="SPY", scale=True, rolling=False):
         """Main pipeline to build the high-dimensional feature set."""
         fred_df = self.fetch_fred_data(start_date, end_date)
         yf_df = self.fetch_yf_data(start_date, end_date)
@@ -549,7 +556,7 @@ class DataIngestor:
         
         # Scaling
         if scale:
-            scaled = self.scale_features(stationary, expanding=expanding)
+            scaled = self.scale_features(stationary, rolling=rolling)
             return scaled
             
         return stationary

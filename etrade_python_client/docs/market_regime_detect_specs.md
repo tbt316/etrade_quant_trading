@@ -3,6 +3,9 @@
 ## 1. Core Philosophy: Absolute Non-Anticipativity
 The primary goal of the Market Regime Detection (MRD) engine is to provide causal, real-time identification of market archetypes without **look-ahead bias**. In quantitative finance, data leakage from the future into the past (e.g., global scaling, Viterbi decoding over a full sample) results in "beautiful" backtests that fail in live production. This specification mandates a strictly causal pipeline.
 
+**Rule 1.1: Rolling vs. Expanding Windows**
+While an expanding window prevents data leakage, it dilutes recent structural breaks as the sample size grows to infinity. All "expanding" logic must feature a parameterized memory cap (e.g., rolling window or Exponentially Weighted Moving Average) so the models can adapt to new market behaviors without being weighed down by decades of stale data.
+
 ---
 
 ## 2. Data Pipeline & Stationarity
@@ -78,3 +81,42 @@ During walk-forward refits (e.g., every 21 days), the HMM might re-order its sta
 
 ## 7. Goal: Long-Term Memory
 This specification serves as the "source of truth". Any refactor to `ev_engine.py`, `data_ingestion.py`, or `pca_fusion.py` **must not** violate the Non-Anticipativity or Structural Consistency rules. If a change is made that increases "beauty" at the expense of "causality", it is a regression.
+
+---
+
+## 8. Data Ingestion & Preprocessing Constraints (data_ingestion.py)
+
+### Mandate 8.1: Strict Stationarity Enforcement
+Unsupervised models (HMMs/GMMs) and PCA will fail or produce spurious regimes if applied to non-stationary price data.
+- **Agent Instruction**: The script must enforce transformations (e.g., log returns, fractional differencing) on raw price data. Before passing data downstream, the code must dynamically verify stationarity using the adfuller test (rejecting the null hypothesis at p<0.05). If it fails, the script must throw an explicit error or dynamically difference the data.
+
+### Mandate 8.2: Decay-Weighted Robust Scaling
+The current ExpandingRobustScaler concept is causal but assumes equal importance of all historical data.
+- **Agent Instruction**: Modify or replace the expanding scaler with a RollingRobustScaler. Outliers from 10 years ago should not skew the interquartile range (IQR) today.
+
+---
+
+## 9. Dimensionality Reduction Constraints (pca_fusion.py)
+
+### Mandate 9.1: Sequential Subspace Fitting
+- **Agent Instruction**: PCA and SparsePCA must never be instantiated and fit using fit_transform() over the full dataset during backtesting. The agent must implement a sequential loop that fits the PCA strictly on T−window and only transforms the vector at T.
+
+### Mandate 9.2: Eigenvector Sign Flipping (The "Whipsaw" Rule)
+PCA components have arbitrary signs; standard solvers can output X one day and −X the next, flipping the orientation of the entire feature space.
+- **Agent Instruction**: The agent must enforce eigenvector sign alignment across consecutive rolling windows. Calculate the cosine similarity (using scipy.spatial.distance.cosine) between the principal components of T and T−1. If the correlation is negative, the agent must multiply the current component by −1 to ensure continuous, stable feature generation.
+
+---
+
+## 10. Regime Detection Engine Constraints (ev_engine.py)
+
+### Mandate 10.1: Deterministic State Alignment (Label Switching)
+Unsupervised models like GaussianMixture and hmm assign arbitrary integer labels (e.g., State 0, State 1) to regimes. When the model is retrained, "State 0" could spontaneously become the high-volatility bear market instead of the low-volatility bull market, wrecking the downstream strategy.
+- **Agent Instruction**: The agent must implement a deterministic state-mapping heuristic immediately after .fit(). For example, the script must automatically calculate the variance of the emissions for each state, and strictly map the states such that State 0 = Lowest Variance, State 1 = Medium Variance, State N = Highest Variance.
+
+### Mandate 10.2: Causal Viterbi Decoding
+hmmlearn relies on the Viterbi algorithm (.predict()), which naturally looks forward in time to smooth out the hidden state path over a sequence.
+- **Agent Instruction**: During live trading or backtesting, if the agent runs .predict() on a sequence of data, it must only extract the final integer of the output array as the regime for time T. Feeding the smoothed historical sequence back into the backtester will inherently introduce look-ahead bias.
+
+### Mandate 10.3: Model Warm-Starting
+Retraining HMMs daily from random initializations is computationally expensive and guarantees convergence instability.
+- **Agent Instruction**: When retraining the model on a rolling basis, the agent must capture the previous window's transition matrix, means, and covariances, and pass them into the hmm.GaussianHMM(init_params='') constructor as the starting weights for the new window.
