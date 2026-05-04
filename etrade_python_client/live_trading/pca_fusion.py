@@ -107,7 +107,12 @@ class PCAFusion:
             cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
             self.n_components = max(2, np.argmax(cumulative_variance >= 0.90) + 1)
             
+        # Mandate 9.3: Initialize empty loadings for T=0
         pc_values = np.full((n_samples, self.n_components), np.nan)
+
+        if n_samples < window:
+            logger.warning(f"Insufficient samples ({n_samples}) for rolling window ({window}). Returning NaNs.")
+            return pd.DataFrame(pc_values, index=df.index, columns=[f"PC{i+1}" for i in range(self.n_components)])
 
         for t in range(window, n_samples):
             train_window = df.iloc[t-window : t]

@@ -90,9 +90,14 @@ This specification serves as the "source of truth". Any refactor to `ev_engine.p
 Unsupervised models (HMMs/GMMs) and PCA will fail or produce spurious regimes if applied to non-stationary price data.
 - **Agent Instruction**: The script must enforce transformations (e.g., log returns, fractional differencing) on raw price data. Before passing data downstream, the code must dynamically verify stationarity using the adfuller test (rejecting the null hypothesis at p<0.05). If it fails, the script must throw an explicit error or dynamically difference the data.
 
-### Mandate 8.2: Decay-Weighted Robust Scaling
-The current ExpandingRobustScaler concept is causal but assumes equal importance of all historical data.
 - **Agent Instruction**: Modify or replace the expanding scaler with a RollingRobustScaler. Outliers from 10 years ago should not skew the interquartile range (IQR) today.
+
+### Mandate 8.3: Earnings-Neutral Volatility Inputs
+Unsupervised models are highly sensitive to sudden, deterministic volatility spikes.
+- **Agent Instruction**: Ensure that the volatility features fed into the HMM/GMM do not interpret standard quarterly earnings seasons as sudden structural market regime breaks. The engine must explicitly ingest the forward factor with earnings-induced jumps removed to ensure the model reacts only to genuine macroeconomic shifts rather than scheduled calendar events.
+
+### Mandate 8.4: Rolling Window Execution Limits
+- **Agent Instruction**: When implementing the RollingRobustScaler (from Mandate 8.2), the agent must absolutely avoid using slow, iterative pandas.Series.rolling().apply() loops in the core execution path. It must utilize numpy striding (numpy.lib.stride_tricks) or built-in vectorized functions to ensure the scaling logic does not introduce unacceptable execution latency for live trading.
 
 ---
 
@@ -101,9 +106,10 @@ The current ExpandingRobustScaler concept is causal but assumes equal importance
 ### Mandate 9.1: Sequential Subspace Fitting
 - **Agent Instruction**: PCA and SparsePCA must never be instantiated and fit using fit_transform() over the full dataset during backtesting. The agent must implement a sequential loop that fits the PCA strictly on T−window and only transforms the vector at T.
 
-### Mandate 9.2: Eigenvector Sign Flipping (The "Whipsaw" Rule)
-PCA components have arbitrary signs; standard solvers can output X one day and −X the next, flipping the orientation of the entire feature space.
 - **Agent Instruction**: The agent must enforce eigenvector sign alignment across consecutive rolling windows. Calculate the cosine similarity (using scipy.spatial.distance.cosine) between the principal components of T and T−1. If the correlation is negative, the agent must multiply the current component by −1 to ensure continuous, stable feature generation.
+
+### Mandate 9.3: First-Window Edge Cases in PCA Alignment
+- **Agent Instruction**: When implementing the eigenvector sign-flipping logic (Mandate 9.2), the agent must elegantly handle the T=0 edge case. The script must initialize an empty array or safely bypass the cosine similarity check on the very first rolling window, otherwise the script will throw a NoneType or IndexError during the initial backtest step.
 
 ---
 
@@ -117,6 +123,11 @@ Unsupervised models like GaussianMixture and hmm assign arbitrary integer labels
 hmmlearn relies on the Viterbi algorithm (.predict()), which naturally looks forward in time to smooth out the hidden state path over a sequence.
 - **Agent Instruction**: During live trading or backtesting, if the agent runs .predict() on a sequence of data, it must only extract the final integer of the output array as the regime for time T. Feeding the smoothed historical sequence back into the backtester will inherently introduce look-ahead bias.
 
-### Mandate 10.3: Model Warm-Starting
-Retraining HMMs daily from random initializations is computationally expensive and guarantees convergence instability.
 - **Agent Instruction**: When retraining the model on a rolling basis, the agent must capture the previous window's transition matrix, means, and covariances, and pass them into the hmm.GaussianHMM(init_params='') constructor as the starting weights for the new window.
+
+### Mandate 10.4: Holistic State Alignment
+A common implementation failure when mapping HMM states deterministically (e.g., mapping State 0 to Lowest Variance) is only re-labeling the final predictions and ignoring the internal model attributes.
+- **Agent Instruction**: When sorting and reassigning the hidden states, the script must simultaneously reorder the hmm.transmat_ (Transition Matrix), hmm.means_, and hmm.covars_. Failing to realign the underlying probability distributions with the new integer labels will completely decouple the mathematical state from the predicted output, causing a cascading failure when the model attempts a warm start on the next step.
+
+### Mandate 10.5: Warm-Start Fallback Protocol
+- **Agent Instruction**: When injecting the previous window's parameters into the init_params='' constructor for a warm start, the agent must wrap the initialization in a try-except block. If the matrix dimensions misalign or if the model encounters a singular covariance matrix during an anomalous market jump, the code must cleanly fall back to a kmeans initialization rather than crashing the entire pipeline.

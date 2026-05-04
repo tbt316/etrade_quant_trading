@@ -421,8 +421,21 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                         temp_model.weights_ = current_hmm.weights_.copy()
                         temp_model.covars_ = current_hmm.covars_.copy()
                         
-                        stabilized_features = stable_fusion.transform(current_window_scaled).values
-                        temp_model.fit(stabilized_features)
+                        # Mandate 10.5: Warm-Start Fallback Protocol
+                        try:
+                            stabilized_features = stable_fusion.transform(current_window_scaled).values
+                            temp_model.fit(stabilized_features)
+                        except Exception as e:
+                            print(f"  [Warm-Start] Failed at t={t_abs} ({e}). Falling back to kmeans...")
+                            temp_model = hmm.GMMHMM(
+                                n_components=best_k, 
+                                n_mix=current_hmm.n_mix, 
+                                covariance_type="diag", 
+                                n_iter=100, 
+                                init_params="mcw", # Re-initialize
+                                random_state=42
+                            )
+                            temp_model.fit(stabilized_features)
                         
                         if is_hmm_healthy(temp_model):
                             # Explicitly fit scaler for THIS specific historical window
@@ -471,6 +484,25 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                             temp_model.weights_ = temp_model.weights_[new_idx]
                             temp_model.covars_ = temp_model.covars_[new_idx]
                             
+                            # Mandate 10.4: Holistic State Alignment
+                            # Realignment of all internal model attributes to ensure consistency
+                            state_vars_refit = []
+                            for k_idx in range(best_k):
+                                w_r = temp_model.weights_[k_idx]
+                                m_r = temp_model.means_[k_idx]
+                                c_r = temp_model.covars_[k_idx]
+                                mean_r = np.sum(w_r[:, np.newaxis] * m_r, axis=0)
+                                second_m_r = np.sum(w_r[:, np.newaxis] * (c_r + m_r**2), axis=0)
+                                state_vars_refit.append(np.sum(second_m_r - mean_r**2))
+                            
+                            # Sort by variance (lowest to highest) to maintain State 0 = Low Vol
+                            final_order = np.argsort(state_vars_refit)
+                            temp_model.startprob_ = temp_model.startprob_[final_order]
+                            temp_model.transmat_ = temp_model.transmat_[np.ix_(final_order, final_order)]
+                            temp_model.means_ = temp_model.means_[final_order]
+                            temp_model.weights_ = temp_model.weights_[final_order]
+                            temp_model.covars_ = temp_model.covars_[final_order]
+
                             current_hmm = temp_model
                             current_hmm.fusion_ = stable_fusion
                             current_hmm.scaler_ = stabilized_scaler

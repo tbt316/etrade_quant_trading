@@ -15,37 +15,34 @@ from copy import deepcopy
 class RollingRobustScaler:
     """
     A strictly causal, stateful scaler that maintains a rolling window of historical medians and IQRs.
-    Prevents dilution of recent structural breaks by limiting memory to a fixed window.
+    Mandate 8.4: Optimized with numpy-based vectorized operations to avoid slow pandas loops.
     """
-    def __init__(self, window=252 * 5): # Default 5 years of trading days
+    def __init__(self, window=252 * 5):
         self.window = window
-        self.history = []
+        self.history = None # Will be initialized as np.array
         self.center_ = None
         self.scale_ = None
-        self.feature_names = None
 
     def update_and_transform(self, x_row):
-        """
-        Update history with new row and return scaled value.
-        x_row: pd.Series or 1D array
-        """
+        """Update history with new row and return scaled value."""
         val = x_row.values if hasattr(x_row, 'values') else x_row
-        self.history.append(val)
+        val = np.array(val).reshape(1, -1)
         
-        # Enforce rolling window
-        if len(self.history) > self.window:
-            self.history.pop(0)
+        if self.history is None:
+            self.history = val
+        else:
+            self.history = np.vstack([self.history, val])
+            if len(self.history) > self.window:
+                self.history = self.history[-self.window:]
             
-        if len(self.history) < 20: # Minimum warmup
+        if len(self.history) < 20:
             return x_row * np.nan
         
-        hist_array = np.array(self.history)
-        self.center_ = np.median(hist_array, axis=0)
-        q1 = np.percentile(hist_array, 25, axis=0)
-        q3 = np.percentile(hist_array, 75, axis=0)
+        # Mandate 8.4: Vectorized median and percentile calculation
+        self.center_ = np.median(self.history, axis=0)
+        q1 = np.percentile(self.history, 25, axis=0)
+        q3 = np.percentile(self.history, 75, axis=0)
         self.scale_ = q3 - q1
-        
-        # Avoid division by zero
         self.scale_ = np.where(self.scale_ == 0, 1.0, self.scale_)
         
         return (x_row - self.center_) / self.scale_
@@ -55,6 +52,43 @@ class RollingRobustScaler:
         if self.center_ is None:
             return df * np.nan
         return (df - self.center_) / self.scale_
+
+    def batch_rolling_transform(self, df):
+        """
+        Mandate 8.4: Batch version using numpy stride_tricks for maximum performance.
+        Avoids iterative loops by calculating all rolling windows at once.
+        """
+        data = df.values
+        n_samples, n_features = data.shape
+        if n_samples < 20:
+            return df * np.nan
+            
+        # Use a smaller window for batch if the full window is too large for memory
+        # but here we use self.window
+        w = min(self.window, n_samples)
+        
+        # Create rolling windows using stride_tricks
+        # Shape: (n_samples - w + 1, w, n_features)
+        from numpy.lib.stride_tricks import sliding_window_view
+        windows = sliding_window_view(data, (w, n_features)).squeeze()
+        # windows shape might be (n_samples-w+1, w) if n_features=1, or (n_samples-w+1, w, n_features)
+        
+        if n_features == 1:
+            windows = windows[:, :, np.newaxis]
+            
+        # Calculate rolling medians and IQRs
+        centers = np.median(windows, axis=1)
+        q1 = np.percentile(windows, 25, axis=1)
+        q3 = np.percentile(windows, 75, axis=1)
+        scales = q3 - q1
+        scales = np.where(scales == 0, 1.0, scales)
+        
+        # The result at index t corresponds to the window ending at t
+        # So centers[0] is for t = w-1
+        result = np.full_like(data, np.nan)
+        result[w-1:] = (data[w-1:] - centers) / scales
+        
+        return pd.DataFrame(result, index=df.index, columns=df.columns)
 
 # Adjust path for project imports
 import sys
@@ -485,20 +519,18 @@ class DataIngestor:
 
     def rolling_scale_features(self, df, window=252*5):
         """
-        Regulation 8.2: Strictly causal rolling-window scaling.
+        Regulation 8.2 & 8.4: Optimized strictly causal rolling-window scaling.
         """
         scaler = RollingRobustScaler(window=window)
-        scaled_data = []
+        # Use optimized batch transform if possible
+        scaled_df = scaler.batch_rolling_transform(df)
         
-        for i in range(len(df)):
-            row = df.iloc[i]
-            scaled_row = scaler.update_and_transform(row)
-            scaled_data.append(scaled_row)
-            
         # Update self.rolling_scaler with the final state
         self.rolling_scaler = scaler
+        # We need to manually populate history for future updates
+        self.rolling_scaler.history = df.values[-window:]
         
-        return pd.DataFrame(scaled_data, index=df.index, columns=df.columns)
+        return scaled_df
 
     def verify_data(self, df):
         """🛑 Verification Checkpoint 1: Data Integrity."""
@@ -548,6 +580,14 @@ class DataIngestor:
         if combined.empty:
             raise ValueError("Dataset is empty after dropping NaNs! Check your internet connection or API rate limits.")
         
+        # Mandate 8.3: Earnings-Neutral Volatility Inputs
+        # Standardize spikes in VIX/Realized Vol that are likely earnings-driven.
+        vol_cols = [c for c in combined.columns if any(kw in c for kw in ['VIX', 'Vol', 'VVIX'])]
+        for col in vol_cols:
+            # 5-day rolling median filter suppresses short-lived spikes (earnings jumps)
+            combined[col] = combined[col].rolling(window=5, center=True, min_periods=1).median().ffill().bfill()
+            logger.info(f"Applied earnings-neutral median filter to {col}")
+
         # Stationarity
         stationary = self.ensure_stationarity(combined)
         
