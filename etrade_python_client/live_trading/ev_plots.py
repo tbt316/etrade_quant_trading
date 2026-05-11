@@ -24,6 +24,7 @@ from live_trading.ev_engine import (
     fetch_cached_yf_close, fetch_historical_data, build_regime_return_arrays,
     fit_gmm, query_gmm, get_probability_engine, calculate_yield_metrics,
     _build_single_regime_prob_func, train_regime_hmm, calculate_probability_of_touch,
+    calendar_days_to_trading_days,
     get_regime_labels
 )
 from live_trading.data_ingestion import DataIngestor
@@ -33,6 +34,16 @@ TARGET_MARGIN_DOLLARS = 10000.0
 COST_PER_SPREAD = 1.0
 
 # Logic moved to ev_engine.py float(prob)
+
+
+def _dominant_label(frame, state):
+    rows = frame[frame['HMM_State'] == state]
+    if 'Regime_Label' in rows.columns and not rows.empty and rows['Regime_Label'].notna().any():
+        labels = rows['Regime_Label'].dropna()
+        mode = labels.value_counts()
+        if not mode.empty:
+            return mode.index[0]
+    return f"State {state}"
 
 def plot_regime_timeline(n_components=None):
     """
@@ -48,34 +59,18 @@ def plot_regime_timeline(n_components=None):
 
     # Train HMM with expanding_window=True to eliminate look-ahead bias
     best_hmm, best_k, feature_df = train_regime_hmm(df, n_components=n_components, expanding_window=True)
-    regime_labels = get_regime_labels(best_hmm, pc_df=feature_df)
-    
-    # Calculate posterior probabilities (predict_proba) sequentially to avoid look-ahead bias
-    pc_cols = [c for c in feature_df.columns if c.startswith('PC')]
-    features_scaled = feature_df[pc_cols].values
-    
-    n_samples = len(features_scaled)
-    all_probs = np.zeros((n_samples, best_k))
-    warmup = min(252, n_samples - 1)
-    
-    if n_samples > warmup:
-        for t in range(n_samples):
-            if t < warmup:
-                all_probs[t] = best_hmm.predict_proba(features_scaled[:warmup+1])[-1]
-            else:
-                all_probs[t] = best_hmm.predict_proba(features_scaled[:t+1])[-1]
-    else:
-        all_probs = best_hmm.predict_proba(features_scaled)
-    
-    # Attach probabilities to the dataframe for filtering
-    for i in range(best_k):
-        feature_df[f'prob_state_{i}'] = all_probs[:, i]
-
+    # Mandate 10.6: Probabilities are now causally generated and stored in feature_df by the engine.
     # Bring in SPY and VIX from the original df for plotting
     feature_df = feature_df.join(df[['SPY_Close', 'VIX_Close']], how='inner')
 
     # Filter for 2015 onwards
     timeline_df = feature_df[feature_df.index >= '2015-01-01'].copy()
+    if {'Detected_Regime_State', 'Detected_Regime_Label'}.issubset(timeline_df.columns):
+        timeline_df['Raw_HMM_State'] = timeline_df['HMM_State']
+        timeline_df['Raw_Regime_Label'] = timeline_df['Regime_Label']
+        timeline_df['HMM_State'] = timeline_df['Detected_Regime_State']
+        timeline_df['Regime_Label'] = timeline_df['Detected_Regime_Label']
+        best_k = int(timeline_df['HMM_State'].max()) + 1
     if timeline_df.empty:
         print("ERROR: No data available for 2015 onwards.")
         return
@@ -88,6 +83,7 @@ def plot_regime_timeline(n_components=None):
 
     # --- Plot 1: Price and Regimes ---
     colors_list = plt.cm.Set3.colors
+    stable_labels = {i: _dominant_label(timeline_df, i) for i in range(best_k)}
     state_changes = timeline_df['HMM_State'].ne(timeline_df['HMM_State'].shift()).cumsum()
     groups = timeline_df.groupby(state_changes)
     
@@ -98,7 +94,7 @@ def plot_regime_timeline(n_components=None):
         color = colors_list[state_val % len(colors_list)]
         start_date = group.index[0]
         end_date = group.index[-1]
-        label = regime_labels.get(state, f"Regime {state}")
+        label = stable_labels.get(state_val, f"State {state_val}")
         if label not in added_to_legend:
             ax1.axvspan(start_date, end_date, color=color, alpha=0.4, label=label)
             added_to_legend.add(label)
@@ -119,7 +115,10 @@ def plot_regime_timeline(n_components=None):
 
     # --- Plot 2: Probability Stacked Area ---
     prob_data = [timeline_df[f'prob_state_{i}'].values for i in range(best_k)]
-    ax3.stackplot(dates, prob_data, labels=[regime_labels.get(i, f'State {i}') for i in range(best_k)], 
+    state_labels = []
+    for i in range(best_k):
+        state_labels.append(stable_labels.get(i, f'State {i}'))
+    ax3.stackplot(dates, prob_data, labels=state_labels, 
                   colors=colors_list[:best_k], alpha=0.8)
     ax3.set_ylabel('Regime Probability', fontsize=14, fontweight='bold')
     ax3.set_ylim(0, 1)
@@ -262,6 +261,182 @@ def plot_regime_distributions(horizon=45, n_components=None):
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"\n✓ Plot saved to {output_path}")
     plt.show()
+
+def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', output_dir='s_and_p_data'):
+    """
+    Plot the causal regime timeline and fit per-regime GMMs to SPY daily log returns.
+
+    This diagnostic uses `train_regime_hmm(..., expanding_window=True)` and the
+    per-row causal labels returned by the engine. It does not use forward returns.
+    """
+    hist_df = fetch_historical_data()
+    if hist_df.empty:
+        print("ERROR: No historical data available.")
+        return
+
+    best_hmm, best_k, feature_df = train_regime_hmm(
+        hist_df,
+        n_components=n_components,
+        expanding_window=True,
+    )
+    if best_hmm is None or feature_df.empty:
+        print("ERROR: HMM training did not produce a usable feature frame.")
+        return
+
+    common_idx = feature_df.index.intersection(hist_df.index)
+    diag_df = feature_df.loc[common_idx].copy()
+    diag_df['SPY_Close'] = hist_df.loc[common_idx, 'SPY_Close']
+    diag_df['VIX_Close'] = hist_df.loc[common_idx, 'VIX_Close']
+    diag_df['SPY_Log_Return'] = np.log(diag_df['SPY_Close'] / diag_df['SPY_Close'].shift(1))
+    if {'Detected_Regime_State', 'Detected_Regime_Label'}.issubset(diag_df.columns):
+        diag_df['Raw_HMM_State'] = diag_df['HMM_State']
+        diag_df['Raw_Regime_Label'] = diag_df['Regime_Label']
+        diag_df['HMM_State'] = diag_df['Detected_Regime_State']
+        diag_df['Regime_Label'] = diag_df['Detected_Regime_Label']
+    diag_df = diag_df.loc[pd.Timestamp(start_date):].dropna(subset=['SPY_Log_Return', 'HMM_State'])
+    if diag_df.empty:
+        print(f"ERROR: No diagnostic rows available from {start_date}.")
+        return
+    best_k = int(diag_df['HMM_State'].max()) + 1
+
+    os.makedirs(output_dir, exist_ok=True)
+    colors_list = plt.cm.Set3.colors
+
+    fig, (ax_price, ax_prob) = plt.subplots(
+        2, 1, figsize=(24, 14), gridspec_kw={'height_ratios': [3, 1]}, sharex=True
+    )
+    stable_labels = {i: _dominant_label(diag_df, i) for i in range(best_k)}
+    state_changes = diag_df['HMM_State'].ne(diag_df['HMM_State'].shift()).cumsum()
+    added = set()
+    for _, group in diag_df.groupby(state_changes):
+        state = int(group['HMM_State'].iloc[0])
+        label = stable_labels.get(state, f"State {state}")
+        color = colors_list[state % len(colors_list)]
+        if label not in added:
+            ax_price.axvspan(group.index[0], group.index[-1], color=color, alpha=0.35, label=label)
+            added.add(label)
+        else:
+            ax_price.axvspan(group.index[0], group.index[-1], color=color, alpha=0.35)
+
+    ax_price.plot(diag_df.index, diag_df['SPY_Close'], color='navy', linewidth=2.0, label='SPY Close')
+    ax_vix = ax_price.twinx()
+    ax_vix.plot(diag_df.index, diag_df['VIX_Close'], color='darkred', linewidth=1.2, alpha=0.75, label='VIX')
+    ax_price.set_ylabel('SPY Close')
+    ax_vix.set_ylabel('VIX')
+    ax_price.grid(True, alpha=0.25, linestyle='--')
+
+    prob_cols = [f'prob_state_{i}' for i in range(best_k) if f'prob_state_{i}' in diag_df.columns]
+    prob_labels = []
+    for i in range(best_k):
+        prob_labels.append(stable_labels.get(i, f'State {i}'))
+    ax_prob.stackplot(
+        diag_df.index,
+        [diag_df[c].values for c in prob_cols],
+        labels=prob_labels[:len(prob_cols)],
+        colors=colors_list[:len(prob_cols)],
+        alpha=0.85,
+    )
+    ax_prob.set_ylim(0, 1)
+    ax_prob.set_ylabel('Regime Probability')
+    ax_prob.set_xlabel('Date')
+    ax_prob.legend(loc='lower left', fontsize=9, ncol=max(1, min(best_k, 5)))
+    ax_prob.grid(True, alpha=0.25)
+
+    h1, l1 = ax_price.get_legend_handles_labels()
+    h2, l2 = ax_vix.get_legend_handles_labels()
+    ax_price.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, ncol=3)
+    fig.suptitle(
+        f"Causal Market Regime Timeline ({start_date} - present)\n"
+        f"GMMHMM K={best_k} | Signal timestamp: {diag_df.attrs.get('regime_signal_timestamp', 'close_T_for_next_session')}",
+        fontsize=16,
+        fontweight='bold',
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    timeline_path = os.path.join(output_dir, 'regime_log_return_timeline.png')
+    plt.savefig(timeline_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    cols = 2
+    rows = max(1, int(np.ceil(best_k / cols)))
+    fig, axes = plt.subplots(rows, cols, figsize=(18, 5.5 * rows))
+    axes = np.atleast_1d(axes).flatten()
+    summary_rows = []
+    x_all = diag_df['SPY_Log_Return'].values
+    x_min, x_max = np.nanpercentile(x_all, [0.5, 99.5])
+    x_grid = np.linspace(x_min, x_max, 500)
+
+    print("\n" + "=" * 80)
+    print("SPY DAILY LOG RETURN GMM FIT BY CAUSAL HMM REGIME")
+    print("=" * 80)
+
+    for state in range(best_k):
+        ax = axes[state]
+        state_df = diag_df[diag_df['HMM_State'] == state]
+        returns = state_df['SPY_Log_Return'].dropna().values.reshape(-1, 1)
+        label = stable_labels.get(state, f"State {state}")
+        n = len(returns)
+        color = colors_list[state % len(colors_list)]
+
+        if n < 20:
+            ax.set_title(f"{label}\ninsufficient observations: n={n}")
+            ax.text(0.5, 0.5, "Not enough data", transform=ax.transAxes, ha='center', va='center')
+            continue
+
+        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
+        gmm.fit(returns)
+        density = np.exp(gmm.score_samples(x_grid.reshape(-1, 1)))
+        mu = float(np.mean(returns))
+        sigma = float(np.std(returns, ddof=1))
+        skew = float(stats.skew(returns.flatten()))
+        kurt = float(stats.kurtosis(returns.flatten()))
+
+        ax.hist(returns.flatten(), bins=min(80, max(25, n // 20)), density=True,
+                alpha=0.62, color=color, edgecolor='black', linewidth=0.35, label='Empirical')
+        ax.plot(x_grid, density, color='black', linewidth=2.0, label='2-component GMM')
+        for comp_idx, (weight, mean, covar) in enumerate(zip(gmm.weights_, gmm.means_.flatten(), gmm.covariances_.reshape(-1))):
+            comp_density = weight * stats.norm.pdf(x_grid, loc=mean, scale=np.sqrt(max(covar, 1e-12)))
+            ax.plot(x_grid, comp_density, linestyle='--', linewidth=1.2, label=f'Comp {comp_idx + 1}')
+
+        bic = float(gmm.bic(returns))
+        ax.set_title(f"{label}\nn={n:,} | BIC={bic:.1f}")
+        ax.set_xlabel("SPY daily log return")
+        ax.set_ylabel("Density")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+
+        summary_rows.append({
+            'state': state,
+            'label': label,
+            'n': n,
+            'mean_log_return': mu,
+            'std_log_return': sigma,
+            'skew': skew,
+            'excess_kurtosis': kurt,
+            'gmm_bic': bic,
+            'gmm_weights': json.dumps([float(x) for x in gmm.weights_]),
+            'gmm_means': json.dumps([float(x) for x in gmm.means_.flatten()]),
+            'gmm_stds': json.dumps([float(np.sqrt(max(x, 1e-12))) for x in gmm.covariances_.reshape(-1)]),
+        })
+        print(f"State {state} | {label} | n={n:,} | mean={mu:.6f} | std={sigma:.6f} | BIC={bic:.1f}")
+
+    for ax in axes[best_k:]:
+        ax.set_visible(False)
+
+    fig.suptitle("SPY Daily Log Return Distributions by Causal HMM Regime", fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    gmm_path = os.path.join(output_dir, 'regime_log_return_gmm_fits.png')
+    plt.savefig(gmm_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    summary_path = os.path.join(output_dir, 'regime_log_return_gmm_summary.csv')
+    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+    diag_path = os.path.join(output_dir, 'regime_log_return_trace.csv')
+    diag_df.to_csv(diag_path)
+
+    print(f"\n✓ Timeline saved to {timeline_path}")
+    print(f"✓ GMM fit plot saved to {gmm_path}")
+    print(f"✓ Summary saved to {summary_path}")
+    print(f"✓ Causal trace saved to {diag_path}")
 
 def plot_gmm_clusters(horizon=45):
     """
@@ -483,6 +658,27 @@ def get_closest_by_delta(options, target_delta):
     if not options: return None
     return min(options, key=lambda x: abs(x["delta"] - target_delta))
 
+def select_target_expiration(accounts, symbol, target_dte):
+    expirations = accounts.get_available_expirations(symbol)
+    if not expirations:
+        return None
+
+    today = datetime.now().date()
+    parsed = []
+    for exp in expirations:
+        try:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        dte = (exp_date - today).days
+        if dte > 0:
+            parsed.append((abs(dte - target_dte), dte, exp_date))
+
+    if not parsed:
+        return None
+    _, _, selected = min(parsed, key=lambda x: (x[0], x[1]))
+    return datetime.combine(selected, datetime.min.time())
+
 def _build_single_regime_prob_func(spot_price, bucket, regime_label=""):
     """Builds a probability function for one bucket using selected model.
     Assumes bucket contains horizon-appropriate returns.
@@ -657,18 +853,20 @@ def main(args):
     recent_macro = loop.run_until_complete(ingestor.fetch_yf_data(macro_start, macro_end))
     vxv_vix_ratio = recent_macro['VXV_VIX_Ratio'].iloc[-1] if 'VXV_VIX_Ratio' in recent_macro.columns else 1.1
     
-    # Initialize Probability Engines
-    # In rolling horizon mode, we build the arrays for the specific target duration
-    target_exp = "2026-05-29"
-    exp_date_obj = datetime.strptime(target_exp, "%Y-%m-%d")
+    spx_exps = accounts.get_available_expirations(spx_ticker)
+    if not spx_exps:
+        spx_ticker = "SPXW"
+
+    # Initialize Probability Engines. Select the listed expiration closest to target DTE.
+    exp_date_obj = select_target_expiration(accounts, spy_ticker, args.target_dte)
+    if exp_date_obj is None:
+        print(f"CRITICAL: No valid {spy_ticker} expiration found near target DTE {args.target_dte}.")
+        return
+    target_exp = exp_date_obj.strftime("%Y-%m-%d")
     days_to_exp = max(1, (exp_date_obj - datetime.now()).days)
 
     print(f"[Engine] Building {days_to_exp}d rolling-horizon return buckets...", flush=True)
     regime_dict, hmm_model, daily_models = build_regime_return_arrays(int(time.time()/86400), horizon=days_to_exp, n_components=args.force_k)
-    
-    spx_exps = accounts.get_available_expirations(spx_ticker)
-    if not spx_exps:
-        spx_ticker = "SPXW"
 
     print(f"Current VIX: {vix_price:.2f}")
     spy_prob_func, regime_name, projected_weights, _, current_probs = get_probability_engine(
@@ -693,7 +891,10 @@ def main(args):
         if is_neg_gex: print(f"  - Negative GEX ({net_gex:.2f}B) indicates unstable architecture.")
         if is_backwardation: print(f"  - Volatility Curve Backwardation (VXV/VIX={vxv_vix_ratio:.2f}).")
         print("  Recommendation: SKIP PUT SELLING. Risk of tail expansion is high.")
-        # Proceed with caution or exit if user desired strict enforcement
+        if not args.override_risk_gates:
+            print("  Hard gate enforced. Re-run with --override-risk-gates to continue intentionally.")
+            return
+        print("  OVERRIDE ENABLED: continuing despite hard gate.")
     
     # Dynamic Parameter Mapping
     STRATEGY_MAP = {
@@ -1058,8 +1259,9 @@ def run_calibration_backtest(horizon=45, val_start_year=2020, refit_interval=21,
         print("ERROR: No historical data available.")
         return
         
+    trading_horizon = calendar_days_to_trading_days(horizon)
     df = df_raw.copy()
-    df['future_return'] = df['SPY_Close'].shift(-horizon) / df['SPY_Close'] - 1
+    df['future_return'] = df['SPY_Close'].shift(-trading_horizon) / df['SPY_Close'] - 1
     df_full = df.dropna(subset=['future_return']).copy()
     
     # We remove the global feature contamination entirely.
@@ -1097,10 +1299,13 @@ def run_calibration_backtest(horizon=45, val_start_year=2020, refit_interval=21,
         current_date_loc = df_full.index.get_loc(date)
         
         if i - last_refit_idx >= refit_interval:
-            cutoff_loc = max(0, current_date_loc - horizon)
+            cutoff_loc = max(0, current_date_loc - trading_horizon)
             train_data = df_full.iloc[:cutoff_loc].copy()
             
             best_hmm, best_k, model_train_df = train_regime_hmm(train_data, n_components=force_k)
+            train_common_idx = model_train_df.index.intersection(train_data.index)
+            model_train_df = model_train_df.loc[train_common_idx].copy()
+            model_train_df['future_return'] = train_data.loc[train_common_idx, 'future_return']
             current_hmm = best_hmm
             K = best_k
             
@@ -1134,7 +1339,9 @@ def run_calibration_backtest(horizon=45, val_start_year=2020, refit_interval=21,
         posteriors = current_hmm.predict_proba(pcs)
         current_probs = posteriors[-1]
         
-        projected_probs = current_probs @ np.linalg.matrix_power(current_hmm.transmat_, horizon)
+        projected_probs = current_probs
+        if USE_MARKOV_TRANSITIONS:
+            projected_probs = current_probs @ np.linalg.matrix_power(current_hmm.transmat_, trading_horizon)
         dominant_state = np.argmax(projected_probs)
         
         for m in moneyness_levels:
@@ -1186,7 +1393,7 @@ def run_calibration_backtest(horizon=45, val_start_year=2020, refit_interval=21,
     from scipy.stats import kruskal
     unique_dates = results.drop_duplicates(subset=['date'])
     # Resample non-overlapping windows to satisfy i.i.d assumption
-    unique_dates = unique_dates.iloc[::horizon]
+    unique_dates = unique_dates.iloc[::trading_horizon]
     print(f"  (Evaluating true independent samples for KW test: n={len(unique_dates)})")
     
     groups = []
@@ -1244,8 +1451,9 @@ def sample_prediction_outcomes(horizon=45, force_k=None):
     """
     df = fetch_historical_data()
     if df.empty: return
+    trading_horizon = calendar_days_to_trading_days(horizon)
     df = df.copy()
-    df['future_return'] = df['SPY_Close'].shift(-horizon) / df['SPY_Close'] - 1
+    df['future_return'] = df['SPY_Close'].shift(-trading_horizon) / df['SPY_Close'] - 1
     df_full = df.dropna(subset=['future_return']).copy()
 
     # Specific dates of interest across different regimes
@@ -1283,11 +1491,14 @@ def sample_prediction_outcomes(horizon=45, force_k=None):
         
         # Training data: STRICTLY before this date, completely dropping the horizon bleed
         current_date_loc = df_full.index.get_loc(date)
-        train_end_idx = max(0, current_date_loc - horizon)
+        train_end_idx = max(0, current_date_loc - trading_horizon)
         train_data = df_full.iloc[:train_end_idx].copy()
         
         # Train HMM on strictly isolated data
         best_hmm, best_k, model_train_df = train_regime_hmm(train_data, n_components=force_k)
+        train_common_idx = model_train_df.index.intersection(train_data.index)
+        model_train_df = model_train_df.loc[train_common_idx].copy()
+        model_train_df['future_return'] = train_data.loc[train_common_idx, 'future_return']
         
         # Use upgraded inference with PCA projection
         ingestor = DataIngestor()
@@ -1302,7 +1513,9 @@ def sample_prediction_outcomes(horizon=45, force_k=None):
         pcs = best_hmm.fusion_.sparse_pca.transform(scaled_df)
         posteriors = best_hmm.predict_proba(pcs)
         current_probs = posteriors[-1]
-        projected_probs = current_probs @ np.linalg.matrix_power(best_hmm.transmat_, horizon)
+        projected_probs = current_probs
+        if USE_MARKOV_TRANSITIONS:
+            projected_probs = current_probs @ np.linalg.matrix_power(best_hmm.transmat_, trading_horizon)
         
         # Fit GMMs for each state
         gmm_models = []
@@ -1312,7 +1525,7 @@ def sample_prediction_outcomes(horizon=45, force_k=None):
             gmm_models.append(fit_gmm(ret_subset, regime_label=f'State_{s}'))
             
         dominant_state = np.argmax(projected_probs)
-        regime_label = f"HMM State {dominant_state}"
+        regime_label = get_regime_labels(best_hmm).get(dominant_state, f"HMM State {dominant_state}")
         
         for m in moneyness_levels:
             predicted_p = 0.0
@@ -1344,6 +1557,11 @@ if __name__ == "__main__":
                         action='store_true')
     parser.add_argument('--timeline', help='plot regime timeline from 2024 and exit (no login needed)',
                         action='store_true')
+    parser.add_argument('--regime-log-return-gmm',
+                        help='plot causal regime timeline and per-regime SPY daily log-return GMM fits',
+                        action='store_true')
+    parser.add_argument('--diagnostic-start', help='Start date for regime diagnostics (YYYY-MM-DD)',
+                        type=str, default='2015-01-01')
     parser.add_argument('--backtest', help='run historical option backtest using Massive API (no login needed)',
                         action='store_true')
     parser.add_argument('--backtest-start', help='Backtest start date (YYYY-MM-DD)', type=str, default='2025-01-01')
@@ -1369,6 +1587,7 @@ if __name__ == "__main__":
     parser.add_argument('--panic-width-mult', help='Spread width multiplier in panic regime', type=float, default=2.0)
     parser.add_argument('--no-panic-swap', help='Disable closing all positions when entering panic regime', action='store_true')
     parser.add_argument('--strategy-id', help='Load configuration from strategy_registry.md by ID', type=str)
+    parser.add_argument('--override-risk-gates', help='Allow live trade construction even when hard regime/GEX/vol gates fire', action='store_true')
     args = parser.parse_args()
 
     if args.distributions:
@@ -1383,9 +1602,11 @@ if __name__ == "__main__":
         sample_prediction_outcomes(horizon=args.horizon, force_k=args.force_k)
     elif args.timeline:
         plot_regime_timeline(n_components=args.force_k)
+    elif args.regime_log_return_gmm:
+        plot_regime_log_return_gmm(n_components=args.force_k, start_date=args.diagnostic_start)
     elif args.backtest:
         import asyncio
-        from backtesting.backtest_runner import run_put_credit_spread_backtest
+        from backtesting.backtest_runner import run_put_credit_spread_backtest, get_trading_dates, lag_daily_regime_map
         from backtesting.strategy_loader import load_strategy
         from live_trading.ev_engine import fetch_historical_data, train_regime_hmm
         
@@ -1444,57 +1665,27 @@ if __name__ == "__main__":
             import sys
             sys.exit(1)
             
-        # Walk-forward regime generation to eliminate look-ahead bias
-        # We start calibration 1 year before the backtest start to have a stable initial model
-        cal_start_date = pd.to_datetime(args.backtest_start) - timedelta(days=365)
-        df_cal = df_hist[df_hist.index >= cal_start_date].copy()
-        
-        # Use refit_interval=21 (monthly) for the walk-forward
-        print(f"  [Walk-Forward] Starting calibration from {cal_start_date.strftime('%Y-%m-%d')} to {args.backtest_end}")
-        
-        # We need to compute regimes day-by-day or in chunks
-        regimes_dict = {}
-        regime_labels = {}
-        
-        val_dates = df_hist[(df_hist.index >= args.backtest_start) & (df_hist.index <= args.backtest_end)].index
-        refit_interval = 21
-        last_refit_idx = -refit_interval
-        
-        best_hmm = None
-        for i, date in enumerate(val_dates):
-            if i - last_refit_idx >= refit_interval:
-                # Training data is everything up to 'date'
-                train_data = df_hist[df_hist.index < date].copy()
-                if len(train_data) < 252: # Minimum 1 year of data
-                    # Fallback to a slightly larger window if needed
-                    train_data = df_hist.iloc[:252]
-                    
-                best_hmm, k, _ = train_regime_hmm(train_data, n_components=args.force_k)
-                regime_labels = get_regime_labels(best_hmm)
-                last_refit_idx = i
-                print(f"    [Refit] {date.strftime('%Y-%m-%d')} | K={k}")
-            
-            # Project today's state
-            ingestor = DataIngestor()
-            start_p = (date - timedelta(days=30)).strftime("%Y-%m-%d") # Short window for current projection
-            end_p = date.strftime("%Y-%m-%d")
-            
-            # build_fused_dataset is async
-            import asyncio
-            loop = asyncio.get_event_loop()
-            stationary_df = loop.run_until_complete(ingestor.build_fused_dataset(start_p, end_p, scale=False))
-            
-            if not stationary_df.empty:
-                # Use the scaler and fusion from the currently fitted model
-                scaled = best_hmm.scaler_.transform(stationary_df)
-                pcs = best_hmm.fusion_.sparse_pca.transform(scaled)
-                # Filtered probability (causal)
-                probs = best_hmm.predict_proba(pcs)[-1]
-                state = int(np.argmax(probs))
-                regimes_dict[date.strftime('%Y-%m-%d')] = state
-            else:
-                # Fallback to previous state or 0
-                regimes_dict[date.strftime('%Y-%m-%d')] = 0
+        # Walk-forward regime generation to eliminate parameter look-ahead bias.
+        # The resulting close_T labels are lagged before trade entry below.
+        cal_start_date = pd.to_datetime(args.backtest_start) - timedelta(days=365 * 5)
+        df_cal = df_hist[
+            (df_hist.index >= cal_start_date) &
+            (df_hist.index <= pd.to_datetime(args.backtest_end))
+        ].copy()
+        print(f"  [Walk-Forward] Training causal trace from {cal_start_date.strftime('%Y-%m-%d')} to {args.backtest_end}")
+        best_hmm, k, feature_df = train_regime_hmm(df_cal, n_components=args.force_k, expanding_window=True)
+        if best_hmm is None or feature_df.empty:
+            print("  ERROR: Could not build causal regime trace.")
+            import sys
+            sys.exit(1)
+        regime_labels = get_regime_labels(best_hmm, feature_df)
+        close_regimes = {
+            d.strftime('%Y-%m-%d'): int(s)
+            for d, s in feature_df['HMM_State'].dropna().to_dict().items()
+        }
+        trading_dates = get_trading_dates(args.backtest_start, args.backtest_end)
+        regimes_dict = lag_daily_regime_map(close_regimes, trading_dates)
+        print("  [Regime Timing] Using one-trading-day-lagged close_T regimes for trade entry.")
 
         # Extract SPY and VIX prices
         spy_close = df_hist['SPY_Close'].copy()

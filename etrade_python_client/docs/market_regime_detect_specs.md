@@ -17,8 +17,13 @@ All macroeconomic and price-based features must be stationary to prevent varianc
 
 ### 2.2 Causal Scaling
 - **Regulation**: Never use `StandardScaler` or `RobustScaler` from `sklearn` directly on the entire dataset before training or inference.
-- **Implementation**: The agent **MUST** implement a custom `ExpandingRobustScaler` or use a strict rolling window. Calling `.fit()` or `.fit_transform()` on a DataFrame containing future data relative to the current evaluation step is a catastrophic failure. At time $t$, the features are scaled using ONLY the median/IQR calculated from $X[0 \dots t]$.
+- **Implementation**: The agent **MUST** implement a custom `ExpandingRobustScaler` or use a strict rolling window. Calling `.fit()` or `.fit_transform()` on a DataFrame containing future data relative to the current evaluation step is a catastrophic failure. At time $t$, the features are scaled using only data that would be observable before the decision timestamp. If the regime is used for a next-session trade after the close, scaling may use data through close $t$. If the regime is used for an intraday or same-session trade, scaling must use only $X[0 \dots t-1]$ and the resulting signal must be timestamped accordingly.
 - **Reasoning**: Global scaling leaks future volatility into the past. If the 2020 VIX spike is in the dataset, global scaling suppresses the relative magnitude of the 2018 Volmageddon event, altering historical regime classification.
+
+### 2.3 Signal Availability Boundary
+- **Regulation**: Causal math and tradable availability are separate requirements. A feature value can be causal in an end-of-day research sense while still being unavailable for a same-day trade.
+- **Implementation**: Every regime feature frame must carry or document whether each row is available at `open_T`, `intraday_T`, `close_T`, or `next_open_T_plus_1`. Backtests must consume the regime value only after that timestamp. For daily close inputs such as `SPY_Close`, `VIX_Close`, realized volatility, and option end-of-day marks, the default tradable regime for date `T` is the previous trading day's regime unless the strategy explicitly models close-after-finalization execution.
+- **Reasoning**: Same-row contamination can enter through rolling scalers, trailing filters, and close-based features even when no future calendar date is used.
 
 ---
 
@@ -131,3 +136,147 @@ A common implementation failure when mapping HMM states deterministically (e.g.,
 
 ### Mandate 10.5: Warm-Start Fallback Protocol
 - **Agent Instruction**: When injecting the previous window's parameters into the init_params='' constructor for a warm start, the agent must wrap the initialization in a try-except block. If the matrix dimensions misalign or if the model encounters a singular covariance matrix during an anomalous market jump, the code must cleanly fall back to a kmeans initialization rather than crashing the entire pipeline.
+
+### Mandate 10.6: Causal Probability Trace Extraction
+When visualizing or backtesting regimes, downstream scripts (e.g., plotting utilities) often require the full historical probability trace.
+- **Agent Instruction**: The agent is strictly forbidden from manually reconstructing historical probabilities using a `for` loop that calls `predict_proba()` sequentially on the *final* returned global model (which contains parameters fitted on future data). This introduces severe look-ahead bias.
+- **Agent Instruction**: Instead, the regime training engine (`train_regime_hmm`) must calculate, store, and return the causal probabilities directly within its walk-forward refit loop. Downstream scripts must exclusively read these pre-calculated causal probability traces from the returned DataFrame.
+
+### Mandate 10.7: Scaler Inverse Transformation Safety
+- **Agent Instruction**: The `RollingRobustScaler` (or any custom causal scaler) used in `data_ingestion.py` must explicitly implement an `inverse_transform` method. Downstream logic in `get_regime_labels` relies on this method to convert physical PCA centroids back to raw VIX/Return values for semantic labeling.
+- **Agent Instruction**: Bare `try-except Exception:` blocks in `get_regime_labels` that swallow missing method errors and silently assign fallback values (like `avg_vix=20.0` for all states) are strictly forbidden. This silently destroys archetype ranking, causing the engine to misidentify regimes (e.g., mistaking an expansion for turmoil).
+
+---
+
+## 11. Empirical Return Construction Constraints
+
+### Mandate 11.1: Calendar vs. Trading Day Alignment
+- **Agent Instruction**: When constructing forward return buckets (e.g., `build_regime_return_arrays`), the agent must mathematically distinguish between calendar days and trading days. Option horizons (`days_to_exp`) are calculated in calendar days, whereas the historical `DataFrame` index consists only of trading days.
+- **Agent Instruction**: The script must never blindly execute `df.shift(-horizon)` when `horizon` is derived from calendar days. A row shift of 45 on a trading-day dataset steps forward ~63 calendar days, artificially inflating historical standard deviation and causing massive mispricing in the empirical expected value (EV) engine. The agent must reliably convert the calendar day horizon into equivalent trading days (e.g., `int(horizon * 252 / 365)`) before applying the positional `.shift()`.
+
+### Mandate 11.2: Walk-Forward Return Bucket Availability
+- **Agent Instruction**: A backtest must never price a trade at date T using a regime return bucket that includes future terminal returns whose entry date or exit date is after T. Forward returns are valid labels for research, but they become data leakage when used to estimate the probability model for earlier trades.
+- **Agent Instruction**: For historical backtests, `regime_dict`, daily GMM models, and any EV probability engine must be rebuilt or incrementally updated using only observations whose full forward horizon has already resolved by T. For a 42-calendar-day option, the latest eligible bucket entry at T is approximately `T - trading_horizon`.
+- **Reasoning**: Grouping all 2015-2026 future returns by causal regime is still non-causal if a 2016 trade is priced with 2020 crash outcomes. Live trading may use all history available as of today; backtests must simulate that availability date by date.
+
+### Mandate 11.3: Cache Key Completeness
+- **Agent Instruction**: Regime caches must be keyed by `as_of_date`, `horizon_calendar_days`, converted `trading_horizon`, `n_components`, feature list/hash, scaler/PCA version, model class, and data vintage. Timestamp-only caches are forbidden.
+- **Agent Instruction**: If `build_regime_return_arrays` is called with a different horizon or K than the cached object was built with, the cache must be invalidated. The function must not return a 7-day bucket to a 42-day strategy or a 42-day bucket to a 21-day strategy.
+- **Reasoning**: Reusing stale buckets silently changes the payoff distribution and can make the EV surface appear stable when it is using the wrong horizon.
+
+### Mandate 11.4: Entry-Date Censoring in Research Audits
+- **Agent Instruction**: Any script that audits probabilities at trade date `T` must censor the empirical return sample to entries whose terminal outcome is already known by `T`. If the return label is `r_{t->t+h}`, then the latest admissible entry row in the sample is `t <= T - h_trading`.
+- **Agent Instruction**: `df.loc[:T].dropna(subset=[future_return])` is forbidden when `future_return` was precomputed with a forward shift, because the final `h_trading` rows before `T` still encode outcomes from after `T`.
+- **Reasoning**: This is the audit-script version of look-ahead bias. The sample appears historical because the row index is in the past, but the label itself contains future prices beyond the decision date.
+
+---
+
+## 12. Current `ev_plots.py` / `ev_engine.py` Audit Regulations
+
+### Mandate 12.1: No Centered Rolling Filters
+- **Issue Observed**: `data_ingestion.py` applies a 5-day rolling median with `center=True` to volatility columns. A centered window uses future rows (`t+1`, `t+2`) to rewrite the feature at T.
+- **Agent Instruction**: All feature smoothing used for training, backtesting, live inference, charts, or return bucketing must be strictly trailing. `rolling(..., center=True)` is forbidden in the MRD pipeline. Use `center=False`, EWMA, or a trailing median and document whether the signal is available at close T or next open T+1.
+- **Reasoning**: Centered filtering is direct look-ahead bias and will make volatility shocks appear earlier and cleaner than they were in real time.
+
+### Mandate 12.2: Walk-Forward Model Selection
+- **Issue Observed**: `train_regime_hmm(expanding_window=True)` currently performs BIC state-count selection on the full feature sample before the walk-forward inference loop.
+- **Agent Instruction**: If K is selected dynamically, K must be selected inside the walk-forward refit at each refit date using only training data available at that date. Alternatively, K must be fixed by an out-of-sample research decision before the backtest period starts and recorded in configuration.
+- **Reasoning**: Full-sample K selection leaks future regime complexity into the past. A model that knows 2020-like turmoil requires more states in 2015 is not causal.
+
+### Mandate 12.3: No Future-Trained Warm Starts
+- **Issue Observed**: The walk-forward loop initializes `current_hmm` from a model fitted on the full sample, then warm-starts historical refits from those parameters.
+- **Agent Instruction**: A walk-forward model at date T must not use transition matrices, mixture weights, means, covariances, scaler state, PCA loadings, or labels from any model fitted with data after T. The first historical model must be initialized from scratch using only the first training window. Subsequent warm starts may use only the immediately prior walk-forward model.
+- **Reasoning**: EM warm starts can retain future information even after refitting on a shorter window, especially when iteration counts are capped.
+
+### Mandate 12.4: Scaler/PCA/Model Window Consistency
+- **Issue Observed**: Refit code mixes causal rolling-scaled features with a freshly fit `RobustScaler` on raw historical data for semantic labels. This can make `get_regime_labels` invert centroids through a scaler that was not used to produce the HMM emissions.
+- **Agent Instruction**: Every HMM snapshot must carry the exact scaler snapshot and PCA/fusion snapshot used to generate the emissions on which it was fit. Label inversion, current inference, and plotted centroids must use those exact objects. Re-fitting a different scaler merely for labeling is forbidden.
+- **Reasoning**: If the inverse transform is not the inverse of the transform that trained the model, archetype rankings can flip and downstream strategy logic will trade the wrong regime.
+
+### Mandate 12.5: Full Forward Filtering, Not Posterior History Reuse
+- **Agent Instruction**: For live decisions, using `predict_proba(X[:T])[-1]` is acceptable as a practical filtering approximation because the final posterior has no future observations inside that prefix. For historical traces, scripts must only store that final probability for each prefix. They must never reuse earlier rows from `predict_proba(X[:T])` as labels for earlier dates.
+- **Reasoning**: Earlier rows in a prefix are smoothed by later observations within that prefix. Only the final row is causal for decision time T.
+
+### Mandate 12.6: Decision Timestamp Discipline
+- **Agent Instruction**: Every regime value must declare its tradable timestamp: `close_T_for_next_session`, `intraday_T`, or `open_T`. If a feature uses daily close, VIX close, or same-day option chain settlement data, trades may only be entered after that data is actually observable, usually next session unless the strategy explicitly runs at the close after all source data is finalized.
+- **Reasoning**: A model can be mathematically causal and still operationally leaked if it enters before the data used to compute the signal was known.
+
+### Mandate 12.6a: Backtest Regime Map Lag
+- **Agent Instruction**: Daily backtests that enter during session `T` must pass a one-trading-day-lagged regime map into `run_put_credit_spread_backtest` when the regime detector uses daily close or end-of-day features. A dictionary keyed by `T` must contain only the latest regime observable before that trade decision, normally the regime calculated from `T-1`.
+- **Agent Instruction**: Unshifted maps such as `{date_T: HMM_State_T}` are allowed only for pure end-of-day reporting or for strategies that explicitly execute after all `T` inputs are finalized and whose option pricing also reflects that same decision timestamp.
+- **Reasoning**: `HMM_State_T` may be causal as a label for the close of `T`, but it is not available for selecting a trade earlier on `T`.
+
+### Mandate 12.7: Hard Risk Gates Must Be Enforced
+- **Issue Observed**: `ev_plots.py` prints "SKIP PUT SELLING" when Market Turmoil, negative GEX, or VIX backwardation is detected, but the script continues into put-spread selection.
+- **Agent Instruction**: A hard gate must return before trade construction unless the caller passes an explicit override flag that is logged with timestamp, reason, and operator. Warnings that continue into trade generation are not risk controls.
+- **Reasoning**: Tail-risk gates only protect capital if they affect execution.
+
+### Mandate 12.8: Expiration Selection Must Be Dynamic
+- **Issue Observed**: `ev_plots.py` hard-codes `target_exp = "2026-05-29"`.
+- **Agent Instruction**: Live and backtest strategy code must select expiration from the available option expirations based on configured target DTE and liquidity filters. Hard-coded future dates are forbidden outside one-off research scripts.
+- **Reasoning**: A hard-coded expiration silently becomes stale and can select unavailable, illiquid, or unintended contracts.
+
+### Mandate 12.9: Audit Horizon Consistency
+- **Agent Instruction**: If an audit script prices a contract using the actual listed expiration selected from the chain, then the realized benchmark and empirical return bucket must use that exact expiration date or exact day count for that trade date. Mixing an approximate trading-day shift for the probability estimate with a separate calendar-date lookup for realized outcome is forbidden.
+- **Reasoning**: If the forecast horizon and realized horizon differ, the audit is no longer comparing like with like; the measured edge can come from horizon mismatch rather than regime skill.
+
+### Mandate 12.10: Regime Label Provenance
+- **Agent Instruction**: Historical audit rows must display the semantic label generated by the HMM snapshot that existed at that row's decision time, or an explicitly versioned mapping derived only from information available then. Re-labeling all historical rows with `get_regime_labels(final_model)` is forbidden.
+- **Reasoning**: Even if the integer state trace is causal, projecting final-model semantics backward can rewrite the narrative of past regimes and hide state-identity drift.
+
+### Mandate 12.11: Audit Cache Validity
+- **Agent Instruction**: Research audit caches must include `audit_start`, `audit_end`, target horizon, selected expiration policy, data vintage, feature hash, and code/spec version. A bare JSON cache keyed only by filename is forbidden.
+- **Agent Instruction**: If any of those inputs change, the audit must recompute rather than load stale results.
+- **Reasoning**: Cached research output is part of the evidence base. Reusing a stale audit after model or data changes is functionally equivalent to looking at the wrong experiment.
+
+### Mandate 12.12: Raw-vs-Filtered Feature Disclosure
+- **Agent Instruction**: Any regime audit or chart that relies on filtered volatility features (for example a trailing median on VIX or realized vol) must explicitly disclose that the HMM operated on filtered inputs rather than raw closes. Where the objective is raw-data forensic validation, the script must offer a no-filter mode.
+- **Reasoning**: A trailing filter can be causal and still materially reshape shocks, persistence, and state boundaries. If that transformation is not disclosed, reviewers may attribute behavior to the raw market tape when it was created by preprocessing.
+
+### Mandate 12.13: Existing Backtest Script Safety
+- **Issue Observed**: `scratch/run_best_backtest.py` historically called `train_regime_hmm(df_hist, n_components=k)` without `expanding_window=True`, then passed the resulting same-date regime dictionary directly into the backtester.
+- **Agent Instruction**: Any script used for regime-aware historical backtests must either call the walk-forward causal path (`expanding_window=True`) or load a precomputed causal trace. It must not use the default non-expanding/global model for 2020-2026 performance claims.
+- **Agent Instruction**: If the declared experiment is "2020-2026 using historical data up to 2018", calibration, K selection, scaler/PCA snapshots, label mapping, and return/probability buckets must be fit or selected using data no later than `2018-12-31`. Subsequent 2020-2026 regime inference must be out-of-sample filtering unless the experiment explicitly declares walk-forward refits and their allowed training window.
+- **Reasoning**: A script can reference causal APIs elsewhere in the codebase and still run a non-causal experiment if it uses the wrong defaults or an unlagged regime map.
+
+---
+
+## 13. Regime-to-Strategy Adaptation Rules
+
+The backtest strategy registry currently contains three relevant profiles: a non-regime-aware fixed-delta baseline, a planned EV-optimized put spread, and an implemented dynamic delta variant. Regime detection should be used as a risk overlay first, and as an entry optimizer second.
+
+### Mandate 13.1: Baseline Strategy Must Remain a Control
+- **Agent Instruction**: `fixed_delta_put_spread` should remain `regime_aware: false` as the experimental control. Do not tune its entries by regime. Use it to measure whether the HMM overlay adds value after costs.
+
+### Mandate 13.2: Regime Overlay for Put Credit Spreads
+- **Agent Instruction**: For regime-aware put selling, use these default controls until walk-forward tests justify different values:
+    1. **Robust Expansion**: put credit spreads allowed; target short delta may be increased modestly from -0.15 toward -0.20; normal DTE and normal margin cap may be used.
+    2. **Emerging Expansion**: put credit spreads allowed at baseline risk; target short delta around -0.15; avoid increasing margin until the regime persists after debounce.
+    3. **High Vol Chop**: reduce risk; target short delta around -0.10, lower `margin_limit_pct`, require higher minimum credit/EV, and prefer wider long-leg protection only if EV per unit expected shortfall improves.
+    4. **Cautious Decline**: defensive mode; either skip new put spreads or use very low delta, reduced size, shorter holding periods, and stricter profit-taking. Do not roll losing puts mechanically into larger exposure.
+    5. **Market Turmoil**: no new short puts by default. Only hedged/risk-defined trades with explicit override are allowed. Close or reduce existing short-vol exposure according to a pre-declared crisis protocol.
+- **Reasoning**: Put credit spreads are short downside convexity. The correct regime response is primarily to reduce left-tail exposure, not to chase higher premium.
+
+### Mandate 13.3: Panic Swap Controls
+- **Agent Instruction**: `dynamic_delta_variant` must not force-close and replace positions 1:1 during Market Turmoil unless a walk-forward test proves that the replacement improves drawdown and expected shortfall after transaction costs. If enabled, `panic_qty_multiplier` should default below 1.0, and the strategy must cap aggregate short put delta, margin usage, and portfolio expected shortfall.
+- **Reasoning**: A 1:1 panic swap can realize losses, pay wide spreads, and immediately reload short crash convexity at the worst liquidity point.
+
+### Mandate 13.4: EV-Optimized Strategy Validation
+- **Agent Instruction**: `ev_optimized_put_spread` may use the GMM/HMM probability engine only with walk-forward return buckets available as of the trade date. Entry requires positive EV, acceptable EV/expected-shortfall ratio, liquidity filters, and a hard block in Market Turmoil unless explicitly overridden.
+- **Reasoning**: EV optimization is highly sensitive to tail distribution estimation. If the regime return buckets leak or are stale, the optimizer will select the most overfit spread.
+
+---
+
+## 14. Enforcement & Agent Operating Rules
+
+### Mandate 14.1: Spec Must Be Loaded Before MRD Work
+- **Agent Instruction**: Before modifying, reviewing, or running market-regime detection, EV probability, or regime-aware backtest code, the coding agent must read this file and cite which mandates govern the task.
+- **Scope**: This applies at minimum to `live_trading/ev_engine.py`, `live_trading/ev_plots.py`, `live_trading/data_ingestion.py`, `live_trading/pca_fusion.py`, `backtesting/backtest_runner.py`, `backtesting/strategy_registry.md`, and `scratch/*regime*` / `scratch/*backtest*` scripts.
+
+### Mandate 14.2: Specs Are Not Self-Enforcing
+- **Agent Instruction**: A Markdown specification is advisory unless it is connected to agent instructions, tests, linters, CI checks, or runtime assertions. Any critical non-anticipativity rule must have at least one executable guard where practical.
+- **Recommended Guards**:
+  1. A repo-level `AGENTS.md` that requires agents to read this spec before MRD/backtest work.
+  2. Regression tests that fail on global scaler/PCA fitting, non-expanding backtest traces, unlagged daily regime maps, stale cache keys, and unresolved forward-return buckets.
+  3. Runtime assertions in backtest scripts that record `train_end`, `regime_signal_timestamp`, and whether regime maps are lagged.
+- **Reasoning**: Agents and humans do not automatically ingest every Markdown file in a repository. The spec must be promoted into the working instructions and backed by failing checks.

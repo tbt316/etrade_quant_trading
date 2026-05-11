@@ -378,11 +378,53 @@ def update_spy_daily_snapshot(
     spy_positions = _extract_spy_positions(all_positions)
     
     # Calculate total option price (signed quantity * price * 100)
-    total_option_price = 0.0
+    # Filter out long-only positions (only include shorts and matched longs)
+    from collections import defaultdict
+    type_groups = defaultdict(list)
     for pos in spy_positions:
         qty = pos.get('quantity', 0) or 0
-        price = pos.get('last_price', 0) or 0
-        total_option_price += qty * price * 100.0
+        if qty == 0: continue
+        # Handle both formats: snapshot format and trade object format
+        expiry = pos.get('expiration_date', '') or pos.get('expiry_date', '')
+        call_put = pos.get('call_put', '') or pos.get('option_type', '')
+        key = (str(expiry), str(call_put).upper())
+        type_groups[key].append({
+            'qty': qty,
+            'price': pos.get('last_price', 0) or pos.get('price', 0) or 0,
+            'strike': pos.get('strike_price', 0) or pos.get('strike', 0) or 0
+        })
+
+    total_option_price = 0.0
+    for key, group in type_groups.items():
+        shorts = [p for p in group if p['qty'] < 0]
+        longs = [p for p in group if p['qty'] > 0]
+        
+        opt_type = key[1]
+        # Sort to match spread legs appropriately
+        # For PUTs, higher strike matches to short first
+        if opt_type == 'PUT':
+            longs.sort(key=lambda x: x['strike'], reverse=True)
+            shorts.sort(key=lambda x: x['strike'], reverse=True)
+        else:
+            longs.sort(key=lambda x: x['strike'])
+            shorts.sort(key=lambda x: x['strike'])
+
+        for short in shorts:
+            # Add short position value (qty is negative, so value is negative)
+            total_option_price += short['qty'] * short['price'] * 100.0
+            
+            # Match longs to this short to form a spread
+            short_qty_abs = abs(short['qty'])
+            for long in longs:
+                if long['qty'] <= 0: continue
+                matched_qty = min(short_qty_abs, long['qty'])
+                if matched_qty > 0:
+                    # Add matched long position value (positive)
+                    total_option_price += matched_qty * long['price'] * 100.0
+                    short_qty_abs -= matched_qty
+                    long['qty'] -= matched_qty
+                if short_qty_abs <= 0:
+                    break
     
     # Total margin
     total_margin = spy_total_margin

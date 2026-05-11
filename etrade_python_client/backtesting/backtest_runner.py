@@ -45,6 +45,26 @@ CLR_RST = "\033[0m"
 NYSE = mcal.get_calendar("NYSE")
 
 
+def lag_daily_regime_map(regimes: Dict[str, int], trading_dates: List[str]) -> Dict[str, int]:
+    """
+    Shift close_T regime labels forward one trading session for trade entry.
+
+    The regime detector uses daily close inputs, so a state calculated for date T
+    is available for the next trading session by default. This helper converts a
+    close-dated trace into the map consumed by run_put_credit_spread_backtest().
+    """
+    if not regimes:
+        return {}
+    lagged = {}
+    previous_state = None
+    for td in trading_dates:
+        if previous_state is not None:
+            lagged[td] = previous_state
+        if td in regimes:
+            previous_state = regimes[td]
+    return lagged
+
+
 @dataclass
 class SpreadTrade:
     """Represents a single credit spread trade."""

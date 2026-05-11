@@ -147,6 +147,12 @@ REFRESH_REQUESTED = threading.Event()
 MANUAL_TRADE_REQUESTED = threading.Event()
 MANUAL_TRADE_PARAMS = {}
 CURRENT_CLOSE_PROPOSALS = [] # Global for dashboard access
+CURRENT_NEUTRALIZE_PROPOSALS = [] # Global for dashboard access
+ACTIVE_DASHBOARD_ORDERS = set() # Global for tracking orders submitted to E*TRADE
+
+NEUTRALIZE_DELTA_THRESHOLD = 0.20
+NEUTRALIZE_TRIGGER_DTE = 21
+NEUTRALIZE_TARGET_DTE = 42
 
 def send_login_failure_notification(error_message, screenshot_path=None):
     """Send an email notification when automated login fails."""
@@ -285,8 +291,8 @@ def load_live_settings():
         "auto_close_gain_threshold": 70.0,
         "pair_quantity": 1,
         "target_weeks": 6,
-        "target_expiration": null,
-        "auto_open_enabled": false,
+        "target_expiration": None,
+        "auto_open_enabled": False,
         "pin": "1234"
     }
 
@@ -299,6 +305,228 @@ def save_live_settings(settings):
     except Exception as e:
         print(f"⚠️ Error saving settings: {e}")
         return False
+
+
+def _normalize_order_payload(order):
+    """Return a single order dict from generate_option_order output."""
+    if isinstance(order, list):
+        return order[0] if order else None
+    return order
+
+
+def _format_osi(symbol, exp_date, call_put, strike):
+    """Build an E*TRADE OSI string for an option leg."""
+    if hasattr(exp_date, "year"):
+        return f"{symbol}:{exp_date.year}:{exp_date.month:02d}:{exp_date.day:02d}:{call_put}:{strike}"
+    parts = str(exp_date).split("-")
+    return f"{symbol}:{parts[0]}:{parts[1]}:{parts[2]}:{call_put}:{strike}"
+
+
+def _quote_spread_midpoint(market, short_lot, long_lot):
+    """Quote a vertical spread and return midpoint plus leg prices."""
+    short_osi = _format_osi(short_lot.symbol, short_lot.expiration_date, short_lot.call_put, short_lot.strike_price)
+    long_osi = _format_osi(long_lot.symbol, long_lot.expiration_date, long_lot.call_put, long_lot.strike_price)
+
+    resp = market.get_quote([short_osi, long_osi], resp_format="json")
+    quote_data = resp.get("QuoteResponse", {}).get("QuoteData", [])
+
+    def _match_quote(osi_str):
+        parts = osi_str.split(':')
+        for q in quote_data:
+            p = q.get("Product", {})
+            try:
+                if (p.get("symbol") == parts[0] and
+                    str(p.get("expiryYear")) == parts[1] and
+                    int(p.get("expiryMonth")) == int(parts[2]) and
+                    int(p.get("expiryDay")) == int(parts[3]) and
+                    p.get("callPut") == parts[4] and
+                    abs(float(p.get("strikePrice", 0)) - float(parts[5])) < 0.01):
+                    return q.get("All", {})
+            except Exception:
+                continue
+        return None
+
+    short_q = _match_quote(short_osi)
+    long_q = _match_quote(long_osi)
+    if not short_q or not long_q:
+        return None
+
+    short_bid = float(short_q.get("bid", 0))
+    short_ask = float(short_q.get("ask", 0))
+    long_bid = float(long_q.get("bid", 0))
+    long_ask = float(long_q.get("ask", 0))
+    short_mid = (short_bid + short_ask) / 2.0
+    long_mid = (long_bid + long_ask) / 2.0
+    return {
+        "midpoint": short_mid - long_mid,
+        "short_bid": short_bid,
+        "short_ask": short_ask,
+        "long_bid": long_bid,
+        "long_ask": long_ask,
+    }
+
+
+def build_neutralize_proposals(screened, accounts, market, live_settings, rejected_proposals_today):
+    """Build neutralize proposals for risky short spreads."""
+    proposals = []
+    target_delta = float(live_settings.get("target_delta", 0.15) or 0.15)
+    hedge_spread = float(live_settings.get("hedge_spread", 20.0) or 20.0)
+    today = datetime.now().date()
+
+    for entry in screened:
+        if not entry.get("is_spread"):
+            continue
+
+        short_lot = entry.get("short_lot")
+        long_lot = entry.get("long_lot")
+        if not short_lot or not long_lot:
+            continue
+        if getattr(short_lot, "call_put", None) != getattr(long_lot, "call_put", None):
+            continue
+        if getattr(short_lot, "quantity", 0) >= 0 or getattr(long_lot, "quantity", 0) <= 0:
+            continue
+        if getattr(short_lot, "expiration_date", None) is None:
+            continue
+
+        try:
+            dte = (short_lot.expiration_date - today).days
+        except Exception:
+            continue
+
+        try:
+            short_delta = float(getattr(short_lot, "delta", 0) or 0)
+        except Exception:
+            continue
+
+        if abs(short_delta) <= NEUTRALIZE_DELTA_THRESHOLD or dte > NEUTRALIZE_TRIGGER_DTE or dte < 0:
+            continue
+
+        proposal_id = f"{short_lot.symbol}_{short_lot.strike_price}_{short_lot.call_put}_{short_lot.expiration_date}_neutralize"
+        if proposal_id in rejected_proposals_today:
+            continue
+
+        try:
+            quote_info = _quote_spread_midpoint(market, short_lot, long_lot)
+        except Exception as e:
+            print(f"   [Neutralize] Quote fetch failed for {short_lot.symbol}: {e}")
+            continue
+        if not quote_info:
+            continue
+
+        qty = int(entry.get("pair_quantity", 1) or 1)
+        close_debit = abs(quote_info["midpoint"])
+        side_title = "Call" if short_lot.call_put == "CALL" else "Put"
+        opposite_title = "Put" if side_title == "Call" else "Call"
+        original_spread_width = abs(float(long_lot.strike_price) - float(short_lot.strike_price))
+        if original_spread_width <= 0:
+            continue
+
+        try:
+            same_side_spread = accounts.get_option_spread_by_price(
+                short_lot.symbol,
+                side_title,
+                days_to_expire=NEUTRALIZE_TARGET_DTE,
+                target_premium=0,
+                hedge_ratio=1,
+                hedge_spread=original_spread_width,
+                qty=qty,
+                target_delta=target_delta
+            )
+            opposite_side_spread = accounts.get_option_spread_by_price(
+                short_lot.symbol,
+                opposite_title,
+                days_to_expire=NEUTRALIZE_TARGET_DTE,
+                target_premium=0,
+                hedge_ratio=1,
+                hedge_spread=hedge_spread,
+                qty=qty,
+                target_delta=target_delta
+            )
+        except Exception as e:
+            print(f"   [Neutralize] Failed to build replacement spreads for {short_lot.symbol}: {e}")
+            continue
+
+        if not same_side_spread or not opposite_side_spread:
+            continue
+
+        same_profit = float(same_side_spread.get("profit", 0) or 0)
+        opposite_profit = float(opposite_side_spread.get("profit", 0) or 0)
+        if same_profit <= 0.01 or opposite_profit <= 0.01:
+            continue
+
+        same_sell = same_side_spread.get("sell_option")
+        same_buy = same_side_spread.get("buy_option")
+        opp_sell = opposite_side_spread.get("sell_option")
+        opp_buy = opposite_side_spread.get("buy_option")
+        if not same_sell or not same_buy or not opp_sell or not opp_buy:
+            continue
+
+        close_order = accounts.generate_option_order(
+            single_leg_stock_position=None,
+            action="SPREAD",
+            spread_sell_option=long_lot,
+            spread_buy_option=short_lot,
+            priceType={"priceType": "NET_DEBIT", "limitPrice": round(close_debit, 2)}
+        )
+        same_order = accounts.generate_option_order(
+            single_leg_stock_position=None,
+            action="SPREAD",
+            spread_sell_option=same_sell,
+            spread_buy_option=same_buy,
+            priceType={"priceType": "NET_CREDIT", "limitPrice": round(same_profit, 2)}
+        )
+        opp_order = accounts.generate_option_order(
+            single_leg_stock_position=None,
+            action="SPREAD",
+            spread_sell_option=opp_sell,
+            spread_buy_option=opp_buy,
+            priceType={"priceType": "NET_CREDIT", "limitPrice": round(opposite_profit, 2)}
+        )
+
+        proposals.append({
+            "proposal_id": proposal_id,
+            "ticker": short_lot.symbol,
+            "qty": qty,
+            "original": {
+                "call_put": short_lot.call_put,
+                "expiration": short_lot.expiration_date.strftime("%Y-%m-%d"),
+                "short_strike": float(short_lot.strike_price),
+                "long_strike": float(long_lot.strike_price),
+                "delta": round(short_delta, 4),
+                "dte": int(dte),
+                "midpoint_debit": round(close_debit, 2),
+                "spread_width": round(original_spread_width, 2),
+            },
+            "replacement": {
+                "call_put": side_title.upper(),
+                "expiration": same_sell.expiration_date.strftime("%Y-%m-%d"),
+                "short_strike": float(same_sell.strike_price),
+                "long_strike": float(same_buy.strike_price),
+                "spread_width": round(abs(float(same_buy.strike_price) - float(same_sell.strike_price)), 2),
+                "delta": round(float(getattr(same_sell, "delta", 0) or 0), 4),
+                "credit": round(float(same_side_spread.get("profit", 0) or 0), 2),
+            },
+            "offset": {
+                "call_put": opposite_title.upper(),
+                "expiration": opp_sell.expiration_date.strftime("%Y-%m-%d"),
+                "short_strike": float(opp_sell.strike_price),
+                "long_strike": float(opp_buy.strike_price),
+                "spread_width": round(abs(float(opp_buy.strike_price) - float(opp_sell.strike_price)), 2),
+                "delta": round(float(getattr(opp_sell, "delta", 0) or 0), 4),
+                "credit": round(float(opposite_side_spread.get("profit", 0) or 0), 2),
+            },
+            "estimated_close_debit": round(close_debit, 2),
+            "estimated_open_credit": round(same_profit + opposite_profit, 2),
+            "estimated_net_credit": round(same_profit + opposite_profit - close_debit, 2),
+            "has_open_order": False,
+            "orders": {
+                "close_order": _normalize_order_payload(close_order),
+                "replacement_order": _normalize_order_payload(same_order),
+                "offset_order": _normalize_order_payload(opp_order),
+            }
+        })
+
+    return proposals
 
 
 class RefreshHandler(BaseHTTPRequestHandler):
@@ -425,6 +653,30 @@ class RefreshHandler(BaseHTTPRequestHandler):
             MANUAL_TRADE_PARAMS = data
             MANUAL_TRADE_REQUESTED.set()
             self._send_safe_response(200, {"status": "ok", "message": "Order request sent."})
+
+        elif self.path.startswith('/api/execute_neutralize_order'):
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            settings = load_live_settings()
+
+            if data.get('pin') != settings.get('pin'):
+                log_dashboard_request(self.path, {"error": "Invalid PIN attempt"})
+                self._send_safe_response(403, {"error": "Invalid PIN"})
+                return
+
+            if not data.get('proposal_id'):
+                log_dashboard_request(self.path, {"error": "Missing neutralize proposal_id"})
+                self._send_safe_response(400, {"error": "Missing neutralize proposal_id"})
+                return
+
+            log_dashboard_request(self.path, data)
+            print(f"\n⚡ [Dashboard] Neutralize risk request for proposal: {data.get('proposal_id')}")
+            data['is_neutralize'] = True
+            data['is_close'] = False
+            MANUAL_TRADE_PARAMS = data
+            MANUAL_TRADE_REQUESTED.set()
+            self._send_safe_response(200, {"status": "ok", "message": "Neutralize request sent."})
 
         elif self.path.startswith('/api/close_position') or self.path.startswith('/api/execute_close_order'):
             content_length = int(self.headers['Content-Length'])
@@ -592,6 +844,15 @@ class RefreshHandler(BaseHTTPRequestHandler):
             for p in CURRENT_CLOSE_PROPOSALS:
                 cp = p.copy()
                 if 'close_order' in cp: del cp['close_order']
+                cp['has_open_order'] = cp.get('proposal_id') in ACTIVE_DASHBOARD_ORDERS
+                clean_proposals.append(cp)
+            self._send_safe_response(200, clean_proposals)
+        elif self.path.startswith('/api/neutralize_risk'):
+            clean_proposals = []
+            for p in CURRENT_NEUTRALIZE_PROPOSALS:
+                cp = p.copy()
+                cp.pop('orders', None)
+                cp['has_open_order'] = cp.get('proposal_id') in ACTIVE_DASHBOARD_ORDERS
                 clean_proposals.append(cp)
             self._send_safe_response(200, clean_proposals)
         else:
@@ -1971,7 +2232,23 @@ if __name__ == "__main__":
             positions_to_roll = accounts.get_option_trade(all_positions)
             executed_orders_list = etrade_instance.order.get_executed_orders(passed_monday.strftime("%Y-%m-%d"))
             accounts.update_csv_order_statuses(executed_orders_list)
-            # etrade_instance.order.refresh_order_limit()
+            
+            try:
+                open_orders = etrade_instance.order.get_open_orders()
+                if open_orders is not None:
+                    ACTIVE_DASHBOARD_ORDERS.clear()
+                    for o in open_orders:
+                        if o.get("orderAction") in ("BUY_CLOSE", "SELL_CLOSE"):
+                            sym = o.get("symbol")
+                            strike = o.get("strikePrice")
+                            cp_opt = o.get("callPut")
+                            exp = o.get("expiryDate")
+                            if sym and strike and cp_opt and exp:
+                                # Add variants to match both datetime and date string representations
+                                ACTIVE_DASHBOARD_ORDERS.add(f"{sym}_{float(strike)}_{cp_opt}_{exp}")
+                                ACTIVE_DASHBOARD_ORDERS.add(f"{sym}_{float(strike)}_{cp_opt}_{exp} 00:00:00")
+            except Exception as e:
+                print(f"[Open Orders Sync] Warning: Could not fetch open orders: {e}")
 
             # If market is not open (PRE_MARKET or AFTER_HOURS), update HTML but skip position actions
             if market_status in ("PRE_MARKET", "AFTER_HOURS") and not is_manual_trade:
@@ -2080,22 +2357,26 @@ if __name__ == "__main__":
                                     except Exception as e:
                                         print(f"❌ Failed to auto-close spread {spread_id}: {e}")
 
+            # Source of truth for execution: dashboard manual trade or auto-open enabled
+            is_manual_close = is_manual_trade and MANUAL_TRADE_PARAMS.get('is_close', False)
+            is_manual_neutralize = is_manual_trade and MANUAL_TRADE_PARAMS.get('is_neutralize', False)
+            is_manual_open = is_manual_trade and not is_manual_close and not is_manual_neutralize
+
             # --- POSITION OPENING ACTION SECTION ---
-            # Attempt to open new positions if auto-open is enabled and we haven't traded yet today 
-            # OR if manual refresh/manual trade is requested
+            # Attempt to open new positions if auto-open is enabled and we haven't traded yet today
+            # OR if manual refresh/manual open is requested. Manual close/neutralize requests are
+            # isolated from normal open automation so a risk action cannot create unrelated spreads.
             auto_open_enabled = live_settings.get('auto_open_enabled', False)
-            # is_manual_trade already checked above
             if is_manual_trade:
                 print("\n⚡ [Main Loop] Manual trade request detected. Proceeding to execution logic...")
                 MANUAL_TRADE_REQUESTED.clear()
             
-            # Source of truth for execution: dashboard manual trade or auto-open enabled
-            is_manual_close = is_manual_trade and MANUAL_TRADE_PARAMS.get('is_close', False)
-            is_manual_open = is_manual_trade and not is_manual_close
-            
             # --- OPENING EXECUTION GATE ---
             # Only search for new positions if it's an AUTO-OPEN or a MANUAL-OPEN request
-            execute_open_now = (auto_open_enabled and last_trade_date != current_date) or is_manual_open
+            execute_open_now = (
+                (auto_open_enabled and last_trade_date != current_date and not is_manual_close and not is_manual_neutralize)
+                or is_manual_open
+            )
             
             if execute_open_now or is_manual_refresh:
                 if is_manual_refresh:
@@ -2555,7 +2836,7 @@ if __name__ == "__main__":
                         last_trade_date = current_date
                         trade_executed_flag = True
                 else:
-                    if not execute_now:
+                    if not execute_open_now:
                         print("Search complete. No orders executed (Refresh mode).")
                     else:
                         print("No valid orders found to execute.")
@@ -2675,26 +2956,72 @@ if __name__ == "__main__":
 
             # Update global list for dashboard
             CURRENT_CLOSE_PROPOSALS = close_proposals
+            CURRENT_NEUTRALIZE_PROPOSALS = build_neutralize_proposals(
+                screened,
+                accounts,
+                market,
+                live_settings,
+                rejected_proposals_today
+            )
+
+            # State Mismatch Bug Fix: Check if requested manual close still exists
+            if is_manual_close:
+                found = False
+                req_ticker = MANUAL_TRADE_PARAMS.get('ticker')
+                req_strike = MANUAL_TRADE_PARAMS.get('sell_strike')
+                for cp in close_proposals:
+                    if cp['ticker'] == req_ticker and float(cp['short_strike']) == float(req_strike):
+                        found = True
+                        break
+                if not found:
+                    print(f"⚠️ [Manual Trade] Position {req_ticker} (Strike {req_strike}) no longer qualifies for auto-close thresholds. Skipping execution.")
+                    MANUAL_TRADE_REQUESTED.clear()
+                    is_manual_close = False
 
             # --- Auto-approval (Guarded by master toggle OR manual override) ---
             if close_proposals:
-                if auto_open_enabled or is_manual_close:
+                if (auto_open_enabled and not is_manual_neutralize) or is_manual_close:
                     close_reason = "Manual Dashboard Close" if is_manual_close else "Automatic System Close"
                     print(f"✅ Close-spread proposals approved ({close_reason}). Executing...")
                     for cp in close_proposals:
+                        # Massive Close Bug Fix: If manual close, only process the specific requested position
+                        if is_manual_close:
+                            req_ticker = MANUAL_TRADE_PARAMS.get('ticker')
+                            req_strike = MANUAL_TRADE_PARAMS.get('sell_strike')
+                            if cp['ticker'] != req_ticker or float(cp['short_strike']) != float(req_strike):
+                                continue
+
                         close_order = cp['close_order']
                         if isinstance(close_order, list): 
                             close_order = close_order[0]
+                            
+                        # Mark order as active for the frontend
+                        proposal_id = cp.get('proposal_id')
+                        if proposal_id:
+                            ACTIVE_DASHBOARD_ORDERS.add(proposal_id)
 
-                        # Re-fetch latest price after approval delay
-                        _, refreshed_debit = refresh_spread_limit_price(
-                            market, cp['ticker'],
-                            cp['short_strike'], cp['long_strike'],
-                            cp['call_put'], cp['expiration'],
-                            close_order, is_credit=False
-                        )
+                        # Limit Price Overwrite Bug Fix: Respect frontend price for manual trades
+                        if is_manual_close and MANUAL_TRADE_PARAMS.get('midpoint') is not None:
+                            frontend_price = abs(float(MANUAL_TRADE_PARAMS.get('midpoint')))
+                            # Update the order limit price
+                            if isinstance(close_order, dict):
+                                close_order['limitPrice'] = frontend_price
+                            elif isinstance(close_order, list):
+                                for od in close_order:
+                                    if isinstance(od, dict) and 'limitPrice' in od:
+                                        od['limitPrice'] = frontend_price
+                            limit_price_val = frontend_price
+                            print(f"   [Manual Trade] Using frontend requested price: ${frontend_price:.2f}")
+                        else:
+                            # Re-fetch latest price after approval delay (for automatic trades)
+                            _, refreshed_debit = refresh_spread_limit_price(
+                                market, cp['ticker'],
+                                cp['short_strike'], cp['long_strike'],
+                                cp['call_put'], cp['expiration'],
+                                close_order, is_credit=False
+                            )
+                            limit_price_val = close_order.get('limitPrice', 'N/A')
 
-                        limit_price_val = close_order.get('limitPrice', 'N/A')
                         print(f"   Submitting close order for {cp['ticker']} {cp['call_put']} {cp['short_strike']}/{cp['long_strike']} @ ${limit_price_val}...")
                         order_id = etrade_instance.order.place_order(close_order, preview_only=False)
                         if order_id:
@@ -2725,15 +3052,156 @@ if __name__ == "__main__":
                                 print(f"   Auto-adjust for close order {order_id} error: {e}")
                         else:
                             print(f"   ❌ Close order submission failed for {cp['ticker']}")
+                        
+                        # Remove from active orders after completion
+                        if proposal_id in ACTIVE_DASHBOARD_ORDERS:
+                            ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
+                            
                         t.sleep(3)
                     # Clear flags
                     MANUAL_TRADE_REQUESTED.clear()
                     is_manual_close = False
                 else:
-                    print(f"📝 {len(close_proposals)} Close-spread proposals detected. Waiting for manual approval on dashboard (Automatic Open is OFF).")
+                    wait_reason = "neutralize request in progress" if is_manual_neutralize else "Automatic Open is OFF"
+                    print(f"📝 {len(close_proposals)} Close-spread proposals detected. Waiting for manual approval on dashboard ({wait_reason}).")
             else:
                 print("   No high-gain spreads detected for closing.")
-    
+
+            # --- MANUAL NEUTRALIZE REQUEST ---
+            if is_manual_trade and MANUAL_TRADE_PARAMS.get('is_neutralize'):
+                print("\n🔐 [Manual Trade] Processing NEUTRALIZE request from dashboard...")
+                data = MANUAL_TRADE_PARAMS
+                MANUAL_TRADE_REQUESTED.clear()
+                proposal_id = data.get('proposal_id')
+
+                try:
+                    target_proposal = None
+                    for proposal in CURRENT_NEUTRALIZE_PROPOSALS:
+                        if proposal.get('proposal_id') == proposal_id:
+                            target_proposal = proposal
+                            break
+                    if target_proposal is None:
+                        print(f"   ❌ No matching neutralize proposal found for {proposal_id}.")
+                        REFRESH_REQUESTED.set()
+                        continue
+
+                    close_order = _normalize_order_payload(target_proposal.get('orders', {}).get('close_order'))
+                    replacement_order = _normalize_order_payload(target_proposal.get('orders', {}).get('replacement_order'))
+                    offset_order = _normalize_order_payload(target_proposal.get('orders', {}).get('offset_order'))
+                    if not close_order or not replacement_order or not offset_order:
+                        print("   ❌ Neutralize proposal is missing one or more orders.")
+                        REFRESH_REQUESTED.set()
+                        continue
+
+                    original = target_proposal.get('original', {})
+                    replacement = target_proposal.get('replacement', {})
+                    offset = target_proposal.get('offset', {})
+                    ticker = target_proposal.get('ticker')
+                    qty = int(target_proposal.get('qty', 1) or 1)
+                    print(f"   [Neutralize] {ticker} {original.get('call_put')} {original.get('short_strike')}/{original.get('long_strike')} -> 42 DTE roll + opposite spread")
+
+                    # Re-price the three orders immediately before sending.
+                    refresh_spread_limit_price(
+                        market,
+                        ticker,
+                        original.get('short_strike'),
+                        original.get('long_strike'),
+                        original.get('call_put'),
+                        original.get('expiration'),
+                        close_order,
+                        is_credit=False
+                    )
+                    refresh_spread_limit_price(
+                        market,
+                        ticker,
+                        replacement.get('short_strike'),
+                        replacement.get('long_strike'),
+                        replacement.get('call_put'),
+                        replacement.get('expiration'),
+                        replacement_order,
+                        is_credit=True
+                    )
+                    refresh_spread_limit_price(
+                        market,
+                        ticker,
+                        offset.get('short_strike'),
+                        offset.get('long_strike'),
+                        offset.get('call_put'),
+                        offset.get('expiration'),
+                        offset_order,
+                        is_credit=True
+                    )
+
+                    close_order = _normalize_order_payload(close_order)
+                    replacement_order = _normalize_order_payload(replacement_order)
+                    offset_order = _normalize_order_payload(offset_order)
+
+                    if not close_order or not replacement_order or not offset_order:
+                        print("   ❌ Neutralize order payload normalization failed.")
+                        REFRESH_REQUESTED.set()
+                        continue
+
+                    if float(replacement_order.get('limitPrice', 0) or 0) <= 0.01 or float(offset_order.get('limitPrice', 0) or 0) <= 0.01:
+                        print("   ❌ Neutralize replacement/offset credit no longer valid; skipping execution.")
+                        REFRESH_REQUESTED.set()
+                        continue
+
+                    if proposal_id:
+                        ACTIVE_DASHBOARD_ORDERS.add(proposal_id)
+
+                    close_reason = "Manual Dashboard Neutralize"
+                    executed_orders = [
+                        ("close", close_order, original.get('short_strike'), original.get('long_strike'), original.get('call_put')),
+                        ("replacement", replacement_order, replacement.get('short_strike'), replacement.get('long_strike'), replacement.get('call_put')),
+                        ("offset", offset_order, offset.get('short_strike'), offset.get('long_strike'), offset.get('call_put')),
+                    ]
+
+                    neutralize_failed = False
+                    for leg_name, order_to_send, short_strike, long_strike, call_put in executed_orders:
+                        if neutralize_failed:
+                            break
+                        print(f"   [Neutralize] Submitting {leg_name} order for {ticker} {call_put} {short_strike}/{long_strike}...")
+                        order_id = etrade_instance.order.place_order(order_to_send, preview_only=False)
+                        if not order_id:
+                            neutralize_failed = True
+                            print(f"   ❌ Neutralize {leg_name} order submission failed for {ticker}")
+                            break
+
+                        print(f"   [Neutralize] Order submitted! ID: {order_id}")
+                        try:
+                            executed, final_id = etrade_instance.order.wait_and_adjust_until_filled(
+                                order_id, step=0.01, interval_sec=30, max_checks=60
+                            )
+                            if executed:
+                                print(f"   ✅ Neutralize {leg_name} order filled (ID: {final_id})")
+                                order_audit = {
+                                    'ticker': ticker,
+                                    'sell_strike': short_strike,
+                                    'long_strike': long_strike,
+                                    'qty': qty,
+                                    'order_id': final_id,
+                                    'is_close': (leg_name == "close"),
+                                }
+                                log_order_execution(order_audit, close_reason, "FILLED")
+                                send_trade_notification_email(order_audit, close_reason)
+                            else:
+                                neutralize_failed = True
+                                print(f"   ❌ Neutralize {leg_name} order did not fill for {ticker}")
+                        except Exception as e:
+                            neutralize_failed = True
+                            print(f"   Auto-adjust for neutralize {leg_name} order {order_id} error: {e}")
+
+                    if proposal_id in ACTIVE_DASHBOARD_ORDERS:
+                        ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
+                except Exception as e:
+                    if proposal_id in ACTIVE_DASHBOARD_ORDERS:
+                        ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
+                    print(f"   ❌ Error executing neutralize request: {e}")
+                    traceback.print_exc()
+
+                REFRESH_REQUESTED.set()
+                continue
+
             # Existing position neutralization logic (unchanged)
             for position in all_positions:
                 if position.security_type == "Option" and position.symbol == "BA" and position.strike_price == 1700 and position.call_put == "PUT":

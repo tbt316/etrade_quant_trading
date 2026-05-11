@@ -2,17 +2,22 @@ import os
 import json
 import time
 import functools
+import hashlib
+import multiprocessing as mp
+from copy import deepcopy
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import scipy.stats as stats
 from sklearn.mixture import GaussianMixture
 from hmmlearn import hmm
-from live_trading.data_ingestion import DataIngestor
+from live_trading.data_ingestion import DataIngestor, RollingRobustScaler
 from live_trading.pca_fusion import PCAFusion
 from datetime import datetime, timedelta
 import asyncio
 from sklearn.preprocessing import RobustScaler
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
 
 def is_hmm_healthy(model):
     """Check if the HMM model has valid (non-NaN, non-Inf) parameters."""
@@ -36,6 +41,316 @@ def is_hmm_healthy(model):
     except Exception:
         return False
     return True
+
+def _state_emission_mean_var(model, state_idx):
+    if hasattr(model, "weights_"):
+        w = model.weights_[state_idx]
+        c = model.covars_[state_idx]
+        m = model.means_[state_idx]
+        mean_state = np.sum(w[:, np.newaxis] * m, axis=0)
+        second_moment = np.sum(w[:, np.newaxis] * (c + m**2), axis=0)
+        var_state = second_moment - mean_state**2
+        return mean_state, var_state
+
+    mean_state = np.asarray(model.means_[state_idx], dtype=float)
+    covar = np.asarray(model.covars_[state_idx], dtype=float)
+    if covar.ndim == 2:
+        var_state = np.diag(covar)
+    else:
+        var_state = covar
+    return mean_state, var_state
+
+def _align_hmm_states_by_variance(model):
+    """Deterministically reorder states from lowest to highest emission variance."""
+    if model is None or not is_hmm_healthy(model):
+        return model
+
+    state_vars = []
+    for i in range(model.n_components):
+        _, var_state = _state_emission_mean_var(model, i)
+        state_vars.append(np.sum(var_state))
+
+    order = np.argsort(state_vars)
+    model.startprob_ = model.startprob_[order]
+    model.transmat_ = model.transmat_[np.ix_(order, order)]
+    model.means_ = model.means_[order]
+    if hasattr(model, "weights_"):
+        model.weights_ = model.weights_[order]
+        model.covars_ = model.covars_[order]
+    elif hasattr(model, "_covars_"):
+        model._covars_ = model._covars_[order]
+    else:
+        model.covars_ = model.covars_[order]
+    return model
+
+def _causal_pca_worker(args):
+    """Worker function for parallel causal PCA computation.
+    Processes a chunk of time steps, using anchor_loadings for sign/rank consistency.
+    Returns (indices, pc_values, final_loadings) for the chunk.
+    """
+    chunk_indices, scaled_values, scaled_columns, anchor_loadings, n_components, alpha = args
+    from live_trading.pca_fusion import PCAFusion
+    from scipy.spatial.distance import cdist
+    from scipy.optimize import linear_sum_assignment
+
+    n_features = scaled_values.shape[1]
+    pc_results = np.full((len(chunk_indices), n_components), np.nan)
+    prev_loadings = anchor_loadings  # Start from the anchor
+
+    for local_i, t in enumerate(chunk_indices):
+        # Regulation 3.1: PCA loadings at time t derived from data 0..t-1
+        window_end = t - 1 if t > 20 else t
+        window_data = np.nan_to_num(scaled_values[:window_end], nan=0.0)
+        if len(window_data) < 20:
+            window_data = np.nan_to_num(scaled_values[:t], nan=0.0)
+
+        fusion = PCAFusion(n_components=n_components, alpha=alpha, use_sparse=False)
+        fusion.fit(pd.DataFrame(window_data, columns=scaled_columns))
+
+        current_loadings = fusion.sparse_pca.components_
+        if prev_loadings is not None:
+            sim_matrix = 1 - cdist(current_loadings, prev_loadings, metric='cosine')
+            new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
+            fusion.sparse_pca.components_ = fusion.sparse_pca.components_[new_idx]
+            current_loadings = fusion.sparse_pca.components_
+            for i in range(len(current_loadings)):
+                if np.dot(current_loadings[i], prev_loadings[old_idx[i]]) < 0:
+                    fusion.sparse_pca.components_[i] *= -1
+
+        prev_loadings = fusion.sparse_pca.components_.copy()
+
+        # Transform the single point at t-1
+        point = np.nan_to_num(scaled_values[t-1:t], nan=0.0)
+        pc_results[local_i] = fusion.sparse_pca.transform(point)[0]
+
+    return chunk_indices, pc_results, prev_loadings
+
+
+def _make_hmm(k, n_iter=100, init_params="mc", persistence=0.98, n_mix=1, model_class="gaussian"):
+    if model_class == "gmm":
+        model = hmm.GMMHMM(
+            n_components=k,
+            n_mix=n_mix,
+            covariance_type="diag",
+            n_iter=n_iter,
+            random_state=42,
+            min_covar=0.05,
+            init_params=init_params or "",
+        )
+    else:
+        model = hmm.GaussianHMM(
+            n_components=k,
+            covariance_type="diag",
+            n_iter=n_iter,
+            random_state=42,
+            min_covar=0.05,
+            init_params=init_params or "",
+        )
+    if init_params:
+        model.startprob_ = np.ones(k) / k
+        model.transmat_ = np.eye(k) * persistence + np.ones((k, k)) * (1.0 - persistence) / k
+        model.transmat_ /= model.transmat_.sum(axis=1)[:, np.newaxis]
+    model.transmat_prior = np.eye(k) * 20.0 + 1.0
+    return model
+
+def _sanitize_hmm_params(model):
+    """Last-resort cleanup when hmmlearn returns numerically ugly parameters."""
+    if model is None:
+        return None
+    try:
+        if hasattr(model, "startprob_"):
+            model.startprob_ = np.nan_to_num(model.startprob_, nan=1.0 / model.n_components)
+            s = model.startprob_.sum()
+            model.startprob_ = model.startprob_ / s if s > 0 else np.ones(model.n_components) / model.n_components
+
+        if hasattr(model, "transmat_"):
+            model.transmat_ = np.nan_to_num(model.transmat_, nan=0.0, posinf=0.0, neginf=0.0)
+            row_sums = model.transmat_.sum(axis=1, keepdims=True)
+            bad_rows = row_sums.squeeze() <= 0
+            if np.any(bad_rows):
+                model.transmat_[bad_rows] = 1.0 / model.n_components
+                row_sums = model.transmat_.sum(axis=1, keepdims=True)
+            model.transmat_ = model.transmat_ / row_sums
+
+        if hasattr(model, "weights_"):
+            model.weights_ = np.nan_to_num(model.weights_, nan=1.0)
+            weight_sums = model.weights_.sum(axis=1, keepdims=True)
+            bad_rows = weight_sums.squeeze() <= 0
+            if np.any(bad_rows):
+                model.weights_[bad_rows] = 1.0
+                weight_sums = model.weights_.sum(axis=1, keepdims=True)
+            model.weights_ = model.weights_ / weight_sums
+
+        if hasattr(model, "means_"):
+            model.means_ = np.nan_to_num(model.means_, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if hasattr(model, "covars_"):
+            covars = np.nan_to_num(model.covars_, nan=1.0, posinf=1.0, neginf=1.0)
+            covars = np.maximum(covars, 1e-3)
+            if hasattr(model, "weights_"):
+                model.covars_ = covars
+            elif hasattr(model, "_covars_"):
+                model._covars_ = np.diagonal(covars, axis1=1, axis2=2) if covars.ndim == 3 else covars
+            else:
+                model.covars_ = covars
+    except Exception:
+        return None
+    return model if is_hmm_healthy(model) else None
+
+def _fit_hmm_model(features, n_components=None, previous_model=None):
+    """Fit an HMM on the provided historical feature block only."""
+    features = np.nan_to_num(np.asarray(features), nan=0.0, posinf=0.0, neginf=0.0)
+    if len(features) < 20:
+        raise ValueError(f"Need at least 20 feature rows for HMM fit, got {len(features)}")
+
+    if previous_model is not None:
+        k = previous_model.n_components
+        try:
+            previous_is_gmm = hasattr(previous_model, "weights_")
+            model = _make_hmm(
+                k,
+                n_iter=50,
+                init_params="",
+                n_mix=getattr(previous_model, "n_mix", 1),
+                model_class="gmm" if previous_is_gmm else "gaussian",
+            )
+            model.startprob_ = previous_model.startprob_.copy()
+            model.transmat_ = previous_model.transmat_.copy()
+            model.means_ = previous_model.means_.copy()
+            if previous_is_gmm:
+                model.weights_ = previous_model.weights_.copy()
+                model.covars_ = previous_model.covars_.copy()
+            elif hasattr(previous_model, "_covars_"):
+                model._covars_ = previous_model._covars_.copy()
+            else:
+                prev_covars = np.asarray(previous_model.covars_)
+                model.covars_ = np.diagonal(prev_covars, axis1=1, axis2=2) if prev_covars.ndim == 3 else prev_covars.copy()
+            model.fit(features)
+            if is_hmm_healthy(model):
+                return _align_hmm_states_by_variance(model), k
+            model = _sanitize_hmm_params(model)
+            if model is not None:
+                return _align_hmm_states_by_variance(model), k
+        except Exception as e:
+            print(f"  [Warm-Start] Failed ({e}). Falling back to kmeans...")
+
+    if n_components is not None:
+        last_error = None
+        try:
+            model = _make_hmm(n_components, persistence=0.95, model_class="gaussian")
+            model.fit(features)
+            if is_hmm_healthy(model):
+                return _align_hmm_states_by_variance(model), n_components
+            model = _sanitize_hmm_params(model)
+            if model is not None:
+                return _align_hmm_states_by_variance(model), n_components
+        except Exception as e:
+            last_error = e
+        raise ValueError(f"HMM fit produced unhealthy parameters for K={n_components}: {last_error}")
+
+    best_hmm = None
+    best_k = 0
+    best_bic = np.inf
+    for k in range(3, 6):
+        try:
+            model = _make_hmm(k, model_class="gaussian")
+            model.fit(features)
+            if not is_hmm_healthy(model):
+                model = _sanitize_hmm_params(model)
+            if model is None:
+                continue
+            log_likelihood = model.score(features)
+            n_features = features.shape[1]
+            n_params = k * (k - 1) + 2 * k * n_features
+            bic = -2 * log_likelihood + n_params * np.log(len(features))
+            if bic < best_bic:
+                best_bic = bic
+                best_hmm = model
+                best_k = k
+        except Exception as e:
+            print(f"  [BIC Optimization] K={k} failed: {e}")
+
+    if best_hmm is None:
+        raise ValueError("All HMM training attempts failed")
+    return _align_hmm_states_by_variance(best_hmm), best_k
+
+def _rolling_scaler_snapshot(raw_window, window=252 * 5):
+    """Create a scaler snapshot from data available at one historical timestamp."""
+    scaler = RollingRobustScaler(window=window)
+    hist = np.asarray(raw_window.tail(window).values, dtype=float)
+    scaler.history = hist
+    scaler.center_ = np.median(hist, axis=0)
+    q1 = np.percentile(hist, 25, axis=0)
+    q3 = np.percentile(hist, 75, axis=0)
+    scaler.scale_ = np.where((q3 - q1) == 0, 1.0, q3 - q1)
+    return scaler
+
+
+def _apply_causal_stress_overlay(feature_df, raw_df, base_state_count):
+    """
+    Add a causal, raw-market stress overlay on top of the unsupervised HMM state.
+
+    HMMs are intentionally persistent and can under-react to abrupt drawdowns.
+    These overlay columns preserve the raw HMM output while exposing a tradable
+    detected regime that reacts to close-T SPY/VIX stress for next-session use.
+    """
+    if feature_df.empty or raw_df.empty:
+        return feature_df
+
+    required = {"SPY_Close", "VIX_Close"}
+    if not required.issubset(raw_df.columns):
+        return feature_df
+
+    aligned = raw_df.reindex(feature_df.index)
+    spy = aligned["SPY_Close"].astype(float)
+    vix = aligned["VIX_Close"].astype(float)
+    log_ret = np.log(spy / spy.shift(1))
+    ret_5d = np.log(spy / spy.shift(5))
+    drawdown_21d = spy / spy.rolling(21, min_periods=5).max() - 1.0
+
+    panic_mask = (
+        (vix >= 35.0)
+        | ((vix >= 30.0) & (drawdown_21d <= -0.08))
+        | (log_ret <= -0.045)
+        | (ret_5d <= -0.075)
+    )
+    decline_mask = (
+        ~panic_mask
+        & (
+            (vix >= 25.0)
+            | (drawdown_21d <= -0.06)
+            | (ret_5d <= -0.04)
+        )
+    )
+
+    detected_state = feature_df["HMM_State"].astype(int).copy()
+    detected_label = feature_df["Regime_Label"].copy()
+    decline_state = int(base_state_count)
+    panic_state = int(base_state_count + 1)
+
+    detected_state.loc[decline_mask] = decline_state
+    detected_label.loc[decline_mask] = f"Cautious Decline ({decline_state})"
+    detected_state.loc[panic_mask] = panic_state
+    detected_label.loc[panic_mask] = f"Panic / Crisis ({panic_state})"
+
+    feature_df["Detected_Regime_State"] = detected_state
+    feature_df["Detected_Regime_Label"] = detected_label
+    feature_df["Stress_Overlay"] = np.select(
+        [panic_mask.fillna(False), decline_mask.fillna(False)],
+        ["panic_crisis", "cautious_decline"],
+        default="none",
+    )
+    feature_df["Stress_21d_Drawdown"] = drawdown_21d
+    feature_df["Stress_5d_Log_Return"] = ret_5d
+    feature_df["Stress_1d_Log_Return"] = log_ret
+    feature_df["Stress_VIX_Close"] = vix
+    feature_df.attrs["stress_overlay"] = "close_T_for_next_session"
+    return feature_df
+
+
+def calendar_days_to_trading_days(calendar_days):
+    """Approximate calendar-day option horizons on a trading-day index."""
+    return max(1, int(round(float(calendar_days) * 252.0 / 365.0)))
 
 # Constants moved from ev_plots.py
 PROBABILITY_MODEL = 'gmm'  # Options: 'bootstrap', 'parametric', 'gmm'
@@ -143,7 +458,7 @@ def prepare_hmm_features(df):
     features = df[cols].values
     return features, df
 
-def train_regime_hmm(df, n_components=None, expanding_window=False):
+def train_regime_hmm(df, n_components=None, expanding_window=False, exclude_features=None):
     """
     Upgraded HMM training using PCA-fused features and BIC optimization.
     """
@@ -176,53 +491,110 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     # ENSURE WE ONLY USE DATA UP TO THE PROVIDED DF'S END DATE (Double check)
     stationary_df = stationary_df[stationary_df.index <= df.index.max()]
     
+    if exclude_features:
+        cols_to_drop = [c for c in exclude_features if c in stationary_df.columns]
+        if cols_to_drop:
+            stationary_df = stationary_df.drop(columns=cols_to_drop)
+            print(f"  [Feature Selection] Dropped features: {cols_to_drop}")
+
     # 2. CAUSAL FEATURE PREPARATION (Strictly on past data if expanding_window=True)
     if expanding_window:
-        print("  [Causal] Preparing features with expanding scaling and PCA...")
+        print(f"  [Step 1/4] Rolling robust scaling on {len(stationary_df)} rows...", flush=True)
+        _t0_scale = time.time()
         # Use rolling scale from DataIngestor
         scaled_df = ingestor.scale_features(stationary_df, rolling=True, window=min(252*5, len(stationary_df)-1))
+        print(f"  [Step 1/4] Scaling done in {time.time()-_t0_scale:.1f}s.", flush=True)
         
         # Causal PCA: For each point t, we need the PCA projection based on data up to t
         pc_values = np.full((len(scaled_df), 2), np.nan)
-        fusion = PCAFusion()
+        fusion = PCAFusion(n_components=2, use_sparse=False)
         
         warmup = min(252, len(scaled_df)-1)
         prev_loadings = None
+        total_pca_steps = len(scaled_df) + 1 - warmup
+        all_t_indices = list(range(warmup, len(scaled_df) + 1))
         
-        for t in range(warmup, len(scaled_df) + 1):
-            # Regulation 3.1: PCA loadings at time t must only be derived from data 0 to t-1
-            # Here t-1 is the point we are transforming, so we fit on :t-1
-            window = scaled_df.iloc[:t-1].fillna(0)
-            if len(window) < 20: # Defensive
-                window = scaled_df.iloc[:t].fillna(0)
-                
-            fusion.fit(window)
+        n_workers = min(mp.cpu_count(), 8)
+        # Shared numpy array for multiprocessing (converted from DataFrame)
+        scaled_values = scaled_df.fillna(0).values
+        scaled_columns = scaled_df.columns.tolist()
+        
+        print(f"  [Step 2/4] Causal PCA projection: {total_pca_steps} steps (warmup={warmup}), "
+              f"using {n_workers} parallel workers...", flush=True)
+        _t0_pca = time.time()
+        
+        # === PARALLEL CHUNKED CAUSAL PCA ===
+        # Strategy: Divide time steps into N chunks. For each chunk, compute an
+        # "anchor" loading at the chunk boundary (serially, fast) then parallelize
+        # all steps within the chunk using that anchor for sign/rank consistency.
+        
+        # Step A: Compute anchor loadings at chunk boundaries (serial, ~N fits)
+        chunk_size = max(50, total_pca_steps // n_workers)
+        chunks = []
+        for start in range(0, len(all_t_indices), chunk_size):
+            end = min(start + chunk_size, len(all_t_indices))
+            chunks.append(all_t_indices[start:end])
+        
+        print(f"    Split into {len(chunks)} chunks (avg {chunk_size} steps each)", flush=True)
+        
+        # Compute anchor loadings at each chunk boundary serially
+        anchor_loadings_list = [None]  # First chunk has no anchor
+        for chunk_idx in range(1, len(chunks)):
+            boundary_t = chunks[chunk_idx][0]
+            window_data = scaled_df.iloc[:boundary_t-1].fillna(0)
+            if len(window_data) < 20:
+                window_data = scaled_df.iloc[:boundary_t].fillna(0)
+            anchor_fusion = PCAFusion(n_components=2, use_sparse=False)
+            anchor_fusion.fit(window_data)
             
-            # FIX: Enforce PCA Structural Consistency (Sign + Rank)
-            current_loadings = fusion.sparse_pca.components_
-            if prev_loadings is not None:
-                # 1. Cosine Similarity Matrix to detect Rank Swapping
-                from scipy.spatial.distance import cdist
-                # cdist(A, B, 'cosine') returns 1 - cos(theta). We want cos(theta) = 1 - cdist
-                sim_matrix = 1 - cdist(current_loadings, prev_loadings, metric='cosine')
-                
-                # Find best mapping (Hungarian)
-                from scipy.optimize import linear_sum_assignment
-                new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix)) # Maximize absolute similarity
-                
-                # Reorder current loadings and components to match previous rank
-                fusion.sparse_pca.components_ = fusion.sparse_pca.components_[new_idx]
-                current_loadings = fusion.sparse_pca.components_
-                
-                # 2. Enforce Sign Consistency on the mapped components
-                for i in range(len(current_loadings)):
-                    if np.dot(current_loadings[i], prev_loadings[old_idx[i]]) < 0:
-                        fusion.sparse_pca.components_[i] *= -1
+            # Apply sign consistency against previous anchor
+            if anchor_loadings_list[-1] is not None:
+                curr = anchor_fusion.sparse_pca.components_
+                prev = anchor_loadings_list[-1]
+                sim_matrix = 1 - cdist(curr, prev, metric='cosine')
+                new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
+                anchor_fusion.sparse_pca.components_ = anchor_fusion.sparse_pca.components_[new_idx]
+                for i in range(len(anchor_fusion.sparse_pca.components_)):
+                    if np.dot(anchor_fusion.sparse_pca.components_[i], prev[old_idx[i]]) < 0:
+                        anchor_fusion.sparse_pca.components_[i] *= -1
             
-            prev_loadings = fusion.sparse_pca.components_.copy()
-            
-            pc_values[t-1] = fusion.transform(scaled_df.iloc[t-1:t].fillna(0)).values[0]
-            
+            anchor_loadings_list.append(anchor_fusion.sparse_pca.components_.copy())
+        
+        print(f"    Anchor loadings computed in {time.time()-_t0_pca:.1f}s. Launching parallel PCA...", flush=True)
+        
+        # Step B: Dispatch chunks to worker pool
+        # Use 'spawn' context on macOS for stability.
+        # Safe because workers only use numpy/scipy/sklearn.
+        worker_args = [
+            (chunks[i], scaled_values, scaled_columns, anchor_loadings_list[i], 2, 0.1)
+            for i in range(len(chunks))
+        ]
+        
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=n_workers) as pool:
+            results = pool.map(_causal_pca_worker, worker_args)
+        
+        # Step C: Reassemble results
+        for chunk_indices, pc_chunk, final_loadings in results:
+            for local_i, t in enumerate(chunk_indices):
+                pc_values[t-1] = pc_chunk[local_i]
+        
+        # Keep the last anchor loadings for downstream use
+        _, _, prev_loadings = results[-1]
+        # Re-fit final fusion object on full data for downstream use
+        fusion.fit(scaled_df.fillna(0))
+        if prev_loadings is not None:
+            curr = fusion.sparse_pca.components_
+            sim_matrix = 1 - cdist(curr, prev_loadings, metric='cosine')
+            new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
+            fusion.sparse_pca.components_ = fusion.sparse_pca.components_[new_idx]
+            for i in range(len(fusion.sparse_pca.components_)):
+                if np.dot(fusion.sparse_pca.components_[i], prev_loadings[old_idx[i]]) < 0:
+                    fusion.sparse_pca.components_[i] *= -1
+        
+        elapsed_pca = time.time() - _t0_pca
+        print(f"  [Step 2/4] Parallel Causal PCA done in {elapsed_pca:.1f}s "
+              f"({n_workers} workers, {total_pca_steps} steps).", flush=True)
         pc_df = pd.DataFrame(pc_values, index=scaled_df.index, columns=['PC1', 'PC2'])
         scaler = None 
     else:
@@ -232,7 +604,7 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
         scaled_df = pd.DataFrame(scaled_values, index=stationary_df.index, columns=stationary_df.columns)
         
         # LOCAL PCA FUSION
-        fusion = PCAFusion()
+        fusion = PCAFusion(n_components=2, use_sparse=False)
         pc_df = fusion.fit_transform(scaled_df)
     
     features_scaled = pc_df.dropna().values
@@ -251,6 +623,129 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     if np.any(np.isnan(features_input)) or np.any(np.isinf(features_input)):
         print("  WARNING: Input features contain NaNs. Cleaning...")
         features_input = np.nan_to_num(features_input, nan=0.0)
+
+    if expanding_window:
+        refit_interval = 21
+        n_samples = len(features_input)
+        n_refits = n_samples // refit_interval + 1
+        print(f"  [Step 3/4] Walk-Forward HMM Refit: {n_samples} samples, ~{n_refits} refits (every {refit_interval}d)...", flush=True)
+        _t0_wf = time.time()
+        offset = len(scaled_df) - n_samples
+        if n_samples == 0:
+            return None, 0, pc_df
+
+        causal_states = []
+        causal_labels = []
+        causal_probs = []
+        current_hmm = None
+        current_k = n_components
+        current_fusion = None
+        prev_refit_loadings = None
+        debounce_counter = 0
+        candidate_state = None
+        _refit_count = 0
+        next_refit_i = 0
+
+        for i in range(n_samples):
+            t_abs = i + offset
+
+            if i >= next_refit_i:
+                try:
+                    _refit_count += 1
+                    elapsed_wf = time.time() - _t0_wf
+                    rate_wf = i / max(elapsed_wf, 0.01) if i > 0 else 1
+                    eta_wf = (n_samples - i) / max(rate_wf, 0.01)
+                    refit_date = scaled_df.index[t_abs].strftime('%Y-%m-%d') if t_abs < len(scaled_df) else '?'
+                    print(f"    HMM refit #{_refit_count} at sample {i}/{n_samples} "
+                          f"(date={refit_date}, {100*i/n_samples:.0f}%) "
+                          f"| elapsed {elapsed_wf:.0f}s | ETA {eta_wf:.0f}s", flush=True)
+
+                    current_window_scaled = scaled_df.iloc[:t_abs].fillna(0)
+                    current_window_raw = stationary_df.iloc[:t_abs].dropna()
+                    if len(current_window_scaled) < 20 or len(current_window_raw) < 20:
+                        continue
+
+                    stable_fusion = PCAFusion(n_components=2, use_sparse=False)
+                    stable_fusion.fit(current_window_scaled)
+
+                    current_loadings = stable_fusion.sparse_pca.components_
+                    if prev_refit_loadings is not None:
+                        raw_dist = cdist(current_loadings, prev_refit_loadings, metric='cosine')
+                        clean_dist = np.nan_to_num(raw_dist, nan=1.0, posinf=1.0, neginf=1.0)
+                        sim_matrix = 1.0 - clean_dist
+                        new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
+                        stable_fusion.sparse_pca.components_ = stable_fusion.sparse_pca.components_[new_idx]
+                        for c, old_c in enumerate(old_idx):
+                            if np.dot(stable_fusion.sparse_pca.components_[c], prev_refit_loadings[old_c]) < 0:
+                                stable_fusion.sparse_pca.components_[c] *= -1
+
+                    refit_features = stable_fusion.transform(current_window_scaled).values
+                    current_hmm, current_k = _fit_hmm_model(
+                        refit_features,
+                        n_components=current_k,
+                        previous_model=current_hmm,
+                    )
+                    current_hmm.fusion_ = stable_fusion
+                    current_hmm.scaler_ = _rolling_scaler_snapshot(
+                        current_window_raw,
+                        window=min(252 * 5, len(current_window_raw)),
+                    )
+                    current_hmm.feature_names_ = stationary_df.columns.tolist()
+                    current_fusion = stable_fusion
+                    prev_refit_loadings = stable_fusion.sparse_pca.components_.copy()
+                    next_refit_i = i + refit_interval
+                except Exception as e:
+                    print(f"  [Refit] Refit at t={t_abs} failed: {e}. Keeping previous model.", flush=True)
+                    next_refit_i = i + refit_interval
+                    if current_hmm is None:
+                        continue
+
+            current_window_scaled = scaled_df.iloc[:t_abs + 1].fillna(0)
+            current_window_projected = current_fusion.transform(current_window_scaled).values
+            current_prob = current_hmm.predict_proba(current_window_projected)[-1]
+
+            potential_state = int(np.argmax(current_prob))
+            if not causal_states:
+                state = potential_state
+                candidate_state = state
+                debounce_counter = 0
+            else:
+                prev_state = int(causal_states[-1])
+                if potential_state != prev_state:
+                    if potential_state == candidate_state:
+                        debounce_counter += 1
+                    else:
+                        candidate_state = potential_state
+                        debounce_counter = 1
+                    state = potential_state if current_prob[potential_state] > 0.70 and debounce_counter >= 3 else prev_state
+                else:
+                    state = prev_state
+                    candidate_state = state
+                    debounce_counter = 0
+
+            causal_states.append(state)
+            causal_probs.append(current_prob)
+            labels_t = get_regime_labels(current_hmm)
+            causal_labels.append(labels_t.get(state, f"Regime {state}"))
+
+        print(f"  [Step 3/4] Walk-Forward done in {time.time()-_t0_wf:.1f}s ({_refit_count} refits).", flush=True)
+
+        if not causal_states:
+            print("  CRITICAL: Walk-forward HMM never produced a valid model.")
+            return None, 0, pc_df
+
+        causal_probs_arr = np.vstack(causal_probs)
+        result_index = pc_df.index[-len(causal_states):]
+        pc_df = pc_df.loc[result_index].copy()
+        pc_df['HMM_State'] = np.asarray(causal_states, dtype=int)
+        pc_df['Regime_Label'] = causal_labels
+        pc_df['Regime_Signal_Timestamp'] = 'close_T_for_next_session'
+        pc_df.attrs['regime_signal_timestamp'] = 'close_T_for_next_session'
+        pc_df.attrs['regime_inference_mode'] = 'walk_forward_refit'
+        for k in range(current_k):
+            pc_df[f'prob_state_{k}'] = causal_probs_arr[:, k]
+        pc_df = _apply_causal_stress_overlay(pc_df, df, current_k)
+        return current_hmm, current_k, pc_df
 
     if n_components is not None:
         best_hmm = hmm.GMMHMM(n_components=n_components, n_mix=2, covariance_type="diag", n_iter=100, random_state=42, min_covar=0.05, init_params="mcw")
@@ -279,8 +774,11 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
             print(f"  CRITICAL: HMM fit failed for K={n_components}: {e}")
             return None, 0, pc_df
     else:
+        print(f"  [BIC] Testing K=3,4,5 on {features_input.shape[0]} samples...", flush=True)
         best_bic = np.inf
         for k in range(3, 6):
+            _t0_bic = time.time()
+            print(f"    Fitting GMMHMM K={k}...", end=' ', flush=True)
             try:
                 model = hmm.GMMHMM(n_components=k, n_mix=2, covariance_type="diag", n_iter=100, random_state=42, min_covar=0.05, init_params="mcw")
                 model.startprob_ = np.ones(k) / k
@@ -291,6 +789,7 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                 model.fit(features_input)
                 
                 if not is_hmm_healthy(model):
+                    print(f"unhealthy model, skipped ({time.time()-_t0_bic:.1f}s)", flush=True)
                     continue
 
                 log_likelihood = model.score(features_input)
@@ -299,13 +798,15 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                 n_params = k*(k-1) + k*(2-1) + k*2*n_features + k*2*n_features
                 n_samples = features_input.shape[0]
                 bic = -2 * log_likelihood + n_params * np.log(n_samples)
+                winner = " ← new best" if bic < best_bic else ""
+                print(f"BIC={bic:.1f} LL={log_likelihood:.1f}{winner} ({time.time()-_t0_bic:.1f}s)", flush=True)
                 
                 if bic < best_bic:
                     best_bic = bic
                     best_hmm = model
                     best_k = k
             except Exception as e:
-                print(f"  [BIC Optimization] K={k} failed: {e}")
+                print(f"failed: {e} ({time.time()-_t0_bic:.1f}s)", flush=True)
                 continue
     
     if best_hmm is None:
@@ -360,6 +861,7 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
     n_samples = len(features_input)
     causal_states = np.zeros(n_samples)
     causal_labels = ["Unknown"] * n_samples
+    causal_probs = np.zeros((n_samples, best_k))
     
     if n_samples > 0:
         if expanding_window:
@@ -377,20 +879,16 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                 
                 if i % refit_interval == 0:
                     try:
-                        from copy import deepcopy
-                        from scipy.optimize import linear_sum_assignment
-                        
-                        old_hmm = deepcopy(current_hmm)
+                        old_hmm = current_hmm
                         # 1. Manifold Stabilization 
                         # Regulation 3.1: PCA loadings for index t_abs derived from data up to t_abs - 1
                         current_window_scaled = scaled_df.iloc[:t_abs].fillna(0)
                         
-                        stable_fusion = PCAFusion()
+                        stable_fusion = PCAFusion(n_components=2, use_sparse=False)
                         stable_fusion.fit(current_window_scaled)
                         
                         current_loadings = stable_fusion.sparse_pca.components_
                         if prev_loadings is not None:
-                            from scipy.spatial.distance import cdist
                             # Use explicit sanitation for the similarity matrix
                             raw_dist = cdist(current_loadings, prev_loadings, metric='cosine')
                             # Handle NaNs and Infs explicitly: distance = 1.0 (zero similarity) for invalid entries
@@ -438,9 +936,11 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                             temp_model.fit(stabilized_features)
                         
                         if is_hmm_healthy(temp_model):
-                            # Explicitly fit scaler for THIS specific historical window
                             current_raw_data = stationary_df.iloc[:t_abs]
-                            stabilized_scaler = RobustScaler().fit(current_raw_data)
+                            stabilized_scaler = _rolling_scaler_snapshot(
+                                current_raw_data,
+                                window=min(252 * 5, len(current_raw_data)),
+                            )
                             
                             # KL Divergence logic for state identity preservation
                             def calculate_symmetric_kl(m1, c1, m2, c2):
@@ -467,22 +967,23 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                                                np.sum(w[:, np.newaxis] * (m - combined_mean)**2, axis=0)
                                 return combined_mean, combined_var
 
-                            old_dists = [get_state_dist(old_hmm, k) for k in range(best_k)]
-                            new_dists = [get_state_dist(temp_model, k) for k in range(best_k)]
-                            
-                            dist_matrix = np.zeros((best_k, best_k))
-                            for k1 in range(best_k):
-                                for k2 in range(best_k):
-                                    dist_matrix[k1, k2] = calculate_symmetric_kl(new_dists[k1][0], new_dists[k1][1], 
-                                                                               old_dists[k2][0], old_dists[k2][1])
-                            
-                            new_idx, old_idx = linear_sum_assignment(dist_matrix)
-                            
-                            temp_model.startprob_ = temp_model.startprob_[new_idx]
-                            temp_model.transmat_ = temp_model.transmat_[np.ix_(new_idx, new_idx)]
-                            temp_model.means_ = temp_model.means_[new_idx]
-                            temp_model.weights_ = temp_model.weights_[new_idx]
-                            temp_model.covars_ = temp_model.covars_[new_idx]
+                            if old_hmm is not None:
+                                old_dists = [get_state_dist(old_hmm, k) for k in range(best_k)]
+                                new_dists = [get_state_dist(temp_model, k) for k in range(best_k)]
+                                
+                                dist_matrix = np.zeros((best_k, best_k))
+                                for k1 in range(best_k):
+                                    for k2 in range(best_k):
+                                        dist_matrix[k1, k2] = calculate_symmetric_kl(new_dists[k1][0], new_dists[k1][1], 
+                                                                                   old_dists[k2][0], old_dists[k2][1])
+                                
+                                new_idx, old_idx = linear_sum_assignment(dist_matrix)
+                                
+                                temp_model.startprob_ = temp_model.startprob_[new_idx]
+                                temp_model.transmat_ = temp_model.transmat_[np.ix_(new_idx, new_idx)]
+                                temp_model.means_ = temp_model.means_[new_idx]
+                                temp_model.weights_ = temp_model.weights_[new_idx]
+                                temp_model.covars_ = temp_model.covars_[new_idx]
                             
                             # Mandate 10.4: Holistic State Alignment
                             # Realignment of all internal model attributes to ensure consistency
@@ -551,6 +1052,7 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                         candidate_state = state
                 
                 causal_states[i] = state
+                causal_probs[i] = current_prob
                 labels_t = get_regime_labels(current_hmm)
                 causal_labels[i] = labels_t.get(state, f"Regime {state}")
         else:
@@ -581,10 +1083,12 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
                         candidate_state = state
                 
                 causal_states[i] = state
+                causal_probs[i] = current_prob
                 labels_all = get_regime_labels(best_hmm)
                 causal_labels[i] = labels_all.get(causal_states[i], f"Regime {causal_states[i]}")
     else:
         probs = best_hmm.predict_proba(features_input)
+        causal_probs = probs
         causal_states = np.argmax(probs, axis=1)
         labels_all = get_regime_labels(best_hmm)
         for i, s in enumerate(causal_states):
@@ -592,6 +1096,11 @@ def train_regime_hmm(df, n_components=None, expanding_window=False):
         
     pc_df['HMM_State'] = causal_states
     pc_df['Regime_Label'] = causal_labels
+    pc_df['Regime_Signal_Timestamp'] = 'close_T_for_next_session' if expanding_window else 'full_sample_research_only'
+    pc_df.attrs['regime_signal_timestamp'] = pc_df['Regime_Signal_Timestamp'].iloc[0] if len(pc_df) else ''
+    pc_df.attrs['regime_inference_mode'] = 'walk_forward_refit' if expanding_window else 'full_sample_research_only'
+    for k in range(best_k):
+        pc_df[f'prob_state_{k}'] = causal_probs[:, k]
     
     # Return the LAST model from the expanding window as the "live" model
     if expanding_window and n_samples > warmup:
@@ -606,7 +1115,7 @@ def get_regime_labels(hmm_model, pc_df=None):
     Instead of absolute thresholds (which fail across secular shifts), we rank states 
     relative to each other based on their intrinsic Risk/Return profiles.
     """
-    if hmm_model is None or not hasattr(hmm_model, 'means_') or not hasattr(hmm_model, 'weights_'):
+    if hmm_model is None or not hasattr(hmm_model, 'means_'):
         return {}
 
     K = hmm_model.n_components
@@ -622,7 +1131,7 @@ def get_regime_labels(hmm_model, pc_df=None):
     # 1. Extract physical centroids for all states
     for i in range(K):
         try:
-            state_mean_pc = np.sum(hmm_model.weights_[i][:, np.newaxis] * hmm_model.means_[i], axis=0)
+            state_mean_pc, _ = _state_emission_mean_var(hmm_model, i)
             state_mean_scaled = hmm_model.fusion_.sparse_pca.inverse_transform(state_mean_pc.reshape(1, -1))
             
             if not hasattr(hmm_model.scaler_, "center_"):
@@ -631,8 +1140,10 @@ def get_regime_labels(hmm_model, pc_df=None):
                 state_mean_raw = hmm_model.scaler_.inverse_transform(state_mean_scaled)[0]
                 avg_vix = state_mean_raw[vix_idx] if vix_idx != -1 else 20.0
                 avg_ret = state_mean_raw[spy_ret_idx] if spy_ret_idx != -1 else 0.0
-        except Exception:
-            avg_vix, avg_ret = 20.0, 0.0
+        except Exception as e:
+            from live_trading.data_ingestion import red_alert
+            red_alert(f"Failed to inverse transform state centroids: {e}")
+            raise e
             
         state_metrics.append({
             'id': i,
@@ -677,15 +1188,25 @@ def get_regime_labels(hmm_model, pc_df=None):
             
     return labels
 
-def save_regime_cache(regime_dict, hmm_model, daily_models):
+def _feature_hash(feature_names):
+    payload = json.dumps(list(feature_names or []), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+def save_regime_cache(regime_dict, hmm_model, daily_models, metadata=None):
     """Saves the regime detection results to a pickle file."""
     import pickle
     try:
+        metadata = metadata or {}
+        if hmm_model is not None:
+            metadata.setdefault("fitted_n_components", getattr(hmm_model, "n_components", None))
+            metadata.setdefault("feature_hash", _feature_hash(getattr(hmm_model, "feature_names_", [])))
+            metadata.setdefault("feature_names", getattr(hmm_model, "feature_names_", []))
         data = {
             "regime_dict": regime_dict,
             "hmm_model": hmm_model,
             "daily_models": daily_models,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "metadata": metadata,
         }
         with open(REGIME_CACHE_FILE, "wb") as f:
             pickle.dump(data, f)
@@ -695,7 +1216,7 @@ def save_regime_cache(regime_dict, hmm_model, daily_models):
         print(f"❌ Failed to cache regime data: {e}")
         return False
 
-def load_regime_cache():
+def load_regime_cache(expected_metadata=None):
     """Loads the market regime data from the pickle file."""
     import pickle
     if not os.path.exists(REGIME_CACHE_FILE):
@@ -707,8 +1228,20 @@ def load_regime_cache():
         # Check if the cache is stale (e.g., > 24 hours)
         cache_time = datetime.fromisoformat(data["timestamp"])
         if datetime.now() - cache_time > timedelta(hours=24):
-            print(f"⚠️ Market regime cache is stale ({cache_time.strftime('%Y-%m-%d %H:%M')}).")
-            # We still return it but with a warning, or we could return None to force refit
+            print(f"⚠️ Market regime cache is stale ({cache_time.strftime('%Y-%m-%d %H:%M')}). Forcing a refit.")
+            return None
+
+        expected_metadata = expected_metadata or {}
+        actual_metadata = data.get("metadata", {})
+        for key, expected_value in expected_metadata.items():
+            if expected_value is None:
+                continue
+            if actual_metadata.get(key) != expected_value:
+                print(
+                    f"⚠️ Market regime cache mismatch for {key}: "
+                    f"cached={actual_metadata.get(key)} requested={expected_value}. Forcing a refit."
+                )
+                return None
         
         return data
     except Exception as e:
@@ -718,15 +1251,28 @@ def load_regime_cache():
 
 
 @functools.lru_cache(maxsize=10)
-def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=None, force_refit=False):
+def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=None, force_refit=False, as_of_date=None):
+    trading_horizon = calendar_days_to_trading_days(horizon)
+    as_of_ts = pd.Timestamp(as_of_date).normalize() if as_of_date is not None else pd.Timestamp(datetime.now()).normalize()
+    requested_metadata = {
+        "as_of_date": as_of_ts.strftime("%Y-%m-%d"),
+        "horizon_calendar_days": int(horizon),
+        "trading_horizon": int(trading_horizon),
+        "requested_n_components": n_components if n_components is not None else "auto",
+        "probability_model": PROBABILITY_MODEL,
+        "model_class": "GMMHMM",
+    }
+
     # Try loading from cache first to avoid heavy training in live loops
     if not force_refit:
-        cached_data = load_regime_cache()
+        cached_data = load_regime_cache(requested_metadata)
         if cached_data:
             print(f"📈 Using cached market regime data (from {cached_data['timestamp']})")
             return cached_data["regime_dict"], cached_data["hmm_model"], cached_data["daily_models"]
 
     print("🧠 Starting heavy HMM market regime training (this may take several minutes)...")
+    print(f"  Config: horizon={horizon}cal/{trading_horizon}trd days, K={n_components or 'auto(3-5)'}, as_of={as_of_ts.date()}", flush=True)
+    _t0_total = time.time()
     df = fetch_historical_data()
     if df.empty: 
         return {}, None, []
@@ -735,6 +1281,7 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=None, f
     try:
         # For historical analysis, we MUST use expanding_window=True to eliminate parameter look-ahead bias
         best_hmm, best_k, feature_df = train_regime_hmm(df, n_components=n_components, expanding_window=True)
+        print(f"  [Step 4/4] Building return buckets & GMM fitting...", flush=True)
     except Exception as e:
         from live_trading.data_ingestion import red_alert
         red_alert(f"Failed to train HMM: {e}")
@@ -752,8 +1299,13 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=None, f
         else:
             feature_df['Log_Return'] = np.log(feature_df['SPY_Close'] / feature_df['SPY_Close'].shift(1))
     
-    feature_df['future_terminal_return'] = feature_df['SPY_Close'].shift(-horizon) / feature_df['SPY_Close'] - 1
+    # Mandate 11.1: Calendar vs. Trading Day Alignment
+    feature_df['future_terminal_return'] = feature_df['SPY_Close'].shift(-trading_horizon) / feature_df['SPY_Close'] - 1
     feature_df = feature_df.dropna(subset=['future_terminal_return'])
+    if not feature_df.empty:
+        as_of_pos = feature_df.index.searchsorted(as_of_ts, side="right") - 1
+        eligible_positions = np.arange(len(feature_df)) + trading_horizon <= as_of_pos
+        feature_df = feature_df.iloc[eligible_positions].copy()
     
     regime_dict = {}
     daily_models = []
@@ -770,7 +1322,22 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=None, f
         else:
             daily_models.append({"type": "gaussian_fallback", "loc": 0.0, "scale": 0.01})
         
+    # Summary
+    labels = get_regime_labels(best_hmm)
+    for state in range(best_k):
+        n_obs = len(regime_dict.get(f'State_{state}', []))
+        label = labels.get(state, f'State {state}')
+        print(f"    State {state} ({label}): {n_obs} return observations", flush=True)
+    total_elapsed = time.time() - _t0_total
+    print(f"  ✅ Regime training complete in {total_elapsed:.1f}s (K={best_k})", flush=True)
+
+    cache_metadata = dict(requested_metadata)
+    cache_metadata["fitted_n_components"] = best_k
+    cache_metadata["feature_hash"] = _feature_hash(getattr(best_hmm, "feature_names_", []))
+    cache_metadata["feature_names"] = getattr(best_hmm, "feature_names_", [])
+    save_regime_cache(regime_dict, best_hmm, daily_models, metadata=cache_metadata)
     return regime_dict, best_hmm, daily_models
+
 
 def fit_gmm(bucket_returns, regime_label=""):
     n = len(bucket_returns)
@@ -824,8 +1391,10 @@ def get_probability_engine(spot_price, current_vix, regime_dict, horizon=45, hmm
         prev_turmoil_prob = all_posteriors[-2][np.argmax(current_probs)] # Simplified flip logic
         # Implementation of detailed flip logic as per plan
     
+    trading_horizon = calendar_days_to_trading_days(horizon)
+
     if USE_MARKOV_TRANSITIONS:
-        projected_probs = current_probs @ np.linalg.matrix_power(hmm_model.transmat_, horizon)
+        projected_probs = current_probs @ np.linalg.matrix_power(hmm_model.transmat_, trading_horizon)
     else:
         projected_probs = current_probs
     
@@ -848,44 +1417,72 @@ def get_probability_engine(spot_price, current_vix, regime_dict, horizon=45, hmm
 def calculate_probability_of_touch(current_state_probs, trans_matrix, gmm_models, dte, strike_pct_drop, num_paths=1000, option_type="put"):
     """
     Simulates daily market paths to find the probability of touching the short strike mid-trade.
-    Vectorized for performance.
+    Fully vectorized: simulates all paths simultaneously using numpy broadcasting.
     """
-    touches = 0
     num_states = len(gmm_models)
+    rng = np.random.default_rng()
     
-    for _ in range(num_paths):
-        current_state = np.random.choice(num_states, p=current_state_probs)
-        cumulative_return = 0.0
-        path_breached = False
+    # Pre-generate all random state sequences (num_paths x dte)
+    # Initial states
+    states = rng.choice(num_states, size=num_paths, p=current_state_probs)
+    
+    # Pre-compute cumulative log returns for all paths
+    cumulative_returns = np.zeros(num_paths)
+    breached = np.zeros(num_paths, dtype=bool)
+    
+    for day in range(dte):
+        # Mask: only simulate paths that haven't breached yet
+        active = ~breached
+        if not np.any(active):
+            break
         
-        for day in range(dte):
-            model = gmm_models[current_state]
+        active_states = states[active]
+        n_active = np.sum(active)
+        daily_returns = np.zeros(n_active)
+        
+        for s in range(num_states):
+            mask_s = active_states == s
+            count_s = np.sum(mask_s)
+            if count_s == 0:
+                continue
+            
+            model = gmm_models[s]
             if model["type"] == "gaussian_fallback":
-                daily_return = np.random.normal(loc=model["loc"], scale=model["scale"])
+                daily_returns[mask_s] = rng.normal(loc=model["loc"], scale=model["scale"], size=count_s)
             else:
-                comp = np.random.choice(len(model["weights"]), p=model["weights"])
-                daily_return = np.random.normal(loc=model["means"][comp], scale=model["stds"][comp])
-                
-            cumulative_return += daily_return
-            simple_return = np.exp(cumulative_return) - 1
-            
-            # FIX: Directional Boundary Logic
-            # Puts breach on downside (simple_return <= strike_pct_drop)
-            # Calls breach on upside (simple_return >= strike_pct_drop)
-            if option_type == "put" and simple_return <= strike_pct_drop:
-                path_breached = True
-                break
-            elif option_type == "call" and simple_return >= strike_pct_drop:
-                path_breached = True
-                break
-                
-            state_transition_probs = trans_matrix[current_state]
-            current_state = np.random.choice(num_states, p=state_transition_probs)
-            
-        if path_breached:
-            touches += 1
-            
-    return touches / num_paths
+                # Sample GMM components then draw from the selected Gaussian
+                comps = rng.choice(len(model["weights"]), size=count_s, p=model["weights"])
+                state_indices = np.where(mask_s)[0]
+                for c_idx in range(len(model["weights"])):
+                    comp_mask = comps == c_idx
+                    n_comp = np.sum(comp_mask)
+                    if n_comp > 0:
+                        draws = rng.normal(loc=model["means"][c_idx], scale=model["stds"][c_idx], size=n_comp)
+                        daily_returns[state_indices[comp_mask]] = draws
+        
+        # Update cumulative returns for active paths
+        active_indices = np.where(active)[0]
+        cumulative_returns[active_indices] += daily_returns
+        simple_returns = np.exp(cumulative_returns[active_indices]) - 1
+        
+        # Check breach conditions
+        if option_type == "put":
+            new_breaches = simple_returns <= strike_pct_drop
+        else:
+            new_breaches = simple_returns >= strike_pct_drop
+        
+        breached[active_indices[new_breaches]] = True
+        
+        # State transitions for surviving paths
+        still_active = active & ~breached
+        if np.any(still_active):
+            for s in range(num_states):
+                s_mask = still_active & (states == s)
+                n_trans = np.sum(s_mask)
+                if n_trans > 0:
+                    states[s_mask] = rng.choice(num_states, size=n_trans, p=trans_matrix[s])
+    
+    return np.sum(breached) / num_paths
 
 def calculate_yield_metrics(short_strike, long_strike, net_credit_per_share, prob_func):
     prob_short_itm = 1.0 - prob_func(short_strike)

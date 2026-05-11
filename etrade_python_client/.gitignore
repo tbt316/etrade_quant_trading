@@ -1,0 +1,36 @@
+# Local configuration
+config.ini
+
+# Environment variables
+.env
+*.env
+
+# E*TRADE OAuth session data
+.etrade_oauth
+etrade_session.json
+
+# Local logs and generated data
+daily_log/
+executed_order_tracker/
+python_client.log*
+server_log.txt
+ngrok.log
+dashboard_requests.log
+
+# Cache files
+*.json
+*.csv
+!etrade_cover_call_flow.md
+
+# Plots and HTML outputs
+*.html
+*.png
+option_value_plot/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.DS_Store

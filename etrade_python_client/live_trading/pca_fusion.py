@@ -7,15 +7,38 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PCAFusion:
-    def __init__(self, alpha=0.1, n_components=None):
+    def __init__(self, alpha=0.1, n_components=None, use_sparse=True):
         self.alpha = alpha
         self.n_components = n_components
+        self.use_sparse = use_sparse
         self.sparse_pca = None
         self.feature_names = None
         self.loadings_baseline = None
 
+    def _fit_standard_pca(self, df):
+        std_pca = PCA(n_components=self.n_components)
+        std_pca.fit(df)
+        self.sparse_pca = std_pca
+
+    def _needs_orthogonal_fallback(self, df):
+        if self.sparse_pca is None:
+            return True
+
+        components = getattr(self.sparse_pca, "components_", None)
+        if components is None or np.any(np.all(np.isclose(components, 0.0), axis=1)):
+            return True
+
+        pcs = self.sparse_pca.transform(df)
+        if pcs.ndim != 2 or pcs.shape[1] < 2:
+            return False
+
+        pc_corr = pd.DataFrame(pcs).corr().values
+        np.fill_diagonal(pc_corr, 0.0)
+        max_corr = np.nanmax(np.abs(pc_corr))
+        return bool(np.isnan(max_corr) or max_corr > 0.1)
+
     def fit(self, df):
-        """Fit Sparse PCA on the data."""
+        """Fit PCA on the data, falling back to standard PCA if sparse PCs collapse."""
         self.feature_names = df.columns.tolist()
         
         # Determine optimal number of components if not provided
@@ -27,16 +50,15 @@ class PCAFusion:
             self.n_components = max(2, np.argmax(cumulative_variance >= 0.90) + 1)
             logger.info(f"Automatically selected {self.n_components} components (min 2 enforced).")
 
-        self.sparse_pca = SparsePCA(n_components=self.n_components, alpha=self.alpha, random_state=42)
-        self.sparse_pca.fit(df)
-        
-        # FIX: Zero-Vector Fallback
-        # If any component is all zeros, SparsePCA has collapsed. Fallback to Standard PCA.
-        if np.any(np.all(self.sparse_pca.components_ == 0, axis=1)):
-            logger.warning("⚠️ SparsePCA produced zero-vector components. Falling back to Standard PCA.")
-            std_pca = PCA(n_components=self.n_components)
-            std_pca.fit(df)
-            self.sparse_pca = std_pca
+        if not self.use_sparse:
+            self._fit_standard_pca(df)
+        else:
+            self.sparse_pca = SparsePCA(n_components=self.n_components, alpha=self.alpha, random_state=42)
+            self.sparse_pca.fit(df)
+
+        if self.use_sparse and self._needs_orthogonal_fallback(df):
+            logger.warning("SparsePCA produced collapsed or non-orthogonal components. Falling back to Standard PCA.")
+            self._fit_standard_pca(df)
 
         # Mandate 9.2: Eigenvector Sign Flipping
         if self.loadings_baseline is not None:
@@ -75,20 +97,6 @@ class PCAFusion:
         """Fit Sparse PCA and transform the data with strict orthogonality enforcement."""
         self.fit(df)
         pcs = self.sparse_pca.transform(df)
-        
-        # Regulation 3.2: Strict Orthogonality Enforcement
-        if pcs.shape[1] >= 2:
-            pc_df_temp = pd.DataFrame(pcs)
-            corr_matrix = pc_df_temp.corr().values
-            np.fill_diagonal(corr_matrix, 0)
-            max_corr = np.max(np.abs(corr_matrix))
-            
-            if max_corr > 0.1 or np.isnan(max_corr):
-                logger.warning(f"⚠️ SparsePCA components non-orthogonal (max_corr={max_corr:.4f}). Falling back to Standard PCA.")
-                std_pca = PCA(n_components=self.n_components)
-                pcs = std_pca.fit_transform(df)
-                self.sparse_pca = std_pca 
-        
         pc_cols = [f"PC{i+1}" for i in range(self.n_components)]
         return pd.DataFrame(pcs, index=df.index, columns=pc_cols)
 

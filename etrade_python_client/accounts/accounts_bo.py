@@ -174,6 +174,9 @@ def process_folder_and_plot_risks_combined(folder_path):
                 })
 
     # Create a DataFrame for all risks
+    if not daily_risks:
+        return "<p>No daily risk data found.</p>", "<p>No daily risk data found.</p>"
+
     risks_df = pd.DataFrame(daily_risks)
 
     # Pivot data for plotting
@@ -2287,9 +2290,11 @@ class Accounts:
             ("gain_loss_percentage","Gain/Loss"),("days_to_expiration","DTE"),("distance_to_strike","Strike Distance"),("extrinsic_value","Extrinsic Val"),
             # ("volatility","Volatility"), # Hidden as requested
             ("strike_price","Strike"),("expiration_date","Expiration"),
-            # ("implied_volatility","IV"),("delta","delta"),("this_delta","delta"), # Hidden as requested
+            ("delta","Delta"),
+            # ("implied_volatility","IV"),("this_delta","delta"), # Hidden as requested
             # ("hedge","hedge"),("net_ticker_delta","net_delta"),("gamma","gamma"),("this_gamma","gamma"),("net_ticker_gamma","net_gamma"), # Hidden as requested
             ("theta","theta"),("theta_pct","theta_pct"),
+
         ]
 
         def _as_num(v, default=0.0):
@@ -2506,7 +2511,11 @@ class Accounts:
 
         # --- Add totals row (left aligned) ---
         total_price = 0.0
+        spy_total_option_price = 0.0
         itm_by_symbol = {}
+
+        from collections import defaultdict
+        type_groups = defaultdict(list)
 
         for item in screened_options:
             for leg in (item.get("long_lot"), item.get("short_lot")):
@@ -2518,13 +2527,51 @@ class Accounts:
                 ul = getattr(leg, "underlying_last_price", None)
                 cp = getattr(leg, "call_put", None)
                 sym = getattr(leg, "symbol", "")
-
-                total_price += qty * price * 100.0
+                exp = getattr(leg, "expiration_date", "")
 
                 if strike is not None and ul is not None:
                     is_itm = (cp == "CALL" and ul > strike) or (cp == "PUT" and ul < strike)
                     if is_itm:
                         itm_by_symbol[sym] = itm_by_symbol.get(sym, 0.0) + qty * price * 100.0
+                
+                if qty != 0:
+                    key = (str(sym).upper(), str(exp), str(cp).upper())
+                    type_groups[key].append({
+                        'qty': qty,
+                        'price': price,
+                        'strike': strike or 0
+                    })
+
+        for key, group in type_groups.items():
+            shorts = [p for p in group if p['qty'] < 0]
+            longs = [p for p in group if p['qty'] > 0]
+            
+            opt_type = key[2]
+            if opt_type == 'PUT':
+                longs.sort(key=lambda x: x['strike'], reverse=True)
+                shorts.sort(key=lambda x: x['strike'], reverse=True)
+            else:
+                longs.sort(key=lambda x: x['strike'])
+                shorts.sort(key=lambda x: x['strike'])
+
+            for short in shorts:
+                val = short['qty'] * short['price'] * 100.0
+                total_price += val
+                if key[0] == 'SPY':
+                    spy_total_option_price += val
+                short_qty_abs = abs(short['qty'])
+                for long in longs:
+                    if long['qty'] <= 0: continue
+                    matched_qty = min(short_qty_abs, long['qty'])
+                    if matched_qty > 0:
+                        val_long = matched_qty * long['price'] * 100.0
+                        total_price += val_long
+                        if key[0] == 'SPY':
+                            spy_total_option_price += val_long
+                        short_qty_abs -= matched_qty
+                        long['qty'] -= matched_qty
+                    if short_qty_abs <= 0:
+                        break
 
         # Format ITM breakdown
         itm_parts = [f"{sym}: ${val:,.2f}" for sym, val in itm_by_symbol.items()]
@@ -2738,7 +2785,7 @@ class Accounts:
         <style>
           body { font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 15px; background: #fff; color: #0f172a; margin: 0; }
           h1 { margin: 0 0 15px 0; font-size: 22px; color: #0f172a; font-weight: 600; }
-          .table-container { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 20px; max-width: calc(100vw - 400px); }
+          .table-container { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 20px; max-width: 100%; }
           table { border-collapse: collapse; width: 100%; font-size: 12px; background: #fff; table-layout: auto; }
           th, td { border: 1px solid #e2e8f0; padding: 6px 10px; text-align: right; white-space: nowrap; color: #0f172a; }
           th { background: #f8fafc; position: sticky; top: 0; z-index: 10; text-align: right; color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.025em; }
@@ -2909,12 +2956,12 @@ class Accounts:
         # Only add if we don't already have today's date, or update it if we do
         if chart_dates and chart_dates[-1] == today_str:
             # Update the last point with live values
-            chart_prices[-1] = total_price
+            chart_prices[-1] = spy_total_option_price
             chart_margins[-1] = live_margin
         else:
             # Add new live data point
             chart_dates.append(live_label)
-            chart_prices.append(total_price)
+            chart_prices.append(spy_total_option_price)
             chart_margins.append(live_margin)
             # Keep cash flow/gains as last known value (these don't change intraday)
             if chart_cash_flows:
@@ -3111,12 +3158,16 @@ class Accounts:
             chart_html = f'''
             <div style="margin-bottom: 30px; max-width: 1200px;">
               <h2 style="margin-bottom: 15px;">SPY Benchmark Performance</h2>
-              <canvas id="spyPriceChart" height="100"></canvas>
+              <div style="position: relative; height: 400px; width: 100%;">
+                <canvas id="spyPriceChart"></canvas>
+              </div>
             </div>
             
             <div style="margin-bottom: 30px; max-width: 1200px;">
               <h2 style="margin-bottom: 15px;">SPY Cash Flow, Realized Gain & Margin</h2>
-              <canvas id="spyChart" height="120"></canvas>
+              <div style="position: relative; height: 400px; width: 100%;">
+                <canvas id="spyChart"></canvas>
+              </div>
             </div>
 
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -3195,6 +3246,7 @@ class Accounts:
                 }},
                 options: {{
                   responsive: true,
+                  maintainAspectRatio: false,
                   interaction: {{ mode: 'index', intersect: false }},
                   plugins: {{
                     title: {{ display: true, text: 'SPY Options: Total Portfolio Value' }},
@@ -3277,6 +3329,7 @@ class Accounts:
                 }},
                 options: {{
                   responsive: true,
+                  maintainAspectRatio: false,
                   interaction: {{ mode: 'index', intersect: false }},
                   plugins: {{
                     title: {{ display: true, text: 'SPY Options: Performance & Risk' }},

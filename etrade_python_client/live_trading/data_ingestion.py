@@ -53,12 +53,22 @@ class RollingRobustScaler:
             return df * np.nan
         return (df - self.center_) / self.scale_
 
-    def batch_rolling_transform(self, df):
+    def inverse_transform(self, df):
+        """Mandate 10.7: Inverse transform using currently learned parameters."""
+        if self.center_ is None:
+            return df * np.nan
+        return (df * self.scale_) + self.center_
+
+    def batch_rolling_transform(self, df, include_current=True):
         """
         Mandate 8.4: Batch version using numpy stride_tricks for maximum performance.
         Avoids iterative loops by calculating all rolling windows at once.
+
+        include_current=True is appropriate for a close_T signal consumed after
+        the close. Set include_current=False when the transformed value will be
+        used for an intraday or same-session decision before row T is observable.
         """
-        data = df.values
+        data = df.astype(float).values
         n_samples, n_features = data.shape
         if n_samples < 20:
             return df * np.nan
@@ -83,10 +93,15 @@ class RollingRobustScaler:
         scales = q3 - q1
         scales = np.where(scales == 0, 1.0, scales)
         
-        # The result at index t corresponds to the window ending at t
-        # So centers[0] is for t = w-1
-        result = np.full_like(data, np.nan)
-        result[w-1:] = (data[w-1:] - centers) / scales
+        result = np.full(data.shape, np.nan, dtype=float)
+        if include_current:
+            # The result at index t corresponds to the window ending at t.
+            # This is causal for close_T reporting, but not same-session entry.
+            result[w-1:] = (data[w-1:] - centers) / scales
+        else:
+            # The result at index t uses the window ending at t-1.
+            # centers[0] covers rows 0..w-1 and transforms row w.
+            result[w:] = (data[w:] - centers[:-1]) / scales[:-1]
         
         return pd.DataFrame(result, index=df.index, columns=df.columns)
 
@@ -504,12 +519,12 @@ class DataIngestor:
              raise ValueError("RollingRobustScaler must be fitted or warmed up before calling transform_features.")
         return self.rolling_scaler.transform(df)
 
-    def scale_features(self, df, rolling=False, window=252*5):
+    def scale_features(self, df, rolling=False, window=252*5, include_current=True):
         """
         Scale features using strictly causal logic.
         """
         if rolling:
-            return self.rolling_scale_features(df, window=window)
+            return self.rolling_scale_features(df, window=window, include_current=include_current)
         
         if self.rolling_scaler.center_ is None:
             red_alert("RollingRobustScaler not fitted. This will cause NaNs in inference.")
@@ -517,13 +532,13 @@ class DataIngestor:
             
         return self.transform_features(df)
 
-    def rolling_scale_features(self, df, window=252*5):
+    def rolling_scale_features(self, df, window=252*5, include_current=True):
         """
         Regulation 8.2 & 8.4: Optimized strictly causal rolling-window scaling.
         """
         scaler = RollingRobustScaler(window=window)
         # Use optimized batch transform if possible
-        scaled_df = scaler.batch_rolling_transform(df)
+        scaled_df = scaler.batch_rolling_transform(df, include_current=include_current)
         
         # Update self.rolling_scaler with the final state
         self.rolling_scaler = scaler
@@ -584,8 +599,9 @@ class DataIngestor:
         # Standardize spikes in VIX/Realized Vol that are likely earnings-driven.
         vol_cols = [c for c in combined.columns if any(kw in c for kw in ['VIX', 'Vol', 'VVIX'])]
         for col in vol_cols:
-            # 5-day rolling median filter suppresses short-lived spikes (earnings jumps)
-            combined[col] = combined[col].rolling(window=5, center=True, min_periods=1).median().ffill().bfill()
+            # 5-day trailing median filter suppresses short-lived spikes without
+            # rewriting T with observations from T+1/T+2.
+            combined[col] = combined[col].rolling(window=5, center=False, min_periods=1).median().ffill()
             logger.info(f"Applied earnings-neutral median filter to {col}")
 
         # Stationarity
