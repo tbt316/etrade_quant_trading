@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "etrade-quant-trading"
 version = "0.0.0"
 description = "Backtesting and daily trading utilities"
+readme = "README.md"
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
