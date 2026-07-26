@@ -541,54 +541,197 @@ def generate_trade_parameter_list(stock_universe,sector_key):
     
     return all_trade_parameters
 
-def _get_latest_imessage_code(timeout_minutes=5):
+def _decode_imessage_body(text, attributed_body):
+    if text:
+        return str(text)
+    if not attributed_body:
+        return ""
+
+    if isinstance(attributed_body, memoryview):
+        attributed_body = attributed_body.tobytes()
+    if not isinstance(attributed_body, bytes):
+        return str(attributed_body)
+
+    decoded = attributed_body.decode("utf-8", errors="ignore")
+    chunks = re.findall(r"[\x20-\x7E]{4,}", decoded)
+    return " ".join(chunks)
+
+
+def _imessage_datetime(raw_date):
+    if raw_date is None:
+        return None
+    try:
+        raw = float(raw_date)
+    except (TypeError, ValueError):
+        return None
+
+    abs_raw = abs(raw)
+    if abs_raw > 100_000_000_000_000:
+        seconds_since_2001 = raw / 1_000_000_000
+    elif abs_raw > 100_000_000_000:
+        seconds_since_2001 = raw / 1_000_000
+    else:
+        seconds_since_2001 = raw
+
+    return datetime.fromtimestamp(978307200 + seconds_since_2001)
+
+
+def _extract_mfa_code_from_message(message_text, sender=None):
+    if not message_text:
+        return None
+
+    match = re.search(r"\b(\d{6})\b", message_text)
+    if not match:
+        return None
+
+    combined = f"{sender or ''} {message_text}".lower()
+    default_hints = [
+        "e*trade",
+        "etrade",
+        "e-trade",
+        "morgan stanley",
+        "security code",
+        "verification code",
+        "authentication code",
+        "authorization code",
+        "login code",
+        "one-time",
+        "one time",
+        "passcode",
+    ]
+    extra_hints = [
+        hint.strip().lower()
+        for hint in os.getenv("ETRADE_MFA_MESSAGE_HINTS", "").split(",")
+        if hint.strip()
+    ]
+
+    if not any(hint in combined for hint in default_hints + extra_hints):
+        return None
+
+    return match.group(1)
+
+
+def _copy_messages_db(db_path):
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.TemporaryDirectory(prefix="etrade_messages_")
+    tmp_db_path = os.path.join(tmp_dir.name, "chat.db")
+    shutil.copy2(db_path, tmp_db_path)
+    for suffix in ("-wal", "-shm"):
+        src = f"{db_path}{suffix}"
+        if os.path.exists(src):
+            shutil.copy2(src, f"{tmp_db_path}{suffix}")
+    return tmp_dir, tmp_db_path
+
+
+def _wake_messages_app():
+    if sys.platform != "darwin":
+        return
+    try:
+        import subprocess
+        subprocess.run(
+            ["open", "-gj", "-a", "Messages"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def _get_latest_imessage_code(timeout_minutes=5, since=None, query_limit=500, log_status=False):
     """
     Attempts to read the latest E*TRADE security code from the macOS iMessage database.
     Requires 'Full Disk Access' permissions for the terminal/app.
     """
     db_path = os.path.expanduser("~/Library/Messages/chat.db")
     if not os.path.exists(db_path):
+        if log_status:
+            print(f"iMessage database not found at {db_path}.")
         return None
 
+    db_snapshot = None
     try:
-        # Connect to the iMessage database
-        # Using uri=True and mode=ro to avoid locking issues. Note: on some macOS versions, 
-        # even with ro, Full Disk Access is still strictly required.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            db_snapshot = _copy_messages_db(db_path)
+            read_path = db_snapshot[1]
+        except Exception:
+            read_path = db_path
+
+        conn = sqlite3.connect(f"file:{read_path}?mode=ro", uri=True)
         cursor = conn.cursor()
 
-        # Query for recent messages containing E*TRADE and a 6-digit code
-        # The 'date' in chat.db is Cocoa Core Data timestamp (nanoseconds since 2001-01-01)
-        # We look for messages in the last timeout_minutes
         query = """
-            SELECT 
-                text,
-                datetime(date / 1000000000 + 978307200, 'unixepoch', 'localtime') as date_text
-            FROM 
-                message 
-            WHERE 
-                (text LIKE '%E*TRADE%' OR text LIKE '%Etrade%')
-                AND text GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9]*'
-                AND text NOT LIKE '%Username%'
-            ORDER BY 
-                date DESC 
-            LIMIT 1
+            SELECT
+                message.date,
+                message.text,
+                message.attributedBody,
+                handle.id
+            FROM
+                message
+            LEFT JOIN
+                handle ON message.handle_id = handle.ROWID
+            WHERE
+                message.is_from_me = 0
+            ORDER BY
+                message.date DESC
+            LIMIT ?
         """
-        cursor.execute(query)
-        row = cursor.fetchone()
+        cursor.execute(query, (query_limit,))
+        rows = cursor.fetchall()
         conn.close()
 
-        if row:
-            text, date_text = row
-            # Extract 6-digit code using regex
-            match = re.search(r'\b(\d{6})\b', text)
-            if match:
-                code = match.group(1)
-                # Verify the message is recent (within timeout_minutes)
-                msg_time = datetime.strptime(date_text, '%Y-%m-%d %H:%M:%S')
-                if datetime.now() - msg_time < timedelta(minutes=timeout_minutes):
-                    print(f"Auto-extracted MFA code from iMessage: {code} (sent at {date_text})")
-                    return code
+        cutoff = since or (datetime.now() - timedelta(minutes=timeout_minutes))
+        stale_cutoff = datetime.now() - timedelta(minutes=timeout_minutes)
+        if cutoff < stale_cutoff:
+            cutoff = stale_cutoff
+
+        latest_inbound_time = None
+        latest_matching_time = None
+        scanned_recent = 0
+        scanned_matching = 0
+
+        for raw_date, text, attributed_body, sender in rows:
+            msg_time = _imessage_datetime(raw_date)
+            if not msg_time:
+                continue
+
+            if latest_inbound_time is None or msg_time > latest_inbound_time:
+                latest_inbound_time = msg_time
+
+            message_text = _decode_imessage_body(text, attributed_body)
+            candidate_code = _extract_mfa_code_from_message(message_text, sender=sender)
+            if candidate_code:
+                scanned_matching += 1
+                if latest_matching_time is None or msg_time > latest_matching_time:
+                    latest_matching_time = msg_time
+
+            if msg_time >= cutoff:
+                scanned_recent += 1
+                if candidate_code:
+                    print(f"Auto-extracted MFA code from iMessage (sent at {msg_time:%Y-%m-%d %H:%M:%S}).")
+                    return candidate_code
+
+        if log_status:
+            cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+            if latest_matching_time:
+                age = datetime.now() - latest_matching_time
+                age_minutes = max(0.0, age.total_seconds() / 60.0)
+                print(
+                    "No recent E*TRADE MFA SMS found in iMessage "
+                    f"after {cutoff_text}. Latest matching SMS is {age_minutes:.1f} minutes old "
+                    f"({latest_matching_time:%Y-%m-%d %H:%M:%S})."
+                )
+            elif latest_inbound_time:
+                print(
+                    "No E*TRADE MFA SMS found in recent iMessage rows. "
+                    f"Latest inbound message is {latest_inbound_time:%Y-%m-%d %H:%M:%S}; "
+                    f"scanned {len(rows)} rows, {scanned_recent} after cutoff."
+                )
+            else:
+                print(f"No inbound iMessage rows found while scanning {len(rows)} rows after cutoff {cutoff_text}.")
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e) or "access denied" in str(e).lower():
             print("Warning: Access to iMessage database denied. Please grant 'Full Disk Access' to your Terminal/IDE in System Settings.")
@@ -596,6 +739,9 @@ def _get_latest_imessage_code(timeout_minutes=5):
             print(f"Error reading iMessage database: {e}")
     except Exception as e:
         print(f"Unexpected error reading iMessage: {e}")
+    finally:
+        if db_snapshot:
+            db_snapshot[0].cleanup()
 
     return None
 
@@ -668,6 +814,23 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
         driver.get(oauth_url)
         WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
+        # Check for scheduled maintenance immediately after loading the page
+        try:
+            page_title = (driver.title or "").lower()
+            page_text = driver.execute_script("return document.body ? document.body.innerText : '';").lower()
+            maintenance_keywords = [
+                "maintenance", "temporarily unavailable", "system unavailable", 
+                "service unavailable", "down for maintenance", "scheduled maintenance", 
+                "schedule maintenance", "scheduled maintainance", "schedule maintainance"
+            ]
+            if any(kw in page_title for kw in maintenance_keywords) or any(kw in page_text for kw in maintenance_keywords):
+                print("🛑 E*TRADE Scheduled Maintenance detected via page content/title.")
+                raise LoginFailureException("E*TRADE Scheduled Maintenance: The site is temporarily unavailable due to maintenance.")
+        except LoginFailureException:
+            raise
+        except Exception as check_err:
+            print(f"Could not check for maintenance page: {check_err}")
+
         print("Automating the login process.")
 
         def _find_first(locators, condition=EC.presence_of_element_located, timeout=20):
@@ -676,6 +839,91 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 return WebDriverWait(driver, timeout).until(EC.any_of(*[condition(loc) for loc in locators]))
             except (TimeoutException, AttributeError, Exception):
                 return None
+
+        def _extract_token_from_text(text):
+            if not text:
+                return None
+
+            match = re.search(r"oauth[_-]?verifier[:=\s]+([A-Za-z0-9-_]+)", text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+
+            for line in text.splitlines():
+                candidate = line.strip()
+                if candidate.lower() in ['banking', 'log on', 'etrade', 'accounts', 'markets', 'research', 'transfer', 'support']:
+                    continue
+                if 6 <= len(candidate) <= 128 and re.fullmatch(r"[A-Za-z0-9-_]+", candidate):
+                    return candidate
+            return None
+
+        def _select_remember_device_if_present():
+            try:
+                selected = driver.execute_script("""
+                    const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const bodyText = normalize(document.body ? document.body.innerText : '');
+                    if (!bodyText.includes('save this device') && !bodyText.includes('remember this device')) {
+                        return false;
+                    }
+
+                    const chooseRadio = (radio) => {
+                        if (!radio) {
+                            return false;
+                        }
+                        radio.scrollIntoView({block: 'center', inline: 'center'});
+                        radio.click();
+                        radio.checked = true;
+                        radio.dispatchEvent(new Event('input', {bubbles: true}));
+                        radio.dispatchEvent(new Event('change', {bubbles: true}));
+                        return true;
+                    };
+
+                    for (const label of Array.from(document.querySelectorAll('label'))) {
+                        const labelText = normalize(label.innerText || label.textContent);
+                        if (labelText.includes('yes') && labelText.includes('save this device')) {
+                            const radio = label.htmlFor
+                                ? document.getElementById(label.htmlFor)
+                                : label.querySelector('input[type="radio"]');
+                            if (radio) {
+                                return chooseRadio(radio);
+                            }
+                            label.scrollIntoView({block: 'center', inline: 'center'});
+                            label.click();
+                            return true;
+                        }
+                    }
+
+                    for (const radio of Array.from(document.querySelectorAll('input[type="radio"]'))) {
+                        const parts = [
+                            radio.getAttribute('aria-label'),
+                            radio.value,
+                            radio.id,
+                            radio.name,
+                            radio.nextElementSibling ? radio.nextElementSibling.innerText : '',
+                            radio.parentElement ? radio.parentElement.innerText : '',
+                        ];
+                        const radioText = normalize(parts.join(' '));
+                        if (radioText.includes('yes') && radioText.includes('save this device')) {
+                            return chooseRadio(radio);
+                        }
+                    }
+
+                    for (const el of Array.from(document.querySelectorAll('[role="radio"], button, span, div'))) {
+                        const text = normalize(el.innerText || el.textContent);
+                        if (text === 'yes, save this device.' || text === 'yes, save this device') {
+                            el.scrollIntoView({block: 'center', inline: 'center'});
+                            el.click();
+                            return true;
+                        }
+                    }
+
+                    return false;
+                """)
+                if selected:
+                    print("Selected MFA remember-device option.")
+                return bool(selected)
+            except Exception as e:
+                print(f"Could not select MFA remember-device option: {e}")
+                return False
 
 
         username_locators = [
@@ -787,21 +1035,41 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
         ]
 
         # MFA / Security Code Locators
+        mfa_phone_choice_locators = [
+            (By.XPATH, "//label[contains(., 'iPhone') or contains(., 'Text') or contains(., 'SMS')]"),
+            (By.CSS_SELECTOR, "input[type='radio']"),
+        ]
         mfa_input_locators = [
             (By.CSS_SELECTOR, "input[name='SecurityCode']"),
             (By.CSS_SELECTOR, "input.security-code"),
             (By.ID, "securityCode"),
+            (By.ID, "passcode"),
+            (By.CSS_SELECTOR, "input[name='otp']"),
+            (By.CSS_SELECTOR, "input[name='passcode']"),
+            (By.CSS_SELECTOR, "input[type='tel']"),
+            (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+            (By.CSS_SELECTOR, "input[inputmode='numeric']"),
             (By.CSS_SELECTOR, "input[placeholder*='Security Code']"),
+            (By.CSS_SELECTOR, "input[placeholder*='Verification Code']"),
+            (By.CSS_SELECTOR, "input[placeholder*='code']"),
         ]
         mfa_submit_locators = [
             (By.ID, "previewSubmit"),
             (By.CSS_SELECTOR, "button[data-testid='submit-security-code']"),
             (By.XPATH, "//button[contains(text(), 'Submit')]"),
+            (By.XPATH, "//button[contains(text(), 'Verify')]"),
+            (By.XPATH, "//button[contains(text(), 'Continue')]"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
         ]
         mfa_send_code_locators = [
             (By.ID, "sendOTPCodeBtn"),
             (By.CSS_SELECTOR, "button#sendOTPCodeBtn"),
             (By.XPATH, "//button[contains(text(), 'Send Code')]"),
+            (By.XPATH, "//button[contains(text(), 'Send code')]"),
+            (By.XPATH, "//button[contains(text(), 'Send text')]"),
+            (By.XPATH, "//button[contains(text(), 'Text me')]"),
+            (By.XPATH, "//input[contains(@value, 'Send Code')]"),
+            (By.XPATH, "//input[contains(@value, 'Send code')]"),
         ]
 
         token_locators = [
@@ -819,10 +1087,28 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
         print("Waiting for Token OR Consent OR MFA challenge...")
         
         token = None
-        max_duration = 60 # Total time to wait for the flow to complete
+        max_duration = int(os.getenv("ETRADE_LOGIN_WAIT_SECONDS", "180"))
         start_wait = t.time()
+        mfa_code_requested_at = None
         
         while (t.time() - start_wait) < max_duration:
+            # Check for scheduled maintenance inside loop
+            try:
+                page_title = (driver.title or "").lower()
+                page_text = driver.execute_script("return document.body ? document.body.innerText : '';").lower()
+                maintenance_keywords = [
+                    "maintenance", "temporarily unavailable", "system unavailable", 
+                    "service unavailable", "down for maintenance", "scheduled maintenance", 
+                    "schedule maintenance", "scheduled maintainance", "schedule maintainance"
+                ]
+                if any(kw in page_title for kw in maintenance_keywords) or any(kw in page_text for kw in maintenance_keywords):
+                    print("🛑 E*TRADE Scheduled Maintenance detected inside loop.")
+                    raise LoginFailureException("E*TRADE Scheduled Maintenance: The site is temporarily unavailable due to maintenance.")
+            except LoginFailureException:
+                raise
+            except Exception:
+                pass
+
             # 1. Success Condition: Check for the Token first (it might be already there)
             # Try JS extraction first for speed
             try:
@@ -841,6 +1127,7 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 all_conditions = []
                 for loc in token_locators: all_conditions.append(EC.presence_of_element_located(loc))
                 for loc in accept_locators: all_conditions.append(EC.element_to_be_clickable(loc))
+                for loc in mfa_phone_choice_locators: all_conditions.append(EC.element_to_be_clickable(loc))
                 for loc in mfa_send_code_locators: all_conditions.append(EC.element_to_be_clickable(loc))
                 for loc in mfa_input_locators: all_conditions.append(EC.visibility_of_element_located(loc))
                 
@@ -868,15 +1155,25 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 except:
                     pass
 
-            # 5. Check for MFA "Send Code" button (Choice screen)
-            mfa_send_code = _find_first(mfa_send_code_locators, EC.element_to_be_clickable, timeout=0.1)
-            if mfa_send_code:
-                print("MFA 'Send Code' button found. Triggering SMS...")
+            # 5. Check for MFA device choice and "Send Code" button (Choice screen)
+            mfa_phone_choice = _find_first(mfa_phone_choice_locators, EC.element_to_be_clickable, timeout=0.1)
+            if mfa_phone_choice:
                 try:
-                    mfa_send_code.click()
-                    continue # Re-evaluate state immediately
+                    mfa_phone_choice.click()
                 except:
                     pass
+
+            mfa_send_code = _find_first(mfa_send_code_locators, EC.element_to_be_clickable, timeout=0.1)
+            if mfa_send_code:
+                if not mfa_code_requested_at or datetime.now() - mfa_code_requested_at > timedelta(seconds=30):
+                    print("MFA 'Send Code' button found. Triggering SMS...")
+                    try:
+                        mfa_code_requested_at = datetime.now() - timedelta(seconds=10)
+                        mfa_send_code.click()
+                        _wake_messages_app()
+                        continue # Re-evaluate state immediately
+                    except:
+                        pass
 
             # 6. Check for MFA Challenge (Input screen)
             mfa_input = _find_first(mfa_input_locators, EC.visibility_of_element_located, timeout=0.1)
@@ -886,14 +1183,24 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 # Attempt auto-extraction from iMessage
                 security_code = None
                 print("Checking iMessage for security code...")
-                for i in range(6): # Try for 15 seconds, polling faster
-                    security_code = _get_latest_imessage_code(timeout_minutes=3)
+                _wake_messages_app()
+                mfa_wait_seconds = int(os.getenv("ETRADE_MFA_WAIT_SECONDS", "90"))
+                poll_count = max(1, int(mfa_wait_seconds / 2.5))
+                code_since = (mfa_code_requested_at or datetime.now()) - timedelta(minutes=2)
+                for i in range(poll_count): # SMS forwarding to Messages can lag.
+                    security_code = _get_latest_imessage_code(
+                        timeout_minutes=10,
+                        since=code_since,
+                        log_status=(i == 0 or i == poll_count - 1),
+                    )
                     if security_code:
-                        print(f"Found code: {security_code}")
+                        print("Found security code in iMessage.")
                         break
                     t.sleep(2.5)
                 
                 if not security_code:
+                    if headless or not sys.stdin.isatty():
+                        raise LoginFailureException("MFA code required, but no recent iMessage code was found.")
                     print("Auto-extraction failed. Falling back to manual input.")
                     security_code = input(">> Please enter code: ").strip()
                 
@@ -901,6 +1208,7 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                     print("Submitting MFA code...")
                     mfa_input.clear()
                     mfa_input.send_keys(security_code)
+                    _select_remember_device_if_present()
                     mfa_submit = _find_first(mfa_submit_locators, EC.element_to_be_clickable, timeout=1)
                     if mfa_submit:
                         mfa_submit.click()
@@ -952,24 +1260,6 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
             raise LoginFailureException("Unable to retrieve OAuth verifier token automatically.", screenshot_path=screenshot_path)
 
         return token
-
-
-        def _extract_token_from_text(text):
-            if not text:
-                return None
-
-            match = re.search(r"oauth[_-]?verifier[:=\s]+([A-Za-z0-9-_]+)", text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-
-            for line in text.splitlines():
-                candidate = line.strip()
-                # Filter out common words that might match the regex
-                if candidate.lower() in ['banking', 'log on', 'etrade', 'accounts', 'markets', 'research', 'transfer', 'support']:
-                    continue
-                if 6 <= len(candidate) <= 128 and re.fullmatch(r"[A-Za-z0-9-_]+", candidate):
-                    return candidate
-            return None
 
 
     finally:

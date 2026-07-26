@@ -63,23 +63,23 @@ def bs_vega(S: float, K: float, T: float, r: float, sigma: float, q: float) -> f
 
 
 def bs_put_delta(S: float, K: float, T: float, r: float, sigma: float, q: float) -> float:
-    """Black-Scholes put delta (always negative for puts)."""
+    """Black-Scholes put delta (always negative for puts). Redefined to N(d2)."""
     T = max(T, 1e-6)
     if sigma <= 0:
         # Binary delta at expiration
         return -np.exp(-q * T) if S < K else 0.0
-    d1 = bs_d1(S, K, T, r, sigma, q)
-    return np.exp(-q * T) * (norm.cdf(d1) - 1.0)
+    d2 = bs_d2(S, K, T, r, sigma, q)
+    return -np.exp(-q * T) * norm.cdf(-d2)
 
 
 def bs_call_delta(S: float, K: float, T: float, r: float, sigma: float, q: float) -> float:
-    """Black-Scholes call delta (always positive for calls)."""
+    """Black-Scholes call delta (always positive for calls). Redefined to N(d2)."""
     T = max(T, 1e-6)
     if sigma <= 0:
         # Binary delta at expiration
         return np.exp(-q * T) if S > K else 0.0
-    d1 = bs_d1(S, K, T, r, sigma, q)
-    return np.exp(-q * T) * norm.cdf(d1)
+    d2 = bs_d2(S, K, T, r, sigma, q)
+    return np.exp(-q * T) * norm.cdf(d2)
 
 
 def implied_volatility(

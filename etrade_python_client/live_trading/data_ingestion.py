@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import pandas_datareader.data as web
+# import pandas_datareader.data as web  # Disabled due to pandas deprecate_kwarg compatibility issue
 from datetime import datetime, timedelta
 from statsmodels.tsa.stattools import adfuller
 from sklearn.preprocessing import RobustScaler
@@ -111,9 +111,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backtesting.massive_api_client import MassiveAPIClient
 from backtesting.option_data_cache import OptionDataCache
-from backtesting.greeks_calculator import bs_gamma, implied_volatility
+from backtesting.greeks_calculator import bs_call_delta, bs_gamma, bs_put_delta, implied_volatility
+from backtesting.sharded_option_data_cache import _root_aliases
 
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def red_alert(msg):
     """Print a prominent red alert to the console."""
@@ -121,7 +124,9 @@ def red_alert(msg):
     logger.error(f"RED ALERT: {msg}")
 
 class DataCacheManager:
-    def __init__(self, cache_dir="s_and_p_data/api_cache"):
+    def __init__(self, cache_dir=None):
+        if cache_dir is None:
+            cache_dir = os.path.join(PROJECT_ROOT, "s_and_p_data", "api_cache")
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         self._lock = threading.Lock()
@@ -205,19 +210,7 @@ class DataIngestor:
             print(f"🔄 [DataIngestor] Background sync started for {len(symbols)} symbols from {source}...")
             while True:
                 try:
-                    all_covered = True
-                    for sym in symbols:
-                        if not self.cache_manager.check_coverage(sym, start_date, end_date):
-                            all_covered = False
-                            print(f"📡 [DataIngestor] Polling API for {sym}...")
-                            if source == 'yf':
-                                # Small fetch for just the gap might be better but for now we fetch the range
-                                df = self._fetch_yf_raw(sym, start_date, end_date)
-                                if not df.empty: self.cache_manager.save(sym, df)
-                            else:
-                                df = self._fetch_fred_raw([sym], start_date, end_date)
-                                if not df.empty: self.cache_manager.save(sym, df)
-                    
+                    all_covered = self.sync_data(symbols, source=source, start_date=start_date, end_date=end_date)
                     if all_covered:
                         print(f"✅ [DataIngestor] Background sync complete for {source} symbols.")
                         break
@@ -232,42 +225,65 @@ class DataIngestor:
         t = threading.Thread(target=sync_task, daemon=True)
         t.start()
 
+    def sync_data(self, symbols, source='yf', start_date=None, end_date=None):
+        """
+        Synchronously sync symbols. Returns True if all symbols are now covered.
+        """
+        if not start_date: start_date = (datetime.now() - timedelta(days=365*5)).strftime("%Y-%m-%d")
+        if not end_date: end_date = datetime.now().strftime("%Y-%m-%d")
+        
+        all_covered = True
+        for sym in symbols:
+            cached = self.cache_manager.load(sym)
+            has_ohlc = not cached.empty and 'Open' in cached.columns
+            covered = self.cache_manager.check_coverage(sym, start_date, end_date)
+            if source == 'yf':
+                covered = covered and has_ohlc
+
+            if not covered:
+                all_covered = False
+                print(f"📡 [DataIngestor] Syncing {sym} from {source}...")
+                if source == 'yf':
+                    df = self._fetch_yf_raw(sym, start_date, end_date)
+                    if not df.empty: self.cache_manager.save(sym, df)
+                else:
+                    df = self._fetch_fred_raw([sym], start_date, end_date)
+                    if not df.empty: self.cache_manager.save(sym, df)
+        return all_covered
+
     def _fetch_fred_raw(self, symbols, start_date, end_date):
         try:
-            df = web.DataReader(symbols, 'fred', start_date, end_date)
-            return self._normalize_index(df)
+            combined = pd.DataFrame()
+            for sym in symbols:
+                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sym}"
+                df = pd.read_csv(url, index_col='DATE', parse_dates=True)
+                df.index = pd.to_datetime(df.index)
+                df = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
+                df[sym] = pd.to_numeric(df[sym], errors='coerce')
+                if combined.empty:
+                    combined = df
+                else:
+                    combined = combined.merge(df, left_index=True, right_index=True, how='outer')
+            return self._normalize_index(combined)
         except Exception as e:
             logger.error(f"FRED fetch error: {e}")
             return pd.DataFrame()
 
     def _fetch_yf_raw(self, symbol, start_date, end_date):
         try:
-            # 🚨 CRITICAL: Use auto_adjust=False to get raw Close price (NOT dividend-adjusted).
-            # Historical option strikes (Massive API/Polygon) are UNADJUSTED. 
-            # Using Adjusted Close (auto_adjust=True) will cause spot/strike misalignment (e.g. SPY 2015).
-            # See backtesting/strategy_registry.md -> Data Integrity for details.
+            # 🚨 CRITICAL: Use auto_adjust=False to get raw prices.
             df = yf.download(symbol, start=start_date, end=end_date, progress=False, auto_adjust=False)
             if not df.empty:
-                # Robust extraction of 'Close' and flattening to a simple 1-column DataFrame
+                # Standardize columns to [Open, High, Low, Close, Volume]
                 if isinstance(df.columns, pd.MultiIndex):
-                    if 'Close' in df.columns.get_level_values(0):
-                        df = df['Close']
-                        if isinstance(df, pd.DataFrame):
-                            df = df.iloc[:, 0] # Extract first ticker if multiple (should be 1)
-                    else:
-                        df = df.iloc[:, 0]
-                elif 'Close' in df.columns:
-                    df = df['Close']
-                else:
-                    df = df.iloc[:, 0]
+                    # Multi-ticker or multi-level index: extract first ticker
+                    tickers = df.columns.get_level_values(1).unique() if df.columns.nlevels > 1 else [None]
+                    df = df.xs(tickers[0], axis=1, level=1) if tickers[0] else df
                 
-                # Force to a simple 1-column DataFrame named 'Close'
-                if isinstance(df, pd.Series):
-                    df = df.to_frame('Close')
-                elif isinstance(df, pd.DataFrame):
-                    df = df.iloc[:, [0]]
-                    df.columns = ['Close']
-                    
+                # Filter to only the core OHLCV columns we need
+                cols = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+                df = df[cols]
+                
                 return self._normalize_index(df)
         except Exception as e:
             logger.error(f"YF fetch error for {symbol}: {e}")
@@ -280,16 +296,23 @@ class DataIngestor:
         df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
         return df
 
-    def fetch_fred_data(self, start_date, end_date):
-        """Fetch macroeconomic data from FRED with local caching."""
+    def fetch_fred_data(self, start_date, end_date, wait=False):
+        """Fetch macroeconomic data from FRED with local caching.
+        
+        NOTE: Fed_Funds_Rate (FEDFUNDS) and 3M_TBill (DTB3) deliberately
+        removed — slow macro rate trends were hijacking PC1 and diluting
+        leading-indicator signal. Yield_Curve_10Y_3M also removed as it
+        depended on 3M_TBill.
+        """
         symbols = {
             'DGS10': '10Y_Treasury',
-            'DTB3': '3M_TBill',
             'BAA10Y': 'High_Yield_Spread',
-            'FEDFUNDS': 'Fed_Funds_Rate',
             'USEPUINDXD': 'EPU_Index'
         }
         
+        if wait:
+            self.sync_data(list(symbols.keys()), source='fred', start_date=start_date, end_date=end_date)
+
         combined_df = pd.DataFrame()
         missing = []
         for sym in symbols.keys():
@@ -300,7 +323,7 @@ class DataIngestor:
                 if combined_df.empty: combined_df = cached
                 else: combined_df = pd.merge(combined_df, cached, left_index=True, right_index=True, how='outer')
         
-        if missing:
+        if missing and not wait:
             red_alert(f"FRED data missing for {missing}. Starting background sync.")
             self.start_background_sync(missing, source='fred', start_date=start_date, end_date=end_date)
         
@@ -310,8 +333,6 @@ class DataIngestor:
         cols_to_use = [c for c in symbols.keys() if c in combined_df.columns]
         df = combined_df[cols_to_use].copy()
         df.rename(columns=symbols, inplace=True)
-        if '10Y_Treasury' in df.columns and '3M_TBill' in df.columns:
-            df['Yield_Curve_10Y_3M'] = df['10Y_Treasury'] - df['3M_TBill']
         
         # Filter to requested range
         req_start = pd.to_datetime(start_date).tz_localize(None).normalize()
@@ -320,49 +341,110 @@ class DataIngestor:
         
         return self._normalize_index(df)
 
-    def fetch_yf_data(self, start_date, end_date):
+    def calculate_yang_zhang_volatility(self, ohlc_df, window=21):
+        """
+        Implementation of Yang-Zhang Volatility Estimator.
+        It is roughly 14x more efficient than Close-to-Close estimators.
+        """
+        if len(ohlc_df) < window + 1:
+            return pd.Series(index=ohlc_df.index, dtype=float)
+            
+        log_ho = np.log(ohlc_df['High'] / ohlc_df['Open'])
+        log_lo = np.log(ohlc_df['Low'] / ohlc_df['Open'])
+        log_co = np.log(ohlc_df['Close'] / ohlc_df['Open'])
+        
+        log_oc = np.log(ohlc_df['Open'] / ohlc_df['Close'].shift(1))
+        log_oc_sq = log_oc**2
+        
+        log_cc = np.log(ohlc_df['Close'] / ohlc_df['Close'].shift(1))
+        log_cc_sq = log_cc**2
+        
+        # Rogers-Satchell component
+        rs_comp = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+        rs_var = rs_comp.rolling(window=window).mean()
+        
+        # Overnight and Open-to-Close components
+        overnight_var = log_oc_sq.rolling(window=window).var()
+        open_to_close_var = log_co.rolling(window=window).var()
+        
+        k = 0.34 / (1.34 + (window + 1) / (window - 1))
+        
+        yz_var = overnight_var + k * open_to_close_var + (1 - k) * rs_var
+        
+        return np.sqrt(yz_var * 252)
+
+    def fetch_yf_data(self, start_date, end_date, wait=False):
         """Fetch price data from Yahoo Finance with local caching."""
         symbols = {
-            'SPY': 'SPY_Close',
-            '^VIX': 'VIX_Close',
-            '^VVIX': 'VVIX_Close',
-            '^VIX3M': 'VXV_Close',
-            'BTC-USD': 'BTC_Close',
-            'CL=F': 'WTI_Oil'
+            'SPY': 'SPY',
+            '^VIX': 'VIX',
+            '^VVIX': 'VVIX',
+            '^VIX3M': 'VXV',
+            'BTC-USD': 'BTC',
+            'CL=F': 'WTI'
         }
         
-        combined_df = pd.DataFrame()
+        if wait:
+            self.sync_data(list(symbols.keys()), source='yf', start_date=start_date, end_date=end_date)
+
+        def load_yf_symbol(sym):
+            cached = self.cache_manager.load(sym)
+            if cached.empty or 'Open' not in cached.columns:
+                return pd.DataFrame()
+            return cached
+
+        ohlc_map = {}
         missing = []
         for sym, name in symbols.items():
-            cached = self.cache_manager.load(sym)
+            cached = load_yf_symbol(sym)
             if cached.empty or not self.cache_manager.check_coverage(sym, start_date, end_date):
                 missing.append(sym)
             if not cached.empty:
-                cached.columns = [name]
-                if combined_df.empty: combined_df = cached
-                else: combined_df = pd.merge(combined_df, cached, left_index=True, right_index=True, how='outer')
+                ohlc_map[name] = cached
 
-        if missing:
-            red_alert(f"YFinance data missing for {missing}. Starting background sync.")
+        if missing and not wait:
+            red_alert(f"YFinance OHLC data missing or outdated for {missing}. Syncing...")
             self.start_background_sync(missing, source='yf', start_date=start_date, end_date=end_date)
+        elif wait and missing:
+            # sync_data() already attempted the refresh; reload the local cache now
+            ohlc_map = {}
+            for sym, name in symbols.items():
+                cached = load_yf_symbol(sym)
+                if not cached.empty:
+                    ohlc_map[name] = cached
 
-        if combined_df.empty: return pd.DataFrame()
+        if not ohlc_map: return pd.DataFrame()
 
-        # Feature engineering (on what we have)
-        df = combined_df
+        # Build combined Close-only DF for most features
+        close_df = pd.DataFrame()
+        for name, df in ohlc_map.items():
+            if 'Close' in df.columns:
+                series = df['Close'].rename(f"{name}_Close")
+                if close_df.empty: close_df = series.to_frame()
+                else: close_df = pd.merge(close_df, series, left_index=True, right_index=True, how='outer')
+
+        # Feature engineering
+        df = close_df
         if 'SPY_Close' in df.columns:
-            # Drop NaNs for calculation to avoid window pollution on weekends
             spy_series = df['SPY_Close'].dropna()
             spy_returns = np.log(spy_series / spy_series.shift(1))
-            # Calculate 21-day Realized Volatility (Annualized) on trading days
-            spy_rv = spy_returns.rolling(window=21).std() * np.sqrt(252)
-            
             df['SPY_Log_Return'] = spy_returns
-            df['SPY_Realized_Vol_21d'] = spy_rv
+            
+            # NOTE: SPY_Realized_Vol_21d deliberately removed — backward-looking
+            # historical variance lags the model. Yang-Zhang is the sole vol estimator.
+            
+            # MANDATE: Add Yang-Zhang Volatility for the primary asset
+            if 'SPY' in ohlc_map:
+                df['SPY_Yang_Zhang_21d'] = self.calculate_yang_zhang_volatility(ohlc_map['SPY'])
+                logger.info("Successfully integrated Yang-Zhang Volatility for SPY.")
+
         if 'BTC_Close' in df.columns:
             df['BTC_Log_Return'] = np.log(df['BTC_Close'] / df['BTC_Close'].shift(1))
         if 'VIX_Close' in df.columns and 'VXV_Close' in df.columns:
             df['VXV_VIX_Ratio'] = df['VXV_Close'] / df['VIX_Close']
+        
+        # Keep VIX_Close available in the raw feature frame for overlay and audit
+        # paths. The HMM training pipeline drops it before scaler/PCA fitting.
 
         # Filter to requested range
         req_start = pd.to_datetime(start_date).tz_localize(None).normalize()
@@ -410,12 +492,283 @@ class DataIngestor:
                 if strike_gex[s1] < 0 and strike_gex[s2] > 0:
                     # Simple interpolation
                     zero_gamma = s1 + (s2 - s1) * abs(strike_gex[s1]) / (abs(strike_gex[s1]) + abs(strike_gex[s2]))
-                    break
-            
             return {
                 "net_gex": total_gex / 1e9, # In billions
                 "zero_gamma": zero_gamma
             }
+
+    def fetch_historical_gex(self, dates, underlying="SPX"):
+        """
+        Calculates Net GEX for a list of string dates using the sharded options database.
+        Highly optimized using vectorized pandas grouping instead of hot-loop queries.
+        """
+        gex_series = pd.Series(index=pd.to_datetime(dates), dtype=float)
+        cache = OptionDataCache()
+        missing_years = []
+        
+        underlying_cache = os.path.join(PROJECT_ROOT, "s_and_p_data", f"underlying_{underlying}.csv")
+        if not os.path.exists(underlying_cache):
+            underlying_cache = os.path.join(PROJECT_ROOT, "s_and_p_data", f"underlying_SPY.csv")
+            
+        if os.path.exists(underlying_cache):
+            try:
+                spot_df = pd.read_csv(underlying_cache, index_col=0)
+                spot_df.index = pd.to_datetime(spot_df.index).tz_localize(None).normalize()
+            except Exception:
+                spot_df = pd.DataFrame()
+        else:
+            spot_df = pd.DataFrame()
+            
+        # Group dates by year to query only once per shard
+        dates_df = pd.DataFrame(index=pd.to_datetime(dates))
+        dates_df['year'] = dates_df.index.strftime("%Y")
+        
+        for year, group in dates_df.groupby('year'):
+            try:
+                # 1. Get connection to options DB
+                if cache.use_shards:
+                    conn = cache._ensure_price_conn(underlying, year)
+                else:
+                    conn = cache.conn
+
+                year_start = pd.Timestamp(f"{year}-01-01")
+                year_end = pd.Timestamp(f"{int(year) + 1}-01-01")
+
+                # Fetch only the option rows needed for this year
+                query = """
+                    SELECT pricing_date, contract_type, gamma, open_interest
+                    FROM option_prices
+                    WHERE underlying = ? AND pricing_date >= ? AND pricing_date < ?
+                """
+                df_year = pd.read_sql(
+                    query,
+                    conn,
+                    params=(underlying, year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d")),
+                )
+                if df_year.empty:
+                    continue
+                
+                df_year['pricing_date'] = pd.to_datetime(df_year['pricing_date'])
+
+                usable = df_year['gamma'].fillna(0).gt(0) & df_year['open_interest'].fillna(0).gt(0)
+                if not usable.any():
+                    missing_years.append(year)
+                    continue
+                df_year = df_year.loc[usable].copy()
+                
+                # Map spot prices
+                if not spot_df.empty:
+                    df_year = df_year.merge(spot_df.iloc[:, 0].rename('spot'), left_on='pricing_date', right_index=True, how='left')
+                else:
+                    df_year['spot'] = 4000.0
+                df_year['spot'] = df_year['spot'].fillna(4000.0)
+                
+                # Vectorized GEX calculation
+                df_year['sign'] = np.where(df_year['contract_type'].str.lower() == 'call', 1.0, -1.0)
+                df_year['gex'] = df_year['sign'] * df_year['open_interest'] * 100 * df_year['gamma'] * (df_year['spot'] ** 2) * 0.01
+                
+                # Aggregate by date
+                daily_gex = df_year.groupby('pricing_date')['gex'].sum() / 1e9 # Billions
+                
+                # Assign back to series
+                gex_series.loc[daily_gex.index] = daily_gex.values
+            except Exception as e:
+                logger.warning(f"Error in vectorized GEX for {year}: {e}")
+
+        if missing_years:
+            logger.warning(
+                f"No usable GEX rows found for {underlying} in years {', '.join(missing_years)}; "
+                "leaving feature missing for those years."
+            )
+
+        if gex_series.notna().sum() < max(10, int(len(gex_series) * 0.1)):
+            logger.warning(f"Historical GEX coverage too sparse for {underlying}; dropping feature.")
+            return np.full(len(gex_series), np.nan, dtype=float)
+
+        return gex_series.values
+
+    def fetch_historical_skew(self, dates, underlying="SPX"):
+        """
+        Calculates 25-Delta Option Implied Skew (IV_Put - IV_Call) closest to 30 DTE.
+        Uses cached option quote history and derives IV from the stored mid price
+        when explicit implied_vol / delta fields are missing in the shard rows.
+        """
+        skew_series = pd.Series(index=pd.to_datetime(dates), dtype=float)
+        cache = OptionDataCache()
+        aliases = _root_aliases(underlying) or [underlying]
+
+        spot_path = os.path.join(PROJECT_ROOT, "s_and_p_data", f"underlying_{underlying}.csv")
+        if not os.path.exists(spot_path) and underlying != "SPY":
+            spot_path = os.path.join(PROJECT_ROOT, "s_and_p_data", "underlying_SPY.csv")
+        try:
+            spot_df = pd.read_csv(spot_path, index_col=0)
+            spot_df.index = pd.to_datetime(spot_df.index).tz_localize(None).normalize()
+            spot_series = spot_df.iloc[:, 0].astype(float)
+        except Exception:
+            spot_series = pd.Series(dtype=float)
+
+        rate_path = os.path.join(PROJECT_ROOT, "s_and_p_data", "underlying_^IRX.csv")
+        try:
+            rate_df = pd.read_csv(rate_path, index_col=0)
+            rate_df.index = pd.to_datetime(rate_df.index).tz_localize(None).normalize()
+            rate_series = (rate_df.iloc[:, 0].astype(float) / 100.0).reindex(pd.to_datetime(dates)).ffill().bfill()
+        except Exception:
+            rate_series = pd.Series(index=pd.to_datetime(dates), data=0.0, dtype=float)
+
+        spot_series = spot_series.reindex(pd.to_datetime(dates)).ffill().bfill()
+        dates_df = pd.DataFrame(index=pd.to_datetime(dates))
+        dates_df['year'] = dates_df.index.strftime("%Y")
+        
+        for year, group in dates_df.groupby('year'):
+            try:
+                year_start = pd.Timestamp(f"{year}-01-01")
+                year_end = pd.Timestamp(f"{int(year) + 1}-01-01")
+
+                frames = []
+                for alias in aliases:
+                    if cache.use_shards:
+                        conn = cache._ensure_price_conn(alias, year)
+                    else:
+                        conn = cache.conn
+                    if alias == "SPX":
+                        pattern = "O:SPX[0-9]*"
+                    elif alias == "SPXW":
+                        pattern = "O:SPXW*"
+                    else:
+                        pattern = f"O:{alias}*"
+                    query = """
+                        SELECT option_ticker, bid, ask, mid, close, pricing_date
+                        FROM option_prices
+                        WHERE pricing_date >= ? AND pricing_date < ?
+                          AND option_ticker GLOB ?
+                    """
+                    df_alias = pd.read_sql(
+                        query,
+                        conn,
+                        params=(year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"), pattern),
+                    )
+                    if not df_alias.empty:
+                        frames.append(df_alias)
+
+                if not frames:
+                    continue
+
+                df_year = pd.concat(frames, ignore_index=True).drop_duplicates(subset=['option_ticker', 'pricing_date'])
+                if df_year.empty:
+                    continue
+
+                parsed = df_year['option_ticker'].str.extract(
+                    r'^(?:O:)?(?P<underlying>[A-Z]+)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})(?P<cp>[CP])(?P<strike_raw>\d{8})$'
+                )
+                df_year = pd.concat([df_year, parsed], axis=1)
+                df_year = df_year.dropna(subset=['yy', 'mm', 'dd', 'cp', 'strike_raw'])
+                if df_year.empty:
+                    logger.warning(f"No parseable skew rows found for {underlying} in {year}; leaving feature missing.")
+                    continue
+
+                df_year['pricing_date'] = pd.to_datetime(df_year['pricing_date']).dt.normalize()
+                df_year['expiration'] = pd.to_datetime(
+                    "20" + df_year['yy'] + "-" + df_year['mm'] + "-" + df_year['dd'],
+                    errors='coerce'
+                )
+                df_year['contract_type'] = np.where(df_year['cp'] == 'C', 'call', 'put')
+                df_year['strike'] = pd.to_numeric(df_year['strike_raw'], errors='coerce') / 1000.0
+                df_year = df_year.dropna(subset=['expiration', 'strike'])
+                if df_year.empty:
+                    continue
+
+                df_year['mid_px'] = pd.to_numeric(df_year['mid'], errors='coerce')
+                df_year['mid_px'] = df_year['mid_px'].where(df_year['mid_px'] > 0)
+                df_year['mid_px'] = df_year['mid_px'].fillna(pd.to_numeric(df_year['close'], errors='coerce'))
+                if 'bid' in df_year.columns and 'ask' in df_year.columns:
+                    fallback_mid = (pd.to_numeric(df_year['bid'], errors='coerce') + pd.to_numeric(df_year['ask'], errors='coerce')) / 2.0
+                    df_year['mid_px'] = df_year['mid_px'].fillna(fallback_mid)
+                df_year = df_year[df_year['mid_px'].notna() & (df_year['mid_px'] > 0)].copy()
+                if df_year.empty:
+                    logger.warning(f"No usable quote mids found for {underlying} in {year}; leaving feature missing.")
+                    continue
+
+                df_year['dte'] = (df_year['expiration'] - df_year['pricing_date']).dt.days
+                df_year['dte_diff'] = (df_year['dte'] - 30).abs()
+                df_valid = df_year[(df_year['dte'] >= 20) & (df_year['dte'] <= 60)].copy()
+                if df_valid.empty:
+                    df_valid = df_year.copy()
+
+                best_exp = (
+                    df_valid.groupby(['pricing_date', 'expiration'], as_index=False)['dte_diff']
+                    .min()
+                    .sort_values(['pricing_date', 'dte_diff', 'expiration'])
+                    .groupby('pricing_date', as_index=False)
+                    .first()[['pricing_date', 'expiration']]
+                )
+
+                df_target = df_year.merge(best_exp, on=['pricing_date', 'expiration'], how='inner')
+                if df_target.empty:
+                    continue
+
+                daily_rows = []
+                for pricing_date, grp in df_target.groupby('pricing_date'):
+                    spot = float(spot_series.get(pricing_date, np.nan))
+                    rate = float(rate_series.get(pricing_date, 0.0))
+                    if not np.isfinite(spot) or spot <= 0:
+                        continue
+                    exp = grp['expiration'].iloc[0]
+                    dte = max(int((exp - pricing_date).days), 1)
+                    t_years = max(dte / 365.0, 1e-5)
+
+                    def _score_side(side_df, option_type):
+                        if side_df.empty:
+                            return None
+                        rows = []
+                        for _, row in side_df.iterrows():
+                            iv = row.get('implied_vol')
+                            if iv is None or not np.isfinite(iv) or iv <= 0:
+                                iv = implied_volatility(
+                                    float(row['mid_px']),
+                                    spot,
+                                    float(row['strike']),
+                                    t_years,
+                                    rate,
+                                    0.0,
+                                    option_type=option_type,
+                                )
+                            if iv is None or not np.isfinite(iv) or iv <= 0:
+                                continue
+                            if option_type == 'call':
+                                delta = bs_call_delta(spot, float(row['strike']), t_years, rate, iv, 0.0)
+                                delta_diff = abs(delta - 0.25)
+                            else:
+                                delta = bs_put_delta(spot, float(row['strike']), t_years, rate, iv, 0.0)
+                                delta_diff = abs(abs(delta) - 0.25)
+                            rows.append((float(row['strike']), float(iv), float(delta), float(delta_diff)))
+                        if not rows:
+                            return None
+                        return min(rows, key=lambda item: item[3])
+
+                    call_best = _score_side(grp[grp['contract_type'] == 'call'], 'call')
+                    put_best = _score_side(grp[grp['contract_type'] == 'put'], 'put')
+                    if call_best is None or put_best is None:
+                        continue
+
+                    call_iv = call_best[1]
+                    put_iv = put_best[1]
+                    daily_rows.append((pricing_date, put_iv - call_iv))
+
+                if daily_rows:
+                    daily_skew = pd.Series(
+                        data=[v for _, v in daily_rows],
+                        index=pd.to_datetime([d for d, _ in daily_rows]),
+                        dtype=float
+                    )
+                    skew_series.loc[daily_skew.index] = daily_skew.values
+            except Exception as e:
+                logger.warning(f"Error in vectorized Skew for {year}: {e}")
+
+        if skew_series.notna().sum() < max(10, int(len(skew_series) * 0.1)):
+            logger.warning(f"Historical skew coverage too sparse for {underlying}; dropping feature.")
+            return np.full(len(skew_series), np.nan, dtype=float)
+
+        return skew_series.values
 
     def fractional_diff(self, series, d, threshold=1e-4):
         """Compute fractional differentiation to preserve memory."""
@@ -447,7 +800,7 @@ class DataIngestor:
             
             # FIX: VIX is naturally mean-reverting and structurally stationary. 
             # Differencing it (even d=0.2) pulls the mean toward zero and breaks labeling logic.
-            if any(kw in col for kw in ['VIX', 'VVIX', 'Ratio', 'Log_Return']):
+            if any(kw in col for kw in ['VIX', 'VVIX', 'Ratio', 'Log_Return', 'Skew', 'Momentum', 'GEX']):
                 logger.info(f"Feature {col} is inherently stationary/bounded. Skipping differencing.")
                 continue
 
@@ -564,10 +917,10 @@ class DataIngestor:
         logger.info("Verification Checkpoint 1 passed.")
         return True
 
-    async def build_fused_dataset(self, start_date, end_date, underlying="SPY", scale=True, rolling=False):
+    async def build_fused_dataset(self, start_date, end_date, underlying="SPY", scale=True, rolling=False, wait=True):
         """Main pipeline to build the high-dimensional feature set."""
-        fred_df = self.fetch_fred_data(start_date, end_date)
-        yf_df = self.fetch_yf_data(start_date, end_date)
+        fred_df = self.fetch_fred_data(start_date, end_date, wait=wait)
+        yf_df = self.fetch_yf_data(start_date, end_date, wait=wait)
         
         # Merge basic features
         if fred_df.empty:
@@ -584,8 +937,29 @@ class DataIngestor:
             logger.warning(f"Dropping features with >80% missing data: {list(bad_cols)}")
             combined = combined.drop(columns=bad_cols)
             
+        # Add High Yield Spread Momentum
+        if 'High_Yield_Spread' in combined.columns:
+            fast = combined['High_Yield_Spread'].ewm(span=5, adjust=False).mean()
+            slow = combined['High_Yield_Spread'].ewm(span=21, adjust=False).mean()
+            combined['High_Yield_Spread_Momentum'] = fast - slow
+            logger.info("Successfully integrated High Yield Spread Momentum.")
+
+        # Add Option-Implied Skew only.
+        # Historical SPX open interest is not present in the available OptionsDX
+        # text cache, so Net_GEX cannot be reconstructed causally here.
+        dates = combined.index.strftime("%Y-%m-%d").tolist()
+        combined['Implied_Skew'] = self.fetch_historical_skew(dates, underlying="SPX")
+        logger.info("Successfully integrated Implied_Skew feature.")
+
+        # Re-run the missingness filter after adding the expensive option features.
+        missing_ratios = combined.isna().mean()
+        bad_cols = missing_ratios[missing_ratios > 0.8].index
+        if len(bad_cols) > 0:
+            logger.warning(f"Dropping features with >80% missing data after enrichment: {list(bad_cols)}")
+            combined = combined.drop(columns=bad_cols)
+            
         # Instead of aggressive dropna, we should drop rows only if core features are missing
-        core_cols = ['SPY_Close', 'VIX_Close']
+        core_cols = ['SPY_Close']
         existing_core = [c for c in core_cols if c in combined.columns]
         if existing_core:
             combined = combined.dropna(subset=existing_core)

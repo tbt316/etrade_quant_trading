@@ -64,7 +64,8 @@ All macroeconomic and price-based features must be stationary to prevent varianc
 
 ### 5.2 State Identity Preservation (KL-Divergence)
 During walk-forward refits (e.g., every 21 days), the HMM might re-order its states. "State 0" in January must mean the same thing as "State 0" in February.
-- **Regulation**: Use **Symmetric KL-Divergence** to map new model states to the previous model's states.
+- **Regulation**: The engine must explicitly defend against HMM label switching after every refit. Use deterministic emission sorting as the primary identity rule and, when warm-starting from a prior model, use **Symmetric KL-Divergence** or an equivalent emission-distance assignment to map newly fitted states to the previous model's state order.
+- **Implementation**: State alignment must be applied to the model object itself, not only to the predicted state vector. Reorder start probabilities, transition matrix rows/columns, means, covariances, mixture weights, and any probability columns together.
 - **Reasoning**: Prevents "identity drift" which would break downstream strategy logic tied to specific regime IDs.
 
 ### 5.3 Adaptive Archetype Ranking
@@ -74,6 +75,18 @@ During walk-forward refits (e.g., every 21 days), the HMM might re-order its sta
     2. **Robust Expansion**: Remaining state with highest Sharpe Ratio (Return/Vol).
     3. **Cautious Decline**: Remaining state with lowest (most negative) return.
 - **Reasoning**: Absolute thresholds fail across secular shifts. Relative ranking ensures the engine always identifies the current extremes.
+- **Boundary**: These labels are relative archetype descriptions only. They must not be treated as absolute macro regimes or hard trading permissions without the actionable overlay in Section 5.4.
+
+### 5.4 Actionable Three-Regime Overlay
+- **Regulation**: Relative HMM archetype labels are diagnostic labels, not sufficient proof of an actionable crisis regime. A state labeled "Market Turmoil" only because it has the highest VIX among current HMM states must not be promoted directly to final `Panic / Crisis`.
+- **Implementation**: The final three-regime taxonomy (`Expansion`, `Cautious Decline`, `Panic / Crisis`) must require causal close-T market stress evidence such as SPY drawdown, recent SPY log return shock, or absolute VIX stress. Preserve raw HMM state/label columns for audit, but downstream plotting/backtesting should consume the final detected regime only after this overlay is applied and timestamped.
+- **Reasoning**: In calm bull markets, the highest relative VIX state can still represent low absolute volatility. Directly mapping that state to `Panic / Crisis` creates false crisis classifications during healthy uptrends.
+
+### 5.5 Semantic Drift and Absolute Anchors
+- **Regulation**: The spec distinguishes label switching from semantic drift. Label switching is a state-permutation bug and must be corrected by sorting/alignment. Semantic drift is the gradual change in the fitted emission distributions and must be disclosed, bounded, or anchored before regime IDs are used for trading.
+- **Implementation**: Any regime-aware backtest or live rule must state whether HMM emissions are adaptive or anchored. If adaptive, downstream logic must use relative HMM labels only as diagnostics and must rely on the final three-regime overlay or another documented absolute risk gate for trade decisions. If absolute regime identity is required, train an anchor model on a representative multi-cycle calibration set and either freeze emission parameters or constrain refits against those anchor emissions while allowing transition probabilities to adapt.
+- **Implementation**: Absolute context features such as VIX level may be used as raw-market overlay inputs. If they are fed into the HMM emission vector, they must be causally timestamped, transformed or scaled without look-ahead, and documented as intentional absolute anchors; they must not violate stationarity and scaling rules by being globally normalized.
+- **Reasoning**: A quiet state in 2008 and a quiet state in 2017 are both relatively quiet inside their local sample, but they are not necessarily the same absolute market condition. Trading logic must not silently depend on that equivalence.
 
 ---
 
@@ -122,13 +135,15 @@ Unsupervised models are highly sensitive to sudden, deterministic volatility spi
 
 ### Mandate 10.1: Deterministic State Alignment (Label Switching)
 Unsupervised models like GaussianMixture and hmm assign arbitrary integer labels (e.g., State 0, State 1) to regimes. When the model is retrained, "State 0" could spontaneously become the high-volatility bear market instead of the low-volatility bull market, wrecking the downstream strategy.
-- **Agent Instruction**: The agent must implement a deterministic state-mapping heuristic immediately after .fit(). For example, the script must automatically calculate the variance of the emissions for each state, and strictly map the states such that State 0 = Lowest Variance, State 1 = Medium Variance, State N = Highest Variance.
+- **Agent Instruction**: The agent must implement a deterministic state-mapping heuristic immediately after every `.fit()`. For equity-index regimes, the default order is emission variance from lowest to highest: State 0 = quietest, State 1 = medium variance, State N = highest variance. The variance metric must be computed from the fitted emission distribution used by the HMM, not from downstream relabeled predictions.
+- **Agent Instruction**: If a prior walk-forward model exists, the refit must also perform continuity alignment against the prior model using symmetric KL divergence, Wasserstein distance, or another documented emission-distance assignment. The implementation must record which mapping was applied for each refit in diagnostics or logs.
 
 ### Mandate 10.2: Causal Viterbi Decoding
 hmmlearn relies on the Viterbi algorithm (.predict()), which naturally looks forward in time to smooth out the hidden state path over a sequence.
 - **Agent Instruction**: During live trading or backtesting, if the agent runs .predict() on a sequence of data, it must only extract the final integer of the output array as the regime for time T. Feeding the smoothed historical sequence back into the backtester will inherently introduce look-ahead bias.
 
-- **Agent Instruction**: When retraining the model on a rolling basis, the agent must capture the previous window's transition matrix, means, and covariances, and pass them into the hmm.GaussianHMM(init_params='') constructor as the starting weights for the new window.
+- **Agent Instruction**: When retraining the model on a rolling or expanding basis, the agent must capture the previous window's transition matrix, means, covariances, mixture weights if present, and start probabilities, and pass them into the next HMM with `init_params=''` or the hmmlearn-equivalent warm-start path.
+- **Agent Instruction**: Random or k-means initialization is allowed only for the first causal training window or after the explicit warm-start fallback protocol in Mandate 10.5 fires. Routine refits must not silently reinitialize from scratch.
 
 ### Mandate 10.4: Holistic State Alignment
 A common implementation failure when mapping HMM states deterministically (e.g., mapping State 0 to Lowest Variance) is only re-labeling the final predictions and ignoring the internal model attributes.
@@ -136,6 +151,7 @@ A common implementation failure when mapping HMM states deterministically (e.g.,
 
 ### Mandate 10.5: Warm-Start Fallback Protocol
 - **Agent Instruction**: When injecting the previous window's parameters into the init_params='' constructor for a warm start, the agent must wrap the initialization in a try-except block. If the matrix dimensions misalign or if the model encounters a singular covariance matrix during an anomalous market jump, the code must cleanly fall back to a kmeans initialization rather than crashing the entire pipeline.
+- **Agent Instruction**: Every fallback must be visible in diagnostics. The trace or report must include enough information to identify fallback dates, reason, fitted K, and whether state alignment was restored afterward.
 
 ### Mandate 10.6: Causal Probability Trace Extraction
 When visualizing or backtesting regimes, downstream scripts (e.g., plotting utilities) often require the full historical probability trace.
@@ -145,6 +161,11 @@ When visualizing or backtesting regimes, downstream scripts (e.g., plotting util
 ### Mandate 10.7: Scaler Inverse Transformation Safety
 - **Agent Instruction**: The `RollingRobustScaler` (or any custom causal scaler) used in `data_ingestion.py` must explicitly implement an `inverse_transform` method. Downstream logic in `get_regime_labels` relies on this method to convert physical PCA centroids back to raw VIX/Return values for semantic labeling.
 - **Agent Instruction**: Bare `try-except Exception:` blocks in `get_regime_labels` that swallow missing method errors and silently assign fallback values (like `avg_vix=20.0` for all states) are strictly forbidden. This silently destroys archetype ranking, causing the engine to misidentify regimes (e.g., mistaking an expansion for turmoil).
+
+### Mandate 10.8: Semantic Drift Diagnostics
+- **Agent Instruction**: Walk-forward diagnostics must report the raw HMM emission summaries for each refit or at least for each analysis period: state mean, variance, mapped prior-state ID, relative archetype label, final detected regime, and overlay reason.
+- **Agent Instruction**: If the same numeric state's emission variance, return mean, or reconstructed VIX proxy changes beyond a documented tolerance between adjacent refits, the report must flag semantic drift. The flag does not automatically invalidate the model, but it prevents downstream code from treating the raw HMM state ID as an absolute regime.
+- **Agent Instruction**: Plots and HTML reports must visibly distinguish raw HMM state/archetype labels from final actionable regime labels.
 
 ---
 
@@ -168,6 +189,11 @@ When visualizing or backtesting regimes, downstream scripts (e.g., plotting util
 - **Agent Instruction**: Any script that audits probabilities at trade date `T` must censor the empirical return sample to entries whose terminal outcome is already known by `T`. If the return label is `r_{t->t+h}`, then the latest admissible entry row in the sample is `t <= T - h_trading`.
 - **Agent Instruction**: `df.loc[:T].dropna(subset=[future_return])` is forbidden when `future_return` was precomputed with a forward shift, because the final `h_trading` rows before `T` still encode outcomes from after `T`.
 - **Reasoning**: This is the audit-script version of look-ahead bias. The sample appears historical because the row index is in the past, but the label itself contains future prices beyond the decision date.
+
+### Mandate 11.5: Return-Distribution GMM Component Selection
+- **Agent Instruction**: Scripts must not hard-code a 2-component GMM for regime-conditioned SPY return distributions. The fitting routine must include `K=1` as a candidate and choose the component count with a penalized model-selection criterion such as BIC, subject to a minimum observation-per-component guardrail.
+- **Agent Instruction**: Reports must disclose the selected component count, BIC/AIC, and candidate scores for each regime. A single Gaussian is the preferred fit whenever additional mixture components do not improve the penalized criterion.
+- **Reasoning**: The priority is to describe each regime's empirical return distribution parsimoniously. Some regimes are close to Gaussian, while others may need more mixture components to capture skew, tails, or multimodality.
 
 ---
 
@@ -243,10 +269,10 @@ When visualizing or backtesting regimes, downstream scripts (e.g., plotting util
 
 ## 13. Regime-to-Strategy Adaptation Rules
 
-The backtest strategy registry currently contains three relevant profiles: a non-regime-aware fixed-delta baseline, a planned EV-optimized put spread, and an implemented dynamic delta variant. Regime detection should be used as a risk overlay first, and as an entry optimizer second.
+The active backtest strategy definitions live in `backtesting/strategies/*.yaml`. Regime detection should be used as a risk overlay first, and as an entry optimizer second.
 
 ### Mandate 13.1: Baseline Strategy Must Remain a Control
-- **Agent Instruction**: `fixed_delta_put_spread` should remain `regime_aware: false` as the experimental control. Do not tune its entries by regime. Use it to measure whether the HMM overlay adds value after costs.
+- **Agent Instruction**: `baseline_put_spread` should remain `regime_aware: false` as the experimental control. Do not tune its entries by regime. Use it to measure whether the HMM overlay adds value after costs.
 
 ### Mandate 13.2: Regime Overlay for Put Credit Spreads
 - **Agent Instruction**: For regime-aware put selling, use these default controls until walk-forward tests justify different values:
@@ -271,7 +297,7 @@ The backtest strategy registry currently contains three relevant profiles: a non
 
 ### Mandate 14.1: Spec Must Be Loaded Before MRD Work
 - **Agent Instruction**: Before modifying, reviewing, or running market-regime detection, EV probability, or regime-aware backtest code, the coding agent must read this file and cite which mandates govern the task.
-- **Scope**: This applies at minimum to `live_trading/ev_engine.py`, `live_trading/ev_plots.py`, `live_trading/data_ingestion.py`, `live_trading/pca_fusion.py`, `backtesting/backtest_runner.py`, `backtesting/strategy_registry.md`, and `scratch/*regime*` / `scratch/*backtest*` scripts.
+- **Scope**: This applies at minimum to `live_trading/ev_engine.py`, `live_trading/ev_plots.py`, `live_trading/data_ingestion.py`, `live_trading/pca_fusion.py`, `backtesting/backtest_runner.py`, active strategy YAML files in `backtesting/strategies/`, and `scratch/*regime*` / `scratch/*backtest*` scripts.
 
 ### Mandate 14.2: Specs Are Not Self-Enforcing
 - **Agent Instruction**: A Markdown specification is advisory unless it is connected to agent instructions, tests, linters, CI checks, or runtime assertions. Any critical non-anticipativity rule must have at least one executable guard where practical.

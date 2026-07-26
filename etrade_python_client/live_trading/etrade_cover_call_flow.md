@@ -33,7 +33,7 @@ The script runs in an infinite loop, performing the following steps:
 
 ### B. Risk Monitoring & Margin Tracking
 - **Extrinsic Value Alerts**: Scans for ITM short options with **<$1.00 extrinsic value**. Sends an email warning of assignment risk.
-- **Stale Limit Order Nudging**: Monitors open limit orders. If an order remains unfilled, it nudges the limit price by $0.01 every 30 seconds to chase the market and secure a fill.
+- **Stale Limit Order Nudging**: Monitors open limit orders. If an order remains unfilled, it nudges the limit price by $0.01 every 30 seconds to chase the market, and it will keep following favorable price movement instead of blindly reverting a better price.
 
 ### C. Automated Management Actions
 - **Expiring ITM Put Close**: After 12:50 PM PT, the script automatically sends market orders to close any ITM put spreads expiring today to avoid assignment.

@@ -15,6 +15,23 @@ class PCAFusion:
         self.feature_names = None
         self.loadings_baseline = None
 
+    def _has_sufficient_variance(self, df, min_rows=20, min_total_std=1e-8):
+        """Reject windows that are too small or effectively constant."""
+        if df is None:
+            return False
+        if len(df) < max(min_rows, int(self.n_components or 2) + 1):
+            return False
+
+        values = np.asarray(df, dtype=float)
+        if values.ndim != 2 or values.size == 0:
+            return False
+
+        finite = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        col_std = np.std(finite, axis=0)
+        if not np.any(np.isfinite(col_std)):
+            return False
+        return bool(np.sum(col_std) > min_total_std and np.max(col_std) > min_total_std)
+
     def _fit_standard_pca(self, df):
         std_pca = PCA(n_components=self.n_components)
         std_pca.fit(df)
@@ -39,6 +56,8 @@ class PCAFusion:
 
     def fit(self, df):
         """Fit PCA on the data, falling back to standard PCA if sparse PCs collapse."""
+        if not self._has_sufficient_variance(df):
+            raise ValueError("PCAFusion input window is too small or near-constant for PCA fit.")
         self.feature_names = df.columns.tolist()
         
         # Determine optimal number of components if not provided
@@ -76,6 +95,8 @@ class PCAFusion:
         """Transform the data using the fitted Sparse PCA."""
         if self.sparse_pca is None:
             raise ValueError("PCAFusion must be fitted before calling transform.")
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df, columns=self.feature_names)
         pcs = self.sparse_pca.transform(df)
         
         # Defensive reshape for 1D returns or transposed results

@@ -7,7 +7,7 @@ import random
 import re
 from datetime import datetime,date,timedelta
 import numpy as np
-from accounts.accounts_bo import StockPosition
+from accounts.accounts_bo import StockPosition, is_etrade_token_expired_response
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import time
@@ -15,6 +15,7 @@ import random
 import logging
 import requests
 from xml.etree import ElementTree as ET
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 # loading configuration file
 config = configparser.ConfigParser()
@@ -32,6 +33,35 @@ logger.addHandler(handler)
 
 class Order:
 
+    @staticmethod
+    def _option_tick_size(price: float) -> float:
+        try:
+            return 0.05 if abs(float(price)) < 3 else 0.10
+        except Exception:
+            return 0.10
+
+    @classmethod
+    def _snap_option_limit_price(cls, target_price: float, current_price: float | None = None) -> float:
+        target = abs(float(target_price))
+        current = abs(float(current_price)) if current_price is not None else target
+        tick = cls._option_tick_size(max(target, current))
+        tick_dec = Decimal(str(tick))
+        target_dec = Decimal(str(target))
+
+        if abs(target - current) < 1e-9:
+            snapped = (Decimal(str(current)) / tick_dec).to_integral_value(rounding=ROUND_HALF_UP) * tick_dec
+            return float(max(tick_dec, snapped))
+
+        rounding = ROUND_FLOOR if target < current else ROUND_CEILING
+        snapped = (target_dec / tick_dec).to_integral_value(rounding=rounding) * tick_dec
+
+        if target < current and float(snapped) >= current - 1e-9:
+            snapped = Decimal(str(max(tick, current - tick)))
+        elif target > current and float(snapped) <= current + 1e-9:
+            snapped = Decimal(str(current + tick))
+
+        return float(max(tick_dec, snapped))
+
     def __init__(self, session, account, base_url, use_sandbox):
         self.session = session
         self.account = account
@@ -41,6 +71,16 @@ class Order:
             self.consumer_key = config["DEFAULT"]["SANDBOX_CONSUMER_KEY"]
         else: 
             self.consumer_key = config["DEFAULT"]["PROD_CONSUMER_KEY"]
+
+    def _refresh_auth_session_if_possible(self, reason):
+        callback = getattr(self, "auth_refresh_callback", None)
+        if not callable(callback):
+            return False
+        refreshed = callback(reason)
+        if not refreshed:
+            return False
+        self.session, self.base_url = refreshed
+        return True
 
     def preview_order(self, order):
         """
@@ -683,6 +723,8 @@ class Order:
         new_client_order_id = str(random.randint(1000000000, 9999999999))
         price_type = order_detail.get("priceType", "LIMIT")
         order_term = order_detail.get("orderTerm", "GOOD_FOR_DAY")
+        current_limit_price = float(order_detail.get("limitPrice", new_limit_price) or new_limit_price)
+        new_limit_price = self._snap_option_limit_price(new_limit_price, current_limit_price)
         instruments_xml = self._build_instruments_xml_from_detail(order_detail)
 
         preview_payload = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -1698,6 +1740,8 @@ class Order:
         params = {"status": "OPEN"}
 
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
+        if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("open orders fetch"):
+            response = self.session.get(url, header_auth=True, params=params, headers=headers)
         logger.debug("Request Header: %s", response.request.headers)
         logger.debug("Response Body: %s", response.text)
 
@@ -1743,6 +1787,65 @@ class Order:
             print(f"Error fetching open orders: {response.status_code} - {response.text}")
 
         return open_orders_list
+
+    def get_cancelled_orders(self, start_date: str) -> list:
+        """
+        Get cancelled orders starting from a certain date.
+        :param start_date: The date from which to start fetching cancelled orders (inclusive)
+        :return: List of cancelled order legs, each represented as a dictionary
+        """
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/orders.json"
+        headers = {"consumerKey": self.consumer_key}
+        params = {"status": "CANCELLED"}
+
+        response = self.session.get(url, header_auth=True, params=params, headers=headers)
+        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Response Body: %s", response.text)
+
+        cancelled_orders_list = []
+        if response.status_code == 200:
+            data = response.json()
+            cancelled_orders = data.get("OrdersResponse", {}).get("Order", [])
+
+            for order in cancelled_orders:
+                for detail in order.get("OrderDetail", []):
+                    order_time = detail.get("cancelledTime") or detail.get("placedTime")
+                    if not order_time:
+                        continue
+                    order_date = datetime.fromtimestamp(order_time / 1000).date()
+                    if order_date < start_date:
+                        continue
+                    for instrument in detail.get('Instrument', []):
+                        product = instrument.get('Product', {})
+                        expiry_year = product.get('expiryYear')
+                        expiry_month = product.get('expiryMonth')
+                        expiry_day = product.get('expiryDay')
+                        if expiry_year is not None and expiry_month is not None and expiry_day is not None:
+                            expiry_date = f"{expiry_year}-{expiry_month:02d}-{expiry_day:02d}"
+                        else:
+                            expiry_date = None
+                        cancelled_orders_list.append({
+                            "order_id": order['orderId'],
+                            "cancelled_price": instrument.get('averageExecutionPrice') or detail.get('limitPrice'),
+                            "cancelled_quantity": instrument.get('cancelledQuantity') or instrument.get('orderedQuantity') or instrument.get('quantity'),
+                            "cancelled_date": datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S'),
+                            "price_type": detail.get('priceType'),
+                            "symbol": product.get('symbol'),
+                            "equity_type": product.get('securityType'),
+                            "client_order_id": order.get('clientOrderId'),
+                            "order_action": instrument.get('orderAction'),
+                            "strike_price": product.get('strikePrice'),
+                            "expiry_date": expiry_date,
+                            "option_type": product.get('callPut'),
+                            "symbol_description": instrument.get('symbolDescription')
+                        })
+        elif response.status_code == 204:
+            logger.debug("No cancelled orders found (204 No Content)")
+        else:
+            logger.error("Failed to fetch cancelled orders. Status Code: %s, Response: %s", response.status_code, response.text)
+
+        return cancelled_orders_list
 
     def get_executed_orders(self, start_date: str) -> list:
         """
@@ -2716,9 +2819,9 @@ class Order:
                     
                     # Calculate new limit price
                     if price_type == "NET_CREDIT":
-                        new_limit_price = limit_price - 0.01
+                        new_limit_price = self._snap_option_limit_price(limit_price - self._option_tick_size(limit_price), limit_price)
                     elif price_type == "NET_DEBIT":
-                        new_limit_price = limit_price + 0.01
+                        new_limit_price = self._snap_option_limit_price(limit_price + self._option_tick_size(limit_price), limit_price)
                     
                     # Generate a new unique clientOrderId
                     new_client_order_id = str(random.randint(1000000000, 9999999999))
@@ -2824,7 +2927,8 @@ class Order:
 
                     # Extract current limit price and calculate new limit price
                     limit_price = float(detail["limitPrice"])
-                    new_limit_price = limit_price - 0.01 if price_type == "NET_CREDIT" else limit_price + 0.01
+                    tick = self._option_tick_size(limit_price)
+                    new_limit_price = limit_price - tick if price_type == "NET_CREDIT" else limit_price + tick
 
                     # Generate a unique clientOrderId
                     new_client_order_id = str(random.randint(1000000000, 9999999999))

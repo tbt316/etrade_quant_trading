@@ -1,0 +1,62 @@
+id: put_call_credit_spread
+name: Put + Call Credit Spread
+status: implemented
+regime_aware: false
+description: >
+  Variant of the baseline daily put credit spread that also sells a same-day,
+  same-expiration call credit spread. Portfolio margin is evaluated by
+  expiration as max(put-side risk, call-side risk), so call-side entries only
+  receive offset credit when a same-expiration put side actually exists. The
+  call side applies a VIX > 20 skip filter and waits an additional 5 trading
+  days after VIX drops back below 20 before re-entering. If VIX spikes back
+  above 20 during that wait, the cooldown restarts.
+instrument: put_call_credit_spread
+underlying: SPX
+
+entry:
+  method: fixed_delta
+  target_dte: 42
+  short_delta: -0.12
+  spread_width: 200.0
+  risk_free_rate: 0.05
+
+call_side:
+  enabled: true
+  short_delta: 0.06
+  spread_width: 200.0
+  min_credit: 0.01
+  skip_when_vix_above: 20.0
+  vix_reentry_delay_days: 5
+  profit_target: 0.50
+  hold_to_expiration: true
+  margin_offset: same_expiration_max_side
+
+exit:
+  method: dynamic_dte + profit_target
+  close_dte: half_entry
+  early_profit_pct: 0.50
+  conditional_half_dte_exit: profitable_only
+  hold_itm_to_expiration: false
+
+sizing:
+  method: daily_pacing
+  initial_capital: 1000000.0
+  margin_limit_pct: 0.25
+  daily_pacing_slots: 15
+
+rolling:
+  trigger: itm_at_close_dte
+  target_dte: 42
+  long_leg_target: atm
+  short_leg_offset: spread_width
+  spread_width_multiplier: 2.0
+  qty_reduction: ceil_half
+  repeat_itm_at_expiration: true
+  prefer_monthly_on_deviation: true
+  stop_when_chain_breakeven: true
+
+filters:
+  min_chain_strikes: 10
+  min_credit: 0.01
+  strike_tolerance_pct: 0.30
+  delta_tolerance_pct: 0.15
