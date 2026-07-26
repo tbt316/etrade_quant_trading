@@ -5,8 +5,15 @@ Loads API key from environment, .env file, or falls back to legacy config.
 import os
 
 
+def _offline_only_enabled() -> bool:
+    return os.environ.get("MASSIVE_OFFLINE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_api_key() -> str:
     """Load API key with cascading fallback."""
+    if _offline_only_enabled():
+        return ""
+
     # 1. Check environment variable
     key = os.environ.get("MASSIVE_API_KEY")
     if key:

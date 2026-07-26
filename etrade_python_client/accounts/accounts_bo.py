@@ -15,8 +15,9 @@ import random
 import pytz
 import os
 import csv
-from io import BytesIO
+from io import BytesIO, StringIO
 import base64
+import requests
 import matplotlib.pyplot as plt
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
@@ -56,8 +57,8 @@ fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
 handler.setFormatter(fmt)
 logger.addHandler(handler)
 
-ETRADE_TICKER=["VIXW","VIX","BRKB","BRK.B"]
-YFINANCE_TICKER=["^VIX","^VIX","BRK-B","BRK-B"]
+ETRADE_TICKER=["VIXW","VIX","BRKB","BRK.B","SPX"]
+YFINANCE_TICKER=["^VIX","^VIX","BRK-B","BRK-B","^SPX"]
 
 def convert_ticker_name(etrade_ticker=None, yfinance_ticker=None):
     """
@@ -105,6 +106,202 @@ def convert_ticker_name(etrade_ticker=None, yfinance_ticker=None):
 
     print("Either etrade_ticker or yfinance_ticker must be provided.")
     return None
+
+
+def _float_or_zero(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _option_quote_mark(quote_data):
+    all_data = quote_data.get("All", {})
+    quote_status = str(quote_data.get("quoteStatus") or all_data.get("quoteStatus") or "").upper()
+    bid = _float_or_zero(all_data.get("bid"))
+    ask = _float_or_zero(all_data.get("ask"))
+    bid_size = _float_or_zero(all_data.get("bidSize"))
+    ask_size = _float_or_zero(all_data.get("askSize"))
+    last_trade = _float_or_zero(all_data.get("lastTrade"))
+
+    if last_trade > 0 and (quote_status == "CLOSING" or (bid_size == 0 and ask_size == 0)):
+        return last_trade
+    if bid > 0 and ask > 0:
+        return round((bid + ask) / 2.0, 4)
+    if last_trade > 0:
+        return last_trade
+    return 0.0
+
+
+def _timestamp_seconds(value):
+    try:
+        timestamp = int(value)
+        return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_quote_price(quote_data):
+    all_data = quote_data.get("All", {})
+    extended_hours = all_data.get("ehQuote") or {}
+    regular_price = _float_or_zero(all_data.get("lastTrade"))
+    extended_price = _float_or_zero(extended_hours.get("lastPrice"))
+    regular_time = _timestamp_seconds(all_data.get("timeOfLastTrade"))
+    extended_time = _timestamp_seconds(extended_hours.get("timeOfLastTrade"))
+
+    if extended_price > 0 and (
+        regular_price <= 0
+        or (
+            extended_time is not None
+            and regular_time is not None
+            and extended_time > regular_time
+        )
+    ):
+        return extended_price
+    return regular_price or extended_price
+
+
+def _quote_metadata(quote_data, price, source="E*TRADE"):
+    all_data = quote_data.get("All", {})
+    extended_hours = all_data.get("ehQuote") or {}
+    timestamp = (
+        extended_hours.get("timeOfLastTrade")
+        if _float_or_zero(extended_hours.get("lastPrice")) == _float_or_zero(price)
+        else all_data.get("timeOfLastTrade")
+    )
+    timestamp = timestamp or quote_data.get("dateTimeUTC")
+    timestamp = _timestamp_seconds(timestamp)
+
+    return {
+        "price": _float_or_zero(price),
+        "source": source,
+        "status": str(quote_data.get("quoteStatus") or "UNKNOWN").upper(),
+        "timestamp": timestamp,
+        "date_time": str(quote_data.get("dateTime") or ""),
+    }
+
+
+def is_etrade_token_expired_response(response):
+    if response is None or getattr(response, "status_code", None) != 401:
+        return False
+    error_text = getattr(response, "text", "") or ""
+    return "oauth_problem=token_expired" in error_text or "token_expired" in error_text
+
+
+def convert_standard_to_nd2_delta(delta: float, iv: float, days_to_expiration: float, call_put: str) -> float:
+    """
+    Convert E*TRADE API's standard delta (approx N(d1)) to the risk-neutral ITM probability delta:
+    - Calls: N(d2)
+    - Puts: -N(-d2)
+    
+    Formula:
+      d1 = ppf(abs(delta)) for calls, or -ppf(abs(delta)) for puts (assuming q=0)
+      d2 = d1 - iv * sqrt(T)
+      Calls return N(d2)
+      Puts return -N(-d2)
+    """
+    import numpy as np
+    from scipy.stats import norm
+    
+    # Scale IV if it is in percentage format (e.g. 25.0 instead of 0.25)
+    if iv > 2.0:
+        iv = iv / 100.0
+    iv = max(iv, 1e-4)
+    
+    T = max(days_to_expiration, 1e-5) / 365.25
+    
+    is_call = call_put.upper() in ["CALL", "C"]
+    
+    # Handle edge cases where delta is 0 or +/-1
+    if delta == 0:
+        return 0.0
+    if abs(delta) >= 1.0:
+        return 1.0 if delta > 0 else -1.0
+        
+    if is_call:
+        # Calls: delta = N(d1)
+        d_clipped = max(1e-7, min(delta, 1.0 - 1e-7))
+        d1 = norm.ppf(d_clipped)
+        d2 = d1 - iv * np.sqrt(T)
+        return float(norm.cdf(d2))
+    else:
+        # Puts: delta = -N(-d1) -> abs(delta) = N(-d1)
+        abs_delta = abs(delta)
+        d_clipped = max(1e-7, min(abs_delta, 1.0 - 1e-7))
+        d1_neg = norm.ppf(d_clipped) # This is -d1
+        # -d2 = -d1 + iv * sqrt(T) = d1_neg + iv * sqrt(T)
+        neg_d2 = d1_neg + iv * np.sqrt(T)
+        return float(-norm.cdf(neg_d2))
+
+
+def _select_nearest_expiration(available_expirations, target_expiration):
+    """Select the listed expiration closest to the target date, preferring later dates on ties."""
+    if not available_expirations:
+        return None
+
+    today = datetime.today().date()
+    parsed = [
+        datetime.strptime(exp, "%Y-%m-%d").date() if isinstance(exp, str) else exp
+        for exp in available_expirations
+    ]
+    candidates = [exp for exp in parsed if exp >= today]
+    if not candidates:
+        candidates = parsed
+    friday_candidates = [exp for exp in candidates if exp.weekday() == 4]
+    if friday_candidates:
+        candidates = friday_candidates
+
+    return min(
+        candidates,
+        key=lambda exp: (abs((exp - target_expiration).days), 0 if exp >= target_expiration else 1, exp)
+    )
+
+
+def _symbol_from_osi_key(default_symbol, osi_key):
+    if not osi_key or default_symbol != "SPX":
+        return default_symbol
+
+    osi_text = str(osi_key).upper()
+    if osi_text.startswith("SPXW"):
+        return "SPXW"
+    if osi_text.startswith("SPX-"):
+        return "SPX"
+    return default_symbol
+
+
+def _aggregate_option_symbol(symbol):
+    symbol = (symbol or "").upper()
+    return "SPX" if symbol == "SPXW" else symbol
+
+
+def _missing_market_close_dates(chart_dates, price_cache, today_str, market_active):
+    missing_dates = []
+    for chart_date in chart_dates:
+        if chart_date.endswith(" (Live)"):
+            continue
+
+        date_key = chart_date.replace(" (Live)", "")
+        has_missing_close = any(
+            date_key not in price_cache.get(symbol, {})
+            or pd.isna(price_cache.get(symbol, {}).get(date_key))
+            for symbol in ("SPY", "SPX", "VIX")
+        )
+        if has_missing_close or (date_key == today_str and not market_active):
+            missing_dates.append(date_key)
+    return missing_dates
+
+
+def _extract_cboe_vix_closes(csv_text, requested_dates):
+    table = pd.read_csv(StringIO(csv_text), usecols=["DATE", "CLOSE"])
+    table["DATE"] = pd.to_datetime(table["DATE"], format="%m/%d/%Y", errors="coerce")
+    requested_dates = set(requested_dates)
+    return {
+        row.DATE.strftime("%Y-%m-%d"): round(float(row.CLOSE), 2)
+        for row in table.itertuples(index=False)
+        if not pd.isna(row.DATE)
+        and not pd.isna(row.CLOSE)
+        and row.DATE.strftime("%Y-%m-%d") in requested_dates
+    }
 
 
 def calculate_std_dev(ticker, lookback_window):
@@ -159,6 +356,9 @@ def process_folder_and_plot_risks_combined(folder_path):
 
             # Filter for options only
             options = df[df['Type'] == 'Option']
+
+            options = options.copy()
+            options['Symbol'] = options['Symbol'].map(_aggregate_option_symbol)
 
             # Calculate risks by ticker
             grouped = options.groupby(['Symbol', 'Call/Put']).apply(
@@ -269,8 +469,8 @@ def _spy_margin_totals_external(screened_options):
         for leg in (entry.get("long_lot"), entry.get("short_lot")):
             if not leg:
                 continue
-            sym = (getattr(leg, "symbol", "") or "").upper()
-            if sym != "SPY":
+            sym = _aggregate_option_symbol(getattr(leg, "symbol", ""))
+            if sym not in ("SPY", "SPX"):
                 continue
             cp = (getattr(leg, "call_put", "") or "").upper()
             if cp not in ("CALL", "PUT"):
@@ -311,14 +511,14 @@ def _spy_margin_totals_external(screened_options):
                         longs.pop(best_idx)
                     continue
                 strike_diff = abs(_strike(short) - _strike(long))
-                totals_per_expiry[exp][cp] += strike_diff * pair_qty * 100.0
+                totals_per_expiry[(sym, exp)][cp] += strike_diff * pair_qty * 100.0
                 short["qty"] -= pair_qty
                 long["qty"] -= pair_qty
                 if long["qty"] <= 0:
                     longs.pop(best_idx)
 
             if short["qty"] > 0:
-                totals_per_expiry[exp][cp] += _naked_margin(short["leg"], short["qty"])
+                totals_per_expiry[(sym, exp)][cp] += _naked_margin(short["leg"], short["qty"])
 
     # Calculate total call and put sums for backward compatibility, 
     # and a corrected total margin using the max rule per expiry.
@@ -359,10 +559,13 @@ def calculate_margin(stock_positions, cover_call_list=None):
     positions_by_ticker = {}
     for position in stock_positions:
         # Only consider SPY option positions
-        if position.security_type == "Option" and position.symbol == "SPY":
-            if position.symbol not in positions_by_ticker:
-                positions_by_ticker[position.symbol] = []
-            positions_by_ticker[position.symbol].append(position)
+        if position.security_type == "Option":
+            ticker = _aggregate_option_symbol(position.symbol)
+            if ticker not in ("SPY", "SPX"):
+                continue
+            if ticker not in positions_by_ticker:
+                positions_by_ticker[ticker] = []
+            positions_by_ticker[ticker].append(position)
     
     total_margin = 0
     margin_details = {}
@@ -890,6 +1093,16 @@ class Accounts:
         else: 
             self.consumer_key = config["DEFAULT"]["PROD_CONSUMER_KEY"]
 
+    def _refresh_auth_session_if_possible(self, reason):
+        callback = getattr(self, "auth_refresh_callback", None)
+        if not callable(callback):
+            return False
+        refreshed = callback(reason)
+        if not refreshed:
+            return False
+        self.session, self.base_url = refreshed
+        return True
+
     def account_list(self, selected_account_id=1):
         """
         Calls account list API to retrieve a list of the user's E*TRADE accounts
@@ -956,7 +1169,7 @@ class Accounts:
             else:
                 print("Error: AccountList API service error")
 
-    def get_stock_prices(self, tickers):
+    def get_stock_prices(self, tickers, include_metadata=False):
         """
         Retrieve the current stock prices for multiple tickers in a single API call.
         
@@ -990,13 +1203,17 @@ class Accounts:
         
         # E*TRADE API limits market/quote to 25 symbols per request
         result = {}
+        metadata = {}
         for i in range(0, len(converted_tickers), 25):
             chunk = converted_tickers[i:i+25]
             symbols = ",".join(chunk)
             url = f"{self.base_url}/v1/market/quote/{symbols}.json"
+            params = {"detailFlag": "ALL"}
             
             try:
-                response = self.session.get(url)
+                response = self.session.get(url, params=params)
+                if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("quote fetch"):
+                    response = self.session.get(url, params=params)
                 if response.status_code == 200:
                     data = response.json()
                     quote_data_list = data.get("QuoteResponse", {}).get("QuoteData", [])
@@ -1039,24 +1256,19 @@ class Accounts:
                             mapped_ticker = ticker_map.get(symbol, symbol)
                             
                         all_data = quote_data.get("All", {})
-                        # For options, prefer live bid/ask midpoint over
-                        # potentially stale lastTrade price
                         if prod.get("securityType") == "OPTN":
-                            bid = float(all_data.get("bid", 0) or 0)
-                            ask = float(all_data.get("ask", 0) or 0)
-                            if bid > 0 and ask > 0:
-                                result[mapped_ticker] = round((bid + ask) / 2.0, 4)
-                            else:
-                                result[mapped_ticker] = float(all_data.get("lastTrade", 0.0) or 0.0)
+                            price = _option_quote_mark(quote_data)
                         else:
-                            result[mapped_ticker] = float(all_data.get("lastTrade", 0.0) or 0.0)
+                            price = _market_quote_price(quote_data)
+                        result[mapped_ticker] = price
+                        metadata[mapped_ticker] = _quote_metadata(quote_data, price)
                 else:
                     print(f"E*TRADE quote error {response.status_code} for chunk: {chunk}")
             except Exception as e:
                 print(f"Exception during E*TRADE quote fetch: {e}")
         
         # Identify missing tickers
-        missing_tickers = [t for t in tickers if t not in result or result[t] is None]
+        missing_tickers = [t for t in tickers if _float_or_zero(result.get(t)) <= 0]
         
         if missing_tickers:
             print(f"E*TRADE failed to fetch prices for {missing_tickers}. Attempting with yfinance...")
@@ -1072,7 +1284,15 @@ class Accounts:
                     ticker_obj = yf.Ticker(yf_ticker)
                     data = ticker_obj.history(period="1d")
                     if not data.empty:
-                        result[ticker] = data['Close'].iloc[-1]
+                        result[ticker] = float(data['Close'].iloc[-1])
+                        quote_timestamp = data.index[-1]
+                        metadata[ticker] = {
+                            "price": result[ticker],
+                            "source": "Yahoo Finance fallback",
+                            "status": "FALLBACK",
+                            "timestamp": int(quote_timestamp.timestamp()) if hasattr(quote_timestamp, "timestamp") else None,
+                            "date_time": str(quote_timestamp),
+                        }
                     else:
                         result[ticker] = None
                 except Exception as e:
@@ -1080,8 +1300,9 @@ class Accounts:
                     result[ticker] = None
         
         if single_ticker:
-            return result.get(tickers[0], None)
-        return result
+            price = result.get(tickers[0], None)
+            return (price, metadata.get(tickers[0], {})) if include_metadata else price
+        return (result, metadata) if include_metadata else result
 
     # For backward compatibility, keep the original method but make it use the new one
     def get_stock_price(self, ticker):
@@ -1109,6 +1330,8 @@ class Accounts:
             ticker = "BRK.B"
         params = {"symbol": ticker, "expiryType": "ALL"}
         response = self.session.get(url, params=params, auth=self.session.auth)
+        if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible(f"{ticker} expiration fetch"):
+            response = self.session.get(url, params=params, auth=self.session.auth)
         
         if response.status_code == 200:
             try:
@@ -1153,6 +1376,7 @@ class Accounts:
         Returns:
         - float: The option price (bid) if found, or None if not.
         """
+        self._last_option_price_symbol = symbol
         url = f"{self.base_url}/v1/market/optionchains.json"
         params = {
             "symbol": symbol,
@@ -1160,9 +1384,11 @@ class Accounts:
             "expiryMonth": expiration_date.month,
             "expiryDay": expiration_date.day,
             "includeWeekly": True,
-            "optionCategory": "STANDARD",
+            "skipAdjusted": False,
+            "optionCategory": "ALL",
+            "chainType": call_put,
             "strikePriceNear": strike_price,
-            "noOfStrikes": 1,
+            "noOfStrikes": 20,
         }
         response = self.session.get(url, params=params)
 
@@ -1176,7 +1402,8 @@ class Accounts:
 
         for option_pair in option_pairs:
             option = option_pair.get(call_put.capitalize())
-            if option and option.get("strikePrice") == strike_price:
+            if option and abs(float(option.get("strikePrice", 0)) - float(strike_price)) < 1e-6:
+                self._last_option_price_symbol = _symbol_from_osi_key(symbol, option.get("osiKey"))
                 return option.get("bid")  # return the bid price as the option price
 
         print("Option with specified parameters not found.")
@@ -1209,9 +1436,11 @@ class Accounts:
             print("Failed to retrieve option price from E*TRADE API.")
             return None
 
+        contract_symbol = getattr(self, "_last_option_price_symbol", symbol)
+
         # Create and return a StockPosition object
         stock_position = StockPosition(
-            symbol=symbol,
+            symbol=contract_symbol,
             quantity=1,
             last_price=option_price,
             price_paid=option_price,
@@ -1631,7 +1860,7 @@ class Accounts:
             print("No stock positions with associated options that have negative quantities.")
         return cover_option_positions
 
-    def portfolio(self, print_enable=False, minimal=False):
+    def portfolio(self, print_enable=False, minimal=False, require_success=False):
         """
         Call portfolio API to retrieve a list of positions held in the specified account.
         
@@ -1639,6 +1868,8 @@ class Accounts:
             print_enable (bool): Whether to print position details. Defaults to False.
             minimal (bool): If True, skips time-consuming calculations and returns only basic position data
                         needed for position matching. Defaults to False.
+            require_success (bool): Raise when E*TRADE does not return a successful portfolio response.
+                        Dashboard writers use this to preserve the last confirmed artifact on upstream failure.
         
         Returns:
             list: List of StockPosition objects representing positions in the portfolio.
@@ -1655,11 +1886,19 @@ class Accounts:
         while True:
             params = {"view": "COMPLETE", "count": count, "pageNumber": offset}
             response = self.session.get(url, params=params, header_auth=True)
+            if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("portfolio fetch"):
+                url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/portfolio.json"
+                response = self.session.get(url, params=params, header_auth=True)
             logger.debug("Request Header: %s", response.request.headers)
             
             # Check if API call was successful
             if response.status_code != 200:
                 logger.error("API request failed with status code: %s", response.status_code)
+                if require_success:
+                    raise RuntimeError(
+                        f"E*TRADE portfolio request failed on page {offset} "
+                        f"with status code {response.status_code}"
+                    )
                 break
             
             data = response.json()
@@ -1710,7 +1949,7 @@ class Accounts:
                 stock_price_dict[symbol] = last_price
             # Option positions: collect symbols and data
             elif security_type_code == "OPTN" and not minimal:
-                option_symbols.add(symbol)
+                option_symbols.add(_aggregate_option_symbol(symbol))
                 option_position_data.append(position)
             
         # Fetch additional stock prices for option underlyings if needed
@@ -1847,7 +2086,8 @@ class Accounts:
                 stock_position.call_put = call_put
                 stock_position.expiration_date = expiration_date
                 stock_position.strike_price = strike_price
-                stock_position.underlying_last_price = stock_price_dict.get(symbol, 0.0)
+                aggregate_symbol = _aggregate_option_symbol(symbol)
+                stock_position.underlying_last_price = stock_price_dict.get(aggregate_symbol) or stock_price_dict.get(symbol) or 0.0
                 
                 if not minimal:
                     stock_position.days_to_expiration = days_to_expiration
@@ -1855,7 +2095,15 @@ class Accounts:
                     stock_position.implied_volatility = round(iv / (252 ** 0.5) * 100, 2)
                     stock_position.rho = rho
                     stock_position.vega = vega
-                    stock_position.delta = delta
+                    
+                    # Convert standard delta to N(d2) risk-neutral probability
+                    redefined_delta = delta
+                    if delta is not None and delta != 100:
+                        try:
+                            redefined_delta = convert_standard_to_nd2_delta(delta, iv, days_to_expiration, call_put)
+                        except Exception as e:
+                            logger.error(f"Error converting delta in portfolio: {e}")
+                    stock_position.delta = redefined_delta
                     stock_position.gamma = gamma
                     
                     stock_position.option_intrinsic = (
@@ -1924,7 +2172,7 @@ class Accounts:
             
             for position in stock_positions:
                 if position.security_type == "Option":
-                    symbol = position.symbol
+                    symbol = _aggregate_option_symbol(position.symbol)
                     if symbol not in ticker_net_delta:
                         ticker_net_delta[symbol] = 0
                         ticker_net_gamma[symbol] = 0
@@ -1968,9 +2216,10 @@ class Accounts:
             
             for position in stock_positions:
                 if position.security_type == "Option":
-                    position.net_ticker_delta = round(ticker_net_delta.get(position.symbol, 0), 2)
-                    position.net_ticker_gamma = round(ticker_net_gamma.get(position.symbol, 0), 2)
-                    position.ticker_hedging_cost = ticker_hedging_cost.get(position.symbol, 0)
+                    symbol = _aggregate_option_symbol(position.symbol)
+                    position.net_ticker_delta = round(ticker_net_delta.get(symbol, 0), 2)
+                    position.net_ticker_gamma = round(ticker_net_gamma.get(symbol, 0), 2)
+                    position.ticker_hedging_cost = ticker_hedging_cost.get(symbol, 0)
             
             if print_enable:
                 GREEN, RED, RESET = "\033[92m", "\033[91m", "\033[0m"
@@ -2074,7 +2323,7 @@ class Accounts:
 
         # 1) Normalize legs from incoming positions (options only)
         legs = [p for p in all_positions if isinstance(p, StockPosition) and getattr(p, "security_type", "") == "Option"]
-        legs = [_sanitize_leg(p) for p in legs if p.call_put is not None]
+        legs = [_sanitize_leg(copy(p)) for p in legs if p.call_put is not None]
 
         # 2) Group by (symbol, expiration)
         #    We now group all legs of the same expiry together for pairing, 
@@ -2083,24 +2332,52 @@ class Accounts:
         # Also track total availability for informational display
         counts_by_sym_exp_cp = defaultdict(lambda: {"LONG": 0, "SHORT": 0})
         for leg in legs:
-            key = (leg.symbol, leg.expiration_date)
+            group_symbol = _aggregate_option_symbol(leg.symbol)
+            key = (group_symbol, leg.expiration_date)
             buckets[key].append(leg)
             try:
                 sign = "LONG" if (getattr(leg, "quantity", 0) or 0) > 0 else "SHORT"
-                k2 = (leg.symbol, leg.expiration_date, leg.call_put)
+                k2 = (group_symbol, leg.expiration_date, leg.call_put)
                 counts_by_sym_exp_cp[k2][sign] += abs(int(getattr(leg, "quantity", 0) or 0))
             except Exception:
                 pass
 
         screened_options = []
 
-        def _take_pair(long_leg, short_leg, use_qty):
+        def _open_day(lot):
+            value = getattr(lot, "date_acquired", None)
+            if not value:
+                return None
+            try:
+                return value.date() if hasattr(value, "date") else pd.Timestamp(value).date()
+            except Exception:
+                return None
+
+        def _valid_vertical(short_leg, long_leg):
+            cp = (getattr(short_leg, "call_put", "") or "").upper()
+            s_strike = _as_num(getattr(short_leg, "strike_price", None), 0.0)
+            l_strike = _as_num(getattr(long_leg, "strike_price", None), 0.0)
+            if s_strike <= 0 or l_strike <= 0:
+                return False
+            if cp == "PUT":
+                return l_strike < s_strike
+            if cp == "CALL":
+                return l_strike > s_strike
+            return False
+
+        def _spread_width(short_leg, long_leg):
+            return abs(_as_num(getattr(short_leg, "strike_price", 0.0), 0.0) - _as_num(getattr(long_leg, "strike_price", 0.0), 0.0))
+
+        def _take_pair(long_leg, short_leg, use_qty, pairing_note=None):
             """Create a quantity‑matched pair and append to screened_options."""
             from copy import copy
             long_part = copy(long_leg)
             short_part = copy(short_leg)
             long_part.quantity = int(abs(use_qty))
             short_part.quantity = -int(abs(use_qty))
+            if pairing_note:
+                long_part.pairing_note = pairing_note
+                short_part.pairing_note = pairing_note
 
             init_diff = (
                 _as_num(getattr(short_part, "price_paid", None), 0.0) -
@@ -2117,8 +2394,20 @@ class Accounts:
                 "short_lot": _sanitize_leg(short_part),
             })
 
-        # 3) For each (symbol, expiry), pair CALLs with CALLs and PUTs with PUTs
-        TARGET_SPREAD = 20.0
+        def _add_single(lot, reason):
+            lot.unpaired_reason = reason
+            lot.pairing_note = reason
+            screened_options.append({
+                "is_spread": False,
+                "pair_quantity": int(abs(lot.quantity)),
+                "pair_gain_loss": _compute_gain_loss_pct(lot),
+                "long_lot": _sanitize_leg(lot) if lot.quantity > 0 else None,
+                "short_lot": _sanitize_leg(lot) if lot.quantity < 0 else None,
+            })
+
+        # 3) For each (symbol, expiry), pair CALLs with CALLs and PUTs with PUTs.
+        # For SPY/SPX, always consume valid vertical protection before showing singles.
+        pairable_symbols = {"SPY", "SPX"}
         for (sym, exp), group in buckets.items():
             for cp in ("CALL", "PUT"):
                 longs  = [l for l in group if l.call_put == cp and l.quantity > 0]
@@ -2126,136 +2415,70 @@ class Accounts:
                 had_longs_initial = len(longs) > 0
                 had_shorts_initial = len(shorts) > 0
 
-                # Sort by strike for deterministic behavior
+                if not longs and not shorts:
+                    continue
+
                 longs.sort(key=lambda x: _as_num(x.strike_price, 0.0))
                 shorts.sort(key=lambda x: _as_num(x.strike_price, 0.0))
 
-                # --- First pass: exact strike matching ---
-                i, j = 0, 0
-                while i < len(shorts) and j < len(longs):
-                    s, l = shorts[i], longs[j]
-                    s_strk = _as_num(s.strike_price, 0.0)
-                    l_strk = _as_num(l.strike_price, 0.0)
-                    if s_strk == l_strk:
-                        use = min(l.quantity, abs(s.quantity))
-                        if use > 0:
-                            _take_pair(l, s, use)
-                            l.quantity -= use
-                            s.quantity += use  # s is negative; adding reduces magnitude
-                        if l.quantity == 0:
-                            j += 1
-                        if s.quantity == 0:
-                            i += 1
-                    elif s_strk < l_strk:
-                        i += 1
-                    else:
-                        j += 1
+                if (sym or "").upper() not in pairable_symbols:
+                    for l in longs:
+                        _add_single(l, "non-SPY/SPX shown as single leg")
+                    for s in shorts:
+                        _add_single(s, "non-SPY/SPX shown as single leg")
+                    continue
 
-                longs  = [l for l in longs  if l.quantity > 0]
-                shorts = [s for s in shorts if s.quantity < 0]
+                while True:
+                    candidates = []
+                    for si, s in enumerate(shorts):
+                        if s.quantity >= 0:
+                            continue
+                        for li, l in enumerate(longs):
+                            if l.quantity <= 0 or not _valid_vertical(s, l):
+                                continue
+                            width = _spread_width(s, l)
+                            s_day = _open_day(s)
+                            l_day = _open_day(l)
+                            same_day = s_day is not None and s_day == l_day
+                            date_rank = 0 if same_day else (1 if s_day is None or l_day is None else 2)
+                            candidates.append((date_rank, width, si, li, s, l))
 
-                # --- Second pass: target-spread matching (greedy toward TARGET_SPREAD) ---
-                # Build greedy matches to make spreads roughly equal to TARGET_SPREAD
-                def _spread(s_leg, l_leg):
-                    try:
-                        return abs(_as_num(s_leg.strike_price, 0.0) - _as_num(l_leg.strike_price, 0.0))
-                    except Exception:
-                        return float('inf')
+                    if not candidates:
+                        break
 
-                # Sort strikes to favor natural pairing (e.g., puts: short > long)
-                longs.sort(key=lambda x: _as_num(x.strike_price, 0.0), reverse=True)
-                shorts.sort(key=lambda x: _as_num(x.strike_price, 0.0), reverse=True)
+                    candidates.sort(key=lambda x: (x[0], x[1], _as_num(x[4].strike_price, 0.0), _as_num(x[5].strike_price, 0.0)))
+                    date_rank, width, si, li, s, l = candidates[0]
+                    note = "paired by same acquisition date" if date_rank == 0 else "paired by nearest valid protective leg"
 
-                while shorts and longs:
-                    # pick the highest short (works for puts; for calls it also keeps order stable)
-                    s = shorts[0]
-                    # choose long that minimizes |spread - TARGET_SPREAD|
-                    k = min(
-                        range(len(longs)),
-                        key=lambda idx: abs(_spread(s, longs[idx]) - TARGET_SPREAD)
-                    )
-                    l = longs[k]
                     use = min(l.quantity, abs(s.quantity))
                     if use <= 0:
-                        if l.quantity <= 0:
-                            longs.pop(k)
-                        if s.quantity >= 0:
-                            shorts.pop(0)
-                        continue
-                    _take_pair(l, s, use)
+                        break
+                    _take_pair(l, s, use, pairing_note=note)
                     l.quantity -= use
                     s.quantity += use
-                    if l.quantity == 0:
-                        longs.pop(k)
-                    if s.quantity == 0:
-                        shorts.pop(0)
+                    longs  = [lot for lot in longs if lot.quantity > 0]
+                    shorts = [lot for lot in shorts if lot.quantity < 0]
 
-                # leftovers become singles
                 for l in longs:
-                    # reason for leftover
                     reason_parts = []
                     if not had_shorts_initial:
-                        reason_parts.append("no SHORT legs with same symbol/expiration/open day")
-                        # check if shorts exist on other open days
+                        reason_parts.append("no SHORT legs with same symbol/expiration/type")
                         k2 = (sym, exp, cp)
                         if counts_by_sym_exp_cp.get(k2, {}).get("SHORT", 0) > 0:
-                            reason_parts.append("short legs exist on other open day(s)")
+                            reason_parts.append("short legs exist but no reliable vertical match")
                     else:
-                        reason_parts.append("quantity leftover after pairing")
-                    l.unpaired_reason = "; ".join(reason_parts)
-                    try:
-                        print(
-                            f"[PAIR-DBG] Single LONG {sym} {cp} K={_as_num(l.strike_price,0)} qty={int(abs(l.quantity))} "
-                            f"open={open_day} exp={exp} reason={l.unpaired_reason}"
-                        )
-                    except Exception:
-                        pass
-                    screened_options.append({
-                        "is_spread": False,
-                        "pair_quantity": int(abs(l.quantity)),
-                        "pair_gain_loss": _compute_gain_loss_pct(l),
-                        "long_lot": _sanitize_leg(l),
-                        "short_lot": None,
-                    })
-        # 4) Residual Matching (Residual Pass)
-        # If we have leftover singles, try to match them by (symbol, expiration, cp, quantity)
-        # even if timestamps don't match. This handles orphaned legs from rolls.
-        singles = [opt for opt in screened_options if not opt["is_spread"]]
-        screened_options = [opt for opt in screened_options if opt["is_spread"]]
-        
-        long_singles = [s for s in singles if s.get("long_lot")]
-        short_singles = [s for s in singles if s.get("short_lot")]
-        
-        used_longs = set()
-        used_shorts = set()
-        
-        for i, ls in enumerate(long_singles):
-            if i in used_longs: continue
-            l_leg = ls["long_lot"]
-            for j, ss in enumerate(short_singles):
-                if j in used_shorts: continue
-                s_leg = ss["short_lot"]
-                
-                # Match if sym, exp, cp and quantity match exactly
-                if (l_leg.symbol == s_leg.symbol and 
-                    l_leg.expiration_date == s_leg.expiration_date and 
-                    l_leg.call_put == s_leg.call_put and 
-                    abs(l_leg.quantity) == abs(s_leg.quantity)):
-                    
-                    _take_pair(l_leg, s_leg, abs(l_leg.quantity))
-                    used_longs.add(i)
-                    used_shorts.add(j)
-                    break
-        
-        # Add back remaining singles
-        for i, ls in enumerate(long_singles):
-            if i not in used_longs:
-                screened_options.append(ls)
-        for j, ss in enumerate(short_singles):
-            if j not in used_shorts:
-                screened_options.append(ss)
+                        reason_parts.append("leftover long after reliable pairing")
+                    _add_single(l, "; ".join(reason_parts))
 
-        # 5) Sort for nice HTML grouping
+                for s in shorts:
+                    reason_parts = []
+                    if not had_longs_initial:
+                        reason_parts.append("no LONG protective legs with same symbol/expiration/type")
+                    else:
+                        reason_parts.append("leftover short after all valid protective legs were paired")
+                    _add_single(s, "; ".join(reason_parts))
+
+        # 4) Sort for nice HTML grouping
         if sort_output and screened_options:
             def _k(item):
                 lot = item.get("short_lot") or item.get("long_lot")
@@ -2272,7 +2495,7 @@ class Accounts:
         return screened_options
     
 
-    def render_screened_option_pairs_html(self, screened_options, out_path="history_option/screened_option_pairs.html", title="All Available Options (Pairs View)", order_instance=None, show_refresh=True):
+    def render_screened_option_pairs_html(self, screened_options, out_path="history_option/screened_option_pairs.html", title="Positions by Ticker", order_instance=None, show_refresh=True):
         """
         Render screened options to an HTML file with a SPY tracking chart.
         
@@ -2285,17 +2508,38 @@ class Accounts:
         import os, html
         from pathlib import Path
 
-        COLUMNS = [
-            ("action","Action"),("symbol","Symbol"),("quantity","QTY"),("underlying_last_price","Asset Price"),("last_price","Price"),("net_price","Net Price"),("call_put","Type"),
-            ("gain_loss_percentage","Gain/Loss"),("days_to_expiration","DTE"),("distance_to_strike","Strike Distance"),("extrinsic_value","Extrinsic Val"),
-            # ("volatility","Volatility"), # Hidden as requested
-            ("strike_price","Strike"),("expiration_date","Expiration"),
-            ("delta","Delta"),
-            # ("implied_volatility","IV"),("this_delta","delta"), # Hidden as requested
-            # ("hedge","hedge"),("net_ticker_delta","net_delta"),("gamma","gamma"),("this_gamma","gamma"),("net_ticker_gamma","net_gamma"), # Hidden as requested
-            ("theta","theta"),("theta_pct","theta_pct"),
+        # Portfolio option rows can carry an older underlying price even while
+        # the market is open. Fetch one current quote per displayed ticker and
+        # use it for both the visible tables and today's chart point.
+        live_index_prices = {}
+        live_index_quote_metadata = {}
+        try:
+            displayed_tickers = sorted({
+                _aggregate_option_symbol(getattr(leg, "symbol", "") or "")
+                for item in screened_options
+                for leg in (item.get("short_lot"), item.get("long_lot"))
+                if leg is not None and getattr(leg, "symbol", None)
+            })
+            fetched_index_prices, live_index_quote_metadata = self.get_stock_prices(
+                displayed_tickers,
+                include_metadata=True,
+            )
+            for ticker in displayed_tickers:
+                value = fetched_index_prices.get(ticker) if fetched_index_prices else None
+                if value is not None and float(value) > 0:
+                    live_index_prices[ticker] = round(float(value), 2)
+        except Exception as quote_err:
+            print(f"[Live Price] Could not refresh underlying quotes: {quote_err}")
 
-        ]
+        if live_index_prices:
+            for item in screened_options:
+                for leg_key in ("short_lot", "long_lot"):
+                    leg = item.get(leg_key)
+                    if leg is None:
+                        continue
+                    ticker = _aggregate_option_symbol(getattr(leg, "symbol", "") or "")
+                    if ticker in live_index_prices:
+                        leg.underlying_last_price = live_index_prices[ticker]
 
         def _as_num(v, default=0.0):
             try:
@@ -2343,175 +2587,205 @@ class Accounts:
                 return margin_per_contract * 100.0 * qty_abs
             return 0.0
 
-        def _gain_loss_pct(lot):
-            lp  = _as_num(getattr(lot, "last_price", None), None)
-            pp  = getattr(lot, "price_paid", None)
-            qty = _as_num(getattr(lot, "quantity", 0), 0.0)
-            if pp in (None, 0, 0.0):
-                return 0.0
-            raw_pct = (lp - float(pp)) / float(pp) * 100.0
-            sign    = -1.0 if qty < 0 else 1.0
-            return sign * raw_pct
+        def _fmt_money(value):
+            return f"${_as_num(value):,.2f}"
 
-        def _distance_to_strike(lot):
-            v = getattr(lot, "distance_to_strike", None)
-            if v not in (None, ""):
-                return v
-            ul = getattr(lot, "underlying_last_price", None)
-            strike = getattr(lot, "strike_price", None)
-            cp = getattr(lot, "call_put", None)
-            if ul is None or strike in (None, 0) or cp is None:
-                return None
-            ul = float(ul); strike = float(strike)
-            return (ul - strike) / strike * 100.0 if cp == "CALL" else (strike - ul) / strike * 100.0
+        def _fmt_strike(value):
+            number = _as_num(value)
+            return f"{number:,.0f}" if number.is_integer() else f"{number:,.2f}"
 
-        def _extrinsic_value(lot):
-            ul = _as_num(getattr(lot, "underlying_last_price", None), 0.0)
-            strike = _as_num(getattr(lot, "strike_price", None), 0.0)
-            price = _as_num(getattr(lot, "last_price", None), 0.0)
-            cp = getattr(lot, "call_put", None)
-            if ul <= 0 or strike <= 0 or cp is None:
-                return None
-            intrinsic = max(0.0, ul - strike) if cp == "CALL" else max(0.0, strike - ul)
-            if intrinsic > 0:
-                return max(0.0, price - intrinsic)
-            return None
+        def _dte(lot):
+            expiration = getattr(lot, "expiration_date", None)
+            if not expiration:
+                return 0
+            if isinstance(expiration, datetime):
+                expiration = expiration.date()
+            elif not isinstance(expiration, date):
+                expiration = datetime.strptime(str(expiration)[:10], "%Y-%m-%d").date()
+            return (expiration - datetime.now().date()).days
 
-        def _computed(lot, key):
-            if key == "this_delta":
-                return _as_num(getattr(lot, "quantity", 0)) * _as_num(getattr(lot, "delta", 0))
-            if key == "this_gamma":
-                return _as_num(getattr(lot, "quantity", 0)) * _as_num(getattr(lot, "gamma", 0))
-            if key == "hedge":
-                this_delta = _as_num(getattr(lot, "quantity", 0)) * _as_num(getattr(lot, "delta", 0))
-                ul = _as_num(getattr(lot, "underlying_last_price", 0))
-                return this_delta * 100.0 * ul
-            if key == "theta_pct":
-                th = _as_num(getattr(lot, "theta", 0))
-                ul = _as_num(getattr(lot, "underlying_last_price", 0))
-                return 0.0 if ul == 0 else th / ul * 10000.0
-            if key == "gain_loss_percentage":
-                return _gain_loss_pct(lot)
-            if key == "distance_to_strike":
-                return _distance_to_strike(lot)
-            if key == "extrinsic_value":
-                return _extrinsic_value(lot)
-            return None
+        def _gain_band(value):
+            if value >= 80:
+                return "close-now", "80%+"
+            if value >= 70:
+                return "close-watch", "70%+"
+            if value < 0:
+                return "loss", ""
+            return "positive", ""
 
-        def _cell_value(key, lot, show_action=True, long_strike=None):
-            if key == "gain_loss_percentage":
-                val = _gain_loss_pct(lot)
-            elif key == "days_to_expiration":
-                exp = getattr(lot, "expiration_date", None)
-                if exp:
-                    from datetime import datetime
-                    import pandas as pd
-                    val = (pd.Timestamp(exp).date() - datetime.now().date()).days
-                else:
-                    val = 0
-            elif key == "extrinsic_value":
-                val = _extrinsic_value(lot)
-            elif key == "theta_pct":
-                val = _computed(lot, "theta_pct")
-            elif key == "this_delta":
-                val = _computed(lot, "this_delta")
-            elif key == "this_gamma":
-                val = _computed(lot, "this_gamma")
-            elif key == "hedge":
-                val = _computed(lot, "hedge")
-            elif key in ("delta", "gamma", "net_ticker_delta", "net_ticker_gamma", "implied_volatility", "volatility", "distance_to_strike"):
-                val = _computed(lot, key) if key in ("distance_to_strike",) else getattr(lot, key, None)
+        def _quote_context(ticker, items):
+            first_lot = next(
+                (
+                    item.get("short_lot") or item.get("long_lot")
+                    for item in items
+                    if item.get("short_lot") or item.get("long_lot")
+                ),
+                None,
+            )
+            price = live_index_prices.get(ticker)
+            if not price and first_lot is not None:
+                price = _as_num(getattr(first_lot, "underlying_last_price", None), 0.0)
+
+            metadata = live_index_quote_metadata.get(ticker, {})
+            source = str(metadata.get("source") or "E*TRADE portfolio")
+            status = str(metadata.get("status") or "UNKNOWN").upper()
+            timestamp = metadata.get("timestamp")
+            if timestamp:
+                quote_time = datetime.fromtimestamp(timestamp).astimezone().strftime("%b %d, %I:%M:%S %p %Z")
+                quote_time = quote_time.replace(" 0", " ")
             else:
-                val = getattr(lot, key, None)
+                quote_time = str(metadata.get("date_time") or "time unavailable")
 
-            if key == "action":
-                if not show_action:
-                    return ""
-                # Action button with quantity knob
-                sym = getattr(lot, "symbol", "")
-                qty = abs(int(getattr(lot, "quantity", 0)))
-                cp = getattr(lot, "call_put", "")
-                strike = getattr(lot, "strike_price", 0)
-                exp = str(getattr(lot, "expiration_date", ""))
-                
-                # Check if it's a spread
-                l_strike_val = f"'{long_strike}'" if long_strike is not None else "null"
-                
-                return f'''
-                <div style="display:flex; gap:5px; align-items:center;">
-                    <button onclick="closePosition('{sym}', '{exp}', '{cp}', '{strike}', {l_strike_val}, this)" 
-                            style="background:#ef4444; color:white; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">
-                        Close
-                    </button>
-                    <input type="number" value="{qty}" max="{qty}" min="1" 
-                           style="width:40px; font-size:11px; padding:2px; border:1px solid #ccc; border-radius:3px;">
-                </div>
-                '''
+            status_class = "quote-live" if status in ("REALTIME", "INDICATIVE_REALTIME", "CLOSING") else "quote-warning"
+            return (
+                f'<span class="underlying-price">{html.escape(ticker)} '
+                f'<strong>{html.escape(_fmt_money(price))}</strong></span>'
+                f'<span class="quote-status {status_class}">{html.escape(status)}</span>'
+                f'<span class="quote-time">{html.escape(source)} · {html.escape(quote_time)}</span>'
+            )
 
-            if key in ("gain_loss_percentage", "distance_to_strike", "implied_volatility", "volatility", "theta_pct"):
-                return _fmt_pct(val)
-            if key in ("underlying_last_price","last_price","strike_price","delta","this_delta","gamma","this_gamma","net_ticker_delta","net_ticker_gamma","theta","hedge","extrinsic_value"):
-                return _fmt_num(val, 3 if key not in ("this_delta","this_gamma","hedge","extrinsic_value") else (2 if key not in ("hedge","extrinsic_value") else (2 if key == "extrinsic_value" else 1)))
-            if key == "expiration_date":
-                return "" if not val else str(val)
-            if key == "net_price":
-                return "" # Handled specially in _row_html
-            return "" if val is None else str(val)
-
-        def _row_html(lot, row_class="", net_price=None, show_action=True, long_strike=None):
-            tds = []
-            for key, _ in COLUMNS:
-                cls = ""
-                if key == "net_price":
-                    val = f"{float(net_price):.3f}" if net_price is not None else ""
-                else:
-                    val = _cell_value(key, lot, show_action=show_action, long_strike=long_strike)
-                
-                try:
-                    if key in ("gain_loss_percentage","distance_to_strike"):
-                        f = float(str(val).replace("%","")); cls = "pos" if f >= 0 else "neg"
-                    elif key == "theta_pct":
-                        f = float(str(val).replace("%","")); cls = "pos" if f < -2 else "neg"
-                    elif key == "delta":
-                        f = float(val); cls = "pos" if abs(f) <= 0.1 else "neg"
-                    elif key == "gamma":
-                        f = float(val); cls = "pos" if abs(f) <= 0.1 else "neg"
-                    elif key == "net_ticker_delta":
-                        f = float(val); cls = "pos" if abs(f) <= 1 else "neg"
-                    elif key == "net_ticker_gamma":
-                        f = float(val); cls = "pos" if abs(f) <= 0.1 else "neg"
-                    elif key == "extrinsic_value":
-                        f = float(val); cls = "neg" if f <= 1.0 else "pos"
-                except Exception:
-                    pass
-                
-                # Don't escape the action HTML
-                content = val if key == "action" else html.escape(str(val))
-                tds.append(f'<td class="{cls}">{content}</td>')
-            return f'<tr class="{row_class}">' + "".join(tds) + "</tr>"
-
-        head_cols = "".join(f"<th>{html.escape(h)}</th>" for _, h in COLUMNS)
-        rows_html = []
+        from collections import defaultdict
+        grouped_positions = defaultdict(list)
         for item in screened_options:
-            is_spread = bool(item.get("is_spread"))
-            long_lot = item.get("long_lot")
-            short_lot = item.get("short_lot")
-            if is_spread and short_lot is not None and long_lot is not None:
-                # Calculate net price for the spread (Short - Long)
-                s_price = _as_num(getattr(short_lot, "last_price", 0.0), 0.0)
-                l_price = _as_num(getattr(long_lot, "last_price", 0.0), 0.0)
-                net_price = s_price - l_price
-                
-                # Show action ONLY on the short leg (pair-top), passing the long strike for the combined order
-                rows_html.append(_row_html(short_lot, row_class="pair-top", net_price=net_price, long_strike=long_lot.strike_price))
-                rows_html.append(_row_html(long_lot, row_class="pair-bottom", show_action=False))
-            else:
-                solo = long_lot if long_lot is not None else short_lot
-                rows_html.append(_row_html(solo, row_class="single"))
+            lot = item.get("short_lot") or item.get("long_lot")
+            if lot is not None:
+                grouped_positions[_aggregate_option_symbol(getattr(lot, "symbol", "") or "")].append(item)
+
+        position_groups = []
+        for ticker in sorted(grouped_positions):
+            items = grouped_positions[ticker]
+            items.sort(key=lambda item: (
+                -_as_num(item.get("pair_gain_loss"), 0.0),
+                _dte(item.get("short_lot") or item.get("long_lot")),
+            ))
+            high_gain_count = sum(_as_num(item.get("pair_gain_loss"), 0.0) >= 70 for item in items)
+            overview_class = "has-close-candidates" if high_gain_count else ""
+            overview_text = (
+                f"{high_gain_count} at 70%+"
+                if high_gain_count
+                else f"{len(items)} position{'s' if len(items) != 1 else ''}"
+            )
+
+            group_rows = []
+            for item in items:
+                is_spread = bool(item.get("is_spread"))
+                short_lot = item.get("short_lot")
+                long_lot = item.get("long_lot")
+                action_lot = short_lot or long_lot
+                if action_lot is None:
+                    continue
+
+                raw_symbol = str(getattr(action_lot, "symbol", "") or "")
+                call_put = str(getattr(action_lot, "call_put", "") or "").upper()
+                expiration = str(getattr(action_lot, "expiration_date", "") or "")
+                signed_quantity = int(getattr(action_lot, "quantity", 0) or 0)
+                quantity = int(item.get("pair_quantity") or abs(signed_quantity))
+                short_strike = getattr(action_lot, "strike_price", 0)
+                long_strike = getattr(long_lot, "strike_price", None) if is_spread else None
+                gain_loss = _as_num(item.get("pair_gain_loss"), 0.0)
+                gain_class, threshold_label = _gain_band(gain_loss)
+
+                if is_spread and short_lot is not None and long_lot is not None:
+                    entry_value = (
+                        _as_num(getattr(short_lot, "price_paid", 0.0))
+                        - _as_num(getattr(long_lot, "price_paid", 0.0))
+                    )
+                    current_value = (
+                        _as_num(getattr(short_lot, "last_price", 0.0))
+                        - _as_num(getattr(long_lot, "last_price", 0.0))
+                    )
+                    strikes = (
+                        f'<span class="strike-values">{html.escape(_fmt_strike(short_strike))}'
+                        f'<span aria-hidden="true"> / </span>{html.escape(_fmt_strike(long_strike))}</span>'
+                        '<span class="strike-labels">Short / Long</span>'
+                    )
+                else:
+                    entry_value = _as_num(getattr(action_lot, "price_paid", 0.0))
+                    current_value = _as_num(getattr(action_lot, "last_price", 0.0))
+                    strikes = (
+                        f'<span class="strike-values">{html.escape(_fmt_strike(short_strike))}</span>'
+                        '<span class="strike-labels">Single leg</span>'
+                    )
+
+                underlying = _as_num(getattr(action_lot, "underlying_last_price", 0.0))
+                strike_number = _as_num(short_strike)
+                if underlying > 0 and strike_number > 0:
+                    distance = abs(underlying - strike_number) / underlying * 100.0
+                    is_otm = (
+                        (call_put == "CALL" and strike_number > underlying)
+                        or (call_put == "PUT" and strike_number < underlying)
+                    )
+                    distance_text = f"{distance:.1f}% {'OTM' if is_otm else 'ITM'}"
+                    distance_class = "distance-safe" if is_otm else "distance-risk"
+                else:
+                    distance_text = "—"
+                    distance_class = ""
+
+                attr = lambda value: html.escape(str(value), quote=True)
+                long_strike_attr = "" if long_strike is None else str(long_strike)
+                threshold_html = f"<small>{threshold_label}</small>" if threshold_label else ""
+                group_rows.append(f'''
+                  <tr class="position-row {gain_class}" data-close-position-container>
+                    <td class="expiry-cell"><strong>{_dte(action_lot)} DTE</strong><span>{html.escape(expiration)}</span></td>
+                    <td class="position-cell"><span class="option-type">{html.escape(call_put)}</span>{strikes}</td>
+                    <td class="quantity-cell">{quantity}</td>
+                    <td class="entry-cell desktop-detail">{html.escape(_fmt_money(entry_value))}</td>
+                    <td class="mark-cell desktop-detail">{html.escape(_fmt_money(current_value))}</td>
+                    <td class="distance-cell desktop-detail {distance_class}">{html.escape(distance_text)}</td>
+                    <td class="gain-cell"><span>{gain_loss:.1f}%</span>{threshold_html}</td>
+                    <td class="action-cell">
+                      <input type="number" value="{quantity}" max="{quantity}" min="1" inputmode="numeric"
+                             aria-label="Contracts to close for {attr(ticker)} {attr(expiration)} {attr(call_put)} {attr(short_strike)}">
+                      <button type="button" data-close-position="1" data-symbol="{attr(raw_symbol)}"
+                              data-expiry="{attr(expiration)}" data-cp="{attr(call_put)}"
+                              data-short-strike="{attr(short_strike)}" data-long-strike="{attr(long_strike_attr)}"
+                              data-position-qty="{signed_quantity}"
+                              aria-label="Review close order for {attr(ticker)} {attr(expiration)} {attr(call_put)} {attr(short_strike)}">
+                        Close
+                      </button>
+                    </td>
+                  </tr>
+                ''')
+
+            position_groups.append(f'''
+              <section class="ticker-group" aria-labelledby="ticker-{html.escape(ticker)}">
+                <header class="ticker-header">
+                  <div>
+                    <h2 id="ticker-{html.escape(ticker)}">{html.escape(ticker)}</h2>
+                    <div class="quote-context">{_quote_context(ticker, items)}</div>
+                  </div>
+                  <span class="ticker-overview {overview_class}">{html.escape(overview_text)}</span>
+                </header>
+                <div class="ticker-table-wrap">
+                  <table class="ticker-table" aria-label="{html.escape(ticker)} option positions">
+                    <thead>
+                      <tr>
+                        <th>Expiry</th>
+                        <th>Position</th>
+                        <th>Qty</th>
+                        <th class="desktop-detail">Entry</th>
+                        <th class="desktop-detail">Pair mark</th>
+                        <th class="desktop-detail">Distance</th>
+                        <th>Pair P/L</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>{''.join(group_rows)}</tbody>
+                  </table>
+                </div>
+              </section>
+            ''')
+
+        position_groups_html = "".join(position_groups)
+        rows_html = []
 
         # --- Add totals row (left aligned) ---
         total_price = 0.0
-        spy_total_option_price = 0.0
+        sp_total_option_price = 0.0
+        index_deltas = {
+            "SPY": {"CALL": 0.0, "PUT": 0.0},
+            "SPX": {"CALL": 0.0, "PUT": 0.0},
+        }
         itm_by_symbol = {}
 
         from collections import defaultdict
@@ -2521,12 +2795,23 @@ class Accounts:
             for leg in (item.get("long_lot"), item.get("short_lot")):
                 if not leg:
                     continue
+                sym = _aggregate_option_symbol(getattr(leg, "symbol", ""))
                 qty = getattr(leg, "quantity", 0) or 0   # signed quantity
+                
+                # Delta aggregation for S&P instruments
+                if sym in index_deltas:
+                    delta = _as_num(getattr(leg, "delta", 0.0), 0.0)
+                    if abs(delta) > 2.0: # 100 fallback
+                        delta = 0.0
+                    cp_type = (getattr(leg, "call_put", "") or "").upper()
+                    pos_delta = qty * delta * 100.0
+                    if cp_type in index_deltas[sym]:
+                        index_deltas[sym][cp_type] += pos_delta
+
                 price = getattr(leg, "last_price", 0.0) or 0.0
                 strike = getattr(leg, "strike_price", None)
                 ul = getattr(leg, "underlying_last_price", None)
                 cp = getattr(leg, "call_put", None)
-                sym = getattr(leg, "symbol", "")
                 exp = getattr(leg, "expiration_date", "")
 
                 if strike is not None and ul is not None:
@@ -2557,8 +2842,8 @@ class Accounts:
             for short in shorts:
                 val = short['qty'] * short['price'] * 100.0
                 total_price += val
-                if key[0] == 'SPY':
-                    spy_total_option_price += val
+                if key[0] in ('SPY', 'SPX'):
+                    sp_total_option_price += val
                 short_qty_abs = abs(short['qty'])
                 for long in longs:
                     if long['qty'] <= 0: continue
@@ -2566,8 +2851,8 @@ class Accounts:
                     if matched_qty > 0:
                         val_long = matched_qty * long['price'] * 100.0
                         total_price += val_long
-                        if key[0] == 'SPY':
-                            spy_total_option_price += val_long
+                        if key[0] in ('SPY', 'SPX'):
+                            sp_total_option_price += val_long
                         short_qty_abs -= matched_qty
                         long['qty'] -= matched_qty
                     if short_qty_abs <= 0:
@@ -2577,10 +2862,10 @@ class Accounts:
         itm_parts = [f"{sym}: ${val:,.2f}" for sym, val in itm_by_symbol.items()]
         itm_str = ", ".join(itm_parts) if itm_parts else "$0.00"
 
-        def _spy_margin_totals(items):
+        def _sp_margin_totals(items):
             from collections import defaultdict
 
-            # Group by expiry first
+            # Group by symbol and expiry so SPY and SPX do not offset each other.
             expiry_groups = defaultdict(lambda: {"CALL": 0.0, "PUT": 0.0})
             
             # Sub-grouping logic to handle pairings within each expiry
@@ -2589,8 +2874,8 @@ class Accounts:
                 for leg in (entry.get("long_lot"), entry.get("short_lot")):
                     if not leg:
                         continue
-                    sym = (getattr(leg, "symbol", "") or "").upper()
-                    if sym != "SPY":
+                    sym = _aggregate_option_symbol(getattr(leg, "symbol", ""))
+                    if sym not in ("SPY", "SPX"):
                         continue
                     cp = (getattr(leg, "call_put", "") or "").upper()
                     if cp not in ("CALL", "PUT"):
@@ -2639,19 +2924,19 @@ class Accounts:
                     if short["qty"] > 0:
                         expiry_type_margin += _naked_margin(short["leg"], short["qty"])
                 
-                expiry_groups[exp][cp] += expiry_type_margin
+                expiry_groups[(sym, exp)][cp] += expiry_type_margin
 
             # Final Max Risk Calculation: sum(max(call_margin, put_margin) for each expiry)
             total_corrected = 0.0
             total_call = 0.0
             total_put = 0.0
             breakdown_lines = []
-            for exp, margins in expiry_groups.items():
+            for (sym, exp), margins in expiry_groups.items():
                 risk = max(margins["CALL"], margins["PUT"])
                 total_corrected += risk
                 total_call += margins["CALL"]
                 total_put += margins["PUT"]
-                breakdown_lines.append(f"{exp}: Max(C: ${margins['CALL']:,.0f}, P: ${margins['PUT']:,.0f}) = ${risk:,.0f}")
+                breakdown_lines.append(f"{sym} {exp}: Max(C: ${margins['CALL']:,.0f}, P: ${margins['PUT']:,.0f}) = ${risk:,.0f}")
                 
             return total_corrected, total_call, total_put, breakdown_lines
 
@@ -2670,8 +2955,14 @@ class Accounts:
         except Exception:
             pass
 
-        spy_total_margin, spy_call_margin, spy_put_margin, margin_breakdown = _spy_margin_totals(screened_options)
+        spy_total_margin, spy_call_margin, spy_put_margin, margin_breakdown = _sp_margin_totals(screened_options)
         grand_total_margin = stock_margin + spy_total_margin
+        spy_call_delta = index_deltas["SPY"]["CALL"]
+        spy_put_delta = index_deltas["SPY"]["PUT"]
+        spx_call_delta = index_deltas["SPX"]["CALL"]
+        spx_put_delta = index_deltas["SPX"]["PUT"]
+        total_call_delta = spy_call_delta + spx_call_delta
+        total_put_delta = spy_put_delta + spx_put_delta
         
         # Try to get account-level margin from E*TRADE for comparison
         etrade_margin_info = "N/A"
@@ -2689,8 +2980,12 @@ class Accounts:
 
         totals_row = f"""
         <tr class="totals">
-          <td colspan="{len(COLUMNS)}" style="text-align:left;font-weight:bold;">
+          <td colspan="8" style="text-align:left;font-weight:bold;">
             Total Option Price = ${total_price:,.2f} |
+            Aggregated Delta (SPY+SPX): Call = {total_call_delta:,.1f}, Put = {total_put_delta:,.1f}, Net = {(total_call_delta + total_put_delta):,.1f}
+            <span style="font-weight:normal; color:#64748b;">
+              (SPY Net {(spy_call_delta + spy_put_delta):,.1f}; SPX Net {(spx_call_delta + spx_put_delta):,.1f})
+            </span> |
             Total ITM by Symbol → {itm_str}
           </td>
         </tr>
@@ -2699,7 +2994,7 @@ class Accounts:
 
         margin_row = f"""
         <tr class=\"totals\">
-          <td colspan=\"{len(COLUMNS)}\" style=\"text-align:left;font-weight:bold;\">
+          <td colspan=\"8\" style=\"text-align:left;font-weight:bold;\">
             Total Calculated Margin = ${grand_total_margin:,.2f} |
             E*TRADE Account Maintenance Margin = {etrade_margin_info}
             <div style="font-size:0.8em; font-weight:normal; margin-top:5px; color:#aaa;">
@@ -2737,15 +3032,15 @@ class Accounts:
                 frozen_ytd_gain = last_snap.get("ytd_realized_gain", 0.0)
                 frozen_timestamp = last_snap.get("timestamp", last_date)
                 
-                # Calculate differences
-                price_diff = total_price - frozen_opt_price
+                # Calculate differences against the same SPY/SPX/SPXW scope as the tracker.
+                price_diff = sp_total_option_price - frozen_opt_price
                 margin_diff = spy_total_margin - frozen_margin
                 
                 price_diff_class = "pos" if price_diff >= 0 else "neg"
                 margin_diff_class = "neg" if margin_diff > 0 else "pos"  # Lower margin is better
                 
                 tracker_summary_html = f'''
-                <div style="margin: 15px 0; padding: 12px 15px; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 8px; border-left: 4px solid #6c757d; max-width: 800px;">
+                <div style="margin: 15px 0; padding: 12px 15px; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 8px; border-left: 4px solid #6c757d; max-width: 800px; box-sizing: border-box; overflow-x: auto; -webkit-overflow-scrolling: touch;">
                   <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                     <span style="font-weight: 600; font-size: 14px; color: #495057;">📊 Historical Tracker (Frozen End-of-Day)</span>
                     <span style="font-size: 12px; color: #6c757d;">Last recorded: {last_date}</span>
@@ -2758,8 +3053,8 @@ class Accounts:
                       <th style="text-align: right; padding: 6px 10px; border-bottom: 1px solid #dee2e6; background: #f8f9fa;">Diff</th>
                     </tr>
                     <tr>
-                      <td style="padding: 6px 10px; border-bottom: 1px solid #f1f3f4;">Option Price</td>
-                      <td style="text-align: right; padding: 6px 10px; border-bottom: 1px solid #f1f3f4;">${total_price:,.2f}</td>
+                      <td style="padding: 6px 10px; border-bottom: 1px solid #f1f3f4;">SPY/SPX/SPXW Option Price</td>
+                      <td style="text-align: right; padding: 6px 10px; border-bottom: 1px solid #f1f3f4;">${sp_total_option_price:,.2f}</td>
                       <td style="text-align: right; padding: 6px 10px; border-bottom: 1px solid #f1f3f4;">${frozen_opt_price:,.2f}</td>
                       <td style="text-align: right; padding: 6px 10px; border-bottom: 1px solid #f1f3f4;" class="{price_diff_class}">{'+' if price_diff >= 0 else ''}${price_diff:,.2f}</td>
                     </tr>
@@ -2785,26 +3080,86 @@ class Accounts:
         <style>
           body { font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 15px; background: #fff; color: #0f172a; margin: 0; }
           h1 { margin: 0 0 15px 0; font-size: 22px; color: #0f172a; font-weight: 600; }
-          .table-container { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 20px; max-width: 100%; }
-          table { border-collapse: collapse; width: 100%; font-size: 12px; background: #fff; table-layout: auto; }
-          th, td { border: 1px solid #e2e8f0; padding: 6px 10px; text-align: right; white-space: nowrap; color: #0f172a; }
-          th { background: #f8fafc; position: sticky; top: 0; z-index: 10; text-align: right; color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.025em; }
-          td:first-child, th:first-child { text-align: left; position: sticky; left: 0; background: inherit; z-index: 5; border-right: 2px solid #e2e8f0; }
-          th:first-child { background: #f8fafc; }
-          tr:nth-child(even) { background-color: #fcfcfd; }
-          tr:hover { background-color: #f1f5f9; }
           td.pos { color: #10b981 !important; font-weight: 600; }
           td.neg { color: #ef4444 !important; font-weight: 600; }
-          tr.pair-top td { border-top: 2px solid #64748b; }
-          tr.pair-bottom td { border-bottom: 2px solid #64748b; border-top: 1px dashed #e2e8f0; }
-          tr.single td { border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
-          tr.totals td { background: #f1f5f9; border-top: 2px solid #cbd5e1; font-weight: 600; }
+          .position-groups { display: grid; gap: 18px; margin: 0 0 20px; }
+          .ticker-group { overflow: hidden; border: 1px solid #dbe4ee; border-radius: 14px; background: #fff; box-shadow: 0 3px 14px rgba(15, 23, 42, 0.05); }
+          .ticker-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 16px; background: linear-gradient(135deg, #f8fafc, #f0f9ff); border-bottom: 1px solid #dbe4ee; }
+          .ticker-header h2 { margin: 0; color: #0f172a; font-size: 21px; line-height: 1.1; }
+          .quote-context { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 5px; color: #64748b; font-size: 12px; }
+          .underlying-price strong { margin-left: 4px; color: #0f172a; font-size: 14px; font-variant-numeric: tabular-nums; }
+          .quote-status { padding: 2px 6px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; }
+          .quote-live { color: #047857; background: #d1fae5; }
+          .quote-warning { color: #92400e; background: #fef3c7; }
+          .ticker-overview { flex: 0 0 auto; padding: 6px 9px; border-radius: 999px; background: #e2e8f0; color: #475569; font-size: 11px; font-weight: 700; }
+          .ticker-overview.has-close-candidates { background: #dcfce7; color: #047857; }
+          .ticker-table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+          .ticker-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; font-variant-numeric: tabular-nums; }
+          .ticker-table th { padding: 8px 9px; background: #f8fafc; color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-align: right; text-transform: uppercase; white-space: nowrap; }
+          .ticker-table th:first-child, .ticker-table th:nth-child(2) { text-align: left; }
+          .ticker-table td { padding: 9px; border-top: 1px solid #eef2f7; color: #0f172a; text-align: right; vertical-align: middle; }
+          .ticker-table tbody tr:first-child td { border-top: 0; }
+          .ticker-table tbody tr:hover { background: #f8fafc; }
+          .ticker-table .expiry-cell, .ticker-table .position-cell { text-align: left; }
+          .expiry-cell strong, .expiry-cell span, .strike-values, .strike-labels { display: block; }
+          .expiry-cell strong { font-size: 13px; }
+          .expiry-cell span, .strike-labels { margin-top: 2px; color: #64748b; font-size: 10px; }
+          .option-type { display: inline-block; min-width: 38px; margin-right: 7px; padding: 3px 5px; border-radius: 5px; background: #e0e7ff; color: #3730a3; font-size: 10px; font-weight: 800; text-align: center; }
+          .strike-values { display: inline; font-size: 13px; font-weight: 700; }
+          .strike-labels { margin-left: 49px; }
+          .distance-safe { color: #047857 !important; }
+          .distance-risk { color: #dc2626 !important; font-weight: 700; }
+          .gain-cell span { display: inline-block; min-width: 58px; padding: 5px 7px; border-radius: 7px; background: #ecfdf5; color: #047857; font-size: 13px; font-weight: 800; text-align: center; }
+          .gain-cell small { display: block; margin-top: 2px; color: inherit; font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; }
+          .position-row.close-watch { background: #f0fdf4; }
+          .position-row.close-now { background: #dcfce7; }
+          .position-row.close-watch .gain-cell span { background: #bbf7d0; color: #166534; }
+          .position-row.close-now .gain-cell span { background: #16a34a; color: #fff; }
+          .position-row.loss .gain-cell span { background: #fef2f2; color: #dc2626; }
+          .action-cell { white-space: nowrap; }
+          .action-cell input { box-sizing: border-box; width: 40px; min-height: 34px; margin-right: 5px; padding: 4px; border: 1px solid #cbd5e1; border-radius: 7px; background: #fff; color: #0f172a; font: inherit; font-size: 14px; text-align: center; }
+          .action-cell button { min-height: 34px; padding: 5px 10px; border: 0; border-radius: 7px; background: #dc2626; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
+          .action-cell button:disabled { background: #94a3b8; cursor: wait; }
+          .portfolio-summary { width: 100%; overflow-x: auto; margin-bottom: 20px; border: 1px solid #e2e8f0; border-radius: 10px; }
+          .summary-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+          .summary-table td { padding: 10px 12px; background: #f8fafc; border-top: 1px solid #e2e8f0; white-space: normal; }
+          .summary-table tr:first-child td { border-top: 0; }
           
           @media (max-width: 768px) {
-            body { padding: 10px; }
+            body { padding: max(8px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)); background: #f8fafc; }
             h1 { font-size: 18px; }
-            th, td { padding: 8px 6px; font-size: 12px; }
-            .table-container { border-radius: 0; border-left: none; border-right: none; }
+            h2 { font-size: 17px; }
+            .diagnostic-data { display: none; }
+            .desktop-analytics { display: block; min-width: 0; overflow: hidden; }
+            .desktop-analytics > div { max-width: 100% !important; margin-bottom: 24px !important; }
+            .desktop-analytics h2 { font-size: 17px; line-height: 1.3; }
+            .desktop-analytics canvas { max-width: 100% !important; }
+            .desktop-analytics button { min-height: 44px; padding: 8px 12px !important; }
+            .position-groups { gap: 12px; }
+            .ticker-group { border-radius: 11px; }
+            .ticker-header { align-items: flex-start; padding: 11px 10px; }
+            .ticker-header h2 { font-size: 19px; }
+            .quote-context { gap: 5px; font-size: 10px; }
+            .quote-time { flex-basis: 100%; }
+            .ticker-overview { padding: 5px 7px; font-size: 10px; }
+            .ticker-table { min-width: 0; table-layout: fixed; }
+            .ticker-table th, .ticker-table td { padding: 7px 4px; }
+            .ticker-table th { font-size: 9px; white-space: normal; line-height: 1.05; }
+            .ticker-table th:nth-child(1) { width: 18%; }
+            .ticker-table th:nth-child(2) { width: 28%; }
+            .ticker-table th:nth-child(3) { width: 8%; }
+            .ticker-table th:nth-child(7) { width: 19%; }
+            .ticker-table th:nth-child(8) { width: 27%; }
+            .desktop-detail { display: none; }
+            .expiry-cell strong { font-size: 12px; }
+            .expiry-cell span { font-size: 9px; white-space: normal; }
+            .option-type { display: block; min-width: 0; width: fit-content; margin: 0 0 3px; padding: 2px 4px; font-size: 8px; }
+            .strike-values { font-size: 12px; white-space: nowrap; }
+            .strike-labels { margin-left: 0; font-size: 8px; }
+            .gain-cell span { min-width: 0; width: 100%; padding: 5px 2px; font-size: 12px; }
+            .action-cell input { width: 30px; min-height: 34px; margin-right: 2px; padding: 2px; font-size: 13px; }
+            .action-cell button { min-height: 34px; padding: 4px 6px; font-size: 10px; }
+            .portfolio-summary { display: none; }
           }
         </style>
         """
@@ -2812,6 +3167,7 @@ class Accounts:
         Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
         
         # Generate SPY tracking chart data
+        cash_flow_sync = {}
         try:
             import sys
             import os as os_mod
@@ -2820,19 +3176,28 @@ class Accounts:
             if parent_dir not in sys.path:
                 sys.path.insert(0, parent_dir)
             
-            # Use the extended history function if order_instance is available (to get historical gains)
-            if order_instance is not None:
-                from live_trading.spy_position_tracker import get_spy_tracking_history_with_gains
-                spy_history = get_spy_tracking_history_with_gains(order_instance, start_date="2025-01-01")
-            else:
-                from live_trading.spy_position_tracker import get_spy_tracking_history
-                spy_history = get_spy_tracking_history()
+            # Use the extended history function to get historical gains and cash flows
+            from live_trading.spy_position_tracker import get_spy_tracking_history_with_gains
+            spy_history = get_spy_tracking_history_with_gains(order_instance, start_date="2025-01-01")
             
             chart_dates = spy_history.get("dates", [])
             chart_prices = spy_history.get("total_option_prices", [])
             chart_margins = spy_history.get("total_margins", [])
             chart_cash_flows = spy_history.get("cash_flows", [])
             chart_realized_gains = spy_history.get("realized_gains", [])
+            live_cash_flow = spy_history.get("cash_flow_current")
+            live_realized_gain = spy_history.get("ytd_current")
+            cash_flow_sync = spy_history.get("sync_health", {})
+
+            series_lengths = {
+                len(chart_dates),
+                len(chart_prices),
+                len(chart_margins),
+                len(chart_cash_flows),
+                len(chart_realized_gains),
+            }
+            if len(series_lengths) != 1:
+                raise ValueError("SPY chart history series are not date-aligned")
 
             # ===== FILTER FOR TRADING DAYS ONLY =====
             try:
@@ -2868,7 +3233,7 @@ class Accounts:
             
             # ===== MANUAL EXCLUSION =====
             # Add dates here to manually exclude them from the charts
-            MANUAL_EXCLUDE_DATES = ["2025-01-20", "2026-03-23"] # Example: "2025-01-20"
+            MANUAL_EXCLUDE_DATES = ["2025-01-20"] # Example: "2025-01-20"
             
             if chart_dates:
                 excluded_this_time = [d for d in chart_dates if d.split(' ')[0] in MANUAL_EXCLUDE_DATES]
@@ -2878,66 +3243,10 @@ class Accounts:
                 valid_manual_indices = [i for i, d in enumerate(chart_dates) 
                                         if d.split(' ')[0] not in MANUAL_EXCLUDE_DATES]
                 chart_dates = [chart_dates[i] for i in valid_manual_indices]
-                chart_prices = [chart_prices[i] for i in valid_manual_indices if i < len(chart_prices)]
-                chart_margins = [chart_margins[i] for i in valid_manual_indices if i < len(chart_margins)]
-                chart_cash_flows = [chart_cash_flows[i] for i in valid_manual_indices if i < len(chart_cash_flows)]
-                chart_realized_gains = [chart_realized_gains[i] for i in valid_manual_indices if i < len(chart_realized_gains)]
-                
-                num_excluded = len(valid_manual_indices) - len(chart_dates) # This logic is slightly wrong but you get the idea
-                # Correct way to count:
-                total_before = len(valid_manual_indices) + (len(chart_dates) if not chart_dates else 0) # simplified
-                # Let's just print the list of active dates if needed
-                # print(f"[Manual Exclude] Active dates: {chart_dates[-5:]}")
-
-            # ===== OUTLIER FILTERING =====
-            # Remove extreme outliers from chart to improve visualization
-            # Uses IQR method: values beyond Q1 - 3*IQR or Q3 + 3*IQR are outliers
-            if len(chart_cash_flows) > 10:
-                import numpy as np
-                
-                # Filter based on Cash Flows
-                cf_array = np.array(chart_cash_flows)
-                q1_cf, q3_cf = np.percentile(cf_array, [25, 75])
-                iqr_cf = q3_cf - q1_cf
-                lower_cf = q1_cf - 3 * iqr_cf
-                upper_cf = q3_cf + 3 * iqr_cf
-                
-                # Filter based on Option Prices
-                price_array = np.array([p for p in chart_prices if p is not None])
-                if len(price_array) > 10:
-                    q1_p, q3_p = np.percentile(price_array, [25, 75])
-                    iqr_p = q3_p - q1_p
-                    lower_p = q1_p - 3 * iqr_p
-                    upper_p = q3_p + 3 * iqr_p
-                else:
-                    lower_p, upper_p = -float('inf'), float('inf')
-                
-                # Find indices of non-outlier values (must be valid in both)
-                valid_indices = []
-                for i in range(len(chart_cash_flows)):
-                    val_cf = chart_cash_flows[i]
-                    val_p = chart_prices[i] if i < len(chart_prices) else None
-                    
-                    is_valid_cf = lower_cf <= val_cf <= upper_cf
-                    is_valid_p = True
-                    if val_p is not None:
-                        is_valid_p = (lower_p <= val_p <= upper_p) and (val_p != 0.0)
-                        
-                    if is_valid_cf and is_valid_p:
-                        valid_indices.append(i)
-                
-                # Only filter if we remove less than 15% of data points
-                if len(valid_indices) >= len(chart_cash_flows) * 0.85:
-                    removed_dates = [chart_dates[i] for i in range(len(chart_dates)) 
-                                     if i not in valid_indices]
-                    if removed_dates:
-                        print(f"[SPY Chart] Filtered {len(removed_dates)} outlier date(s): {removed_dates}")
-                    
-                    chart_dates = [chart_dates[i] for i in valid_indices]
-                    chart_prices = [chart_prices[i] for i in valid_indices if i < len(chart_prices)]
-                    chart_margins = [chart_margins[i] for i in valid_indices if i < len(chart_margins)]
-                    chart_cash_flows = [chart_cash_flows[i] for i in valid_indices]
-                    chart_realized_gains = [chart_realized_gains[i] for i in valid_indices if i < len(chart_realized_gains)]
+                chart_prices = [chart_prices[i] for i in valid_manual_indices]
+                chart_margins = [chart_margins[i] for i in valid_manual_indices]
+                chart_cash_flows = [chart_cash_flows[i] for i in valid_manual_indices]
+                chart_realized_gains = [chart_realized_gains[i] for i in valid_manual_indices]
         except Exception as chart_err:
             print(f"[SPY Chart] Could not load tracking history: {chart_err}")
             chart_dates = []
@@ -2945,32 +3254,47 @@ class Accounts:
             chart_margins = []
             chart_cash_flows = []
             chart_realized_gains = []
+            live_cash_flow = None
+            live_realized_gain = None
+            cash_flow_sync = {}
         
         # ===== ADD LIVE DATA POINT TO CHARTS =====
         # Append current live values so charts reflect real-time data
         from datetime import datetime as dt_mod
-        today_str = dt_mod.now().strftime("%Y-%m-%d")
+        today_str = dt_mod.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d")
         live_label = f"{today_str} (Live)"
         live_margin = spy_total_margin
+        if live_cash_flow is None and chart_cash_flows:
+            live_cash_flow = chart_cash_flows[-1]
+        if live_realized_gain is None and chart_realized_gains:
+            live_realized_gain = chart_realized_gains[-1]
         
         # Only add if we don't already have today's date, or update it if we do
-        if chart_dates and chart_dates[-1] == today_str:
+        last_chart_date = chart_dates[-1].replace(' (Live)', '') if chart_dates else None
+        if chart_dates and last_chart_date == today_str:
             # Update the last point with live values
-            chart_prices[-1] = spy_total_option_price
+            chart_dates[-1] = live_label
+            chart_prices[-1] = sp_total_option_price
             chart_margins[-1] = live_margin
+            if chart_cash_flows:
+                chart_cash_flows[-1] = live_cash_flow if live_cash_flow is not None else chart_cash_flows[-1]
+            elif live_cash_flow is not None:
+                chart_cash_flows.append(live_cash_flow)
+            if chart_realized_gains:
+                chart_realized_gains[-1] = live_realized_gain if live_realized_gain is not None else chart_realized_gains[-1]
+            elif live_realized_gain is not None:
+                chart_realized_gains.append(live_realized_gain)
         else:
             # Add new live data point
             chart_dates.append(live_label)
-            chart_prices.append(spy_total_option_price)
+            chart_prices.append(sp_total_option_price)
             chart_margins.append(live_margin)
-            # Keep cash flow/gains as last known value (these don't change intraday)
-            if chart_cash_flows:
-                chart_cash_flows.append(chart_cash_flows[-1])
-            if chart_realized_gains:
-                chart_realized_gains.append(chart_realized_gains[-1])
+            chart_cash_flows.append(live_cash_flow if live_cash_flow is not None else 0.0)
+            chart_realized_gains.append(live_realized_gain if live_realized_gain is not None else 0.0)
         
-        # ===== FETCH SPY & VIX CLOSING PRICES (CACHED) =====
+        # ===== FETCH SPY, SPX & VIX CLOSING PRICES (CACHED) =====
         spy_closes = []
+        spx_closes = []
         vix_closes = []
         _PRICE_CACHE_FILE = "spy_vix_price_cache.json"
         try:
@@ -2982,29 +3306,42 @@ class Accounts:
             today_str_cache = _dt_cache.now().strftime("%Y-%m-%d")
 
             # Load existing cache
-            _price_cache = {"SPY": {}, "VIX": {}}
+            _price_cache = {"SPY": {}, "SPX": {}, "VIX": {}}
             try:
                 with open(_PRICE_CACHE_FILE, 'r') as _cf:
                     _price_cache = json.load(_cf)
                     if "SPY" not in _price_cache:
                         _price_cache["SPY"] = {}
+                    if "SPX" not in _price_cache:
+                        _price_cache["SPX"] = {}
                     if "VIX" not in _price_cache:
                         _price_cache["VIX"] = {}
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
 
             # Determine which dates are missing from cache
-            # Today's date is always refetched (price may still be updating intraday)
-            missing_dates = [d for d in clean_dates
-                             if d not in _price_cache["SPY"] or d == today_str_cache]
+            # Only query yfinance for today's price outside of market hours (before 9:00 AM or after 5:00 PM EST)
+            # to prevent hitting yfinance rate limits. During market hours, we use E*TRADE's real-time fallback.
+            import pytz as _pytz
+            _et_tz = _pytz.timezone('US/Eastern')
+            _now_et = _dt_cache.now(_et_tz)
+            _is_market_active = (_now_et.weekday() < 5) and (9 <= _now_et.hour < 17)
+            
+            missing_dates = _missing_market_close_dates(
+                chart_dates,
+                _price_cache,
+                today_str_cache,
+                _is_market_active,
+            )
 
             if missing_dates:
                 # Fetch starting 3 days before to ensure we catch everything reliably
                 start_dt_obj = _dt_cache.strptime(min(missing_dates), '%Y-%m-%d')
                 safe_start = (start_dt_obj - __import__('datetime').timedelta(days=3)).strftime('%Y-%m-%d')
                 
-                print(f"[SPY/VIX Cache] Fetching {len(missing_dates)} date(s) from yfinance (safe_start={safe_start})...")
+                print(f"[SPY/SPX/VIX Cache] Fetching {len(missing_dates)} date(s) from yfinance (safe_start={safe_start})...")
                 spy_raw = yf_chart.download('SPY', start=safe_start, progress=False, auto_adjust=False)
+                spx_raw = yf_chart.download('^SPX', start=safe_start, progress=False, auto_adjust=False)
                 vix_raw = yf_chart.download('^VIX', start=safe_start, progress=False, auto_adjust=False)
 
                 # Robust extraction: flatten MultiIndex columns, reset index, iterate rows
@@ -3046,6 +3383,9 @@ class Accounts:
                             val = temp_df.loc[idx, close_col]
                             if hasattr(val, 'iloc'): # In case of duplicate index
                                 val = val.iloc[0]
+                            if pd.isna(val):
+                                result[dt_str] = None
+                                continue
                             result[dt_str] = round(float(val), 2)
 
                         except (ValueError, TypeError, IndexError):
@@ -3053,9 +3393,66 @@ class Accounts:
                     return result
 
                 spy_new = _extract_closes(spy_raw)
+                spx_new = _extract_closes(spx_raw)
                 vix_new = _extract_closes(vix_raw)
-                print(f"[SPY/VIX Cache] Fetched {len(spy_new)} SPY and {len(vix_new)} VIX prices.")
+
+                # Yahoo occasionally rate-limits the dashboard host. Use two
+                # independent daily sources so missing closes do not remain
+                # stale or get replaced by a live portfolio quote.
+                missing_spy_dates = [d for d in missing_dates if d not in spy_new]
+                if missing_spy_dates:
+                    try:
+                        response = requests.get(
+                            "https://stockanalysis.com/etf/spy/history/",
+                            timeout=15,
+                        )
+                        response.raise_for_status()
+                        table = pd.read_html(StringIO(response.text))[0]
+                        table["Date"] = pd.to_datetime(table["Date"])
+                        for _, row in table.iterrows():
+                            date_key = row["Date"].strftime("%Y-%m-%d")
+                            if date_key in missing_spy_dates:
+                                spy_new[date_key] = round(float(row["Close"]), 2)
+                    except Exception as fallback_err:
+                        print(f"[SPY Cache] Historical fallback failed: {fallback_err}")
+
+                missing_spx_dates = [d for d in missing_dates if d not in spx_new]
+                if missing_spx_dates:
+                    try:
+                        fred_url = (
+                            "https://fred.stlouisfed.org/graph/fredgraph.csv"
+                            f"?id=SP500&cosd={min(missing_spx_dates)}&coed={max(missing_spx_dates)}"
+                        )
+                        response = requests.get(fred_url, timeout=15)
+                        response.raise_for_status()
+                        fred_data = pd.read_csv(StringIO(response.text))
+                        for _, row in fred_data.iterrows():
+                            date_key = str(row["observation_date"])
+                            if date_key in missing_spx_dates and not pd.isna(row["SP500"]):
+                                spx_new[date_key] = round(float(row["SP500"]), 2)
+                    except Exception as fallback_err:
+                        print(f"[SPX Cache] FRED fallback failed: {fallback_err}")
+
+                missing_vix_dates = [
+                    d for d in missing_dates
+                    if d not in vix_new or vix_new[d] is None or pd.isna(vix_new[d])
+                ]
+                if missing_vix_dates:
+                    try:
+                        response = requests.get(
+                            "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+                            timeout=15,
+                        )
+                        response.raise_for_status()
+                        vix_new.update(
+                            _extract_cboe_vix_closes(response.text, missing_vix_dates)
+                        )
+                    except Exception as fallback_err:
+                        print(f"[VIX Cache] Cboe historical fallback failed: {fallback_err}")
+
+                print(f"[SPY/SPX/VIX Cache] Fetched {len(spy_new)} SPY, {len(spx_new)} SPX and {len(vix_new)} VIX prices.")
                 _price_cache["SPY"].update(spy_new)
+                _price_cache["SPX"].update(spx_new)
                 _price_cache["VIX"].update(vix_new)
 
                 # Save updated cache
@@ -3063,19 +3460,22 @@ class Accounts:
                     with open(_PRICE_CACHE_FILE, 'w') as _cf:
                         json.dump(_price_cache, _cf)
                 except Exception as _save_err:
-                    print(f"[SPY/VIX Cache] Warning: could not save cache: {_save_err}")
+                    print(f"[SPY/SPX/VIX Cache] Warning: could not save cache: {_save_err}")
             else:
-                print(f"[SPY/VIX Cache] All {len(clean_dates)} dates served from cache.")
+                print(f"[SPY/SPX/VIX Cache] All {len(clean_dates)} dates served from cache.")
 
             # Build a date-keyed lookup; chart arrays will be aligned later to price_dates
             _spy_cache_map = _price_cache["SPY"]
+            _spx_cache_map = _price_cache["SPX"]
             _vix_cache_map = _price_cache["VIX"]
-            _spy_vix_count = sum(1 for d in clean_dates if d in _spy_cache_map)
+            _spy_count = sum(1 for d in clean_dates if d in _spy_cache_map)
+            _spx_count = sum(1 for d in clean_dates if d in _spx_cache_map)
             _vix_count = sum(1 for d in clean_dates if d in _vix_cache_map)
-            print(f"[SPY/VIX Chart] Loaded {_spy_vix_count} SPY and {_vix_count} VIX data points.")
+            print(f"[SPY/SPX/VIX Chart] Loaded {_spy_count} SPY, {_spx_count} SPX and {_vix_count} VIX data points.")
         except Exception as yf_err:
-            print(f"[SPY/VIX Chart] Could not fetch closing prices: {yf_err}")
+            print(f"[SPY/SPX/VIX Chart] Could not fetch closing prices: {yf_err}")
             _spy_cache_map = {}
+            _spx_cache_map = {}
             _vix_cache_map = {}
             # Ensure safe fallback for today's date if exception occurred
             try:
@@ -3087,17 +3487,27 @@ class Accounts:
         # Build Chart.js HTML section
         raw_prices_html = ""
         if chart_dates:
-            # Price Chart should use the ALREADY FILTERED chart_dates and chart_prices
-            # Filter the date arrays so the first chart only spans from where Total Option Price begins
+            # Filter all tracking arrays to start at 2025-05-01 to avoid pre-May margin spikes
             first_valid_idx = 0
-            for i, v in enumerate(chart_prices):
-                if v is not None:
+            for i, d in enumerate(chart_dates):
+                clean_d = d.replace(' (Live)', '')
+                if clean_d >= "2025-05-01":
                     first_valid_idx = i
                     break
                     
-            price_dates = chart_dates[first_valid_idx:]
-            price_values = chart_prices[first_valid_idx:]
+            chart_dates = chart_dates[first_valid_idx:]
+            chart_prices = chart_prices[first_valid_idx:]
+            chart_margins = chart_margins[first_valid_idx:]
+            chart_cash_flows = chart_cash_flows[first_valid_idx:]
+            chart_realized_gains = chart_realized_gains[first_valid_idx:]
             
+            price_dates = chart_dates
+            price_values = []
+            last_price_value = None
+            for value in chart_prices:
+                if value is not None:
+                    last_price_value = value
+                price_values.append(last_price_value)
             # Diagnostic for raw price data table (optional, showing filtered)
             raw_prices_html = "<h3>Filtered Total Option Price Data</h3><div style='max-height: 200px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; font-family: monospace; font-size: 12px;'>"
             for d, v in zip(price_dates, price_values):
@@ -3112,27 +3522,30 @@ class Accounts:
             except Exception:
                 pass
 
-            # Align SPY/VIX closes to the same price_dates used for the chart x-axis
+            # Align SPY/SPX/VIX closes to the same price_dates used for the chart x-axis
             spy_closes = []
+            spx_closes = []
             vix_closes = []
             for d in price_dates:
                 clean_d = d.replace(' (Live)', '')
                 s_val = _spy_cache_map.get(clean_d)
+                x_val = _spx_cache_map.get(clean_d)
                 v_val = _vix_cache_map.get(clean_d)
+                s_missing = s_val is None or pd.isna(s_val)
+                x_missing = x_val is None or pd.isna(x_val)
                 
-                # Fallback for SPY price if yfinance hasn't updated yet for the most recent points
-                # Use fallback if:
-                # 1. It's within the last 5 dates in price_dates (likely recent days)
-                # 2. It matches today's date string (cache version)
-                # 3. It's explicitly marked as "(Live)"
-                is_recent = (d in price_dates[-5:])
+                # A live portfolio quote is valid only for today's point.  Using it
+                # for a missing historical close makes several days look flat.
                 is_today = (clean_d == today_str_cache)
                 is_live = (' (Live)' in d)
                 
-                if s_val is None and (is_recent or is_today or is_live):
+                if s_missing and (is_today or is_live):
+                    if live_index_prices.get("SPY"):
+                        s_val = live_index_prices["SPY"]
+                        print(f"[SPY Align] Using live quote for {clean_d}: ${s_val}")
                     try:
                         # Search for SPY in the position list to get latest underlying price
-                        if current_positions:
+                        if (s_val is None or pd.isna(s_val)) and current_positions:
                             for pos in current_positions:
                                 symbol = getattr(pos, 'symbol', '') or ''
                                 if symbol.upper() == 'SPY':
@@ -3144,27 +3557,308 @@ class Accounts:
                                     break
                     except Exception:
                         pass
-                
+
+                if x_missing and (is_today or is_live):
+                    if live_index_prices.get("SPX"):
+                        x_val = live_index_prices["SPX"]
+                        print(f"[SPX Align] Using live quote for {clean_d}: ${x_val}")
+                    try:
+                        # Search for SPX/SPXW in the position list to get latest underlying price
+                        if (x_val is None or pd.isna(x_val)) and current_positions:
+                            for pos in current_positions:
+                                symbol = _aggregate_option_symbol(getattr(pos, 'symbol', '') or '')
+                                if symbol == 'SPX':
+                                    fallback_val = getattr(pos, 'underlying_last_price', None)
+                                    if fallback_val:
+                                        x_val = round(float(fallback_val), 2)
+                                        print(f"[SPX Align] Using portfolio fallback for {clean_d}: ${x_val}")
+
+                                    break
+                    except Exception:
+                        pass
+
                 spy_closes.append(s_val)
+                spx_closes.append(x_val)
                 vix_closes.append(v_val)
+
+            # ===== EXTRACT ACTIVE SPX/SPXW SPREADS & BUILD DATASETS =====
+            from datetime import datetime as dt_exc, timedelta
+            today_str = dt_exc.now().strftime("%Y-%m-%d")
+            
+            active_spx_spreads = []
+            for item in screened_options:
+                if not item.get("is_spread"):
+                    continue
+                short_lot = item.get("short_lot")
+                long_lot = item.get("long_lot")
+                if not short_lot or not long_lot:
+                    continue
+                
+                sym = _aggregate_option_symbol(getattr(short_lot, "symbol", "") or "")
+                if sym != "SPX":
+                    continue
+                
+                # Extract opened date
+                opened_date_dt = getattr(short_lot, "date_acquired", None)
+                if not opened_date_dt:
+                    opened_date_dt = getattr(long_lot, "date_acquired", None)
+                
+                if opened_date_dt:
+                    if hasattr(opened_date_dt, "strftime"):
+                        opened_date = opened_date_dt.strftime("%Y-%m-%d")
+                    else:
+                        opened_date = str(opened_date_dt).split(" ")[0]
+                else:
+                    # Fallback: 14 days ago
+                    opened_date = (dt_exc.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+                    
+                # Extract expiration date
+                exp_date_dt = getattr(short_lot, "expiration_date", None)
+                if exp_date_dt:
+                    if hasattr(exp_date_dt, "strftime"):
+                        exp_date = exp_date_dt.strftime("%Y-%m-%d")
+                    else:
+                        exp_date = str(exp_date_dt).split(" ")[0]
+                else:
+                    continue
+                    
+                s_strike = _as_num(getattr(short_lot, "strike_price", 0.0), 0.0)
+                l_strike = _as_num(getattr(long_lot, "strike_price", 0.0), 0.0)
+                qty = item.get("pair_quantity", 1)
+                
+                # Net Delta of the spread
+                s_delta = _as_num(getattr(short_lot, "delta", 0.0), 0.0)
+                l_delta = _as_num(getattr(long_lot, "delta", 0.0), 0.0)
+                s_qty = int(getattr(short_lot, "quantity", 0) or 0)
+                l_qty = int(getattr(long_lot, "quantity", 0) or 0)
+                net_delta = (s_delta * s_qty) + (l_delta * l_qty)
+                
+                cp = getattr(short_lot, "call_put", "PUT")
+                
+                active_spx_spreads.append({
+                    "opened_date": opened_date,
+                    "expiration_date": exp_date,
+                    "short_strike": s_strike,
+                    "long_strike": l_strike,
+                    "quantity": qty,
+                    "net_delta": round(net_delta, 4),
+                    "call_put": cp,
+                    "gain_loss": item.get("pair_gain_loss", 0.0)
+                })
+
+            # Determine maximum future expiration date to extend timeline
+            max_future_exp = None
+            for spread in active_spx_spreads:
+                exp_str = spread["expiration_date"]
+                if exp_str > today_str:
+                    if not max_future_exp or exp_str > max_future_exp:
+                        max_future_exp = exp_str
+
+            # Generate extended labels array
+            extended_dates = list(price_dates)
+            if max_future_exp and max_future_exp > today_str:
+                end_date_obj = dt_exc.strptime(max_future_exp, "%Y-%m-%d")
+                curr_date_obj = dt_exc.strptime(today_str, "%Y-%m-%d") + timedelta(days=1)
+                while curr_date_obj <= end_date_obj:
+                    fut_str = curr_date_obj.strftime("%Y-%m-%d")
+                    is_trade_day = curr_date_obj.weekday() < 5  # Simple weekday check
+                    if is_trade_day:
+                        extended_dates.append(fut_str)
+                    curr_date_obj += timedelta(days=1)
+
+            # Re-align spx/vix/price data arrays with extended_dates (padding with None)
+            extended_spx_closes = []
+            extended_vix_closes = []
+            extended_price_values = []
+            
+            hist_spx_lookup = {d.replace(' (Live)', ''): val for d, val in zip(price_dates, spx_closes)}
+            hist_vix_lookup = {d.replace(' (Live)', ''): val for d, val in zip(price_dates, vix_closes)}
+            hist_price_lookup = {d.replace(' (Live)', ''): val for d, val in zip(price_dates, price_values)}
+            
+            for d in extended_dates:
+                clean_d = d.replace(' (Live)', '')
+                extended_spx_closes.append(hist_spx_lookup.get(clean_d, None))
+                extended_vix_closes.append(hist_vix_lookup.get(clean_d, None))
+                extended_price_values.append(hist_price_lookup.get(clean_d, None))
+
+            # ===== SCALE X-AXIS FOR SPREADS TIMELINE BASED ON OLDEST OPENED DATE =====
+            oldest_open_date = today_str
+            if active_spx_spreads:
+                oldest_open_date = min(s["opened_date"] for s in active_spx_spreads)
+                # Give a 2-day lookback buffer for nice visual padding on the left
+                try:
+                    buffer_dt = dt_exc.strptime(oldest_open_date, "%Y-%m-%d") - timedelta(days=2)
+                    oldest_open_date = buffer_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+                    
+            filtered_extended_dates = []
+            filtered_spx_closes = []
+            filtered_vix_closes = []
+            
+            for d, spx, vix in zip(extended_dates, extended_spx_closes, extended_vix_closes):
+                clean_d = d.split(' ')[0]
+                if clean_d >= oldest_open_date:
+                    filtered_extended_dates.append(d)
+                    filtered_spx_closes.append(spx)
+                    filtered_vix_closes.append(vix)
+                    
+            # Safe fallback if filtered array becomes empty
+            if not filtered_extended_dates:
+                filtered_extended_dates = extended_dates
+                filtered_spx_closes = extended_spx_closes
+                filtered_vix_closes = extended_vix_closes
+
+            # Build Javascript Position Datasets (using filtered timeline!)
+            js_position_datasets = []
+            for spread in active_spx_spreads:
+                s_strike = spread["short_strike"]
+                opened = spread["opened_date"]
+                expiry = spread["expiration_date"]
+                qty = spread["quantity"]
+                cp = spread["call_put"]
+                net_delta = spread["net_delta"]
+                
+                # Determine color based on net delta (PUT spread positive delta -> green, CALL spread negative delta -> red)
+                if net_delta >= 0:
+                    color_str = "rgba(16, 185, 129, 0.85)"  # Green
+                else:
+                    color_str = "rgba(239, 68, 68, 0.85)"   # Red
+                    
+                # Thickness scales with quantity, but let's make it much thinner and cleaner
+                thickness = min(3.5, 1.2 + qty * 0.15)
+                
+                # Build active dataset (solid horizontal line from opened_date to today_str)
+                active_data = []
+                for d in filtered_extended_dates:
+                    clean_d = d.split(' ')[0]
+                    if opened <= clean_d <= today_str:
+                        active_data.append(s_strike)
+                    else:
+                        active_data.append(None)
+                        
+                active_ds = {
+                    "label": f"SPX {cp} Short Strike {s_strike}",
+                    "data": active_data,
+                    "borderColor": color_str,
+                    "borderWidth": thickness,
+                    "hoverBorderWidth": thickness + 1.5,
+                    "fill": False,
+                    "pointRadius": 0,
+                    "pointHoverRadius": 4,
+                    "yAxisID": "y",  # Align with left Y-axis (SPX Price) in spySpreadsChart!
+                    "spanGaps": False,
+                    "positionDetails": spread
+                }
+                js_position_datasets.append(active_ds)
+                
+                # Build future extension dataset (dashed horizontal line from today_str to expiry)
+                ext_data = []
+                for d in filtered_extended_dates:
+                    clean_d = d.split(' ')[0]
+                    if today_str <= clean_d <= expiry:
+                        ext_data.append(s_strike)
+                    else:
+                        ext_data.append(None)
+                        
+                ext_ds = {
+                    "label": f"SPX {cp} Short Strike {s_strike} (Ext)",
+                    "data": ext_data,
+                    "borderColor": color_str,
+                    "borderWidth": thickness,
+                    "hoverBorderWidth": thickness + 1.5,
+                    "borderDash": [5, 5],
+                    "fill": False,
+                    "pointRadius": 0,
+                    "pointHoverRadius": 4,
+                    "yAxisID": "y",  # Align with left Y-axis (SPX Price) in spySpreadsChart!
+                    "spanGaps": False,
+                    "positionDetails": spread
+                }
+                js_position_datasets.append(ext_ds)
 
             # Diagnostic logging
             if len(price_dates) > 0:
-                print(f"[SPY/VIX Align] First: {price_dates[0]} -> SPY: {spy_closes[0]}, VIX: {vix_closes[0]}")
-                print(f"[SPY/VIX Align] Last:  {price_dates[-1]} -> SPY: {spy_closes[-1]}, VIX: {vix_closes[-1]}")
-                print(f"[SPY/VIX Align] Total Chart Points: {len(price_dates)} | Dataset Lengths -> Price: {len(price_values)}, SPY: {len(spy_closes)}, VIX: {len(vix_closes)}")
+                print(f"[SPX/VIX Align] First: {price_dates[0]} -> SPX: {spx_closes[0]}, VIX: {vix_closes[0]}")
+                print(f"[SPX/VIX Align] Last:  {price_dates[-1]} -> SPX: {spx_closes[-1]}, VIX: {vix_closes[-1]}")
+                print(f"[SPX/VIX Align] Spreads Zoomed Range: {filtered_extended_dates[0]} to {filtered_extended_dates[-1]} (Total: {len(filtered_extended_dates)} days)")
 
+
+            sync_status = cash_flow_sync.get("status")
+            sync_timestamp = (
+                cash_flow_sync.get("last_successful_at")
+                if sync_status == "error"
+                else cash_flow_sync.get("attempted_at")
+            )
+            if sync_timestamp:
+                try:
+                    sync_timestamp = (
+                        datetime.fromisoformat(sync_timestamp)
+                        .astimezone(pytz.timezone("US/Eastern"))
+                        .strftime("%b %d, %Y %I:%M %p ET")
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            if sync_status == "error":
+                sync_badge_color = "#b45309"
+                sync_badge_background = "#fffbeb"
+                sync_badge_border = "#f59e0b"
+                sync_badge_text = (
+                    "Cash-flow sync delayed; showing the last confirmed history"
+                    + (f" from {sync_timestamp}" if sync_timestamp else "")
+                    + "."
+                )
+            elif sync_status == "ok":
+                sync_badge_color = "#166534"
+                sync_badge_background = "#f0fdf4"
+                sync_badge_border = "#86efac"
+                sync_badge_text = (
+                    "Cash-flow orders synced"
+                    + (f" {sync_timestamp}" if sync_timestamp else "")
+                    + f" · {cash_flow_sync.get('orders_fetched', 0)} orders"
+                )
+            else:
+                sync_badge_color = "#475569"
+                sync_badge_background = "#f8fafc"
+                sync_badge_border = "#cbd5e1"
+                sync_badge_text = "Cash-flow sync status unavailable"
+
+            from html import escape as html_escape
+            sync_badge_text = html_escape(sync_badge_text)
 
             chart_html = f'''
             <div style="margin-bottom: 30px; max-width: 1200px;">
               <h2 style="margin-bottom: 15px;">SPY Benchmark Performance</h2>
+              <div style="display: flex; align-items: center; gap: 8px; margin: 0 0 12px 0; flex-wrap: wrap;">
+                <span style="font-size: 13px; font-weight: 600; color: #4b5563;">Time span:</span>
+                <button type="button" data-benchmark-range="1month" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">1month</button>
+                <button type="button" data-benchmark-range="3month" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">3month</button>
+                <button type="button" data-benchmark-range="1year" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">1year</button>
+              </div>
               <div style="position: relative; height: 400px; width: 100%;">
                 <canvas id="spyPriceChart"></canvas>
               </div>
             </div>
             
             <div style="margin-bottom: 30px; max-width: 1200px;">
-              <h2 style="margin-bottom: 15px;">SPY Cash Flow, Realized Gain & Margin</h2>
+              <h2 style="margin-bottom: 15px;">SPX Active Credit Spreads Timeline</h2>
+              <div style="position: relative; height: 600px; width: 100%;">
+                <canvas id="spySpreadsChart"></canvas>
+              </div>
+            </div>
+            
+            <div style="margin-bottom: 30px; max-width: 1200px;">
+              <h2 style="margin-bottom: 15px;">SPY/SPX/SPXW Cash Flow, Realized Gain & Margin</h2>
+              <div style="display: flex; align-items: center; gap: 8px; margin: 0 0 12px 0; flex-wrap: wrap;">
+                <span style="font-size: 13px; font-weight: 600; color: #4b5563;">Time span:</span>
+                <button type="button" data-cashflow-range="1month" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">1month</button>
+                <button type="button" data-cashflow-range="3month" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">3month</button>
+                <button type="button" data-cashflow-range="1year" style="padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #111827; cursor: pointer;">1year</button>
+              </div>
+              <div id="cashFlowSyncStatus" data-sync-status="{sync_status or 'unknown'}" style="display: inline-block; margin: 0 0 12px 0; padding: 6px 10px; border: 1px solid {sync_badge_border}; border-radius: 999px; background: {sync_badge_background}; color: {sync_badge_color}; font-size: 12px; font-weight: 600;">
+                {sync_badge_text}
+              </div>
               <div style="position: relative; height: 400px; width: 100%;">
                 <canvas id="spyChart"></canvas>
               </div>
@@ -3174,6 +3868,19 @@ class Accounts:
             <script>
               const labels = {json.dumps(chart_dates)};
               const priceLabels = {json.dumps(price_dates)};
+              const extendedLabels = {json.dumps(filtered_extended_dates)};
+              const benchmarkSeries = {{
+                labels: priceLabels,
+                optionValues: {json.dumps(price_values)},
+                spyCloses: {json.dumps(spy_closes)},
+                vixCloses: {json.dumps(vix_closes)}
+              }};
+              const cashFlowSeries = {{
+                labels: labels,
+                cashFlows: {json.dumps(chart_cash_flows)},
+                realizedGains: {json.dumps(chart_realized_gains)},
+                margins: {json.dumps(chart_margins)}
+              }};
               
               // Helper to generate monthly labels for X axis
               const xAxisTickCallback = function(value, index, ticks) {{
@@ -3203,15 +3910,97 @@ class Accounts:
                 }}
               }};
 
+              const parseBenchmarkDate = function(label) {{
+                const cleanLabel = String(label || '').split(' ')[0];
+                return new Date(`${{cleanLabel}}T00:00:00`);
+              }};
+
+              const filterBenchmarkSeries = function(rangeKey) {{
+                if (!benchmarkSeries.labels.length) {{
+                  return benchmarkSeries;
+                }}
+
+                const endDate = parseBenchmarkDate(benchmarkSeries.labels[benchmarkSeries.labels.length - 1]);
+                const cutoff = new Date(endDate.getTime());
+
+                if (rangeKey === '1month') {{
+                  cutoff.setMonth(cutoff.getMonth() - 1);
+                }} else if (rangeKey === '3month') {{
+                  cutoff.setMonth(cutoff.getMonth() - 3);
+                }} else if (rangeKey === '1year') {{
+                  cutoff.setFullYear(cutoff.getFullYear() - 1);
+                }}
+
+                const filtered = {{
+                  labels: [],
+                  optionValues: [],
+                  spyCloses: [],
+                  vixCloses: []
+                }};
+
+                benchmarkSeries.labels.forEach((label, idx) => {{
+                  const parsedDate = parseBenchmarkDate(label);
+                  if (!Number.isNaN(parsedDate.getTime()) && parsedDate >= cutoff) {{
+                    filtered.labels.push(label);
+                    filtered.optionValues.push(benchmarkSeries.optionValues[idx]);
+                    filtered.spyCloses.push(benchmarkSeries.spyCloses[idx]);
+                    filtered.vixCloses.push(benchmarkSeries.vixCloses[idx]);
+                  }}
+                }});
+
+	                return filtered.labels.length ? filtered : benchmarkSeries;
+	              }};
+
+              const filterCashFlowSeries = function(rangeKey) {{
+                if (!cashFlowSeries.labels.length) {{
+                  return cashFlowSeries;
+                }}
+
+                const endDate = parseBenchmarkDate(cashFlowSeries.labels[cashFlowSeries.labels.length - 1]);
+                const cutoff = new Date(endDate.getTime());
+
+                if (rangeKey === '1month') {{
+                  cutoff.setMonth(cutoff.getMonth() - 1);
+                }} else if (rangeKey === '3month') {{
+                  cutoff.setMonth(cutoff.getMonth() - 3);
+                }} else if (rangeKey === '1year') {{
+                  cutoff.setFullYear(cutoff.getFullYear() - 1);
+                }}
+
+                const filtered = {{
+                  labels: [],
+                  cashFlows: [],
+                  realizedGains: [],
+                  margins: []
+                }};
+
+                cashFlowSeries.labels.forEach((label, idx) => {{
+                  const parsedDate = parseBenchmarkDate(label);
+                  if (!Number.isNaN(parsedDate.getTime()) && parsedDate >= cutoff) {{
+                    filtered.labels.push(label);
+                    filtered.cashFlows.push(cashFlowSeries.cashFlows[idx]);
+                    filtered.realizedGains.push(cashFlowSeries.realizedGains[idx]);
+                    filtered.margins.push(cashFlowSeries.margins[idx]);
+                  }}
+                }});
+
+                return filtered.labels.length ? filtered : cashFlowSeries;
+              }};
+
+              const defaultBenchmarkRange = '1month';
+              const initialBenchmarkSeries = filterBenchmarkSeries(defaultBenchmarkRange);
+              const defaultCashFlowRange = '1year';
+              const initialCashFlowSeries = filterCashFlowSeries(defaultCashFlowRange);
+
               // --- Chart 1: Total Option Price ---
               const priceCtx = document.getElementById('spyPriceChart').getContext('2d');
-              new Chart(priceCtx, {{
+              const benchmarkChart = new Chart(priceCtx, {{
                 type: 'line',
                 data: {{
-                  labels: priceLabels,
+                  labels: initialBenchmarkSeries.labels,
                   datasets: [{{
-                    label: 'Total Option Price ($)',
-                    data: {json.dumps(price_values)},
+                    label: 'SPY + SPX Option Value ($)',
+                    data: initialBenchmarkSeries.optionValues,
                     borderColor: 'rgb(54, 162, 235)',
                     backgroundColor: 'rgba(54, 162, 235, 0.1)',
                     fill: true,
@@ -3220,7 +4009,7 @@ class Accounts:
                   }},
                   {{
                     label: 'SPY Close ($)',
-                    data: {json.dumps(spy_closes)},
+                    data: initialBenchmarkSeries.spyCloses,
                     borderColor: 'rgb(34, 139, 34)',
                     backgroundColor: 'rgba(34, 139, 34, 0.05)',
                     fill: false,
@@ -3232,7 +4021,7 @@ class Accounts:
                   }},
                   {{
                     label: 'VIX Close',
-                    data: {json.dumps(vix_closes)},
+                    data: initialBenchmarkSeries.vixCloses,
                     borderColor: 'rgb(255, 140, 0)',
                     backgroundColor: 'rgba(255, 140, 0, 0.05)',
                     fill: false,
@@ -3249,7 +4038,7 @@ class Accounts:
                   maintainAspectRatio: false,
                   interaction: {{ mode: 'index', intersect: false }},
                   plugins: {{
-                    title: {{ display: true, text: 'SPY Options: Total Portfolio Value' }},
+                    title: {{ display: true, text: 'SPY + SPX Options: Total Portfolio Value' }},
                     tooltip: {{
                       callbacks: {{
                         label: function(ctx) {{
@@ -3267,7 +4056,7 @@ class Accounts:
                       position: 'left',
                       beginAtZero: false,
                       grace: '5%',
-                      title: {{ display: true, text: 'Option Price ($)', color: 'rgb(54, 162, 235)' }},
+                      title: {{ display: true, text: 'Option Portfolio Value ($)', color: 'rgb(54, 162, 235)' }},
                       ticks: {{ callback: (v) => '$' + v.toLocaleString(), color: 'rgb(54, 162, 235)' }}
                     }},
                     y1: {{
@@ -3290,25 +4079,137 @@ class Accounts:
                 }}
               }});
 
-              // --- Chart 2: Cash Flow, Gains & Margin ---
-              const mainCtx = document.getElementById('spyChart').getContext('2d');
-              new Chart(mainCtx, {{
+              const benchmarkRangeButtons = document.querySelectorAll('[data-benchmark-range]');
+              const setBenchmarkRange = function(rangeKey) {{
+                const filtered = filterBenchmarkSeries(rangeKey);
+                benchmarkChart.data.labels = filtered.labels;
+                benchmarkChart.data.datasets[0].data = filtered.optionValues;
+                benchmarkChart.data.datasets[1].data = filtered.spyCloses;
+                benchmarkChart.data.datasets[2].data = filtered.vixCloses;
+                benchmarkChart.update();
+                benchmarkRangeButtons.forEach((button) => {{
+                  const isActive = button.dataset.benchmarkRange === rangeKey;
+                  button.style.background = isActive ? '#1d4ed8' : '#f8fafc';
+                  button.style.borderColor = isActive ? '#1d4ed8' : '#cbd5e1';
+                  button.style.color = isActive ? '#ffffff' : '#111827';
+                }});
+              }};
+
+              benchmarkRangeButtons.forEach((button) => {{
+                button.addEventListener('click', () => setBenchmarkRange(button.dataset.benchmarkRange));
+              }});
+              setBenchmarkRange(defaultBenchmarkRange);
+
+              // --- Chart 2 (NEW): SPX Active Credit Spreads Timeline ---
+              const spreadsCtx = document.getElementById('spySpreadsChart').getContext('2d');
+              new Chart(spreadsCtx, {{
                 type: 'line',
                 data: {{
-                  labels: labels,
-                  datasets: [
-                    {{
-                      label: 'Cumulative Cash Flow ($)',
-                      data: {json.dumps(chart_cash_flows)},
+                  labels: extendedLabels,
+                  datasets: [{{
+                    label: 'SPX Close ($)',
+                    data: {json.dumps(filtered_spx_closes)},
+                    borderColor: 'rgb(34, 139, 34)',
+                    backgroundColor: 'rgba(34, 139, 34, 0.05)',
+                    fill: false,
+                    tension: 0.2,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: true,
+                    yAxisID: 'y'
+                  }},
+                  {{
+                    label: 'VIX Close',
+                    data: {json.dumps(filtered_vix_closes)},
+                    borderColor: 'rgb(255, 140, 0)',
+                    backgroundColor: 'rgba(255, 140, 0, 0.05)',
+                    fill: false,
+                    tension: 0.2,
+                    borderWidth: 1.5,
+                    borderDash: [5, 3],
+                    pointRadius: 0,
+                    spanGaps: true,
+                    yAxisID: 'y1'
+                  }}].concat({json.dumps(js_position_datasets)})
+                }},
+                options: {{
+                  responsive: true,
+                  maintainAspectRatio: false,
+                  interaction: {{ mode: 'nearest', intersect: false, axis: 'xy' }},
+                  plugins: {{
+                    legend: {{
+                      labels: {{
+                        filter: function(item, chart) {{
+                          return item.text === 'SPX Close ($)' || item.text === 'VIX Close';
+                        }}
+                      }}
+                    }},
+                    title: {{ display: true, text: 'Active SPX Credit Spreads vs Spot Price' }},
+                    tooltip: {{
+                      callbacks: {{
+                        label: function(ctx) {{
+                          const dataset = ctx.dataset;
+                          const val = ctx.parsed.y;
+                          if (val == null) return null;
+                          if (dataset.positionDetails) {{
+                            const details = dataset.positionDetails;
+                            return [
+                              dataset.label.replace(' (Ext)', ''),
+                              `  Short Strike: $${{details.short_strike}}`,
+                              `  Long Strike: $${{details.long_strike}}`,
+                              `  Quantity: ${{details.quantity}} pairs`,
+                              `  Net Delta: ${{details.net_delta}}`,
+                              `  Opened Date: ${{details.opened_date}}`,
+                              `  Expiration: ${{details.expiration_date}}`,
+                              `  Gain/Loss: ${{details.gain_loss}}%`
+                            ];
+                          }}
+                          if (ctx.dataset.yAxisID === 'y1') return ctx.dataset.label + ': ' + val.toFixed(2);
+                          return ctx.dataset.label + ': $' + val.toLocaleString('en-US', {{minimumFractionDigits: 2}});
+                        }}
+                      }}
+                    }}
+                  }},
+                  scales: {{
+                    x: commonXAxis,
+                    y: {{
+                      position: 'left',
+                      beginAtZero: false,
+                      grace: '5%',
+                      title: {{ display: true, text: 'SPX Price ($)', color: 'rgb(34, 139, 34)' }},
+                      ticks: {{ callback: (v) => '$' + v.toLocaleString(), color: 'rgb(34, 139, 34)' }}
+                    }},
+                    y1: {{
+                      position: 'right',
+                      beginAtZero: false,
+                      grace: '5%',
+                      title: {{ display: true, text: 'VIX Level', color: 'rgb(255, 140, 0)' }},
+                      ticks: {{ color: 'rgb(255, 140, 0)' }},
+                      grid: {{ drawOnChartArea: false }}
+                    }}
+                  }}
+                }}
+              }});
+
+	              // --- Chart 2: Cash Flow, Gains & Margin ---
+	              const mainCtx = document.getElementById('spyChart').getContext('2d');
+	              const cashFlowChart = new Chart(mainCtx, {{
+	                type: 'line',
+	                data: {{
+	                  labels: initialCashFlowSeries.labels,
+	                  datasets: [
+	                    {{
+	                      label: 'SPY/SPX/SPXW Cumulative Cash Flow ($)',
+	                      data: initialCashFlowSeries.cashFlows,
                       borderColor: 'rgb(75, 192, 92)',
                       backgroundColor: 'rgba(75, 192, 92, 0.1)',
                       fill: false,
                       tension: 0.2,
                       yAxisID: 'y'
                     }},
-                    {{
-                      label: 'Realized Gain ($)',
-                      data: {json.dumps(chart_realized_gains)},
+	                    {{
+	                      label: 'SPY/SPX/SPXW Realized Gain ($)',
+	                      data: initialCashFlowSeries.realizedGains,
                       borderColor: 'rgb(255, 159, 64)',
                       backgroundColor: 'rgba(255, 159, 64, 0.1)',
                       fill: false,
@@ -3316,13 +4217,14 @@ class Accounts:
                       borderDash: [5, 5],
                       yAxisID: 'y'
                     }},
-                    {{
-                      label: 'Total Margin Required ($)',
-                      data: {json.dumps(chart_margins)},
+	                    {{
+	                      label: 'SPY/SPX/SPXW Total Margin Required ($)',
+	                      data: initialCashFlowSeries.margins,
                       borderColor: 'rgb(255, 99, 132)',
                       backgroundColor: 'rgba(255, 99, 132, 0.1)',
                       fill: false,
                       tension: 0.2,
+                      spanGaps: false,
                       yAxisID: 'y1'
                     }}
                   ]
@@ -3332,7 +4234,7 @@ class Accounts:
                   maintainAspectRatio: false,
                   interaction: {{ mode: 'index', intersect: false }},
                   plugins: {{
-                    title: {{ display: true, text: 'SPY Options: Performance & Risk' }},
+                    title: {{ display: true, text: 'SPY/SPX/SPXW Options: Performance & Risk' }},
                     tooltip: {{
                       callbacks: {{
                         label: (ctx) => ctx.dataset.label + ': $' + ctx.parsed.y.toLocaleString('en-US', {{minimumFractionDigits: 2}})
@@ -3343,19 +4245,40 @@ class Accounts:
                     x: commonXAxis,
                     y: {{
                       position: 'left',
-                      title: {{ display: true, text: 'Cash Flow / Gains ($)' }},
+                      title: {{ display: true, text: 'SPY/SPX/SPXW Cash Flow / Gains ($)' }},
                       ticks: {{ callback: (v) => '$' + v.toLocaleString() }}
                     }},
                     y1: {{
                       position: 'right',
-                      title: {{ display: true, text: 'Margin Required ($)' }},
+                      title: {{ display: true, text: 'SPY/SPX/SPXW Margin Required ($)' }},
                       ticks: {{ callback: (v) => '$' + v.toLocaleString() }},
                       grid: {{ drawOnChartArea: false }}
                     }}
-                  }}
-                }}
+	                  }}
+	                }}
+	              }});
+
+              const cashFlowRangeButtons = document.querySelectorAll('[data-cashflow-range]');
+              const setCashFlowRange = function(rangeKey) {{
+                const filtered = filterCashFlowSeries(rangeKey);
+                cashFlowChart.data.labels = filtered.labels;
+                cashFlowChart.data.datasets[0].data = filtered.cashFlows;
+                cashFlowChart.data.datasets[1].data = filtered.realizedGains;
+                cashFlowChart.data.datasets[2].data = filtered.margins;
+                cashFlowChart.update();
+                cashFlowRangeButtons.forEach((button) => {{
+                  const isActive = button.dataset.cashflowRange === rangeKey;
+                  button.style.background = isActive ? '#1d4ed8' : '#f8fafc';
+                  button.style.borderColor = isActive ? '#1d4ed8' : '#cbd5e1';
+                  button.style.color = isActive ? '#ffffff' : '#111827';
+                }});
+              }};
+
+              cashFlowRangeButtons.forEach((button) => {{
+                button.addEventListener('click', () => setCashFlowRange(button.dataset.cashflowRange));
               }});
-            </script>
+              setCashFlowRange(defaultCashFlowRange);
+	            </script>
             '''
         else:
             chart_html = '<p style="color: #666; margin-bottom: 20px;"><em>No SPY tracking history available yet. Data will appear after the first portfolio refresh.</em></p>'
@@ -3416,56 +4339,215 @@ class Accounts:
                 }
               }
 
-              async function closePosition(symbol, expiry, cp, short_strike, long_strike, btn) {
-                const row = btn.closest('tr');
-                const qtyInput = row.querySelector('input[type="number"]');
+            </script>
+        '''
+
+        close_button_script_html = '''
+            <script>
+              function resetCloseButton(btn) {
+                btn.disabled = false;
+                btn.textContent = btn.dataset.defaultLabel || 'Review Close';
+              }
+
+              function getDashboardPin() {
+                try {
+                  if (window.parent && window.parent !== window && window.parent.location.origin === window.location.origin) {
+                    return window.parent.currentDashboardPin || '';
+                  }
+                } catch (error) {
+                  console.warn('Unable to read the dashboard PIN from the parent page.', error);
+                }
+                return sessionStorage.getItem('dashboard_pin') || '';
+              }
+
+              function invalidateDashboardPin() {
+                sessionStorage.removeItem('dashboard_pin');
+                try {
+                  if (window.parent && window.parent !== window && window.parent.location.origin === window.location.origin && typeof window.parent.clearPin === 'function') {
+                    window.parent.clearPin();
+                  }
+                } catch (error) {
+                  console.warn('Unable to reset the dashboard PIN in the parent page.', error);
+                }
+              }
+
+              async function pollCloseStatus(requestId, btn) {
+                const endpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/status' : '/api/status';
+                for (let i = 0; i < 90; i++) {
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  try {
+                    const response = await fetch(endpoint);
+                    if (!response.ok) continue;
+                    const status = await response.json();
+                    const requests = (status.manual_orders && status.manual_orders.requests) || [];
+                    const manual = requests.find(r => r.request_id === requestId) || {};
+                    if (!manual.request_id) continue;
+                    const label = manual.status || 'queued';
+                    btn.innerHTML = label;
+                    if (manual.status === 'failed') {
+                      resetCloseButton(btn);
+                      alert('❌ Close failed: ' + (manual.message || 'Unknown error'));
+                      return;
+                    }
+                    if (manual.status === 'placed' || manual.status === 'filled') {
+                      alert('✅ ' + (manual.message || 'Close order submitted'));
+                      window.location.reload();
+                      return;
+                    }
+                  } catch (err) {
+                    console.error('Close status poll failed', err);
+                  }
+                }
+                btn.innerHTML = 'Pending';
+              }
+
+              async function closePosition(symbol, expiry, cp, short_strike, long_strike, btn, position_qty = null) {
+                const actionContainer = btn.closest('[data-close-position-container], tr');
+                const qtyInput = actionContainer.querySelector('input[type="number"]');
                 const quantity = qtyInput.value;
-                
+
+                btn.dataset.defaultLabel = btn.dataset.defaultLabel || btn.textContent.trim() || 'Review Close';
+                let pin = getDashboardPin();
+                if (!pin && window.parent === window) {
+                  pin = window.prompt('Enter the dashboard PIN to review this close order:');
+                }
+                if (!pin) {
+                  resetCloseButton(btn);
+                  return;
+                }
+
+                const requestPayload = {
+                  pin,
+                  symbol,
+                  expiry,
+                  cp,
+                  sell_strike: short_strike,
+                  long_strike,
+                  quantity,
+                  position_qty
+                };
+
+                btn.disabled = true;
+                btn.textContent = 'Checking…';
+
+                try {
+                  const reviewEndpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/review_close_position' : '/api/review_close_position';
+                  const reviewResponse = await fetch(reviewEndpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestPayload)
+                  });
+                  const reviewResult = await reviewResponse.json();
+                  if (!reviewResponse.ok) {
+                    resetCloseButton(btn);
+                    if (reviewResponse.status === 403) invalidateDashboardPin();
+                    alert('❌ Error: ' + (reviewResult.error || 'Unable to review close order'));
+                    return;
+                  }
+                } catch (err) {
+                  resetCloseButton(btn);
+                  alert('❌ Connection Error: ' + err.message);
+                  return;
+                }
+
+                resetCloseButton(btn);
                 let msg = `Are you sure you want to CLOSE ${quantity} contracts of ${symbol} ${expiry} ${cp} ${short_strike}`;
                 if (long_strike) {
-                    msg += ` / ${long_strike} SPREAD`;
+                  msg += ` / ${long_strike} SPREAD`;
                 }
                 msg += ` using MID PRICE?`;
 
                 if (!confirm(msg)) {
-                    return;
+                  return;
                 }
-                
+
                 btn.disabled = true;
-                btn.innerHTML = '...';
-                
+                btn.textContent = '...';
+
                 try {
-                    const pin = localStorage.getItem('dashboard_pin') || (window.parent && window.parent.currentPin);
                     const endpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/close_position' : '/api/close_position';
                     const response = await fetch(endpoint, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ 
-                            pin,
-                            symbol, 
-                            expiry, 
-                            cp, 
-                            sell_strike: short_strike, 
-                            long_strike: long_strike,
-                            quantity 
-                        })
+                        body: JSON.stringify(requestPayload)
                     });
                     
                     const result = await response.json();
                     if (response.ok) {
-                        alert('✅ Success: ' + result.message);
-                        window.location.reload();
+                        btn.innerHTML = 'Queued';
+                        if (result.request_id) {
+                            pollCloseStatus(result.request_id, btn);
+                        } else {
+                            alert('✅ Success: ' + result.message);
+                            window.location.reload();
+                        }
                     } else {
+                        resetCloseButton(btn);
+                        if (response.status === 403) invalidateDashboardPin();
                         alert('❌ Error: ' + result.error);
-                        btn.disabled = false;
-                        btn.innerHTML = 'Close';
                     }
                 } catch (err) {
+                    resetCloseButton(btn);
                     alert('❌ Connection Error: ' + err.message);
-                    btn.disabled = false;
-                    btn.innerHTML = 'Close';
                 }
               }
+
+              window.pollCloseStatus = pollCloseStatus;
+              window.closePosition = closePosition;
+              document.documentElement.dataset.closePositionReady = '1';
+              document.addEventListener('click', (event) => {
+                const btn = event.target.closest('button[data-close-position="1"]');
+                if (!btn) return;
+                closePosition(
+                  btn.dataset.symbol,
+                  btn.dataset.expiry,
+                  btn.dataset.cp,
+                  btn.dataset.shortStrike,
+                  btn.dataset.longStrike || null,
+                  btn,
+                  btn.dataset.positionQty === undefined ? null : Number(btn.dataset.positionQty)
+                );
+              });
+            </script>
+        '''
+
+        market_close_auto_reload_html = '''
+            <script>
+              (function scheduleMarketCloseReload() {
+                const storageKey = 'screened-option-pairs-market-close-reload';
+
+                function easternParts(now) {
+                  const parts = new Intl.DateTimeFormat('en-US', {
+                    timeZone: 'America/New_York',
+                    weekday: 'short',
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false
+                  }).formatToParts(now);
+                  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+                }
+
+                function maybeReloadForClose() {
+                  const parts = easternParts(new Date());
+                  if (parts.weekday === 'Sat' || parts.weekday === 'Sun') return;
+                  const hour = Number(parts.hour);
+                  const minute = Number(parts.minute);
+                  const inPostCloseWindow = hour === 16 && minute >= 6 && minute <= 45;
+                  if (!inPostCloseWindow) return;
+
+                  const bucket = Math.floor(minute / 5);
+                  const reloadToken = `${parts.year}-${parts.month}-${parts.day}-${hour}-${bucket}`;
+                  if (localStorage.getItem(storageKey) === reloadToken) return;
+                  localStorage.setItem(storageKey, reloadToken);
+                  window.location.reload();
+                }
+
+                maybeReloadForClose();
+                window.setInterval(maybeReloadForClose, 60000);
+              })();
             </script>
         '''
 
@@ -3474,22 +4556,25 @@ class Accounts:
         <html>
           <head>
             <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
             <title>{html.escape(title)}</title>
             {style}
           </head>
           <body>
             <h1>{html.escape(title)}</h1>
             {refresh_button_html if show_refresh else ""}
-            {chart_html}
-            {raw_prices_html}
-            <div class="table-container">
-              <table>
-                <thead><tr>{head_cols}</tr></thead>
-                <tbody>
-                  {''.join(rows_html)}
-                </tbody>
+            {close_button_script_html}
+            {market_close_auto_reload_html}
+            <div class="position-groups" aria-label="Option positions grouped by ticker">
+              {position_groups_html}
+            </div>
+            <div class="portfolio-summary">
+              <table class="summary-table" aria-label="Portfolio totals">
+                <tbody>{''.join(rows_html)}</tbody>
               </table>
             </div>
+            <div class="desktop-analytics">{chart_html}</div>
+            <div class="diagnostic-data">{raw_prices_html}</div>
             {tracker_summary_html}
           </body>
         </html>
@@ -3652,9 +4737,11 @@ class Accounts:
             print("Failed to retrieve option price from E*TRADE API.")
             return None
 
+        contract_symbol = getattr(self, "_last_option_price_symbol", symbol)
+
         # Step 3: Create and return a StockPosition object with the option details
         stock_position = StockPosition(
-            symbol=symbol,
+            symbol=contract_symbol,
             quantity=1,  # Set default quantity as 1, or adjust based on requirements
             last_price=option_price,
             price_paid=option_price,
@@ -5274,7 +6361,7 @@ class Accounts:
         # Return 0 if no matching position is found
         return 0
 
-    def get_option_spread_by_price(self, ticker, call_put, days_to_expire, target_premium, hedge_ratio, hedge_spread = None, qty=1, target_delta = None):
+    def get_option_spread_by_price(self, ticker, call_put, days_to_expire, target_premium, hedge_ratio, hedge_spread = None, qty=1, target_delta = None, target_expiration = None):
         stock_price = self.get_stock_price(ticker)
         if stock_price is None:
             print("Failed to retrieve stock price.")
@@ -5287,22 +6374,21 @@ class Accounts:
             return None
         
         today = datetime.today().date()
-        target_expire = pd.Timestamp(today + pd.Timedelta(days=days_to_expire))
+        if target_expiration is not None:
+            if isinstance(target_expiration, str):
+                target_expiration = datetime.strptime(target_expiration, "%Y-%m-%d").date()
+        else:
+            target_expire = pd.Timestamp(today + pd.Timedelta(days=days_to_expire))
 
-        available_expirations = self.get_available_expirations(ticker)
-        if not available_expirations:
-            print("No available expiration dates for options.", ticker)
-            return None
-        
-        available_expirations = [datetime.strptime(exp, "%Y-%m-%d").date() if isinstance(exp, str) else exp for exp in available_expirations]
-
-        filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()]
-        if filtered_expirations[0] != target_expire.date():
-            filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()-timedelta(days=7)] #fall back to the previous friday if not available
-            if filtered_expirations[0] != target_expire.date()-timedelta(days=7):
-                filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()-timedelta(days=8)] #fall back to the previous thursday if previous friday is not available either
-        
-        target_expiration = filtered_expirations[0]
+            available_expirations = self.get_available_expirations(ticker)
+            if not available_expirations:
+                print("No available expiration dates for options.", ticker)
+                return None
+            
+            target_expiration = _select_nearest_expiration(available_expirations, target_expire.date())
+            if target_expiration is None:
+                print("No available future expiration dates for options.", ticker)
+                return None
 
         url = f"{self.base_url}/v1/market/optionchains.json"
 
@@ -5327,6 +6413,24 @@ class Accounts:
         data = response.json()
 
         option_pairs = data.get("OptionChainResponse", {}).get("OptionPair", [])
+
+        # Ensure consistency in option contract types for SPX (SPX vs SPXW)
+        has_spxw = False
+        if ticker == "SPX" and option_pairs:
+            has_spxw = any(
+                pair.get(call_put, {}).get("osiKey", "").startswith("SPXW")
+                for pair in option_pairs if pair.get(call_put)
+            )
+            if has_spxw:
+                option_pairs = [
+                    pair for pair in option_pairs
+                    if pair.get(call_put) and pair.get(call_put, {}).get("osiKey", "").startswith("SPXW")
+                ]
+            else:
+                option_pairs = [
+                    pair for pair in option_pairs
+                    if pair.get(call_put) and pair.get(call_put, {}).get("osiKey", "").startswith("SPX-")
+                ]
                 
         def get_option_by_price(target_price, call_put, buy_sell, strike_overwrite = None, target_delta = None):
             # Sort pairs first
@@ -5357,47 +6461,62 @@ class Accounts:
                 option_price = (options.get("bid", 0) + options.get("ask", 0)) / 2
                 strike = options.get("strikePrice")
                 volume = options.get("volume", 0) or 0
+                open_interest = options.get("openInterest", 0) or 0
                 ask_bid_spread = round(options.get("ask", 0) - options.get("bid", 0), 4)
                 delta = options.get("OptionGreeks", {}).get("delta", 0)
                 gamma = options.get("OptionGreeks", {}).get("gamma", 0)
                 osi_key = options.get("osiKey")
+                contract_symbol = _symbol_from_osi_key(ticker, osi_key)
 
                 if osi_key:
                     expiry_date_str = osi_key[6:12]
                     expiry_date = datetime.strptime(expiry_date_str, "%y%m%d").date()
 
+                # Convert E*TRADE standard delta to N(d2) risk-neutral probability
+                redefined_delta = delta
+                if delta != 0:
+                    try:
+                        iv = options.get("OptionGreeks", {}).get("iv", 0)
+                        dte_days = (expiry_date - today).days
+                        redefined_delta = convert_standard_to_nd2_delta(delta, iv, dte_days, call_put)
+                    except Exception as e:
+                        redefined_delta = delta
+
                 if target_delta is not None:
                     # Target delta search (e.g. 0.15)
                     # Automatically handle signs: Calls are positive, Puts are negative
                     effective_target = abs(target_delta) if call_put == "Call" else -abs(target_delta)
-                    price_diff = abs(delta - effective_target)
+                    price_diff = abs(redefined_delta - effective_target)
                 else:
                     # Target price search
                     price_diff = abs(option_price - target_price)
                 
-                if price_diff < min_price_diff and volume > 0 and options.get("bid",0) > 0 and options.get("ask",0) > 0:
+                if price_diff < min_price_diff and (open_interest > 0 or volume > 0) and options.get("bid",0) > 0 and options.get("ask",0) > 0:
                     if ( strike > stock_price and call_put == "Call" ) or ( strike < stock_price and call_put == "Put" ):
                         min_price_diff = price_diff
                         candidate = {
+                            "symbol": contract_symbol,
                             "strikePrice": strike,
                             "optionPrice": option_price,
                             "volume": volume,
+                            "openInterest": open_interest,
                             "ask_bid_spread": ask_bid_spread,
                             "expiryDate": expiry_date,
                             "distance": round((strike - stock_price)/stock_price * 100,2),
-                            "delta": round(delta, 4),
+                            "delta": round(redefined_delta, 4),
                             "gamma": round(gamma, 4)
                         }
                 if strike_overwrite is not None:
                     if previous_strike and ( ( call_put == 'Put' and previous_strike >= strike_overwrite >= strike ) or ( call_put == 'Call' and previous_strike <= strike_overwrite <= strike ) ):
                         candidate = {
+                            "symbol": contract_symbol,
                             "strikePrice": strike,
                             "optionPrice": option_price,
                             "volume": volume,
                             "ask_bid_spread": ask_bid_spread,
                             "expiryDate": expiry_date,
                             "distance": round((strike - stock_price)/stock_price * 100,2),
-                            "delta": round(delta, 4),
+                            "delta": round(redefined_delta, 4),
                             "gamma": round(gamma, 4)
                         }
                         break
@@ -5424,6 +6543,50 @@ class Accounts:
             return candidate
 
         sell_option = get_option_by_price(target_premium, call_put, "sell", target_delta=target_delta)
+        
+        # Check if the selected sell option is at the very edge of the returned strikes, 
+        # which indicates the target strike was cut off by E*TRADE's strike limit.
+        if sell_option is not None and target_delta is not None:
+            strikes = [p.get(call_put, {}).get("strikePrice") for p in option_pairs if p.get(call_put)]
+            if strikes:
+                min_strike = min(strikes)
+                max_strike = max(strikes)
+                
+                is_boundary = (call_put == "Put" and sell_option["strikePrice"] == min_strike) or \
+                              (call_put == "Call" and sell_option["strikePrice"] == max_strike)
+                
+                effective_target = abs(target_delta) if call_put == "Call" else -abs(target_delta)
+                deviates_significantly = abs(sell_option["delta"] - effective_target) > 0.015
+                
+                if is_boundary and deviates_significantly:
+                    print(f"Sell option strike {sell_option['strikePrice']} is at the boundary ({min_strike}/{max_strike}) and deviates from target delta {target_delta} (actual: {sell_option['delta']}). Re-fetching centered further out...")
+                    
+                    # Shift center by 3% to keep it centered close to the boundary
+                    estimated_center = sell_option["strikePrice"] * 0.97 if call_put == "Put" else sell_option["strikePrice"] * 1.03
+                    
+                    sec_params = params.copy()
+                    sec_params["strikePriceNear"] = estimated_center
+                    sec_params["noOfStrikes"] = 200
+                    sec_response = self.session.get(url, params=sec_params, auth=self.session.auth)
+                    if sec_response.status_code == 200:
+                        sec_data = sec_response.json()
+                        sec_pairs = sec_data.get("OptionChainResponse", {}).get("OptionPair", [])
+                        
+                        if ticker == "SPX" and sec_pairs:
+                            if has_spxw:
+                                sec_pairs = [p for p in sec_pairs if p.get(call_put) and p.get(call_put, {}).get("osiKey", "").startswith("SPXW")]
+                            else:
+                                sec_pairs = [p for p in sec_pairs if p.get(call_put) and p.get(call_put, {}).get("osiKey", "").startswith("SPX-")]
+                        
+                        if sec_pairs:
+                            original_option_pairs = option_pairs
+                            option_pairs = sec_pairs
+                            better_sell_option = get_option_by_price(target_premium, call_put, "sell", target_delta=target_delta)
+                            if better_sell_option is not None:
+                                print(f"Found better sell option after boundary shift: {better_sell_option['strikePrice']} (delta: {better_sell_option['delta']})")
+                                sell_option = better_sell_option
+                            else:
+                                option_pairs = original_option_pairs
         if sell_option is not None:
             print(f"Sell {call_put} option for {ticker} price now: ${stock_price} strike {sell_option['strikePrice']} price {sell_option['optionPrice']:.4f}, volume {sell_option['volume']}, delta {sell_option['delta']} ask_bid_spread {sell_option['ask_bid_spread']:.4f} expire {sell_option['expiryDate']}")
             if target_delta is None and (1.5 < sell_option['optionPrice'] / target_premium < 0.5):
@@ -5431,9 +6594,9 @@ class Accounts:
                 return None
         else:
             return None
-        
+	        
         sell_position = StockPosition(
-            symbol=ticker,
+            symbol=sell_option.get("symbol", ticker),
             quantity=qty,
             last_price=sell_option['optionPrice']
         )
@@ -5441,6 +6604,7 @@ class Accounts:
         sell_position.expiration_date = sell_option['expiryDate']
         sell_position.call_put = call_put
         sell_position.distance_to_strike = sell_option['distance']
+        sell_position.delta = sell_option.get('delta')
 
         if hedge_ratio == 1 and hedge_spread is None:
             print(f"No hedge planned")
@@ -5454,14 +6618,49 @@ class Accounts:
                     buy_strike_target = sell_option['strikePrice'] + hedge_spread
                 if call_put == "Put":
                     buy_strike_target = sell_option['strikePrice'] - hedge_spread
-                buy_option = get_option_by_price(target_premium / hedge_ratio,call_put, "buy",strike_overwrite=buy_strike_target)
+                
+                # Check if target strike is likely out of range of current option_pairs
+                non_empty_strikes = [p.get(call_put, {}).get("strikePrice") for p in option_pairs if p.get(call_put)]
+                if non_empty_strikes:
+                    min_strike = min(non_empty_strikes)
+                    max_strike = max(non_empty_strikes)
+                else:
+                    min_strike, max_strike = 0, float("inf")
+                
+                if (call_put == "Put" and buy_strike_target < min_strike) or (call_put == "Call" and buy_strike_target > max_strike):
+                    print(f"Target strike {buy_strike_target} is out of current option chain range ({min_strike} to {max_strike}). Fetching new chain centered near target...")
+                    sec_params = params.copy()
+                    sec_params["strikePriceNear"] = buy_strike_target
+                    sec_params["noOfStrikes"] = 100
+                    sec_response = self.session.get(url, params=sec_params, auth=self.session.auth)
+                    if sec_response.status_code == 200:
+                        sec_data = sec_response.json()
+                        sec_pairs = sec_data.get("OptionChainResponse", {}).get("OptionPair", [])
+                        
+                        # Consistently filter the new chain
+                        if ticker == "SPX" and sec_pairs:
+                            if has_spxw:
+                                sec_pairs = [p for p in sec_pairs if p.get(call_put) and p.get(call_put, {}).get("osiKey", "").startswith("SPXW")]
+                            else:
+                                sec_pairs = [p for p in sec_pairs if p.get(call_put) and p.get(call_put, {}).get("osiKey", "").startswith("SPX-")]
+                        
+                        # Search in the new chain
+                        original_option_pairs = option_pairs
+                        option_pairs = sec_pairs
+                        buy_option = get_option_by_price(target_premium / hedge_ratio, call_put, "buy", strike_overwrite=buy_strike_target)
+                        option_pairs = original_option_pairs
+                    else:
+                        print(f"Error fetching option chain near target: {sec_response.status_code}")
+                        buy_option = None
+                else:
+                    buy_option = get_option_by_price(target_premium / hedge_ratio, call_put, "buy", strike_overwrite=buy_strike_target)
             else:
-                buy_option = get_option_by_price(target_premium / hedge_ratio,call_put, "buy")
+                buy_option = get_option_by_price(target_premium / hedge_ratio, call_put, "buy")
 
             print(f"Buy {call_put} option for {ticker} price now: ${stock_price} strike {buy_option['strikePrice']} price {buy_option['optionPrice']:.4f}, volume {buy_option['volume']}, ask_bid_spread {buy_option['ask_bid_spread']:.4f} expire {buy_option['expiryDate']}")
             expect_profit = round(sell_option['optionPrice'] - buy_option['optionPrice'], 2)
             buy_position_target = {
-                "ticker": ticker,
+                "ticker": buy_option.get("symbol", ticker),
                 "call_put": call_put,
                 "strike": buy_option['strikePrice'],
                 "price": buy_option['optionPrice'],
@@ -5471,7 +6670,7 @@ class Accounts:
                 "action": "buy"
             }
             buy_position = StockPosition(
-                symbol=ticker,
+                symbol=buy_option.get("symbol", ticker),
                 quantity=qty,
                 last_price=buy_option['optionPrice']
             )
@@ -5479,13 +6678,14 @@ class Accounts:
             buy_position.expiration_date = buy_option['expiryDate']
             buy_position.call_put = call_put
             buy_position.distance_to_strike = buy_option['distance']
+            buy_position.delta = buy_option.get('delta')
             
             if sell_position.last_price - buy_position.last_price <=0:
                 return None
         print(f"Expect profit: {expect_profit} ")
 
         sell_position_target = {
-            "ticker": ticker,
+            "ticker": sell_option.get("symbol", ticker),
             "call_put": call_put,
             "strike": sell_option['strikePrice'],
             "price": sell_option['optionPrice'],
@@ -5503,6 +6703,184 @@ class Accounts:
             "profit": expect_profit
         }
 
+    def get_option_spread_by_credit_target(self, ticker, call_put, days_to_expire, target_credit, hedge_spread, qty=1):
+        stock_price = self.get_stock_price(ticker)
+        if stock_price is None:
+            print("Failed to retrieve stock price.")
+            return None
+        if target_credit is None or target_credit <= 0:
+            print("Target credit must be positive.")
+            return None
+        if hedge_spread is None or hedge_spread <= 0:
+            print("Hedge spread must be positive.")
+            return None
+
+        today = datetime.today().date()
+        target_expire = pd.Timestamp(today + pd.Timedelta(days=days_to_expire))
+
+        available_expirations = self.get_available_expirations(ticker)
+        if not available_expirations:
+            print("No available expiration dates for options.", ticker)
+            return None
+
+        target_expiration = _select_nearest_expiration(available_expirations, target_expire.date())
+        if target_expiration is None:
+            return None
+
+        url = f"{self.base_url}/v1/market/optionchains.json"
+        params = {
+            "symbol": ticker,
+            "expiryYear": target_expiration.year,
+            "expiryMonth": target_expiration.month,
+            "expiryDay": target_expiration.day,
+            "includeWeekly": True,
+            "skipAdjusted": False,
+            "optionCategory": "ALL",
+            "chainType": call_put,
+            "noOfStrikes": 400
+        }
+        response = self.session.get(url, params=params, auth=self.session.auth)
+        if response.status_code != 200:
+            print("Error fetching option chain:", ticker, response.status_code, response.text)
+            return None
+
+        data = response.json()
+        option_pairs = data.get("OptionChainResponse", {}).get("OptionPair", [])
+
+        options_by_strike = {}
+        for option_pair in option_pairs:
+            option = option_pair.get(call_put)
+            if not option:
+                continue
+            strike = float(option.get("strikePrice"))
+            bid = float(option.get("bid", 0) or 0)
+            ask = float(option.get("ask", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                continue
+
+            osi_key = option.get("osiKey")
+            expiry_date = target_expiration
+            if osi_key:
+                expiry_date = datetime.strptime(osi_key[6:12], "%y%m%d").date()
+
+            raw_delta = float(option.get("OptionGreeks", {}).get("delta", 0))
+            iv = float(option.get("OptionGreeks", {}).get("iv", 0))
+            dte_days = (expiry_date - today).days
+            redefined_delta = raw_delta
+            if raw_delta != 0:
+                try:
+                    redefined_delta = convert_standard_to_nd2_delta(raw_delta, iv, dte_days, call_put)
+                except Exception:
+                    pass
+
+            options_by_strike[strike] = {
+                "symbol": _symbol_from_osi_key(ticker, osi_key),
+                "strikePrice": strike,
+                "optionPrice": (bid + ask) / 2,
+                "volume": option.get("volume", 0) or 0,
+                "openInterest": option.get("openInterest", 0) or 0,
+                "ask_bid_spread": round(ask - bid, 4),
+                "expiryDate": expiry_date,
+                "distance": round((strike - stock_price) / stock_price * 100, 2),
+                "delta": round(redefined_delta, 4),
+                "gamma": round(option.get("OptionGreeks", {}).get("gamma", 0), 4)
+            }
+
+        if not options_by_strike:
+            print(f"No liquid option quotes found for {ticker} {call_put} {target_expiration}.")
+            return None
+
+        strikes = sorted(options_by_strike)
+        candidates = []
+        for short_strike, short_option in options_by_strike.items():
+            if short_option["openInterest"] <= 0 and short_option["volume"] <= 0:
+                continue
+            if call_put == "Call" and short_strike <= stock_price:
+                continue
+            if call_put == "Put" and short_strike >= stock_price:
+                continue
+
+            long_strike_target = short_strike + hedge_spread if call_put == "Call" else short_strike - hedge_spread
+            if call_put == "Call":
+                long_candidates = [strike for strike in strikes if strike > short_strike]
+            else:
+                long_candidates = [strike for strike in strikes if strike < short_strike]
+            if not long_candidates:
+                continue
+
+            long_strike = min(long_candidates, key=lambda strike: abs(strike - long_strike_target))
+            long_option = options_by_strike.get(long_strike)
+            if not long_option or (long_option["openInterest"] <= 0 and long_option["volume"] <= 0):
+                continue
+
+            credit = short_option["optionPrice"] - long_option["optionPrice"]
+            if credit <= 0:
+                continue
+            candidates.append((credit, short_option, long_option))
+
+        if not candidates:
+            print(f"No suitable credit-target spread found for {target_credit:.2f} in {ticker} {call_put}.")
+            return None
+
+        credit, sell_option, buy_option = min(
+            candidates,
+            key=lambda item: (0, item[0] - target_credit) if item[0] >= target_credit else (1, target_credit - item[0])
+        )
+
+        print(
+            f"Sell {call_put} option for {ticker} by target credit ${target_credit:.2f}: "
+            f"strike {sell_option['strikePrice']} price {sell_option['optionPrice']:.4f}, "
+            f"delta {sell_option['delta']} expire {sell_option['expiryDate']}"
+        )
+        print(
+            f"Buy {call_put} option for {ticker} by target credit ${target_credit:.2f}: "
+            f"strike {buy_option['strikePrice']} price {buy_option['optionPrice']:.4f}, "
+            f"expire {buy_option['expiryDate']}"
+        )
+        expect_profit = round(credit, 2)
+        print(f"Expect profit: {expect_profit} ")
+
+        sell_position = StockPosition(symbol=sell_option.get("symbol", ticker), quantity=qty, last_price=sell_option['optionPrice'])
+        sell_position.strike_price = sell_option["strikePrice"]
+        sell_position.expiration_date = sell_option['expiryDate']
+        sell_position.call_put = call_put
+        sell_position.distance_to_strike = sell_option['distance']
+        sell_position.delta = sell_option.get('delta')
+
+        buy_position = StockPosition(symbol=buy_option.get("symbol", ticker), quantity=qty, last_price=buy_option['optionPrice'])
+        buy_position.strike_price = buy_option["strikePrice"]
+        buy_position.expiration_date = buy_option['expiryDate']
+        buy_position.call_put = call_put
+        buy_position.distance_to_strike = buy_option['distance']
+        buy_position.delta = buy_option.get('delta')
+
+        return {
+            "sell_option": sell_position,
+            "buy_option": buy_position,
+            "sell_position_target": {
+                "ticker": sell_option.get("symbol", ticker),
+                "call_put": call_put,
+                "strike": sell_option['strikePrice'],
+                "price": sell_option['optionPrice'],
+                "volume": sell_option['volume'],
+                "spread": sell_option['ask_bid_spread'],
+                "expire": sell_option['expiryDate'],
+                "action": "sell"
+            },
+            "buy_position_target": {
+                "ticker": buy_option.get("symbol", ticker),
+                "call_put": call_put,
+                "strike": buy_option['strikePrice'],
+                "price": buy_option['optionPrice'],
+                "volume": buy_option['volume'],
+                "spread": buy_option['ask_bid_spread'],
+                "expire": buy_option['expiryDate'],
+                "action": "buy"
+            },
+            "profit": expect_profit,
+            "target_credit": round(target_credit, 2)
+        }
+
     def get_option_spread_by_exact_strikes(self, ticker, call_put, days_to_expire, short_strike, long_strike, qty=1):
         stock_price = self.get_stock_price(ticker)
         if stock_price is None:
@@ -5517,21 +6895,9 @@ class Accounts:
             print("No available expiration dates for options.", ticker)
             return None
         
-        available_expirations = [datetime.strptime(exp, "%Y-%m-%d").date() if isinstance(exp, str) else exp for exp in available_expirations]
-
-        filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()]
-        if not filtered_expirations:
+        target_expiration = _select_nearest_expiration(available_expirations, target_expire.date())
+        if target_expiration is None:
             return None
-        if filtered_expirations[0] != target_expire.date():
-            filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()-timedelta(days=7)]
-            if not filtered_expirations:
-                return None
-            if filtered_expirations[0] != target_expire.date()-timedelta(days=7):
-                filtered_expirations = [exp for exp in available_expirations if exp >= target_expire.date()-timedelta(days=8)]
-                if not filtered_expirations:
-                    return None
-        
-        target_expiration = filtered_expirations[0]
 
         url = f"{self.base_url}/v1/market/optionchains.json"
         params = {
@@ -5572,14 +6938,25 @@ class Accounts:
                         expiry_date_str = osi_key[6:12]
                         expiry_date = datetime.strptime(expiry_date_str, "%y%m%d").date()
                     
+                    raw_delta = float(delta)
+                    iv = float(options.get("OptionGreeks", {}).get("iv", 0))
+                    dte_days = ((expiry_date or target_expiration) - today).days
+                    redefined_delta = raw_delta
+                    if raw_delta != 0:
+                        try:
+                            redefined_delta = convert_standard_to_nd2_delta(raw_delta, iv, dte_days, call_put)
+                        except Exception:
+                            pass
+
                     return {
+                        "symbol": _symbol_from_osi_key(ticker, osi_key),
                         "strikePrice": strike,
                         "optionPrice": option_price,
                         "volume": volume,
                         "ask_bid_spread": ask_bid_spread,
                         "expiryDate": expiry_date or target_expiration,
                         "distance": round((strike - stock_price)/stock_price * 100, 2),
-                        "delta": round(delta, 4),
+                        "delta": round(redefined_delta, 4),
                         "gamma": round(gamma, 4)
                     }
             return None
@@ -5592,7 +6969,7 @@ class Accounts:
             return None
         
         sell_position = StockPosition(
-            symbol=ticker,
+            symbol=sell_option.get("symbol", ticker),
             quantity=qty,
             last_price=sell_option['optionPrice']
         )
@@ -5600,9 +6977,10 @@ class Accounts:
         sell_position.expiration_date = sell_option['expiryDate']
         sell_position.call_put = call_put
         sell_position.distance_to_strike = sell_option['distance']
+        sell_position.delta = sell_option.get('delta')
 
         buy_position = StockPosition(
-            symbol=ticker,
+            symbol=buy_option.get("symbol", ticker),
             quantity=qty,
             last_price=buy_option['optionPrice']
         )
@@ -5610,11 +6988,12 @@ class Accounts:
         buy_position.expiration_date = buy_option['expiryDate']
         buy_position.call_put = call_put
         buy_position.distance_to_strike = buy_option['distance']
+        buy_position.delta = buy_option.get('delta')
 
         expect_profit = round(sell_option['optionPrice'] - buy_option['optionPrice'], 2)
 
         sell_position_target = {
-            "ticker": ticker,
+            "ticker": sell_option.get("symbol", ticker),
             "call_put": call_put,
             "strike": sell_option['strikePrice'],
             "price": sell_option['optionPrice'],
@@ -5624,7 +7003,7 @@ class Accounts:
             "action": "sell"
         }
         buy_position_target = {
-            "ticker": ticker,
+            "ticker": buy_option.get("symbol", ticker),
             "call_put": call_put,
             "strike": buy_option['strikePrice'],
             "price": buy_option['optionPrice'],
@@ -6362,7 +7741,7 @@ class Accounts:
         ticker_exp_to_options = defaultdict(list)
         for position in all_positions:
             if position.security_type == "Option":
-                key = (position.symbol, position.expiration_date)
+                key = (_aggregate_option_symbol(position.symbol), position.expiration_date)
                 ticker_exp_to_options[key].append(position)
 
         for (ticker, exp_date), options in ticker_exp_to_options.items():
@@ -6381,7 +7760,7 @@ class Accounts:
             current_price = options[0].underlying_last_price
             stock_quantity = sum(
                 pos.quantity for pos in all_positions
-                if pos.security_type == "Stock" and pos.symbol == ticker
+                if pos.security_type == "Stock" and _aggregate_option_symbol(pos.symbol) == ticker
             )
 
             unique_strikes = sorted(set(option.strike_price for option in options))

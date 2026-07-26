@@ -8,7 +8,7 @@ This document explains how `live_trading/ev_plots.py` and its core math engine `
 
 1. **Fetching Market Data**: Gets live prices (SPY, SPX, VIX) and 15 years of daily history via `yfinance`. Now includes **VVIX** for state detection.
 2. **HMM Regime Detection**: Uses a Continuous **Hidden Markov Model (HMM)** to dynamically detect hidden market states based on Log Returns, **EWMA Realized Volatility**, VIX, and VVIX.
-3. **GMM Probability Projection**: Uses a 2-component Gaussian Mixture Model (GMM) *within* each HMM state to estimate multi-week breach probabilities ($P(spot \le strike)$).
+3. **GMM Probability Projection**: Uses a BIC-selected Gaussian Mixture Model (GMM) *within* each HMM state to estimate multi-week breach probabilities ($P(spot \le strike)$).
 4. **Forward Projection**: Projects today's state probabilities forward to option expiration using **Matrix Exponentiation** of the HMM transition matrix.
 5. **EV & Risk Integration**: Numerically integrates the payout function over the projected probability mixture to find Expected Value (EV), Expected Shortfall (ES), and Loss Probability.
 6. **Portfolio Normalization**: Scales metrics to a consistent $10,000 margin budget.
@@ -30,7 +30,7 @@ To ensure reliability and speed, the heavy lifting is moved to `ev_engine.py`:
 - **Feature Engineering**: Implements 10-day **EWMA Volatility** to eliminate the "ghosting" lag of standard rolling volatility windows.
 - **HMM Training**: Dynamically selects the optimal number of hidden states ($K$) using **AIC/BIC scores** to prevent overfitting.
 - **Regime Bucketing**: Buckets $T$-horizon returns by the starting HMM state rather than static VIX levels.
-- **GMM Implementation**: Logic for fitting 2-component mixtures to multi-week horizon data (capturing fat tails) and querying CDFs is centralized here.
+- **GMM Implementation**: Logic for fitting BIC-selected mixtures to multi-week horizon data (capturing fat tails only when supported by the data) and querying CDFs is centralized here.
 
 ## 3. Global configuration
 
@@ -105,7 +105,7 @@ Inside `_build_single_regime_prob_func(...)`:
 Two-step implementation for speed:
 
 1. `fit_gmm(bucket_returns, regime_label="")`
-   - Fits 2-component `GaussianMixture` to the multi-week horizon data.
+   - Fits `GaussianMixture` candidates, including `K=1`, to the multi-week horizon data and selects by BIC.
    - **No scaling required**: The data itself already represents the total duration (e.g. 43 days). This avoids the 'persistence error' where crash-day means were previously scaled linearly.
    - Falls back to 1-component Gaussian if sample size is too small or fit fails.
 2. `query_gmm(cached_params, spot_price, strike_price)`
@@ -171,7 +171,7 @@ Saved to: `/Users/btian/.gemini/antigravity/artifacts/ev_delta_normalized_margin
 - Typically shows that specific HMM states are significantly more non-Normal than others.
 
 ### B) GMM Clustering (`--gmm-plots`)
-- Visualizes how the 2-component GMM finds "hidden" sub-regimes within the HMM-learned states, identifying internal multi-modality.
+- Visualizes how the selected GMM finds supported sub-distributions within the HMM-learned states, identifying internal multi-modality only when it improves penalized fit.
 
 ### C) GMM Distribution Fit (`--gmm-dist`)
 - Overlays the final GMM density mixture on histograms for each HMM state.

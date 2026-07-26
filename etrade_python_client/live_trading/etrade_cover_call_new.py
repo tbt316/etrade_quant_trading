@@ -13,18 +13,23 @@ import ast
 import os
 import sys
 import traceback
+import random
+import secrets
+import hmac
+import hashlib
 import smtplib
+from http.cookies import SimpleCookie
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import timedelta
-from datetime import datetime
+from datetime import datetime, date
 from logging.handlers import RotatingFileHandler
 import logging
 import pandas as pd
 from live_trading.ev_engine import (
     build_regime_return_arrays, get_probability_engine, calculate_yield_metrics,
-    fetch_cached_yf_close
+    fetch_cached_yf_close, fetch_historical_data, _build_causal_regime_feature_frame
 )
 import yfinance as yf
 from backtesting import backtest_bo
@@ -38,11 +43,14 @@ from core_api.stock_trade_class import *
 import webbrowser
 from rauth import OAuth1Service
 from logging.handlers import RotatingFileHandler
-from accounts.accounts_bo import Accounts, calculate_std_dev, calculate_margin, print_margin_report, find_highest_margin_ratios
+from accounts.accounts_bo import Accounts, calculate_std_dev, calculate_margin, print_margin_report, find_highest_margin_ratios, _select_nearest_expiration, is_etrade_token_expired_response
 from market.market_bo import Market
 import configparser
 import multiprocessing
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+from uuid import uuid4
 from backtesting import option_limit_backtest
 from data_and_research.polygonio_improvequery import get_earnings_dates
 from data_and_research.option_assign_probability import calculate_probability
@@ -50,12 +58,14 @@ from backtesting.polygonio_dailytrade import fetch_yfinance_data
 from pandas_market_calendars import get_calendar
 from live_trading.spy_position_tracker import update_spy_daily_snapshot, record_closed_spy_gain
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import base64
 TRADE_STATUS_FILE = "trade_status.json"
 DASHBOARD_LOG_FILE = "dashboard_requests.log"
 AUDIT_LOG_FILE = "order_audit_log.csv"
+MANUAL_TRADE_STATUS_FILE = "manual_order_status.json"
+ETRADE_SESSION_REFRESH_LOCK = threading.RLock()
 
 def log_order_execution(order_info, reason, status="PLACED"):
     """Log order execution details to a permanent CSV file."""
@@ -140,23 +150,625 @@ def log_dashboard_request(path, data):
     except Exception as e:
         print(f"⚠️ Error logging dashboard request: {e}")
 
+def _repair_benchmark_option_value_gaps(html):
+    try:
+        match = re.search(r'(optionValues:\s*)(\[[^\]]*\])', html)
+        if not match:
+            return html
+        values = json.loads(match.group(2))
+        repaired = []
+        last_value = None
+        changed = False
+        for value in values:
+            if value is not None:
+                last_value = value
+                repaired.append(value)
+            elif last_value is not None:
+                repaired.append(last_value)
+                changed = True
+            else:
+                repaired.append(value)
+        if not changed:
+            return html
+        return html[:match.start(2)] + json.dumps(repaired) + html[match.end(2):]
+    except Exception as e:
+        print(f"⚠️ Could not repair benchmark option value gaps: {e}")
+        return html
+
 # Global flag to signal a manual refresh request from the web UI
 REFRESH_REQUESTED = threading.Event()
+PORTFOLIO_REFRESH_LOCK = threading.Lock()
+PORTFOLIO_REFRESH_STATUS = {
+    "requested_generation": 0,
+    "running_generation": 0,
+    "completed_generation": 0,
+    "last_error_generation": 0,
+    "last_error": None,
+}
+
+
+def _queue_portfolio_refresh():
+    with PORTFOLIO_REFRESH_LOCK:
+        PORTFOLIO_REFRESH_STATUS["requested_generation"] += 1
+        PORTFOLIO_REFRESH_STATUS["last_error"] = None
+        return PORTFOLIO_REFRESH_STATUS["requested_generation"]
+
+
+def _start_portfolio_refresh():
+    with PORTFOLIO_REFRESH_LOCK:
+        generation = PORTFOLIO_REFRESH_STATUS["requested_generation"]
+        if generation <= PORTFOLIO_REFRESH_STATUS["completed_generation"]:
+            generation = PORTFOLIO_REFRESH_STATUS["completed_generation"] + 1
+            PORTFOLIO_REFRESH_STATUS["requested_generation"] = generation
+        PORTFOLIO_REFRESH_STATUS["running_generation"] = generation
+        return generation
+
+
+def _finish_portfolio_refresh(generation, error=None):
+    with PORTFOLIO_REFRESH_LOCK:
+        PORTFOLIO_REFRESH_STATUS["completed_generation"] = max(
+            PORTFOLIO_REFRESH_STATUS["completed_generation"],
+            generation,
+        )
+        if PORTFOLIO_REFRESH_STATUS["running_generation"] == generation:
+            PORTFOLIO_REFRESH_STATUS["running_generation"] = 0
+        if error:
+            PORTFOLIO_REFRESH_STATUS["last_error_generation"] = generation
+            PORTFOLIO_REFRESH_STATUS["last_error"] = str(error)
+        elif PORTFOLIO_REFRESH_STATUS["last_error_generation"] == generation:
+            PORTFOLIO_REFRESH_STATUS["last_error_generation"] = 0
+            PORTFOLIO_REFRESH_STATUS["last_error"] = None
+
+
+def _portfolio_refresh_snapshot():
+    with PORTFOLIO_REFRESH_LOCK:
+        snapshot = dict(PORTFOLIO_REFRESH_STATUS)
+    if snapshot["running_generation"]:
+        snapshot["state"] = "refreshing"
+    elif snapshot["completed_generation"] < snapshot["requested_generation"]:
+        snapshot["state"] = "queued"
+    elif (
+        snapshot["last_error"]
+        and snapshot["last_error_generation"] == snapshot["completed_generation"]
+    ):
+        snapshot["state"] = "failed"
+    else:
+        snapshot["state"] = "idle"
+    return snapshot
 
 # Global flags for order flow
 MANUAL_TRADE_REQUESTED = threading.Event()
 MANUAL_TRADE_PARAMS = {}
+MANUAL_TRADE_QUEUE = Queue()
+MANUAL_TRADE_STATUS = {}
+MANUAL_TRADE_STATUS_LOCK = threading.Lock()
+ORDER_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 CURRENT_CLOSE_PROPOSALS = [] # Global for dashboard access
 CURRENT_NEUTRALIZE_PROPOSALS = [] # Global for dashboard access
 ACTIVE_DASHBOARD_ORDERS = set() # Global for tracking orders submitted to E*TRADE
+MARKET_CLOSE_PRICE_REFRESHED_DATE = None
 
 NEUTRALIZE_DELTA_THRESHOLD = 0.20
 NEUTRALIZE_TRIGGER_DTE = 21
 NEUTRALIZE_TARGET_DTE = 42
+AUTO_REFRESH_INTERVAL_SECONDS = 300
+DASHBOARD_ON_DEMAND_REFRESH_ONLY = True
+
+def _status_now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _next_refresh_sleep_seconds(cycle_started_at, deadline_seconds=None):
+    elapsed = max(0, int((datetime.now() - cycle_started_at).total_seconds()))
+    remaining = max(0, AUTO_REFRESH_INTERVAL_SECONDS - elapsed)
+    if deadline_seconds is not None:
+        remaining = min(remaining, max(0, int(deadline_seconds)))
+    return remaining
+
+def _wait_for_dashboard_work():
+    print("💤 On-demand dashboard mode: waiting for browser refresh or manual trade request.")
+    last_close_check_at = None
+    while not REFRESH_REQUESTED.is_set() and not MANUAL_TRADE_REQUESTED.is_set():
+        now = datetime.now()
+        if last_close_check_at is None or (now - last_close_check_at).total_seconds() >= 30:
+            last_close_check_at = now
+            try:
+                if _market_close_refresh_due():
+                    print("🔄 [Market Close] Waking dashboard loop to capture closing SPY/SPX/VIX data.")
+                    REFRESH_REQUESTED.set()
+                    break
+            except Exception as close_check_err:
+                print(f"⚠️ [Market Close] Could not check close-refresh timing: {close_check_err}")
+        t.sleep(1)
+
+def _sync_manual_trade_event():
+    if MANUAL_TRADE_QUEUE.empty():
+        MANUAL_TRADE_REQUESTED.clear()
+    else:
+        MANUAL_TRADE_REQUESTED.set()
+
+def _save_manual_trade_status_locked():
+    try:
+        tmp_file = MANUAL_TRADE_STATUS_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(MANUAL_TRADE_STATUS, f, indent=2)
+        os.replace(tmp_file, MANUAL_TRADE_STATUS_FILE)
+    except Exception as e:
+        print(f"⚠️ Error saving manual trade status: {e}")
+
+def _load_manual_trade_status_file():
+    if not os.path.exists(MANUAL_TRADE_STATUS_FILE):
+        return {}
+    try:
+        with open(MANUAL_TRADE_STATUS_FILE, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"⚠️ Error loading manual trade status: {e}")
+        return {}
+
+def _hydrate_manual_trade_status_from_file():
+    persisted = _load_manual_trade_status_file()
+    if not persisted:
+        return
+    with MANUAL_TRADE_STATUS_LOCK:
+        for request_id, record in persisted.items():
+            if not isinstance(record, dict):
+                continue
+            current = MANUAL_TRADE_STATUS.get(request_id)
+            if not current or str(record.get("updated_at", "")) > str(current.get("updated_at", "")):
+                MANUAL_TRADE_STATUS[request_id] = record
+
+def update_manual_trade_status(request_id, **updates):
+    if not request_id:
+        return
+    with MANUAL_TRADE_STATUS_LOCK:
+        status = MANUAL_TRADE_STATUS.setdefault(request_id, {"request_id": request_id})
+        status.update(updates)
+        status["updated_at"] = _status_now()
+        _save_manual_trade_status_locked()
+
+def get_manual_trade_status_record(request_id):
+    if not request_id:
+        return {}
+    with MANUAL_TRADE_STATUS_LOCK:
+        return dict(MANUAL_TRADE_STATUS.get(request_id, {}))
+
+def append_manual_trade_status(request_id, key, value):
+    if not request_id:
+        return
+    with MANUAL_TRADE_STATUS_LOCK:
+        status = MANUAL_TRADE_STATUS.setdefault(request_id, {"request_id": request_id})
+        status.setdefault(key, []).append(value)
+        status["updated_at"] = _status_now()
+        _save_manual_trade_status_locked()
+
+def _audit_status_to_manual_status(status):
+    normalized = str(status or "").strip().upper()
+    if normalized in ("FILLED", "EXECUTED"):
+        return "filled"
+    if normalized in ("OPEN", "PLACED", "QUEUED", "PROCESSING"):
+        return "placed"
+    if normalized in ("FAILED", "REJECTED"):
+        return "failed"
+    if normalized == "CANCELLED":
+        return "cancelled"
+    return normalized.lower() or "unknown"
+
+def _today_order_audit_records(today_prefix):
+    if not os.path.exists(AUDIT_LOG_FILE):
+        return []
+    records = []
+    try:
+        with open(AUDIT_LOG_FILE, newline="") as f:
+            for row in csv.DictReader(f):
+                timestamp = row.get("timestamp", "")
+                if not timestamp.startswith(today_prefix):
+                    continue
+                order_id = str(row.get("order_id") or "").strip()
+                ticker = str(row.get("ticker") or "").strip()
+                order_type = str(row.get("type") or "order").strip()
+                strikes = str(row.get("strikes") or "").strip()
+                strike_parts = strikes.split("/", 1)
+                status = _audit_status_to_manual_status(row.get("status"))
+                reason = str(row.get("reason") or "").strip()
+                message_parts = [p for p in [ticker, order_type, strikes, row.get("status"), reason] if p]
+                records.append({
+                    "request_id": f"audit-{order_id}" if order_id and order_id != "N/A" else f"audit-{timestamp}-{ticker}-{strikes}",
+                    "request_type": order_type.lower() if order_type else "order",
+                    "status": status,
+                    "ticker": ticker,
+                    "side": "",
+                    "short_strike": strike_parts[0] if strike_parts else "",
+                    "long_strike": strike_parts[1] if len(strike_parts) > 1 else "",
+                    "quantity": row.get("qty"),
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                    "order_ids": [order_id] if order_id and order_id != "N/A" else [],
+                    "message": " | ".join(message_parts),
+                    "messages": [reason] if reason else []
+                })
+    except Exception as e:
+        print(f"⚠️ Error reading order audit log: {e}")
+    return records
+
+def _dashboard_request_record_from_log(entry):
+    path = entry.get("path")
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    timestamp = entry.get("timestamp", "")
+    if path not in ("/api/execute_manual_order", "/api/close_position", "/api/execute_close_order", "/api/execute_neutralize_order"):
+        return None
+    if "error" in data:
+        return None
+
+    if path == "/api/execute_neutralize_order":
+        ticker = data.get("ticker")
+        request_type = "neutralize"
+        side = ""
+        short_strike = ""
+        long_strike = ""
+        quantity = data.get("qty")
+        message = f"Dashboard neutralize request {data.get('proposal_id', '')}".strip()
+    elif path == "/api/execute_manual_order":
+        ticker = data.get("ticker") or data.get("symbol")
+        request_type = "open"
+        side = data.get("side") or data.get("call_put") or data.get("cp")
+        short_strike = data.get("sell_strike") or data.get("short_strike") or data.get("strike")
+        long_strike = data.get("buy_strike") or data.get("long_strike")
+        quantity = data.get("qty") or data.get("quantity") or data.get("pair_quantity")
+        message = f"Dashboard open request {short_strike}/{long_strike}".strip()
+    else:
+        ticker = data.get("ticker") or data.get("symbol")
+        request_type = "close"
+        side = data.get("side") or data.get("call_put") or data.get("cp")
+        short_strike = data.get("sell_strike") or data.get("short_strike") or data.get("strike")
+        long_strike = data.get("long_strike")
+        quantity = data.get("qty") or data.get("quantity") or data.get("pair_quantity")
+        message = f"Dashboard close request {short_strike}/{long_strike}".strip()
+
+    request_id = f"request-{timestamp}-{path}-{ticker}-{short_strike}-{long_strike}-{quantity}"
+    return {
+        "request_id": request_id,
+        "request_type": request_type,
+        "status": "placed",
+        "ticker": ticker,
+        "side": side,
+        "short_strike": short_strike,
+        "long_strike": long_strike,
+        "quantity": quantity,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "order_ids": [],
+        "message": message,
+        "messages": []
+    }
+
+def _today_dashboard_request_records(today_prefix):
+    if not os.path.exists(DASHBOARD_LOG_FILE):
+        return []
+    records = []
+    try:
+        with open(DASHBOARD_LOG_FILE, "r") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                timestamp = entry.get("timestamp", "")
+                if not timestamp.startswith(today_prefix):
+                    continue
+                record = _dashboard_request_record_from_log(entry)
+                if record:
+                    records.append(record)
+    except Exception as e:
+        print(f"⚠️ Error reading dashboard request log: {e}")
+    return records
+
+def _manual_records_from_open_orders(open_orders):
+    if not open_orders:
+        return []
+    grouped = {}
+    for leg in open_orders:
+        order_id = str(leg.get("orderId") or "").strip()
+        if not order_id:
+            continue
+        grouped.setdefault(order_id, []).append(leg)
+
+    records = []
+    for order_id, legs in grouped.items():
+        first_leg = legs[0]
+        placed_time = first_leg.get("placedTime")
+        if placed_time:
+            try:
+                created_at = datetime.fromtimestamp(int(placed_time) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                created_at = _status_now()
+        else:
+            created_at = _status_now()
+
+        actions = {str(leg.get("orderAction") or "").upper() for leg in legs}
+        if any(action.endswith("_CLOSE") for action in actions):
+            request_type = "close"
+        elif any(action.endswith("_OPEN") for action in actions):
+            request_type = "open"
+        else:
+            request_type = "order"
+
+        strikes = [str(leg.get("strikePrice")) for leg in legs if leg.get("strikePrice") is not None]
+        message = f"Broker open order {order_id}"
+        if first_leg.get("limitPrice") is not None:
+            message += f" @ {first_leg.get('limitPrice')}"
+        if strikes:
+            message += f" | strikes {'/'.join(strikes)}"
+
+        records.append({
+            "request_id": f"broker-open-{order_id}",
+            "request_type": request_type,
+            "status": "placed",
+            "ticker": first_leg.get("symbol"),
+            "side": first_leg.get("callPut"),
+            "short_strike": strikes[0] if strikes else "",
+            "long_strike": strikes[1] if len(strikes) > 1 else "",
+            "quantity": first_leg.get("quantity"),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "order_ids": [order_id],
+            "message": message,
+            "messages": []
+        })
+    return records
+
+def _manual_records_from_executed_orders(executed_orders):
+    if not executed_orders:
+        return []
+    grouped = {}
+    for leg in executed_orders:
+        order_id = str(leg.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        grouped.setdefault(order_id, []).append(leg)
+
+    records = []
+    for order_id, legs in grouped.items():
+        first_leg = legs[0]
+        actions = {str(leg.get("order_action") or "").upper() for leg in legs}
+        if any(action.endswith("_CLOSE") for action in actions):
+            request_type = "close"
+            short_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_CLOSE") and str(leg.get("order_action") or "").upper().startswith("BUY")), legs[0])
+            long_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_CLOSE") and str(leg.get("order_action") or "").upper().startswith("SELL")), legs[-1])
+        elif any(action.endswith("_OPEN") for action in actions):
+            request_type = "open"
+            short_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_OPEN") and str(leg.get("order_action") or "").upper().startswith("SELL")), legs[0])
+            long_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_OPEN") and str(leg.get("order_action") or "").upper().startswith("BUY")), legs[-1])
+        else:
+            request_type = "order"
+            short_leg = legs[0]
+            long_leg = legs[-1]
+
+        short_strike = short_leg.get("strike_price")
+        long_strike = long_leg.get("strike_price")
+        quantity = first_leg.get("executed_quantity")
+        message = f"Broker executed order {order_id}"
+        if short_strike is not None or long_strike is not None:
+            message += f" | strikes {short_strike}/{long_strike}"
+
+        records.append({
+            "request_id": f"broker-executed-{order_id}",
+            "request_type": request_type,
+            "status": "filled",
+            "ticker": first_leg.get("symbol"),
+            "side": first_leg.get("option_type"),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "quantity": quantity,
+            "created_at": first_leg.get("executed_date") or _status_now(),
+            "updated_at": first_leg.get("executed_date") or _status_now(),
+            "order_ids": [order_id],
+            "message": message,
+            "messages": []
+        })
+    return records
+
+def _manual_records_from_cancelled_orders(cancelled_orders):
+    if not cancelled_orders:
+        return []
+    grouped = {}
+    for leg in cancelled_orders:
+        order_id = str(leg.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        grouped.setdefault(order_id, []).append(leg)
+
+    records = []
+    for order_id, legs in grouped.items():
+        first_leg = legs[0]
+        actions = {str(leg.get("order_action") or "").upper() for leg in legs}
+        if any(action.endswith("_CLOSE") for action in actions):
+            request_type = "close"
+            short_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_CLOSE") and str(leg.get("order_action") or "").upper().startswith("BUY")), legs[0])
+            long_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_CLOSE") and str(leg.get("order_action") or "").upper().startswith("SELL")), legs[-1])
+        elif any(action.endswith("_OPEN") for action in actions):
+            request_type = "open"
+            short_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_OPEN") and str(leg.get("order_action") or "").upper().startswith("SELL")), legs[0])
+            long_leg = next((leg for leg in legs if str(leg.get("order_action") or "").upper().endswith("_OPEN") and str(leg.get("order_action") or "").upper().startswith("BUY")), legs[-1])
+        else:
+            request_type = "order"
+            short_leg = legs[0]
+            long_leg = legs[-1]
+
+        short_strike = short_leg.get("strike_price")
+        long_strike = long_leg.get("strike_price")
+        quantity = first_leg.get("cancelled_quantity")
+        message = f"Broker cancelled order {order_id}"
+        if short_strike is not None or long_strike is not None:
+            message += f" | strikes {short_strike}/{long_strike}"
+
+        records.append({
+            "request_id": f"broker-cancelled-{order_id}",
+            "request_type": request_type,
+            "status": "cancelled",
+            "ticker": first_leg.get("symbol"),
+            "side": first_leg.get("option_type"),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "quantity": quantity,
+            "created_at": first_leg.get("cancelled_date") or _status_now(),
+            "updated_at": first_leg.get("cancelled_date") or _status_now(),
+            "order_ids": [order_id],
+            "message": message,
+            "messages": []
+        })
+    return records
+
+def _normalize_manual_order_value(value):
+    if value is None:
+        return ""
+    try:
+        return str(float(value))
+    except Exception:
+        return str(value).strip().upper()
+
+def _manual_order_match_key(record):
+    ticker = str(record.get("ticker") or "").upper()
+    if ticker.startswith("SPX"):
+        ticker = "SPX"
+    return (
+        ticker,
+        str(record.get("request_type") or "").lower(),
+        _normalize_manual_order_value(record.get("short_strike")),
+        _normalize_manual_order_value(record.get("long_strike")),
+        _normalize_manual_order_value(record.get("quantity")),
+    )
+
+def _manual_order_created_key(record):
+    return (
+        str(record.get("created_at") or ""),
+        str(record.get("ticker") or "").upper(),
+        str(record.get("request_type") or "").lower(),
+    )
+
+def _merge_manual_order_records(records, additions):
+    merged = list(records)
+    seen_request_ids = {str(r.get("request_id")) for r in merged if r.get("request_id")}
+    seen_order_ids = {
+        str(order_id)
+        for record in merged
+        for order_id in (record.get("order_ids") or [])
+        if order_id
+    }
+    seen_match_keys = {
+        _manual_order_match_key(record)
+        for record in merged
+        if _manual_order_match_key(record)[0] and _manual_order_match_key(record)[2]
+    }
+    seen_created_keys = {
+        _manual_order_created_key(record)
+        for record in merged
+        if _manual_order_created_key(record)[0] and _manual_order_created_key(record)[1]
+    }
+    for record in additions:
+        request_id = str(record.get("request_id")) if record.get("request_id") else ""
+        order_ids = {str(order_id) for order_id in (record.get("order_ids") or []) if order_id}
+        match_key = _manual_order_match_key(record)
+        created_key = _manual_order_created_key(record)
+        if request_id and request_id in seen_request_ids:
+            continue
+        if order_ids and order_ids.intersection(seen_order_ids):
+            continue
+        if not order_ids and match_key[0] and match_key[2] and match_key in seen_match_keys:
+            continue
+        if not order_ids and created_key[0] and created_key[1] and created_key in seen_created_keys:
+            continue
+        merged.append(record)
+        if request_id:
+            seen_request_ids.add(request_id)
+        seen_order_ids.update(order_ids)
+        if match_key[0] and match_key[2]:
+            seen_match_keys.add(match_key)
+        if created_key[0] and created_key[1]:
+            seen_created_keys.add(created_key)
+    return merged
+
+def _normalize_local_manual_status_record(record):
+    normalized = dict(record)
+    order_ids = normalized.get("order_ids") or []
+    message = str(normalized.get("message") or "")
+    if normalized.get("status") == "failed" and order_ids and "sell_position_target" in message:
+        normalized["status"] = "placed"
+        normalized["message"] = f"Order submitted; target recording failed for order {', '.join(map(str, order_ids))}"
+    return normalized
+
+def get_manual_trade_status_snapshot(broker_open_orders=None, broker_executed_orders=None, broker_cancelled_orders=None):
+    _hydrate_manual_trade_status_from_file()
+    with MANUAL_TRADE_STATUS_LOCK:
+        local_records = [_normalize_local_manual_status_record(record) for record in MANUAL_TRADE_STATUS.values()]
+    today_prefix = datetime.now().strftime("%Y-%m-%d")
+    records = []
+    records = _merge_manual_order_records(records, _manual_records_from_executed_orders(broker_executed_orders))
+    records = _merge_manual_order_records(records, _manual_records_from_open_orders(broker_open_orders))
+    records = _merge_manual_order_records(records, _manual_records_from_cancelled_orders(broker_cancelled_orders))
+    records = _merge_manual_order_records(records, local_records)
+    records = _merge_manual_order_records(records, _today_order_audit_records(today_prefix))
+    records = _merge_manual_order_records(records, _today_dashboard_request_records(today_prefix))
+    records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    today_records = [r for r in records if str(r.get("created_at", "")).startswith(today_prefix)]
+    return {
+        "latest": records[0] if records else {},
+        "requests": records[:25],
+        "today": today_records,
+        "queued_count": MANUAL_TRADE_QUEUE.qsize()
+    }
+
+def enqueue_manual_trade_request(data, request_type, enqueue=True):
+    request = data.copy()
+    request_id = request.get("request_id") or uuid4().hex
+    request["request_id"] = request_id
+    request["request_type"] = request_type
+    if enqueue:
+        MANUAL_TRADE_QUEUE.put(request)
+    with MANUAL_TRADE_STATUS_LOCK:
+        MANUAL_TRADE_STATUS[request_id] = {
+            "request_id": request_id,
+            "request_type": request_type,
+            "status": "queued",
+            "ticker": request.get("ticker") or request.get("symbol"),
+            "side": request.get("side") or request.get("call_put") or request.get("cp"),
+            "short_strike": request.get("sell_strike") or request.get("short_strike") or request.get("strike"),
+            "long_strike": request.get("buy_strike") or request.get("long_strike"),
+            "quantity": request.get("qty") or request.get("quantity") or request.get("pair_quantity"),
+            "created_at": _status_now(),
+            "updated_at": _status_now(),
+            "order_ids": [],
+            "messages": []
+        }
+        _save_manual_trade_status_locked()
+    if enqueue:
+        MANUAL_TRADE_REQUESTED.set()
+    return request_id
+
+def dequeue_manual_trade_request():
+    try:
+        request = MANUAL_TRADE_QUEUE.get_nowait()
+    except Empty:
+        _sync_manual_trade_event()
+        return None
+    _sync_manual_trade_event()
+    update_manual_trade_status(request.get("request_id"), status="processing", message="Request picked up by trading loop")
+    return request
 
 def send_login_failure_notification(error_message, screenshot_path=None):
     """Send an email notification when automated login fails."""
     try:
+        # Check if the error message indicates scheduled maintenance
+        err_msg_lower = error_message.lower() if error_message else ""
+        maintenance_keywords = [
+            "maintenance", "temporarily unavailable", "system unavailable", 
+            "service unavailable", "down for maintenance", "scheduled maintenance", 
+            "schedule maintenance", "scheduled maintainance", "schedule maintainance"
+        ]
+        if any(kw in err_msg_lower for kw in maintenance_keywords):
+            print(f"🛑 Scheduled maintenance detected. Skipping login failure email notification. Error: {error_message}")
+            return
+
         config = configparser.ConfigParser()
         config.read("config.ini")
         
@@ -271,29 +883,66 @@ def send_extrinsic_value_alert(alerts):
         print(f"⚠️ Failed to send extrinsic value alert: {e}")
 
 LIVE_SETTINGS_FILE = "live_trading_settings.json"
+DASHBOARD_SESSION_COOKIE = "etrade_dashboard_session"
+DASHBOARD_SESSION_DAYS = 7
 
 def load_live_settings():
     """Load trading settings from JSON file."""
     try:
         if os.path.exists(LIVE_SETTINGS_FILE):
             with open(LIVE_SETTINGS_FILE, "r") as f:
-                return json.load(f)
+                settings = json.load(f)
+                # Dynamic self-healing migration for SPY & SPX spread width and pair quantity settings
+                modified = False
+                if 'spy_hedge_spread' not in settings:
+                    settings['spy_hedge_spread'] = float(settings.get('hedge_spread', 20.0) or 20.0)
+                    modified = True
+                if 'spx_hedge_spread' not in settings:
+                    settings['spx_hedge_spread'] = 200.0
+                    modified = True
+                if 'spy_pair_quantity' not in settings:
+                    settings['spy_pair_quantity'] = int(settings.get('pair_quantity', 15) or 15)
+                    modified = True
+                if 'spx_pair_quantity' not in settings:
+                    settings['spx_pair_quantity'] = 2
+                    modified = True
+                if 'spy_target_expiration' not in settings:
+                    settings['spy_target_expiration'] = settings.get('target_expiration')
+                    modified = True
+                if 'spx_target_expiration' not in settings:
+                    settings['spx_target_expiration'] = settings.get('target_expiration')
+                    modified = True
+                if 'dashboard_auth_secret' not in settings:
+                    settings['dashboard_auth_secret'] = secrets.token_hex(32)
+                    modified = True
+                if modified:
+                    save_live_settings(settings)
+                return settings
     except Exception as e:
         print(f"⚠️ Error loading settings: {e}")
     
     # Default fallback
     return {
-        "target_delta": 0.15,
+        "target_delta": 0.13,
         "hedge_spread": 20.0,
+        "spy_hedge_spread": 20.0,
+        "spx_hedge_spread": 200.0,
         "trade_start_time": "07:15:00",
         "trade_end_time": "13:30:00",
         "auto_close_midpoint_threshold": 0.30,
         "auto_close_gain_threshold": 70.0,
-        "pair_quantity": 1,
+        "pair_quantity": 15,
+        "spy_pair_quantity": 15,
+        "spx_pair_quantity": 2,
         "target_weeks": 6,
         "target_expiration": None,
+        "spy_target_expiration": None,
+        "spx_target_expiration": None,
         "auto_open_enabled": False,
-        "pin": "1234"
+        "pin": "1234",
+        "dashboard_user": "",
+        "dashboard_pass": "",
+        "dashboard_auth_secret": secrets.token_hex(32)
     }
 
 def save_live_settings(settings):
@@ -307,11 +956,227 @@ def save_live_settings(settings):
         return False
 
 
+def _dashboard_auth_configured(settings=None):
+    settings = settings or load_live_settings()
+    return bool(settings.get('dashboard_user') and settings.get('dashboard_pass'))
+
+
+def _dashboard_session_signature(settings, username, expires_at):
+    secret = settings.get('dashboard_auth_secret') or ''
+    payload = f"{username}|{expires_at}"
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _create_dashboard_session_cookie(settings, username, secure=False):
+    expires_at = int(t.time()) + DASHBOARD_SESSION_DAYS * 24 * 60 * 60
+    signature = _dashboard_session_signature(settings, username, expires_at)
+    value = f"{expires_at}|{signature}"
+    max_age = DASHBOARD_SESSION_DAYS * 24 * 60 * 60
+    secure_attribute = "; Secure" if secure else ""
+    return f"{DASHBOARD_SESSION_COOKIE}={value}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Lax{secure_attribute}"
+
+
+def _clear_dashboard_session_cookie(secure=False):
+    secure_attribute = "; Secure" if secure else ""
+    return f"{DASHBOARD_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax{secure_attribute}"
+
+
+def _is_valid_dashboard_session(headers, settings):
+    cookie_header = headers.get('Cookie')
+    if not cookie_header:
+        return False
+    try:
+        cookie = SimpleCookie(cookie_header)
+        morsel = cookie.get(DASHBOARD_SESSION_COOKIE)
+        if not morsel:
+            return False
+        expires_raw, signature = morsel.value.split('|', 1)
+        expires_at = int(expires_raw)
+        if expires_at < int(t.time()):
+            return False
+        username = settings.get('dashboard_user')
+        expected = _dashboard_session_signature(settings, username, expires_at)
+        return hmac.compare_digest(signature, expected)
+    except Exception:
+        return False
+
+
+def _dashboard_login_html():
+    return """<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>E*TRADE Dashboard Login</title>
+    <style>
+        body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #101418; color: #eef2f6; }
+        form { width: min(360px, calc(100vw - 32px)); display: grid; gap: 12px; }
+        h1 { margin: 0 0 8px; font-size: 22px; font-weight: 650; }
+        input, button { box-sizing: border-box; width: 100%; border-radius: 6px; border: 1px solid #34404c; padding: 12px; font-size: 16px; }
+        input { background: #171d23; color: #eef2f6; }
+        button { border: 0; background: #2383e2; color: white; font-weight: 650; cursor: pointer; }
+        .error { min-height: 20px; color: #ff7676; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <form id="login-form">
+        <h1>Dashboard Login</h1>
+        <input id="username" autocomplete="username" placeholder="Username" required>
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+        <button type="submit">Sign In</button>
+        <div id="error" class="error"></div>
+    </form>
+    <script>
+        document.getElementById('login-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const error = document.getElementById('error');
+            error.textContent = '';
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    username: document.getElementById('username').value,
+                    password: document.getElementById('password').value
+                })
+            });
+            if (res.ok) {
+                window.location.href = '/dashboard';
+            } else {
+                error.textContent = 'Invalid username or password.';
+            }
+        });
+    </script>
+</body>
+</html>"""
+
+
+def _dashboard_manifest():
+    return {
+        "id": "/dashboard",
+        "name": "Antigravity Trader Dashboard",
+        "short_name": "Trader",
+        "description": "Private mobile dashboard for the E*TRADE trading system.",
+        "start_url": "/dashboard",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#ffffff",
+    }
+
+
+def _select_target_expiration(expirations, target_date, today_date):
+    parsed = [
+        datetime.strptime(exp, "%Y-%m-%d").date() if isinstance(exp, str) else exp
+        for exp in (expirations or [])
+    ]
+    candidates = [exp for exp in parsed if exp >= today_date]
+    friday_candidates = [exp for exp in candidates if exp.weekday() == 4]
+    if friday_candidates:
+        candidates = friday_candidates
+    later_candidates = [exp for exp in candidates if exp >= target_date]
+    if later_candidates:
+        return min(later_candidates, key=lambda exp: (exp - target_date).days)
+    if candidates:
+        return min(candidates, key=lambda exp: abs((exp - target_date).days))
+    return None
+
+
+def _target_expiration_from_settings(accounts_obj, ticker, live_settings, today_date, available_expirations=None):
+    ticker_key = "spx" if str(ticker).upper() in ("SPX", "SPXW") else str(ticker).lower()
+    saved_expiry = live_settings.get(f"{ticker_key}_target_expiration") or live_settings.get("target_expiration")
+    try:
+        if saved_expiry:
+            saved_expiry = datetime.strptime(saved_expiry, "%Y-%m-%d").date()
+            if saved_expiry >= today_date:
+                return saved_expiry
+    except Exception:
+        pass
+
+    target_weeks = int(live_settings.get("target_weeks", 6) or 6)
+    target_date = today_date + timedelta(weeks=target_weeks)
+    try:
+        expirations = available_expirations if available_expirations is not None else accounts_obj.get_available_expirations(ticker)
+        selected = _select_target_expiration(expirations, target_date, today_date)
+        if selected:
+            return selected
+    except Exception as e:
+        print(f"⚠️ Failed to resolve target expiration for {ticker}: {e}")
+
+    return target_date
+
+
+def _add_months(base_date, months):
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    days_in_month = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return date(year, month, min(base_date.day, days_in_month[month - 1]))
+
+
 def _normalize_order_payload(order):
     """Return a single order dict from generate_option_order output."""
     if isinstance(order, list):
         return order[0] if order else None
     return order
+
+
+def _date_parts(expiration):
+    if hasattr(expiration, "year"):
+        return expiration.year, expiration.month, expiration.day
+    parsed = datetime.strptime(str(expiration), "%Y-%m-%d")
+    return parsed.year, parsed.month, parsed.day
+
+
+def _template_leg_symbol(template_order, fallback):
+    if isinstance(template_order, dict):
+        for leg in template_order.get("legs", []):
+            symbol = leg.get("symbol")
+            if symbol:
+                return symbol
+    return fallback
+
+
+def _build_neutralize_spread_order(ticker, detail, qty, price_type, limit_price, short_action, long_action, template_order=None):
+    year, month, day = _date_parts(detail.get("expiration"))
+    call_put = str(detail.get("call_put", "")).upper()
+    short_strike = float(detail.get("short_strike"))
+    long_strike = float(detail.get("long_strike"))
+    symbol = _template_leg_symbol(template_order, ticker)
+    width = abs(short_strike - long_strike)
+
+    return {
+        "client_order_id": random.randint(1000000000, 9999999999),
+        "securityType": "OPTN",
+        "orderTerm": "GOOD_FOR_DAY",
+        "orderAction": "SPREAD",
+        "spreadType": "VERTICAL",
+        "orderType": "SPREADS",
+        "priceType": price_type,
+        "limitPrice": round(float(limit_price or 0), 2),
+        "legs": [
+            {
+                "symbol": symbol,
+                "orderAction": short_action,
+                "quantity": qty,
+                "callPut": call_put,
+                "expiryYear": year,
+                "expiryMonth": month,
+                "expiryDay": day,
+                "strikePrice": short_strike,
+            },
+            {
+                "symbol": symbol,
+                "orderAction": long_action,
+                "quantity": qty,
+                "callPut": call_put,
+                "expiryYear": year,
+                "expiryMonth": month,
+                "expiryDay": day,
+                "strikePrice": long_strike,
+            },
+        ],
+        "required_margin": 0 if price_type == "NET_DEBIT" else width * qty * 100,
+    }
 
 
 def _format_osi(symbol, exp_date, call_put, strike):
@@ -366,12 +1231,173 @@ def _quote_spread_midpoint(market, short_lot, long_lot):
     }
 
 
+def build_close_proposals(screened, accounts, market, live_settings, rejected_proposals_today):
+    """Quote screened spreads and return positions that meet close thresholds."""
+    from copy import copy
+
+    proposals = []
+    close_mid_threshold = float(live_settings.get("auto_close_midpoint_threshold", 0.30))
+    target_gain_threshold = float(live_settings.get("auto_close_gain_threshold", 70.0))
+
+    for entry in screened:
+        if not (entry.get("is_spread") and entry.get("short_lot") and entry.get("long_lot")):
+            continue
+
+        short_lot = entry["short_lot"]
+        long_lot = entry["long_lot"]
+        proposal_id = f"{short_lot.symbol}_{short_lot.strike_price}_{short_lot.call_put}_{short_lot.expiration_date}"
+        if proposal_id in rejected_proposals_today:
+            continue
+
+        try:
+            print(f"   Checking quote for {short_lot.symbol} close candidate...")
+            quote_info = _quote_spread_midpoint(market, short_lot, long_lot)
+            if not quote_info:
+                continue
+
+            midpoint = quote_info["midpoint"]
+            gain_val = float(entry.get("pair_gain_loss", 0) or 0)
+            if gain_val < target_gain_threshold or abs(midpoint) > close_mid_threshold:
+                continue
+
+            print(f"\n🚀 DETECTION: Profit Target Met in {short_lot.symbol}")
+            print(f"   Gain: {gain_val:.1f}% >= {target_gain_threshold}%")
+            print(f"   Cost: ${abs(midpoint):.2f} <= ${close_mid_threshold:.2f}")
+            print(f"   Pair Qty: {entry['pair_quantity']}")
+
+            s_lot = copy(short_lot)
+            l_lot = copy(long_lot)
+            s_lot.quantity = entry["pair_quantity"]
+            l_lot.quantity = entry["pair_quantity"]
+            close_order = accounts.generate_option_order(
+                single_leg_stock_position=None,
+                action="SPREAD",
+                spread_sell_option=l_lot,
+                spread_buy_option=s_lot,
+                priceType={"priceType": "NET_DEBIT", "limitPrice": abs(midpoint)}
+            )
+
+            expiry_str = short_lot.expiration_date.strftime("%Y-%m-%d") if hasattr(short_lot.expiration_date, "strftime") else str(short_lot.expiration_date)
+            proposals.append({
+                "ticker": short_lot.symbol,
+                "short_strike": short_lot.strike_price,
+                "long_strike": long_lot.strike_price,
+                "call_put": short_lot.call_put,
+                "expiration": expiry_str,
+                "pair_quantity": entry["pair_quantity"],
+                "gain_pct": short_lot.gain_loss_percentage if hasattr(short_lot, "gain_loss_percentage") else gain_val,
+                "midpoint": midpoint,
+                "short_bid": quote_info["short_bid"],
+                "short_ask": quote_info["short_ask"],
+                "long_bid": quote_info["long_bid"],
+                "long_ask": quote_info["long_ask"],
+                "close_order": close_order,
+                "proposal_id": proposal_id,
+            })
+        except Exception as e:
+            print(f"   Error in auto-close logic for {short_lot.symbol}: {e}")
+            traceback.print_exc()
+
+    return proposals
+
+
+def _neutralize_target_expiration(accounts, ticker, live_settings, today):
+    return _target_expiration_from_settings(accounts, ticker, live_settings, today)
+
+
+def _spread_uses_expiration(spread, expiration_date):
+    if not spread:
+        return False
+    sell_option = spread.get("sell_option")
+    buy_option = spread.get("buy_option")
+    return (
+        sell_option is not None and buy_option is not None and
+        getattr(sell_option, "expiration_date", None) == expiration_date and
+        getattr(buy_option, "expiration_date", None) == expiration_date
+    )
+
+
+def _execute_neutralize_leg(etrade_instance, ticker, leg_name, order_to_send, short_strike, long_strike, call_put, qty, close_reason):
+    """Submit one neutralize leg and keep nudging it until it fills or stops."""
+    print(f"   [Neutralize] Submitting {leg_name} order for {ticker} {call_put} {short_strike}/{long_strike}...")
+    order_id = etrade_instance.order.place_order(order_to_send, preview_only=False)
+    if not order_id:
+        print(f"   ❌ Neutralize {leg_name} order submission failed for {ticker}")
+        return {
+            "leg_name": leg_name,
+            "submitted": False,
+            "executed": False,
+            "order_id": None,
+            "final_id": None,
+        }
+
+    print(f"   [Neutralize] Order submitted! ID: {order_id}")
+    try:
+        executed, final_id = etrade_instance.order.wait_and_adjust_until_filled(
+            order_id, step=0.01, interval_sec=30, max_checks=60
+        )
+        if executed:
+            print(f"   ✅ Neutralize {leg_name} order filled (ID: {final_id})")
+            order_audit = {
+                'ticker': ticker,
+                'sell_strike': short_strike,
+                'long_strike': long_strike,
+                'qty': qty,
+                'order_id': final_id,
+                'is_close': (leg_name == "close"),
+            }
+            log_order_execution(order_audit, close_reason, "FILLED")
+            send_trade_notification_email(order_audit, close_reason)
+        else:
+            print(f"   ❌ Neutralize {leg_name} order did not fill for {ticker}")
+        return {
+            "leg_name": leg_name,
+            "submitted": True,
+            "executed": bool(executed),
+            "order_id": order_id,
+            "final_id": final_id,
+        }
+    except Exception as e:
+        print(f"   Auto-adjust for neutralize {leg_name} order {order_id} error: {e}")
+        return {
+            "leg_name": leg_name,
+            "submitted": True,
+            "executed": False,
+            "order_id": order_id,
+            "final_id": None,
+            "error": str(e),
+        }
+
+
 def build_neutralize_proposals(screened, accounts, market, live_settings, rejected_proposals_today):
     """Build neutralize proposals for risky short spreads."""
     proposals = []
     target_delta = float(live_settings.get("target_delta", 0.15) or 0.15)
     hedge_spread = float(live_settings.get("hedge_spread", 20.0) or 20.0)
     today = datetime.now().date()
+    side_margin_by_expiration = {}
+
+    for entry in screened:
+        if not entry.get("is_spread"):
+            continue
+        short_lot = entry.get("short_lot")
+        long_lot = entry.get("long_lot")
+        if not short_lot or not long_lot:
+            continue
+        if getattr(short_lot, "call_put", None) != getattr(long_lot, "call_put", None):
+            continue
+        if getattr(short_lot, "quantity", 0) >= 0 or getattr(long_lot, "quantity", 0) <= 0:
+            continue
+        exp = getattr(short_lot, "expiration_date", None)
+        if exp is None:
+            continue
+        try:
+            qty = int(entry.get("pair_quantity", 1) or 1)
+            width = abs(float(long_lot.strike_price) - float(short_lot.strike_price))
+        except Exception:
+            continue
+        key = (short_lot.symbol, exp, short_lot.call_put)
+        side_margin_by_expiration[key] = side_margin_by_expiration.get(key, 0.0) + width * qty * 100.0
 
     for entry in screened:
         if not entry.get("is_spread"):
@@ -398,7 +1424,16 @@ def build_neutralize_proposals(screened, accounts, market, live_settings, reject
         except Exception:
             continue
 
-        if abs(short_delta) <= NEUTRALIZE_DELTA_THRESHOLD or dte > NEUTRALIZE_TRIGGER_DTE or dte < 0:
+        is_delta_risk = abs(short_delta) > NEUTRALIZE_DELTA_THRESHOLD and dte <= NEUTRALIZE_TRIGGER_DTE
+        is_put_delta_risk = short_lot.call_put == "PUT" and is_delta_risk
+        has_put_margin = side_margin_by_expiration.get((short_lot.symbol, short_lot.expiration_date, "PUT"), 0.0) > 0
+        is_orphan_call_margin = (
+            short_lot.symbol in ["SPY", "SPX"] and
+            short_lot.call_put == "CALL" and
+            not has_put_margin
+        )
+
+        if dte < 0 or not (is_delta_risk or is_orphan_call_margin):
             continue
 
         proposal_id = f"{short_lot.symbol}_{short_lot.strike_price}_{short_lot.call_put}_{short_lot.expiration_date}_neutralize"
@@ -421,44 +1456,67 @@ def build_neutralize_proposals(screened, accounts, market, live_settings, reject
         if original_spread_width <= 0:
             continue
 
+        target_expiration = _neutralize_target_expiration(accounts, short_lot.symbol, live_settings, today)
+        days_to_expire = (target_expiration - today).days
+        if days_to_expire < 1:
+            continue
+
         try:
+            replacement_target_delta = abs(short_delta) / 2.0 if is_put_delta_risk else target_delta
             same_side_spread = accounts.get_option_spread_by_price(
                 short_lot.symbol,
                 side_title,
-                days_to_expire=NEUTRALIZE_TARGET_DTE,
+                days_to_expire=days_to_expire,
                 target_premium=0,
                 hedge_ratio=1,
                 hedge_spread=original_spread_width,
                 qty=qty,
-                target_delta=target_delta
+                target_delta=replacement_target_delta
             )
-            opposite_side_spread = accounts.get_option_spread_by_price(
-                short_lot.symbol,
-                opposite_title,
-                days_to_expire=NEUTRALIZE_TARGET_DTE,
-                target_premium=0,
-                hedge_ratio=1,
-                hedge_spread=hedge_spread,
-                qty=qty,
-                target_delta=target_delta
-            )
+
+            include_offset = not is_put_delta_risk
+            opposite_side_spread = None
+            opposite_target_delta = None
+            if include_offset:
+                if short_lot.symbol == "SPX":
+                    pos_hedge_spread = float(live_settings.get('spx_hedge_spread', live_settings.get('hedge_spread', 200.0)) or 200.0)
+                else:
+                    pos_hedge_spread = float(live_settings.get('spy_hedge_spread', live_settings.get('hedge_spread', 20.0)) or 20.0)
+
+                opposite_target_delta = target_delta
+                opposite_side_spread = accounts.get_option_spread_by_price(
+                    short_lot.symbol,
+                    opposite_title,
+                    days_to_expire=days_to_expire,
+                    target_premium=0,
+                    hedge_ratio=1,
+                    hedge_spread=pos_hedge_spread,
+                    qty=qty,
+                    target_delta=opposite_target_delta
+                )
         except Exception as e:
             print(f"   [Neutralize] Failed to build replacement spreads for {short_lot.symbol}: {e}")
             continue
 
-        if not same_side_spread or not opposite_side_spread:
+        if not same_side_spread or (include_offset and not opposite_side_spread):
+            continue
+        if not _spread_uses_expiration(same_side_spread, target_expiration):
+            print(f"   [Neutralize] Skipping replacement that fell back before target expiration {target_expiration}.")
+            continue
+        if include_offset and not _spread_uses_expiration(opposite_side_spread, target_expiration):
+            print(f"   [Neutralize] Skipping offset that fell back before target expiration {target_expiration}.")
             continue
 
         same_profit = float(same_side_spread.get("profit", 0) or 0)
-        opposite_profit = float(opposite_side_spread.get("profit", 0) or 0)
-        if same_profit <= 0.01 or opposite_profit <= 0.01:
+        opposite_profit = float(opposite_side_spread.get("profit", 0) or 0) if include_offset else 0.0
+        if same_profit <= 0.01 or (include_offset and opposite_profit <= 0.01):
             continue
 
         same_sell = same_side_spread.get("sell_option")
         same_buy = same_side_spread.get("buy_option")
-        opp_sell = opposite_side_spread.get("sell_option")
-        opp_buy = opposite_side_spread.get("buy_option")
-        if not same_sell or not same_buy or not opp_sell or not opp_buy:
+        opp_sell = opposite_side_spread.get("sell_option") if include_offset else None
+        opp_buy = opposite_side_spread.get("buy_option") if include_offset else None
+        if not same_sell or not same_buy or (include_offset and (not opp_sell or not opp_buy)):
             continue
 
         close_order = accounts.generate_option_order(
@@ -475,18 +1533,34 @@ def build_neutralize_proposals(screened, accounts, market, live_settings, reject
             spread_buy_option=same_buy,
             priceType={"priceType": "NET_CREDIT", "limitPrice": round(same_profit, 2)}
         )
-        opp_order = accounts.generate_option_order(
-            single_leg_stock_position=None,
-            action="SPREAD",
-            spread_sell_option=opp_sell,
-            spread_buy_option=opp_buy,
-            priceType={"priceType": "NET_CREDIT", "limitPrice": round(opposite_profit, 2)}
-        )
+        opp_order = None
+        if include_offset:
+            opp_order = accounts.generate_option_order(
+                single_leg_stock_position=None,
+                action="SPREAD",
+                spread_sell_option=opp_sell,
+                spread_buy_option=opp_buy,
+                priceType={"priceType": "NET_CREDIT", "limitPrice": round(opposite_profit, 2)}
+            )
+
+        offset_details = None
+        if include_offset:
+            offset_details = {
+                "call_put": opposite_title.upper(),
+                "expiration": opp_sell.expiration_date.strftime("%Y-%m-%d"),
+                "short_strike": float(opp_sell.strike_price),
+                "long_strike": float(opp_buy.strike_price),
+                "spread_width": round(abs(float(opp_buy.strike_price) - float(opp_sell.strike_price)), 2),
+                "delta": round(float(getattr(opp_sell, "delta", 0) or 0), 4),
+                "target_delta": round(float(opposite_target_delta), 4),
+                "credit": round(float(opposite_side_spread.get("profit", 0) or 0), 2),
+            }
 
         proposals.append({
             "proposal_id": proposal_id,
             "ticker": short_lot.symbol,
             "qty": qty,
+            "trigger": " & ".join([r for r, cond in [("Delta Risk", is_delta_risk), ("Orphan CALL Margin", is_orphan_call_margin)] if cond]) or "Unknown",
             "original": {
                 "call_put": short_lot.call_put,
                 "expiration": short_lot.expiration_date.strftime("%Y-%m-%d"),
@@ -504,17 +1578,10 @@ def build_neutralize_proposals(screened, accounts, market, live_settings, reject
                 "long_strike": float(same_buy.strike_price),
                 "spread_width": round(abs(float(same_buy.strike_price) - float(same_sell.strike_price)), 2),
                 "delta": round(float(getattr(same_sell, "delta", 0) or 0), 4),
+                "target_delta": round(float(replacement_target_delta), 4),
                 "credit": round(float(same_side_spread.get("profit", 0) or 0), 2),
             },
-            "offset": {
-                "call_put": opposite_title.upper(),
-                "expiration": opp_sell.expiration_date.strftime("%Y-%m-%d"),
-                "short_strike": float(opp_sell.strike_price),
-                "long_strike": float(opp_buy.strike_price),
-                "spread_width": round(abs(float(opp_buy.strike_price) - float(opp_sell.strike_price)), 2),
-                "delta": round(float(getattr(opp_sell, "delta", 0) or 0), 4),
-                "credit": round(float(opposite_side_spread.get("profit", 0) or 0), 2),
-            },
+            "offset": offset_details,
             "estimated_close_debit": round(close_debit, 2),
             "estimated_open_credit": round(same_profit + opposite_profit, 2),
             "estimated_net_credit": round(same_profit + opposite_profit - close_debit, 2),
@@ -522,11 +1589,499 @@ def build_neutralize_proposals(screened, accounts, market, live_settings, reject
             "orders": {
                 "close_order": _normalize_order_payload(close_order),
                 "replacement_order": _normalize_order_payload(same_order),
-                "offset_order": _normalize_order_payload(opp_order),
+                "offset_order": _normalize_order_payload(opp_order) if include_offset else None,
             }
         })
 
     return proposals
+
+
+# --- SPY GEX Calculation & Mock Fallback ---
+
+# In-memory cache for SPY GEX results to prevent spamming E*TRADE API
+spy_gex_cache = {
+    "timestamp": 0.0,
+    "data": None
+}
+
+spy_regime_cache = {
+    "timestamp": 0.0,
+    "data": None
+}
+
+
+def _pct_or_none(value):
+    try:
+        if pd.isna(value):
+            return None
+        return float(value) * 100.0
+    except Exception:
+        return None
+
+
+def _latest_regime_from_diagnostic_csv(error=None):
+    path = os.path.join("research_reports", "regime_diagnostics", "causal_regime_trace.csv")
+    if not os.path.exists(path):
+        return {
+            "available": False,
+            "error": error or "No HMM model loaded and no diagnostic trace found.",
+            "source": "unavailable",
+        }
+
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        if df.empty:
+            raise ValueError("diagnostic trace is empty")
+        row = df.iloc[-1]
+        return _format_regime_row(row, df.index[-1], source="diagnostic_csv_fallback", error=error)
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": error or str(exc),
+            "source": "unavailable",
+        }
+
+
+def _format_regime_row(row, row_date, source, error=None):
+    prob_cols = [c for c in row.index if str(c).startswith("prob_state_")]
+    raw_confidence = None
+    if prob_cols:
+        try:
+            raw_confidence = float(pd.to_numeric(row[prob_cols], errors="coerce").max())
+        except Exception:
+            raw_confidence = None
+
+    detected_prob_cols = [c for c in row.index if str(c).startswith("detected_prob_state_")]
+    detected_confidence = None
+    if detected_prob_cols:
+        try:
+            detected_confidence = float(pd.to_numeric(row[detected_prob_cols], errors="coerce").max())
+        except Exception:
+            detected_confidence = None
+
+    def get_int(field):
+        try:
+            value = row.get(field)
+            if pd.isna(value):
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def get_str(field, default=None):
+        value = row.get(field, default)
+        if value is None:
+            return default
+        try:
+            if pd.isna(value):
+                return default
+        except Exception:
+            pass
+        return str(value)
+
+    date_str = pd.Timestamp(row_date).strftime("%Y-%m-%d")
+    return {
+        "available": True,
+        "source": source,
+        "stale": source != "live_hmm",
+        "error": error,
+        "as_of_date": date_str,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "signal_timestamp": get_str("Regime_Signal_Timestamp", "close_T_for_next_session"),
+        "hmm_refit_date": get_str("HMM_Refit_Date"),
+        "raw_hmm_state": get_int("Raw_HMM_State") if "Raw_HMM_State" in row.index else get_int("HMM_State"),
+        "raw_hmm_label": get_str("Raw_Regime_Label") if "Raw_Regime_Label" in row.index else get_str("Regime_Label"),
+        "raw_hmm_confidence": raw_confidence,
+        "detected_regime_state": get_int("Detected_Regime_State"),
+        "detected_regime_label": get_str("Detected_Regime_Label"),
+        "detected_regime_confidence": detected_confidence,
+        "stress_overlay": get_str("Stress_Overlay", "none"),
+        "spy_close": None if pd.isna(row.get("SPY_Close", np.nan)) else float(row.get("SPY_Close")),
+        "vix_close": None if pd.isna(row.get("VIX_Close", row.get("Stress_VIX_Close", np.nan))) else float(row.get("VIX_Close", row.get("Stress_VIX_Close"))),
+        "stress_21d_drawdown_pct": _pct_or_none(row.get("Stress_21d_Drawdown")),
+        "stress_5d_log_return_pct": _pct_or_none(row.get("Stress_5d_Log_Return")),
+        "stress_1d_log_return_pct": _pct_or_none(row.get("Stress_1d_Log_Return")),
+    }
+
+
+def calculate_spy_regime_status(hmm_model):
+    """
+    Return the latest HMM regime status for the dashboard.
+
+    The HMM uses close-T market data, so the result is labeled for next-session
+    use and should be displayed as risk context rather than intraday clairvoyance.
+    """
+    global spy_regime_cache
+
+    now = t.time()
+    if spy_regime_cache["data"] is not None and (now - spy_regime_cache["timestamp"]) < 900:
+        return spy_regime_cache["data"]
+
+    if hmm_model is None:
+        data = _latest_regime_from_diagnostic_csv("No live HMM model is loaded.")
+        spy_regime_cache = {"timestamp": now, "data": data}
+        return data
+
+    try:
+        historical_df = fetch_historical_data()
+        if historical_df.empty:
+            raise ValueError("historical data is empty")
+
+        as_of_ts = pd.Timestamp(datetime.now()).normalize()
+        causal_df = historical_df.loc[historical_df.index <= as_of_ts].copy()
+        if causal_df.empty:
+            raise ValueError(f"no historical rows available as of {as_of_ts.date()}")
+
+        feature_df = _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts)
+        if feature_df.empty:
+            raise ValueError("HMM scoring returned no rows")
+
+        last_date = feature_df.index[-1]
+        row = feature_df.iloc[-1].copy()
+        raw_row = causal_df.reindex(feature_df.index).iloc[-1]
+        for col in ("SPY_Close", "VIX_Close"):
+            if col in raw_row.index and col not in row.index:
+                row[col] = raw_row[col]
+
+        data = _format_regime_row(row, last_date, source="live_hmm")
+        spy_regime_cache = {"timestamp": now, "data": data}
+        return data
+    except Exception as exc:
+        print(f"⚠️ Error calculating SPY HMM regime status: {exc}")
+        data = _latest_regime_from_diagnostic_csv(str(exc))
+        spy_regime_cache = {"timestamp": now, "data": data}
+        return data
+
+def fetch_option_chain_for_gex(accounts_instance, symbol, expiration, allow_auth_refresh=True):
+    """
+    Fetch the option chain for a given symbol and expiration, near the spot price.
+    """
+    try:
+        spot_price = accounts_instance.get_stock_price(symbol)
+        if not spot_price:
+            return []
+            
+        url = f"{accounts_instance.base_url}/v1/market/optionchains.json"
+        symbol_converted = "BRK.B" if symbol == "BRKB" else symbol
+        
+        if isinstance(expiration, str):
+            dt_obj = datetime.strptime(expiration, "%Y-%m-%d")
+        elif hasattr(expiration, "strftime"):
+            dt_obj = datetime.combine(expiration, datetime.min.time())
+        else:
+            dt_obj = expiration
+
+        params = {
+            "symbol": symbol_converted,
+            "expiryYear": dt_obj.year,
+            "expiryMonth": dt_obj.month,
+            "expiryDay": dt_obj.day,
+            "includeWeekly": True,
+            "skipAdjusted": True,
+            "optionCategory": "STANDARD",
+            "strikePriceNear": round(spot_price),
+            "noOfStrikes": 100
+        }
+        
+        response = accounts_instance.session.get(url, params=params, auth=accounts_instance.session.auth)
+        if is_etrade_token_expired_response(response) and allow_auth_refresh:
+            refreshed = _refresh_etrade_session(f"{symbol} GEX option chain")
+            if refreshed:
+                refreshed_accounts = globals().get("accounts", accounts_instance)
+                return fetch_option_chain_for_gex(refreshed_accounts, symbol, expiration, allow_auth_refresh=False)
+        if response.status_code != 200:
+            print(f"⚠️ Error fetching option chain for {symbol} on {expiration}: {response.status_code}")
+            return []
+            
+        data = response.json()
+        option_pairs = data.get("OptionChainResponse", {}).get("OptionPair", [])
+        return option_pairs
+    except Exception as e:
+        print(f"⚠️ Exception in fetch_option_chain_for_gex: {e}")
+        return []
+
+def generate_mock_spy_gex(spot_price=510.0):
+    """
+    Generate mathematically consistent mock GEX data for SPY when live options data is unavailable.
+    """
+    import random
+    
+    strikes = list(range(int(spot_price) - 30, int(spot_price) + 30))
+    net_gex = []
+    call_gex = []
+    put_gex = []
+    
+    for s in strikes:
+        dist = s - spot_price
+        # Gamma is highest ATM and decays exponentially
+        approx_gamma = float(np.exp(-(dist**2) / (2 * 8.0**2)) * (0.05 + random.uniform(-0.005, 0.005)))
+        
+        # Puts (negative GEX)
+        approx_put_oi = float(np.exp(-((dist + 10)**2) / (2 * 12.0**2)) * 8000 * random.uniform(0.8, 1.2) if dist < 5 else 100)
+        # Calls (positive GEX)
+        approx_call_oi = float(np.exp(-((dist - 10)**2) / (2 * 12.0**2)) * 9000 * random.uniform(0.8, 1.2) if dist > -5 else 100)
+        
+        p_gex = -approx_gamma * approx_put_oi * 100.0 * spot_price / 1_000_000.0
+        c_gex = approx_gamma * approx_call_oi * 100.0 * spot_price / 1_000_000.0
+        
+        call_gex.append(float(round(c_gex, 2)))
+        put_gex.append(float(round(p_gex, 2)))
+        net_gex.append(float(round(c_gex + p_gex, 2)))
+        
+    call_wall = int(strikes[int(np.argmax(call_gex))])
+    put_wall = int(strikes[int(np.argmin(put_gex))])
+    
+    # Zero gamma flip search
+    zero_gamma = float(spot_price)
+    for i in range(len(strikes) - 1):
+        if net_gex[i] < 0 and net_gex[i+1] > 0:
+            zero_gamma = float(strikes[i] + (strikes[i+1] - strikes[i]) * (-net_gex[i]) / (net_gex[i+1] - net_gex[i]))
+            break
+            
+    total_net = float(sum(net_gex))
+    total_call = float(sum(call_gex))
+    total_put = float(sum(put_gex))
+    
+    return {
+        "spot_price": float(round(spot_price, 2)),
+        "total_net_gex": float(round(total_net, 2)),
+        "total_call_gex": float(round(total_call, 2)),
+        "total_put_gex": float(round(total_put, 2)),
+        "call_wall": int(call_wall),
+        "put_wall": int(put_wall),
+        "zero_gamma": float(round(zero_gamma, 2)),
+        "expirations": [(datetime.now() + timedelta(days=d)).strftime("%Y-%m-%d") for d in [1, 3, 5, 8, 15]],
+        "chart_data": {
+            "strikes": [int(s) for s in strikes],
+            "net_gex": [float(v) for v in net_gex],
+            "call_gex": [float(v) for v in call_gex],
+            "put_gex": [float(v) for v in put_gex]
+        },
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " (MOCK)",
+        "is_mock": True
+    }
+
+def calculate_spy_gex(accounts_instance):
+    """
+    Fetch SPY option chains and calculate Gamma Exposure (GEX) profile.
+    """
+    global spy_gex_cache
+    
+    now = t.time()
+    if spy_gex_cache["data"] is not None and (now - spy_gex_cache["timestamp"]) < 60:
+        print("⚡ Returning cached SPY GEX data")
+        return spy_gex_cache["data"]
+        
+    print("🔄 Fetching SPY option chains for GEX calculation...")
+    
+    spot_price = None
+    try:
+        spot_price = accounts_instance.get_stock_price("SPY")
+    except Exception as e:
+        print(f"⚠️ Failed to get SPY price from E*TRADE: {e}")
+        
+    if not spot_price:
+        # Fallback to yfinance
+        try:
+            ticker_obj = yf.Ticker("SPY")
+            data = ticker_obj.history(period="1d")
+            if not data.empty:
+                spot_price = float(data['Close'].iloc[-1])
+        except Exception as e:
+            print(f"⚠️ yfinance fallback for spot price failed: {e}")
+            
+    if not spot_price:
+        print("⚠️ Unable to get a live SPY spot price. Returning mock GEX profile.")
+        return generate_mock_spy_gex(510.0)
+        
+    expirations = None
+    try:
+        expirations = accounts_instance.get_available_expirations("SPY")
+    except Exception as e:
+        print(f"⚠️ Failed to get SPY expirations from E*TRADE: {e}")
+        
+    if not expirations:
+        # Fallback to yfinance
+        try:
+            ticker_obj = yf.Ticker("SPY")
+            expirations = ticker_obj.options
+        except Exception as e:
+            print(f"⚠️ yfinance fallback for expirations failed: {e}")
+            
+    if not expirations:
+        print("⚠️ No expirations found. Returning mock GEX profile.")
+        return generate_mock_spy_gex(spot_price)
+        
+    # Standardize and sort expirations
+    parsed_expirations = []
+    for exp in expirations:
+        try:
+            if isinstance(exp, str):
+                parsed_expirations.append(datetime.strptime(exp, "%Y-%m-%d").date())
+            else:
+                parsed_expirations.append(exp)
+        except Exception:
+            continue
+    parsed_expirations = sorted(parsed_expirations)
+    
+    today = datetime.now().date()
+    active_expirations = [exp for exp in parsed_expirations if exp >= today]
+    
+    target_expirations = active_expirations[:5]
+    if not target_expirations:
+        print("⚠️ No active expirations found. Returning mock GEX profile.")
+        return generate_mock_spy_gex(spot_price)
+        
+    print(f"Targeting SPY expirations: {target_expirations}")
+    
+    strike_gex = {}
+    strike_call_gex = {}
+    strike_put_gex = {}
+    
+    total_net_gex = 0.0
+    total_call_gex = 0.0
+    total_put_gex = 0.0
+    
+    success_count = 0
+    for expiration in target_expirations:
+        option_pairs = fetch_option_chain_for_gex(accounts_instance, "SPY", expiration)
+        if option_pairs:
+            success_count += 1
+            
+        for pair in option_pairs:
+            for opt_type in ["Call", "Put"]:
+                opt = pair.get(opt_type)
+                if not opt:
+                    continue
+                    
+                strike = float(opt.get("strikePrice", 0.0))
+                oi = int(opt.get("openInterest", 0) or 0)
+                
+                greeks = opt.get("OptionGreeks") or {}
+                gamma = 0.0
+                if greeks:
+                    try:
+                        gamma = float(greeks.get("gamma", 0.0) or 0.0)
+                    except (ValueError, TypeError):
+                        gamma = 0.0
+                        
+                if gamma == 100.0 or gamma < 0.0 or gamma > 5.0:
+                    gamma = 0.0
+                    
+                is_call = (opt_type == "Call")
+                sign = 1.0 if is_call else -1.0
+                
+                gex_value = gamma * oi * 100.0 * spot_price * sign
+                gex_value_millions = gex_value / 1_000_000.0
+                
+                if strike not in strike_gex:
+                    strike_gex[strike] = 0.0
+                    strike_call_gex[strike] = 0.0
+                    strike_put_gex[strike] = 0.0
+                    
+                strike_gex[strike] += gex_value_millions
+                if is_call:
+                    strike_call_gex[strike] += gex_value_millions
+                    total_call_gex += gex_value_millions
+                else:
+                    strike_put_gex[strike] += gex_value_millions
+                    total_put_gex += gex_value_millions
+                    
+                total_net_gex += gex_value_millions
+                
+    if success_count == 0 or not strike_gex:
+        print("⚠️ E*TRADE returned empty option chains or failed. Falling back to mock GEX profile.")
+        return generate_mock_spy_gex(spot_price)
+        
+    sorted_strikes = sorted(strike_gex.keys())
+    call_wall = max(strike_call_gex.items(), key=lambda x: x[1], default=(0.0, 0.0))[0]
+    put_wall = min(strike_put_gex.items(), key=lambda x: x[1], default=(0.0, 0.0))[0]
+    
+    zero_gamma = None
+    for i in range(len(sorted_strikes) - 1):
+        s1, s2 = sorted_strikes[i], sorted_strikes[i+1]
+        g1, g2 = strike_gex[s1], strike_gex[s2]
+        if g1 < 0 and g2 > 0:
+            zero_gamma = float(s1 + (s2 - s1) * (-g1) / (g2 - g1))
+            break
+            
+    if zero_gamma is None:
+        zero_gamma = float(min(strike_gex.items(), key=lambda x: abs(x[1]), default=(0.0, 0.0))[0])
+        
+    lower_bound = spot_price * 0.94
+    upper_bound = spot_price * 1.06
+    filtered_strikes = [s for s in sorted_strikes if lower_bound <= s <= upper_bound]
+    
+    if not filtered_strikes:
+        filtered_strikes = sorted_strikes
+        
+    chart_data = {
+        "strikes": [int(s) for s in filtered_strikes],
+        "net_gex": [float(round(strike_gex[s], 2)) for s in filtered_strikes],
+        "call_gex": [float(round(strike_call_gex[s], 2)) for s in filtered_strikes],
+        "put_gex": [float(round(strike_put_gex[s], 2)) for s in filtered_strikes],
+    }
+    
+    result = {
+        "spot_price": float(round(spot_price, 2)),
+        "total_net_gex": float(round(total_net_gex, 2)),
+        "total_call_gex": float(round(total_call_gex, 2)),
+        "total_put_gex": float(round(total_put_gex, 2)),
+        "call_wall": float(round(call_wall, 2)),
+        "put_wall": float(round(put_wall, 2)),
+        "zero_gamma": float(round(zero_gamma, 2)),
+        "expirations": [exp.strftime("%Y-%m-%d") for exp in target_expirations],
+        "chart_data": chart_data,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "is_mock": False
+    }
+    
+    spy_gex_cache["data"] = result
+    spy_gex_cache["timestamp"] = now
+    
+    return result
+
+def log_gex_minute(accounts_instance):
+    """
+    Calculate SPY GEX and log it to spy_gex_intraday_log.csv.
+    Logs: Timestamp, SPY_Spot, Total_Net_GEX, Zero_Gamma, Call_Wall, Put_Wall, Setup (LONG/SHORT_GAMMA), Is_Mock
+    """
+    CSV_FILE = "spy_gex_intraday_log.csv"
+    try:
+        gex_data = calculate_spy_gex(accounts_instance)
+        if not gex_data:
+            return
+            
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        spy_spot = gex_data.get("spot_price")
+        net_gex = gex_data.get("total_net_gex")
+        zero_gamma = gex_data.get("zero_gamma")
+        call_wall = gex_data.get("call_wall")
+        put_wall = gex_data.get("put_wall")
+        is_mock = gex_data.get("is_mock", False)
+        
+        setup = "LONG_GAMMA" if net_gex >= 0 else "SHORT_GAMMA"
+        
+        # Check if file exists to write header
+        write_header = not os.path.exists(CSV_FILE)
+        
+        with open(CSV_FILE, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    "Timestamp", "SPY_Spot", "Total_Net_GEX_M", 
+                    "Zero_Gamma_Flip", "Call_Wall", "Put_Wall", 
+                    "Setup", "Is_Mock"
+                ])
+            writer.writerow([
+                timestamp, spy_spot, net_gex, 
+                zero_gamma, call_wall, put_wall, 
+                setup, is_mock
+            ])
+            
+        print(f"📝 [GEX Logger] Logged intraday data to {CSV_FILE}: SPY=${spy_spot}, NetGEX={net_gex}M, Flip=${zero_gamma}, Wall=C${call_wall}/P${put_wall} ({setup})")
+    except Exception as e:
+        print(f"⚠️ [GEX Logger] Error logging GEX data: {e}")
 
 
 class RefreshHandler(BaseHTTPRequestHandler):
@@ -535,13 +2090,28 @@ class RefreshHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress default logging
         pass
+
+    def _request_uses_https(self):
+        forwarded_proto = self.headers.get('X-Forwarded-Proto', '').split(',', 1)[0].strip().lower()
+        if forwarded_proto == 'https':
+            return True
+        forwarded = self.headers.get('Forwarded', '').lower().replace(',', ';')
+        return any(part.strip() == 'proto=https' for part in forwarded.split(';'))
     
-    def _send_safe_response(self, code, content, content_type='application/json'):
+    def _send_safe_response(self, code, content, content_type='application/json', headers=None):
         """Send a response while safely handling BrokenPipeError."""
         try:
             self.send_response(code)
             self.send_header('Content-Type', content_type)
             self.send_header('Access-Control-Allow-Origin', '*')
+            response_headers = {
+                'Cache-Control': 'no-store, max-age=0',
+                'Pragma': 'no-cache',
+                'Expires': '0',
+            }
+            response_headers.update(headers or {})
+            for key, value in response_headers.items():
+                self.send_header(key, value)
             self.end_headers()
             if content is None:
                 return
@@ -574,8 +2144,10 @@ class RefreshHandler(BaseHTTPRequestHandler):
         user = settings.get('dashboard_user')
         password = settings.get('dashboard_pass')
         
-        # If no auth is configured, allow access (fallback to PIN only)
         if not user or not password:
+            return False
+
+        if _is_valid_dashboard_session(self.headers, settings):
             return True
             
         if not auth_header or not auth_header.startswith('Basic '):
@@ -587,6 +2159,9 @@ class RefreshHandler(BaseHTTPRequestHandler):
             return u == user and p == password
         except Exception:
             return False
+
+    def _send_unauthorized(self):
+        self._send_safe_response(401, {"error": "Authentication required"})
 
     def do_POST(self):
         """Handle POST requests safely."""
@@ -600,19 +2175,68 @@ class RefreshHandler(BaseHTTPRequestHandler):
             self._send_safe_response(500, {"error": str(e)})
 
     def _do_POST_logic(self):
-        global MANUAL_TRADE_PARAMS
-        
+        if self.path.startswith('/api/login'):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length else b'{}'
+            data = json.loads(post_data.decode('utf-8'))
+            settings = load_live_settings()
+            if not _dashboard_auth_configured(settings):
+                self._send_safe_response(400, {"error": "Dashboard username/password are not configured."})
+                return
+            username = str(data.get('username') or '')
+            password = str(data.get('password') or '')
+            if username == settings.get('dashboard_user') and password == settings.get('dashboard_pass'):
+                self._send_safe_response(
+                    200,
+                    {"status": "ok", "session_days": DASHBOARD_SESSION_DAYS},
+                    headers={"Set-Cookie": _create_dashboard_session_cookie(
+                        settings, username, secure=self._request_uses_https()
+                    )}
+                )
+                return
+            self._send_safe_response(403, {"error": "Invalid username or password"})
+            return
+
+        if self.path.startswith('/api/logout'):
+            self._send_safe_response(
+                200,
+                {"status": "ok"},
+                headers={"Set-Cookie": _clear_dashboard_session_cookie(
+                    secure=self._request_uses_https()
+                )}
+            )
+            return
+
         # Security: Check Basic Auth
         if not self.check_auth(self.headers.get('Authorization')):
-            self.send_response(401)
-            self.send_header('WWW-Authenticate', 'Basic realm="ETrade Dashboard"')
-            self.end_headers()
+            self._send_unauthorized()
             return
 
         if self.path == '/refresh':
             print("\n🔄 [Refresh Server] Manual refresh requested via web UI")
+            positions_version = None
+            if os.path.exists("screened_option_pairs.html"):
+                positions_version = str(os.stat("screened_option_pairs.html").st_mtime_ns)
+            refresh_generation = _queue_portfolio_refresh()
             REFRESH_REQUESTED.set()
-            self._send_safe_response(200, {"status": "ok", "message": "Refresh triggered."})
+            self._send_safe_response(200, {
+                "status": "ok",
+                "message": "Refresh triggered.",
+                "positions_version": positions_version,
+                "refresh_generation": refresh_generation,
+            })
+
+        elif self.path == '/api/verify_pin':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length else b'{}'
+            data = json.loads(post_data.decode('utf-8'))
+            settings = load_live_settings()
+            submitted_pin = str(data.get('pin') or '')
+            configured_pin = str(settings.get('pin') or '')
+            if not submitted_pin or not hmac.compare_digest(submitted_pin, configured_pin):
+                self._send_safe_response(403, {"error": "Invalid PIN"})
+                return
+            self._send_safe_response(200, {"status": "ok"})
         
         elif self.path.startswith('/api/settings'):
             content_length = int(self.headers['Content-Length'])
@@ -627,7 +2251,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
             
             log_dashboard_request(self.path, new_settings)
 
-            for key in ['target_delta', 'hedge_spread', 'trade_start_time', 'trade_end_time', 'auto_close_midpoint_threshold', 'auto_close_gain_threshold', 'pair_quantity', 'target_weeks', 'target_expiration', 'auto_open_enabled', 'trade_side', 'dashboard_user', 'dashboard_pass']:
+            for key in ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'auto_close_midpoint_threshold', 'auto_close_gain_threshold', 'pair_quantity', 'spy_pair_quantity', 'spx_pair_quantity', 'target_weeks', 'target_expiration', 'spy_target_expiration', 'spx_target_expiration', 'auto_open_enabled', 'trade_side', 'dashboard_user', 'dashboard_pass']:
                 if key in new_settings:
                     current_settings[key] = new_settings[key]
             
@@ -649,10 +2273,25 @@ class RefreshHandler(BaseHTTPRequestHandler):
 
             log_dashboard_request(self.path, data)
             qty = int(data.get('pair_quantity') or data.get('quantity') or data.get('qty') or 1)
-            print(f"\n⚡ [Dashboard] Manual order execution requested for: {data.get('side', 'PUT')} (Qty: {qty})")
-            MANUAL_TRADE_PARAMS = data
-            MANUAL_TRADE_REQUESTED.set()
-            self._send_safe_response(200, {"status": "ok", "message": "Order request sent."})
+            ticker = (data.get('ticker') or data.get('symbol') or "").upper()
+            if not ticker:
+                try:
+                    ticker = "SPX" if float(data.get('sell_strike', 0)) > 1000 else "SPY"
+                except Exception:
+                    ticker = "SPY"
+            if ticker not in ("SPY", "SPX"):
+                self._send_safe_response(400, {"error": "Manual open ticker must be SPY or SPX"})
+                return
+            data['ticker'] = ticker
+            if _has_exact_manual_open_fields(data) and 'etrade_instance' in globals() and etrade_instance is not None:
+                request_id = enqueue_manual_trade_request(data, "open", enqueue=False)
+                submit_manual_open_fast_async(etrade_instance, accounts, market, data, request_id)
+                print(f"\n⚡ [Dashboard] Manual order scheduled immediately for: {ticker} {data.get('side', 'PUT')} (Qty: {qty}, Request: {request_id})")
+                self._send_safe_response(200, {"status": "ok", "message": "Order worker scheduled.", "request_id": request_id})
+            else:
+                request_id = enqueue_manual_trade_request(data, "open")
+                print(f"\n⚡ [Dashboard] Manual order queued for: {ticker} {data.get('side', 'PUT')} (Qty: {qty}, Request: {request_id})")
+                self._send_safe_response(200, {"status": "ok", "message": "Order request queued.", "request_id": request_id})
 
         elif self.path.startswith('/api/execute_neutralize_order'):
             content_length = int(self.headers['Content-Length'])
@@ -674,9 +2313,95 @@ class RefreshHandler(BaseHTTPRequestHandler):
             print(f"\n⚡ [Dashboard] Neutralize risk request for proposal: {data.get('proposal_id')}")
             data['is_neutralize'] = True
             data['is_close'] = False
-            MANUAL_TRADE_PARAMS = data
-            MANUAL_TRADE_REQUESTED.set()
-            self._send_safe_response(200, {"status": "ok", "message": "Neutralize request sent."})
+            request_id = enqueue_manual_trade_request(data, "neutralize")
+            self._send_safe_response(200, {"status": "ok", "message": "Neutralize request queued.", "request_id": request_id})
+
+        elif self.path == '/api/review_close_position':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length else b'{}'
+            data = json.loads(post_data.decode('utf-8'))
+            settings = load_live_settings()
+
+            submitted_pin = str(data.get('pin') or '')
+            configured_pin = str(settings.get('pin') or '')
+            if not submitted_pin or not hmac.compare_digest(submitted_pin, configured_pin):
+                self._send_safe_response(403, {"error": "Invalid PIN"})
+                return
+
+            symbol = str(data.get('symbol') or data.get('ticker') or '').strip().upper()
+            expiry = str(data.get('expiry') or '').strip()
+            side = str(data.get('cp') or data.get('call_put') or '').strip().upper()
+            sell_strike_raw = data.get('sell_strike') or data.get('strike') or data.get('short_strike')
+            quantity_raw = data.get('quantity') if data.get('quantity') is not None else data.get('qty')
+            missing = [
+                name for name, value in (
+                    ('symbol', symbol),
+                    ('expiry', expiry),
+                    ('cp', side),
+                    ('sell_strike', sell_strike_raw),
+                    ('quantity', quantity_raw),
+                ) if value in (None, '')
+            ]
+            if missing:
+                self._send_safe_response(400, {"error": f"Missing required fields: {', '.join(missing)}"})
+                return
+            if side not in ('CALL', 'PUT'):
+                self._send_safe_response(400, {"error": "cp must be CALL or PUT"})
+                return
+
+            try:
+                sell_strike = float(sell_strike_raw)
+                if sell_strike <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self._send_safe_response(400, {"error": "sell_strike must be a positive number"})
+                return
+
+            long_strike_raw = data.get('long_strike')
+            long_strike = None
+            if long_strike_raw not in (None, ''):
+                try:
+                    long_strike = float(long_strike_raw)
+                    if long_strike <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self._send_safe_response(400, {"error": "long_strike must be a positive number"})
+                    return
+
+            try:
+                if isinstance(quantity_raw, bool):
+                    raise ValueError
+                if isinstance(quantity_raw, float) and not quantity_raw.is_integer():
+                    raise ValueError
+                quantity = int(quantity_raw)
+                if quantity < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self._send_safe_response(400, {"error": "quantity must be an integer of at least 1"})
+                return
+
+            position_qty_raw = data.get('position_qty')
+            position_qty = None
+            if position_qty_raw not in (None, ''):
+                try:
+                    position_qty_number = float(position_qty_raw)
+                    position_qty = int(position_qty_number) if position_qty_number.is_integer() else position_qty_number
+                except (TypeError, ValueError):
+                    self._send_safe_response(400, {"error": "position_qty must be numeric"})
+                    return
+
+            self._send_safe_response(200, {
+                "status": "ok",
+                "preview": {
+                    "symbol": symbol,
+                    "expiry": expiry,
+                    "cp": side,
+                    "sell_strike": sell_strike,
+                    "long_strike": long_strike,
+                    "quantity": quantity,
+                    "position_qty": position_qty,
+                },
+            })
 
         elif self.path.startswith('/api/close_position') or self.path.startswith('/api/execute_close_order'):
             content_length = int(self.headers['Content-Length'])
@@ -702,10 +2427,11 @@ class RefreshHandler(BaseHTTPRequestHandler):
             data['long_strike'] = long_k
             data['side'] = data.get('cp') or data.get('call_put')
             data['pair_quantity'] = qty
+            if data.get('position_qty') is not None:
+                data['position_qty'] = data.get('position_qty')
             
-            MANUAL_TRADE_PARAMS = data
-            MANUAL_TRADE_REQUESTED.set()
-            self._send_safe_response(200, {"status": "ok", "message": "Close order sent."})
+            request_id = enqueue_manual_trade_request(data, "close")
+            self._send_safe_response(200, {"status": "ok", "message": "Close order queued.", "request_id": request_id})
         else:
             self._send_safe_response(404, {"error": "Not found"})
 
@@ -721,11 +2447,22 @@ class RefreshHandler(BaseHTTPRequestHandler):
             self._send_safe_response(500, {"error": str(e)})
 
     def _do_GET_logic(self):
+        if self.path == '/manifest.webmanifest':
+            self._send_safe_response(200, _dashboard_manifest(), 'application/manifest+json')
+            return
+
+        if self.path == '/login':
+            self._send_safe_response(200, _dashboard_login_html(), 'text/html')
+            return
+
         # Security: Check Basic Auth
         if not self.check_auth(self.headers.get('Authorization')):
-            self.send_response(401)
-            self.send_header('WWW-Authenticate', 'Basic realm="ETrade Dashboard"')
-            self.end_headers()
+            if self.path == '/dashboard' or self.path == '/':
+                self.send_response(302)
+                self.send_header('Location', '/login')
+                self.end_headers()
+            else:
+                self._send_unauthorized()
             return
 
         if self.path == '/':
@@ -745,7 +2482,8 @@ class RefreshHandler(BaseHTTPRequestHandler):
 
         elif self.path.startswith('/api/settings'):
             settings = load_live_settings()
-            display_settings = {k: v for k, v in settings.items() if k != 'pin'}
+            hidden_settings = {'pin', 'dashboard_pass', 'dashboard_auth_secret'}
+            display_settings = {k: v for k, v in settings.items() if k not in hidden_settings}
             self._send_safe_response(200, display_settings)
 
         elif self.path.startswith('/api/status'):
@@ -753,47 +2491,113 @@ class RefreshHandler(BaseHTTPRequestHandler):
             trade_status = load_trade_status()
             settings = load_live_settings()
             today = datetime.now()
-            target_weeks = settings.get('target_weeks', 6)
-            friday = today + timedelta(days=((4 - today.weekday()) % 7) + (target_weeks - 1) * 7)
+            fallback_target_expiration = today.date() + timedelta(weeks=int(settings.get('target_weeks', 6) or 6))
+            spy_target_expiration = fallback_target_expiration
+            spx_target_expiration = fallback_target_expiration
             
-            available_expirations = []
+            spy_available_expirations = []
+            spx_available_expirations = []
             if 'accounts' in globals() and accounts is not None:
+                today_str = today.strftime("%Y-%m-%d")
+                expiration_cutoff = _add_months(today.date(), 4).strftime("%Y-%m-%d")
                 try:
-                    available_expirations = accounts.get_available_expirations("SPY")
-                    today_str = today.strftime("%Y-%m-%d")
-                    available_expirations = [exp for exp in available_expirations if exp >= today_str][:20]
-                except: pass
+                    spy_available_expirations = [
+                        exp for exp in accounts.get_available_expirations("SPY")
+                        if today_str <= exp <= expiration_cutoff
+                    ]
+                    spy_target_expiration = _target_expiration_from_settings(
+                        accounts, "SPY", settings, today.date(), spy_available_expirations
+                    )
+                except Exception as e:
+                    print(f"⚠️ Failed to get SPY expirations: {e}")
+                try:
+                    spx_available_expirations = [
+                        exp for exp in accounts.get_available_expirations("SPX")
+                        if today_str <= exp <= expiration_cutoff
+                    ]
+                    spx_target_expiration = _target_expiration_from_settings(
+                        accounts, "SPX", settings, today.date(), spx_available_expirations
+                    )
+                except Exception as e:
+                    print(f"⚠️ Failed to get SPX expirations: {e}")
 
+            broker_open_orders = []
+            broker_executed_orders = []
+            broker_cancelled_orders = []
+            if 'etrade_instance' in globals() and etrade_instance is not None:
+                try:
+                    broker_open_orders = etrade_instance.order.get_open_orders()
+                except Exception as e:
+                    print(f"[Manual Order Status] Warning: Could not fetch open broker orders: {e}")
+                try:
+                    broker_executed_orders = etrade_instance.order.get_executed_orders(today.strftime("%Y-%m-%d"))
+                except Exception as e:
+                    print(f"[Manual Order Status] Warning: Could not fetch executed broker orders: {e}")
+                try:
+                    broker_cancelled_orders = etrade_instance.order.get_cancelled_orders(today.strftime("%Y-%m-%d"))
+                except Exception as e:
+                    print(f"[Manual Order Status] Warning: Could not fetch cancelled broker orders: {e}")
+            manual_orders_snapshot = get_manual_trade_status_snapshot(broker_open_orders, broker_executed_orders, broker_cancelled_orders)
             status = {
                 "market_status": market_status,
                 "is_open": is_open,
                 "last_trade_date": trade_status.get("last_trade_date"),
-                "target_expiration": friday.strftime("%Y-%m-%d"),
-                "available_expirations": available_expirations,
+                "target_expiration": spy_target_expiration.strftime("%Y-%m-%d"),
+                "spy_target_expiration": spy_target_expiration.strftime("%Y-%m-%d"),
+                "spx_target_expiration": spx_target_expiration.strftime("%Y-%m-%d"),
+                "available_expirations": spy_available_expirations,
+                "spy_available_expirations": spy_available_expirations,
+                "spx_available_expirations": spx_available_expirations,
                 "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "account_id": accounts.account.get('accountId', 'N/A') if accounts and accounts.account else 'N/A'
+                "account_id": accounts.account.get('accountId', 'N/A') if accounts and accounts.account else 'N/A',
+                "manual_order": manual_orders_snapshot.get("latest", {}),
+                "manual_orders": manual_orders_snapshot
             }
             self._send_safe_response(200, status)
 
         elif self.path.startswith('/api/preview_spread'):
             from urllib.parse import urlparse, parse_qs
-            query = parse_qs(urlparse(self.path).query)
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             settings = load_live_settings()
-            ticker = "SPY"
+            ticker = query.get('ticker', ["SPY"])[0].upper()
+            if ticker not in ["SPY", "SPX"]:
+                ticker = "SPY"
+
             target_delta = float(query.get('delta', [settings.get('target_delta', 0.15)])[0])
-            hedge_spread = float(query.get('width', [settings.get('hedge_spread', 20)])[0])
+            
+            if ticker == "SPX":
+                default_width = settings.get('spx_hedge_spread', settings.get('hedge_spread', 200.0))
+            else:
+                default_width = settings.get('spy_hedge_spread', settings.get('hedge_spread', 20.0))
+
+            hedge_spread = float(query.get('width', [default_width])[0])
             target_weeks = int(query.get('weeks', [settings.get('target_weeks', 6)])[0])
             explicit_expiry = query.get('expiration', [None])[0]
+            automatic_expiry = explicit_expiry == ""
             side = query.get('side', ["Put"])[0].capitalize()
             
             today = datetime.now()
             if explicit_expiry:
                 expiry_dt = datetime.strptime(explicit_expiry, "%Y-%m-%d")
+                selected_expiration = expiry_dt.date()
                 days_to_expire = (expiry_dt.date() - today.date()).days
+                preview_expiration = explicit_expiry
             else:
-                friday = today + timedelta(days=((4 - today.weekday()) % 7) + (target_weeks - 1) * 7)
-                days_to_expire = (friday.date() - today.date()).days
-                if days_to_expire < 1: days_to_expire = 7
+                preview_settings = dict(settings)
+                preview_settings["target_weeks"] = target_weeks
+                if automatic_expiry:
+                    ticker_key = "spx" if ticker == "SPX" else "spy"
+                    preview_settings[f"{ticker_key}_target_expiration"] = None
+                    preview_settings["target_expiration"] = None
+                target_expiration = _target_expiration_from_settings(accounts, ticker, preview_settings, today.date())
+                selected_expiration = target_expiration
+                days_to_expire = (target_expiration - today.date()).days
+                if days_to_expire < 1:
+                    days_to_expire = 7
+                    selected_expiration = (today + timedelta(days=7)).date()
+                    preview_expiration = selected_expiration.strftime("%Y-%m-%d")
+                else:
+                    preview_expiration = target_expiration.strftime("%Y-%m-%d")
 
             if 'accounts' not in globals() or accounts is None:
                 self._send_safe_response(503, {"error": "Engine loading..."})
@@ -803,38 +2607,68 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 ticker, side, days_to_expire=days_to_expire, 
                 target_premium=0, hedge_ratio=1, 
                 hedge_spread=hedge_spread, qty=1, 
-                target_delta=target_delta
+                target_delta=target_delta,
+                target_expiration=selected_expiration
             )
             
             if spread:
                 sell_leg = spread.get('sell_option')
                 buy_leg = spread.get('buy_option')
+                sell_strike = sell_leg.strike_price if sell_leg else "N/A"
+                
+                spot_price = None
+                if 'accounts' in globals() and accounts is not None:
+                    try:
+                        spot_price = accounts.get_stock_price(ticker)
+                    except: pass
+                
+                otm_pct = None
+                if spot_price and sell_strike != "N/A":
+                    otm_pct = abs(float(sell_strike) - float(spot_price)) / float(spot_price) * 100.0
+
                 res = {
                     "ticker": ticker,
-                    "sell_strike": sell_leg.strike_price if sell_leg else "N/A",
+                    "sell_strike": sell_strike,
                     "buy_strike": buy_leg.strike_price if buy_leg else "None",
                     "premium": spread.get('profit', 0),
                     "expiration": sell_leg.expiration_date.strftime("%Y-%m-%d") if sell_leg and hasattr(sell_leg, 'expiration_date') else "N/A",
                     "delta": sell_leg.delta if sell_leg and hasattr(sell_leg, 'delta') else target_delta,
+                    "otm_pct": round(otm_pct, 2) if otm_pct is not None else None,
                     "side": side.upper(),
                     "is_mock": False
                 }
             else:
-                res = {
-                    "ticker": ticker,
-                    "sell_strike": 700.0 - (target_delta * 100),
-                    "buy_strike": 700.0 - (target_delta * 100) - hedge_spread,
-                    "premium": 1.25 + (target_delta * 5),
-                    "expiration": (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
-                    "delta": target_delta,
-                    "is_mock": True
-                }
+                self._send_safe_response(
+                    503,
+                    {
+                        "error": f"Live {ticker} {side.upper()} spread preview unavailable. Check E*TRADE authentication and option-chain access.",
+                        "ticker": ticker,
+                        "side": side.upper(),
+                        "expiration": preview_expiration,
+                        "is_mock": False
+                    }
+                )
+                return
             self._send_safe_response(200, res)
+
+        elif self.path.startswith('/api/positions_version'):
+            positions_version = None
+            updated_at = None
+            if os.path.exists("screened_option_pairs.html"):
+                stat_result = os.stat("screened_option_pairs.html")
+                positions_version = str(stat_result.st_mtime_ns)
+                updated_at = datetime.fromtimestamp(stat_result.st_mtime).isoformat()
+            self._send_safe_response(200, {
+                "positions_version": positions_version,
+                "updated_at": updated_at,
+                "refresh": _portfolio_refresh_snapshot(),
+            })
 
         elif self.path.startswith('/api/positions'):
             if os.path.exists("screened_option_pairs.html"):
                 with open("screened_option_pairs.html", "r") as f:
                     content = f.read()
+                content = _repair_benchmark_option_value_gaps(content)
                 self._send_safe_response(200, content, 'text/html')
             else:
                 self._send_safe_response(404, "No position data available.", 'text/plain')
@@ -855,6 +2689,18 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 cp['has_open_order'] = cp.get('proposal_id') in ACTIVE_DASHBOARD_ORDERS
                 clean_proposals.append(cp)
             self._send_safe_response(200, clean_proposals)
+        elif self.path.startswith('/api/gex'):
+            if 'accounts' not in globals() or accounts is None:
+                self._send_safe_response(503, {"error": "Engine loading..."})
+                return
+            try:
+                gex_results = calculate_spy_gex(accounts)
+                gex_results["regime"] = calculate_spy_regime_status(globals().get("best_hmm"))
+                self._send_safe_response(200, gex_results)
+            except Exception as e:
+                print(f"⚠️ Error calculating SPY GEX: {e}")
+                traceback.print_exc()
+                self._send_safe_response(500, {"error": str(e)})
         else:
             self._send_safe_response(404, {"error": "Not found"})
 
@@ -900,7 +2746,7 @@ def start_ngrok_tunnel(config, port):
 
 def start_refresh_server(port=8765):
     """Start the HTTP refresh server in a background thread."""
-    server = HTTPServer(('0.0.0.0', port), RefreshHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), RefreshHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     print(f"🌐 [Refresh Server] Started on http://localhost:{port}")
@@ -1035,6 +2881,33 @@ def is_market_open(check_datetime=None):
         else:
             return True, "OPEN", market_open_fallback, market_close_fallback
 
+def _market_close_refresh_due(check_datetime=None, market_status=None, market_close_time=None):
+    """
+    Return True once per trading day shortly after the regular NYSE close.
+    This lets on-demand dashboard mode wake itself to freeze SPY/SPX/VIX closes.
+    """
+    global MARKET_CLOSE_PRICE_REFRESHED_DATE
+    import pytz
+
+    eastern = pytz.timezone('US/Eastern')
+    if check_datetime is None:
+        check_datetime = datetime.now(eastern)
+    elif check_datetime.tzinfo is None:
+        check_datetime = eastern.localize(check_datetime)
+    else:
+        check_datetime = check_datetime.astimezone(eastern)
+
+    today_key = check_datetime.date().isoformat()
+    if MARKET_CLOSE_PRICE_REFRESHED_DATE == today_key:
+        return False
+
+    if market_status is None or market_close_time is None:
+        _, market_status, _, market_close_time = is_market_open(check_datetime)
+
+    if market_status != "AFTER_HOURS" or market_close_time is None:
+        return False
+    return check_datetime >= market_close_time + timedelta(minutes=5)
+
 def load_trade_status():
     """Load the trade status from the JSON file."""
     try:
@@ -1050,42 +2923,96 @@ def save_trade_status(last_trade_date):
 
 def record_market_close_prices(market_instance):
     """
-    Fetch SPY and VIX prices via E*TRADE and record them in the cache at market close.
+    Fetch SPY, SPX and VIX prices and record them in the close-price cache.
+    Yahoo Finance daily closes are preferred after market close; E*TRADE
+    lastTrade is used as the fallback when Yahoo has not published today yet.
     """
     try:
-        from datetime import datetime as dt
+        import pytz
         import json
         
         CACHE_FILE = "spy_vix_price_cache.json"
-        today_str = dt.now().strftime("%Y-%m-%d")
+        eastern = pytz.timezone('US/Eastern')
+        today_str = datetime.now(eastern).strftime("%Y-%m-%d")
         
-        print(f"[Market Close] Recording SPY and VIX prices for {today_str}...")
+        print(f"[Market Close] Recording SPY, SPX and VIX prices for {today_str}...")
         
-        # Fetch quotes
-        resp = market_instance.get_quote(['SPY', '^VIX'], resp_format="json")
-        if not resp or 'QuoteResponse' not in resp or 'QuoteData' not in resp['QuoteResponse']:
-            print("[Market Close] Error: Could not fetch quotes from E*TRADE.")
-            return
+        def _latest_yahoo_close(symbol):
+            try:
+                hist = yf.download(symbol, period="5d", progress=False, auto_adjust=False)
+                if hist is None or hist.empty:
+                    return None
+                if hasattr(hist.columns, "levels") and len(hist.columns.levels) > 1:
+                    try:
+                        hist = hist.droplevel(1, axis=1)
+                    except Exception:
+                        pass
+                close_col = "Close"
+                if close_col not in hist.columns:
+                    for col in hist.columns:
+                        if (isinstance(col, tuple) and "Close" in col) or (isinstance(col, str) and "Close" in col):
+                            close_col = col
+                            break
+                if close_col not in hist.columns:
+                    return None
+                for idx in reversed(hist.index):
+                    dt_str = str(idx.date()) if hasattr(idx, "date") else str(idx).split(" ")[0]
+                    if dt_str != today_str:
+                        continue
+                    value = hist.loc[idx, close_col]
+                    if hasattr(value, "iloc"):
+                        value = value.iloc[0]
+                    if pd.isna(value):
+                        return None
+                    return round(float(value), 2)
+            except Exception as yf_err:
+                print(f"[Market Close] Yahoo close fetch failed for {symbol}: {yf_err}")
+            return None
 
-        quotes = resp['QuoteResponse']['QuoteData']
         prices = {}
-        for q in quotes:
-            sym = q.get('Product', {}).get('symbol')
-            # E*TRADE might return SPY or ^VIX
-            last_price = q.get('All', {}).get('lastTrade')
-            if sym and last_price:
-                prices[sym] = round(float(last_price), 2)
+        sources = {}
 
+        yahoo_spy = _latest_yahoo_close("SPY")
+        yahoo_spx = _latest_yahoo_close("^SPX")
+        yahoo_vix = _latest_yahoo_close("^VIX")
+        if yahoo_spy:
+            prices["SPY"] = yahoo_spy
+            sources["SPY"] = "Yahoo"
+        if yahoo_spx:
+            prices["SPX"] = yahoo_spx
+            sources["SPX"] = "Yahoo"
+        if yahoo_vix:
+            prices["VIX"] = yahoo_vix
+            sources["VIX"] = "Yahoo"
 
-        if 'SPY' not in prices or '^VIX' not in prices:
-             # Try to search for VIX if ^VIX didn't work (E*TRADE symbol convention varies)
-             if 'VIX' in prices and '^VIX' not in prices:
-                 prices['^VIX'] = prices['VIX']
-             else:
-                 print(f"[Market Close] Warning: Missing data in quotes: {prices}")
+        # E*TRADE fallback: useful immediately after the bell before Yahoo daily
+        # bars are available.
+        if "SPY" not in prices or "SPX" not in prices or "VIX" not in prices:
+            resp = market_instance.get_quote(['SPY', 'SPX', '^VIX'], resp_format="json")
+            if not resp or 'QuoteResponse' not in resp or 'QuoteData' not in resp['QuoteResponse']:
+                print("[Market Close] Warning: Could not fetch fallback quotes from E*TRADE.")
+            else:
+                quotes = resp['QuoteResponse']['QuoteData']
+                for q in quotes:
+                    sym = str(q.get('Product', {}).get('symbol') or '').upper()
+                    last_price = q.get('All', {}).get('lastTrade')
+                    if not last_price:
+                        continue
+                    if sym == "SPY" and "SPY" not in prices:
+                        prices["SPY"] = round(float(last_price), 2)
+                        sources["SPY"] = "E*TRADE"
+                    elif sym in ("SPX", "SPXW") and "SPX" not in prices:
+                        prices["SPX"] = round(float(last_price), 2)
+                        sources["SPX"] = "E*TRADE"
+                    elif sym in ("^VIX", "VIX") and "VIX" not in prices:
+                        prices["VIX"] = round(float(last_price), 2)
+                        sources["VIX"] = "E*TRADE"
+
+        if "SPY" not in prices or "SPX" not in prices or "VIX" not in prices:
+            print(f"[Market Close] Warning: Missing close data after fetch: {prices}")
 
         # Load and update cache
-        cache = {"SPY": {}, "VIX": {}}
+        cache = {"SPY": {}, "SPX": {}, "VIX": {}}
         if os.path.exists(CACHE_FILE):
             try:
                 with open(CACHE_FILE, 'r') as f:
@@ -1097,18 +3024,22 @@ def record_market_close_prices(market_instance):
         if 'SPY' in prices:
             cache.setdefault("SPY", {})[today_str] = prices['SPY']
             updated = True
-        if '^VIX' in prices or 'VIX' in prices:
-            v_price = prices.get('^VIX') or prices.get('VIX')
-            cache.setdefault("VIX", {})[today_str] = v_price
+        if 'SPX' in prices:
+            cache.setdefault("SPX", {})[today_str] = prices['SPX']
+            updated = True
+        if 'VIX' in prices:
+            cache.setdefault("VIX", {})[today_str] = prices['VIX']
             updated = True
             
         if updated:
             with open(CACHE_FILE, 'w') as f:
                 json.dump(cache, f)
-            print(f"[Market Close] Successfully recorded prices in {CACHE_FILE}: {prices}")
+            print(f"[Market Close] Successfully recorded prices in {CACHE_FILE}: {prices} (sources={sources})")
+        return updated
             
     except Exception as e:
         print(f"[Market Close] Error recording prices: {e}")
+        return False
 
 def get_previous_trading_day_close(ticker):
     """
@@ -1306,9 +3237,9 @@ def refresh_spread_limit_price(market_instance, ticker, sell_strike, buy_strike,
         buy_mid = (float(buy_q.get("bid", 0)) + float(buy_q.get("ask", 0))) / 2
 
         if is_credit:
-            new_price = round(sell_mid - buy_mid, 2)
+            new_price = _snap_option_limit_price(sell_mid - buy_mid)
         else:
-            new_price = round(abs(sell_mid - buy_mid), 2)
+            new_price = _snap_option_limit_price(abs(sell_mid - buy_mid))
 
         # Determine old price for logging
         if isinstance(order_dict, dict):
@@ -1340,6 +3271,429 @@ def refresh_spread_limit_price(market_instance, ticker, sell_strike, buy_strike,
         original = order_dict.get('limitPrice', 0) if isinstance(order_dict, dict) else 0
         return True, original
 
+def build_manual_open_conflict_order(ticker, spread_candidate, quantity, request_id):
+    """Build one spread order that uses BUY_CLOSE for an already-short bought leg."""
+    buy_conflict_qty = int(spread_candidate.get("buy_conflict_qty") or 0)
+    if buy_conflict_qty >= 0:
+        return None
+
+    sell_opt = spread_candidate.get("sell_option")
+    buy_opt = spread_candidate.get("buy_option")
+    if not sell_opt or not buy_opt:
+        return None
+
+    adjusted_qty = min(abs(buy_conflict_qty), int(quantity))
+    if adjusted_qty <= 0:
+        return None
+
+    detail = {
+        "expiration": sell_opt.expiration_date,
+        "call_put": sell_opt.call_put,
+        "short_strike": sell_opt.strike_price,
+        "long_strike": buy_opt.strike_price,
+    }
+    order = _build_neutralize_spread_order(
+        sell_opt.symbol or ticker,
+        detail,
+        adjusted_qty,
+        "NET_CREDIT",
+        spread_candidate.get("profit", 0),
+        "SELL_OPEN",
+        "BUY_CLOSE",
+    )
+
+    message = (
+        f"Using BUY_CLOSE for existing short {ticker} {buy_opt.call_put} {buy_opt.strike_price} x{adjusted_qty} "
+        f"inside {sell_opt.strike_price}/{buy_opt.strike_price} order"
+    )
+    update_manual_trade_status(request_id, status="adjusted", message=message)
+    print(f"   🔁 [Manual Trade] {message}")
+
+    order_type = f"{sell_opt.call_put.capitalize()} spread conflict adjustment"
+    return {
+        "ticker": ticker,
+        "quote_ticker": sell_opt.symbol or ticker,
+        "type": order_type,
+        "order": order,
+        "spread_data": spread_candidate,
+        "quantity": adjusted_qty,
+        "audit": {
+            "ticker": ticker,
+            "sell_strike": sell_opt.strike_price,
+            "long_strike": buy_opt.strike_price,
+            "qty": adjusted_qty,
+            "is_close": False,
+        },
+    }
+
+def check_manual_open_buy_conflict(accounts, ticker, buy_opt):
+    conflict_qty = accounts.check_conflict_position(buy_opt, "buy", buy_opt.quantity)
+    if conflict_qty != 0 or ticker != "SPX":
+        return conflict_qty
+
+    original_symbol = buy_opt.symbol
+    try:
+        for symbol in ("SPXW", "SPX"):
+            if symbol == original_symbol:
+                continue
+            buy_opt.symbol = symbol
+            conflict_qty = accounts.check_conflict_position(buy_opt, "buy", buy_opt.quantity)
+            if conflict_qty != 0:
+                return conflict_qty
+    finally:
+        buy_opt.symbol = original_symbol
+    return 0
+
+def _has_exact_manual_open_fields(data):
+    return all(data.get(key) not in (None, "") for key in ("sell_strike", "buy_strike", "expiration"))
+
+def _manual_open_target_row(option, action):
+    return {
+        "ticker": option.symbol,
+        "call_put": option.call_put,
+        "strike": option.strike_price,
+        "price": option.last_price,
+        "volume": getattr(option, "volume", ""),
+        "spread": getattr(option, "ask_bid_spread", ""),
+        "expire": option.expiration_date,
+        "action": action,
+    }
+
+def submit_manual_open_fast_async(etrade_instance, accounts, market, data, request_id):
+    update_manual_trade_status(request_id, status="scheduled", message="Manual open worker scheduled")
+    return ORDER_EXECUTOR.submit(
+        _manual_open_fast_worker,
+        etrade_instance,
+        accounts,
+        market,
+        data.copy(),
+        request_id,
+    )
+
+def _manual_open_fast_worker(etrade_instance, accounts, market, data, request_id):
+    ticker = (data.get("ticker") or data.get("symbol") or "").upper()
+    side = str(data.get("side") or data.get("call_put") or data.get("cp") or "PUT").upper()
+    sell_k = data.get("sell_strike")
+    buy_k = data.get("buy_strike")
+    expiration = data.get("expiration")
+    qty = int(data.get("qty") or data.get("quantity") or data.get("pair_quantity") or 1)
+
+    try:
+        if ticker not in ("SPY", "SPX"):
+            update_manual_trade_status(request_id, status="failed", message=f"Unsupported manual open ticker: {ticker or 'missing'}")
+            return False
+        if side not in ("PUT", "CALL"):
+            update_manual_trade_status(request_id, status="failed", message=f"Unsupported manual open side: {side}")
+            return False
+
+        update_manual_trade_status(request_id, status="processing", message=f"Building exact {ticker} {side} {sell_k}/{buy_k}")
+        sell_opt = accounts.manual_option_input(ticker, side, expiration, float(sell_k))
+        buy_opt = accounts.manual_option_input(ticker, side, expiration, float(buy_k))
+        if sell_opt is None or buy_opt is None:
+            update_manual_trade_status(request_id, status="failed", message=f"Could not retrieve quotes for {ticker} {side} {sell_k}/{buy_k}")
+            return False
+
+        exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+        current_price = accounts.get_stock_price(ticker)
+        for opt, strike in ((sell_opt, sell_k), (buy_opt, buy_k)):
+            opt.strike_price = float(strike)
+            opt.expiration_date = exp_date
+            opt.call_put = side
+            opt.quantity = qty
+            opt.distance_to_strike = (float(strike) - current_price) / current_price * 100 if current_price else 0
+
+        buy_conflict_qty = check_manual_open_buy_conflict(accounts, ticker, buy_opt)
+        profit = data.get("premium")
+        profit = float(profit) if profit is not None else round(float(sell_opt.last_price) - float(buy_opt.last_price), 2)
+        spread_candidate = {
+            "sell_option": sell_opt,
+            "buy_option": buy_opt,
+            "sell_position_target": _manual_open_target_row(sell_opt, "sell"),
+            "buy_position_target": _manual_open_target_row(buy_opt, "buy"),
+            "profit": profit,
+            "ticker": ticker,
+            "buy_conflict_qty": buy_conflict_qty,
+        }
+
+        order_info = None
+        if buy_conflict_qty < 0:
+            order_info = build_manual_open_conflict_order(ticker, spread_candidate, qty, request_id)
+        else:
+            order_payload = accounts.generate_option_order(
+                single_leg_stock_position=None,
+                action="SPREAD",
+                custom_order_id=None,
+                spread_sell_option=sell_opt,
+                spread_buy_option=buy_opt,
+                priceType={"priceType": "NET_CREDIT", "limitPrice": round(profit, 2)}
+            )
+            order_info = {
+                "ticker": ticker,
+                "quote_ticker": sell_opt.symbol,
+                "type": f"{side.capitalize()} spread",
+                "order": _normalize_order_payload(order_payload),
+                "spread_data": spread_candidate,
+                "quantity": qty,
+                "audit": {
+                    "ticker": ticker,
+                    "sell_strike": sell_opt.strike_price,
+                    "long_strike": buy_opt.strike_price,
+                    "qty": qty,
+                    "is_close": False,
+                },
+            }
+
+        if not order_info or not order_info.get("order"):
+            update_manual_trade_status(request_id, status="failed", message=f"Could not build {ticker} {side} order payload")
+            return False
+
+        log_dashboard_request("EXECUTION_START", {
+            "is_manual": True,
+            "auto_open": False,
+            "reason": "Manual Dashboard Open",
+            "valid_orders": [ticker],
+            "request_id": request_id,
+            "fast_path": True
+        })
+        refresh_spec = {
+            "ticker": order_info.get("quote_ticker") or sell_opt.symbol or ticker,
+            "sell_strike": sell_opt.strike_price,
+            "buy_strike": buy_opt.strike_price,
+            "call_put": sell_opt.call_put,
+            "expiration_date": sell_opt.expiration_date,
+            "is_credit": True,
+        }
+        return _order_worker(
+            etrade_instance,
+            accounts,
+            market,
+            order_info,
+            "Manual Dashboard Open",
+            request_id,
+            False,
+            180,
+            refresh_spec,
+            True,
+            None,
+            None,
+            datetime.now().date().isoformat(),
+        )
+    except Exception as e:
+        update_manual_trade_status(request_id, status="failed", message=str(e))
+        traceback.print_exc()
+        return False
+
+def build_close_order_payload(ticker, expiration, call_put, short_strike, long_strike, quantity, limit_price, position_qty=None):
+    ticker = (ticker or "").upper()
+    call_put = (call_put or "").upper()
+    exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+    qty = abs(int(quantity or 1))
+    limit_price = round(abs(float(limit_price)), 2)
+    client_id = random.randint(1000000000, 9999999999)
+
+    if long_strike:
+        return {
+            "client_order_id": client_id,
+            "securityType": "OPTN",
+            "orderTerm": "GOOD_FOR_DAY",
+            "orderAction": "SPREAD",
+            "spreadType": "VERTICAL",
+            "orderType": "SPREADS",
+            "priceType": "NET_DEBIT",
+            "limitPrice": limit_price,
+            "legs": [
+                {
+                    "symbol": ticker,
+                    "orderAction": "SELL_CLOSE",
+                    "quantity": qty,
+                    "callPut": call_put,
+                    "expiryYear": exp_date.year,
+                    "expiryMonth": exp_date.month,
+                    "expiryDay": exp_date.day,
+                    "strikePrice": float(long_strike),
+                },
+                {
+                    "symbol": ticker,
+                    "orderAction": "BUY_CLOSE",
+                    "quantity": qty,
+                    "callPut": call_put,
+                    "expiryYear": exp_date.year,
+                    "expiryMonth": exp_date.month,
+                    "expiryDay": exp_date.day,
+                    "strikePrice": float(short_strike),
+                },
+            ],
+            "required_margin": 0,
+        }
+
+    close_action = "SELL_CLOSE" if position_qty is not None and float(position_qty) > 0 else "BUY_CLOSE"
+    return {
+        "client_order_id": client_id,
+        "symbol": ticker,
+        "quantity": qty,
+        "securityType": "OPTN",
+        "orderType": "LIMIT",
+        "priceType": "LIMIT",
+        "orderTerm": "GOOD_FOR_DAY",
+        "limitPrice": limit_price,
+        "orderAction": close_action,
+        "callPut": call_put,
+        "expiryYear": exp_date.year,
+        "expiryMonth": exp_date.month,
+        "expiryDay": exp_date.day,
+        "strikePrice": float(short_strike),
+        "required_margin": 0,
+    }
+
+def submit_order_async(
+    etrade_instance,
+    accounts,
+    market,
+    order_info,
+    reason,
+    request_id=None,
+    preview_only=False,
+    max_checks=180,
+    refresh_spec=None,
+    record_target=False,
+    record_spy_close_payload=None,
+    active_proposal_id=None,
+    trade_date_to_mark=None,
+):
+    """Submit one order in a worker so other dashboard requests can proceed."""
+    if active_proposal_id:
+        ACTIVE_DASHBOARD_ORDERS.add(active_proposal_id)
+    update_manual_trade_status(request_id, status="scheduled", message="Order worker scheduled")
+    return ORDER_EXECUTOR.submit(
+        _order_worker,
+        etrade_instance,
+        accounts,
+        market,
+        order_info,
+        reason,
+        request_id,
+        preview_only,
+        max_checks,
+        refresh_spec,
+        record_target,
+        record_spy_close_payload,
+        active_proposal_id,
+        trade_date_to_mark,
+    )
+
+def _order_worker(
+    etrade_instance,
+    accounts,
+    market,
+    order_info,
+    reason,
+    request_id,
+    preview_only,
+    max_checks,
+    refresh_spec,
+    record_target,
+    record_spy_close_payload,
+    active_proposal_id,
+    trade_date_to_mark,
+):
+    order_payload = order_info.get("order")
+    if isinstance(order_payload, list):
+        order_payload = order_payload[0] if order_payload else None
+    ticker = order_info.get("ticker", "N/A")
+    order_type = order_info.get("type", "order")
+
+    try:
+        if not order_payload:
+            update_manual_trade_status(request_id, status="failed", message=f"No order payload for {ticker}")
+            return False
+
+        if refresh_spec:
+            update_manual_trade_status(request_id, status="repricing", message=f"Refreshing {ticker} {order_type}")
+            is_valid, _ = refresh_spread_limit_price(
+                market,
+                refresh_spec["ticker"],
+                refresh_spec["sell_strike"],
+                refresh_spec["buy_strike"],
+                refresh_spec["call_put"],
+                refresh_spec["expiration_date"],
+                order_payload,
+                is_credit=refresh_spec.get("is_credit", True),
+            )
+            if not is_valid:
+                update_manual_trade_status(request_id, status="failed", message=f"{ticker} spread no longer profitable after price refresh")
+                return False
+
+        update_manual_trade_status(request_id, status="placing", message=f"Placing {ticker} {order_type}")
+        order_id = etrade_instance.order.place_order(order_payload, preview_only=preview_only)
+        while order_id == "INSUFFICIENT_FUNDS":
+            all_positions = accounts.portfolio()
+            release_margin(
+                all_positions=all_positions,
+                cover_call_list=None,
+                etrade_instance=etrade_instance,
+                max_positions=5,
+            )
+            t.sleep(5)
+            accounts.balance()
+            order_id = etrade_instance.order.place_order(order_payload, preview_only=preview_only)
+
+        if not order_id:
+            update_manual_trade_status(request_id, status="failed", message=f"Failed to place {ticker} {order_type}")
+            return False
+
+        append_manual_trade_status(request_id, "order_ids", order_id)
+        update_manual_trade_status(request_id, status="placed", message=f"Placed {ticker} {order_type} order {order_id}")
+        print(f"Placed {ticker} {order_type} order - ID: {order_id}")
+
+        if trade_date_to_mark:
+            save_trade_status(trade_date_to_mark)
+
+        try:
+            print(f"Monitoring order {order_id} for execution and adjusting price by $0.01 every 30s if still open...")
+            executed, final_order_id = etrade_instance.order.wait_and_adjust_until_filled(
+                order_id, step=0.01, interval_sec=30, max_checks=max_checks
+            )
+        except Exception as e:
+            update_manual_trade_status(request_id, status="placed", message=f"Auto-adjust loop for {order_id} error: {e}")
+            print(f"Auto-adjust loop for order {order_id} encountered an error: {e}")
+            return True
+
+        if executed:
+            spread_data = order_info.get("spread_data")
+            if record_target and spread_data:
+                try:
+                    accounts.record_option_target(spread_data, order_id=final_order_id, order_status="EXECUTED")
+                except Exception as e:
+                    print(f"⚠️ Could not record option target for order {final_order_id}: {e}")
+            if record_spy_close_payload and ticker == "SPY":
+                try:
+                    record_closed_spy_gain(record_spy_close_payload)
+                except Exception:
+                    pass
+
+            audit = order_info.get("audit", {}).copy()
+            if not audit and spread_data:
+                audit = {
+                    "ticker": ticker,
+                    "sell_strike": spread_data["sell_option"].strike_price,
+                    "long_strike": spread_data["buy_option"].strike_price,
+                    "qty": order_info.get("quantity", 1),
+                    "is_close": False,
+                }
+            if audit:
+                audit["order_id"] = final_order_id
+                log_order_execution(audit, reason, "FILLED")
+                send_trade_notification_email(audit, reason)
+
+            update_manual_trade_status(request_id, status="filled", message=f"{ticker} {order_type} filled as {final_order_id}")
+            return True
+
+        update_manual_trade_status(request_id, status="placed", message=f"{ticker} {order_type} placed but not filled yet")
+        return True
+    finally:
+        if active_proposal_id in ACTIVE_DASHBOARD_ORDERS:
+            ACTIVE_DASHBOARD_ORDERS.remove(active_proposal_id)
+
 def log_nudge_action(action_type, order_id, ticker, details):
     """Log nudge actions to a persistent JSON file for EOD reporting."""
     history_file = "nudge_history.json"
@@ -1366,6 +3720,21 @@ def log_nudge_action(action_type, order_id, ticker, details):
             json.dump(history, f, indent=4)
     except Exception as e:
         print(f"   ⚠️ [Nudge Log] Error logging action: {e}")
+
+def _option_tick_size(price):
+    try:
+        return 0.05 if abs(float(price)) < 3 else 0.10
+    except Exception:
+        return 0.10
+
+def _snap_option_limit_price(price):
+    try:
+        value = abs(float(price))
+        tick = _option_tick_size(value)
+        snapped = int((value / tick) + 0.5) * tick
+        return round(max(tick, snapped), 2)
+    except Exception:
+        return 0.0
 
 def send_nudge_summary_email(target_date):
     """Read nudge_history.json and send an EOD summary email."""
@@ -1579,7 +3948,7 @@ def monitor_and_nudge_stale_orders(etrade_instance, market_instance, dry_run=Fal
             # Threshold Check ($0.05)
             if abs(current_limit - abs(net_mid)) <= 0.05:
                 # Nudge it!
-                nudge_step = 0.01
+                nudge_step = _option_tick_size(current_limit)
                 if price_type == 'NET_CREDIT':
                     new_limit = current_limit + nudge_step
                 elif price_type == 'NET_DEBIT':
@@ -1803,6 +4172,47 @@ def oauth(use_sandbox, auto_login=True, username=None, password=None, headless=N
     print("New session created and tokens saved.")
     return session, base_url
 
+
+def _attach_etrade_auth_refresh_callbacks():
+    callback = _refresh_etrade_session
+    clients = [globals().get("accounts"), globals().get("market")]
+    etrade = globals().get("etrade_instance")
+    if etrade is not None:
+        clients.extend([
+            getattr(etrade, "account", None),
+            getattr(etrade, "market", None),
+            getattr(etrade, "order", None),
+        ])
+    for client in clients:
+        if client is not None:
+            setattr(client, "auth_refresh_callback", callback)
+
+
+def _refresh_etrade_session(reason="E*TRADE request"):
+    with ETRADE_SESSION_REFRESH_LOCK:
+        use_sandbox_value = globals().get("use_sandbox", False)
+        print(f"🔐 E*TRADE OAuth token expired during {reason}. Refreshing session...")
+        new_session, new_base_url = oauth(use_sandbox_value, auto_login=True)
+
+        globals()["session"] = new_session
+        globals()["base_url"] = new_base_url
+        globals()["last_renewal_time"] = datetime.now()
+
+        if globals().get("accounts") is not None:
+            refreshed_accounts = Accounts(new_session, new_base_url, use_sandbox=use_sandbox_value)
+            refreshed_accounts.account_list(1)
+            globals()["accounts"] = refreshed_accounts
+        if globals().get("market") is not None:
+            globals()["market"] = Market(new_session, new_base_url, use_sandbox=use_sandbox_value)
+
+        etrade = globals().get("etrade_instance")
+        if etrade is not None:
+            etrade.refresh_session(new_session, new_base_url)
+
+        _attach_etrade_auth_refresh_callbacks()
+        return new_session, new_base_url
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Grab all the option chains for the specified symbol',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -1905,6 +4315,7 @@ if __name__ == "__main__":
         accounts = Accounts(session, base_url)
         accounts.account_list(1) # Select the Individual Brokerage account ending in 8703
         market = Market(session, base_url)
+        _attach_etrade_auth_refresh_callbacks()
 
 
 
@@ -1949,19 +4360,22 @@ if __name__ == "__main__":
 
     last_stale_check_time = datetime.now() - timedelta(minutes=6)
 
-    # Load EV/Probability engine data
+    # Load EV/Probability engine data lazily after the market-status gate.
+    # Pre-market refreshes do not need a yfinance-backed regime sync.
+    regime_dict, best_hmm, daily_models = {}, None, []
+    regime_load_deferred_logged = False
     if no_regime:
         print("⏭️  Skipping market regime detection (--no-regime).")
-        regime_dict, best_hmm, daily_models = {}, None, []
     else:
-        print("📈 Loading regime-based return data for EV engine...")
-        # build_regime_return_arrays will now check for cached data first
-        regime_dict, best_hmm, daily_models = build_regime_return_arrays(int(t.time()/86400), horizon=7) 
+        print("📈 Regime-based return data will load when the market is OPEN.")
 
 
     # Start the HTTP server for manual refresh requests from web UI
     try:
         refresh_server = start_refresh_server(port=8765)
+        startup_refresh_generation = _queue_portfolio_refresh()
+        REFRESH_REQUESTED.set()
+        print(f"🔄 [Startup Refresh] Queued portfolio generation {startup_refresh_generation}.")
 
     except Exception as e:
         print(f"⚠️ Could not start refresh server: {e}")
@@ -1977,11 +4391,17 @@ if __name__ == "__main__":
         sys.exit(1)
     
     while True:
+        cycle_started_at = datetime.now()
         try:
+            if DASHBOARD_ON_DEMAND_REFRESH_ONLY and not REFRESH_REQUESTED.is_set() and not MANUAL_TRADE_REQUESTED.is_set():
+                _wait_for_dashboard_work()
+
             # Check for manual refresh request
             is_manual_refresh = REFRESH_REQUESTED.is_set()
+            refresh_generation = None
             if is_manual_refresh:
                 REFRESH_REQUESTED.clear()
+                refresh_generation = _start_portfolio_refresh()
 
             # Refresh live settings on each tick
             live_settings = load_live_settings()
@@ -2014,6 +4434,7 @@ if __name__ == "__main__":
                     accounts.account_list(1)
                     if start_trade and not bypass_etrade:
                         etrade_instance.refresh_session(session, base_url)
+                    _attach_etrade_auth_refresh_callbacks()
                 except LoginFailureException as e:
                     logging.error(f"Failed to renew session (LoginFailure): {e}")
                     send_login_failure_notification(f"Session renewal failed: {e}", e.screenshot_path)
@@ -2026,18 +4447,75 @@ if __name__ == "__main__":
             is_open, market_status, market_open_time, market_close_time = is_market_open()
             print(f"\n📊 Market status: {market_status}  (checked at {now.strftime('%Y-%m-%d %H:%M:%S')})")
 
-            # Detect Market Close Transition to record prices
-            if prev_market_status == "OPEN" and market_status == "AFTER_HOURS":
-                record_market_close_prices(etrade_instance.market)
+            # Capture close prices even in on-demand mode or when the process starts after close.
+            if _market_close_refresh_due(market_status=market_status, market_close_time=market_close_time):
+                if record_market_close_prices(etrade_instance.market):
+                    MARKET_CLOSE_PRICE_REFRESHED_DATE = current_date
             prev_market_status = market_status
 
-            is_manual_trade = MANUAL_TRADE_REQUESTED.is_set()
+            if not no_regime and best_hmm is None:
+                if market_status == "OPEN":
+                    print("📈 Loading regime-based return data for EV engine...")
+                    # build_regime_return_arrays performs yfinance sync; avoid it before regular hours.
+                    regime_dict, best_hmm, daily_models = build_regime_return_arrays(int(t.time()/86400), horizon=7)
+                elif market_status == "PRE_MARKET" and not regime_load_deferred_logged:
+                    print("⏭️  Deferring yfinance-backed regime refresh until market is OPEN (currently PRE_MARKET).")
+                    regime_load_deferred_logged = True
+
+            # Log GEX by minute for intraday analysis (only during market hours)
+            if is_open:
+                log_gex_minute(accounts)
+
+            next_manual_request = dequeue_manual_trade_request()
+            if next_manual_request:
+                MANUAL_TRADE_PARAMS = next_manual_request
+                is_manual_trade = True
+            else:
+                MANUAL_TRADE_PARAMS = {}
+                is_manual_trade = False
+
+            # The dashboard Refresh Data button is a read-only portfolio refresh.
+            # Render it before slower candidate/GEX/order-management scans so the
+            # browser does not keep reloading yesterday's generated HTML.
+            if is_manual_refresh and not is_manual_trade:
+                print(f"🔄 [Manual Refresh] Regenerating portfolio HTML ({market_status})...")
+                try:
+                    accounts.account_list(1)
+                    refresh_positions = accounts.portfolio(print_enable=False, require_success=True)
+                    from copy import deepcopy
+                    refresh_screened = accounts.screen_option(deepcopy(refresh_positions))
+
+                    try:
+                        from accounts.accounts_bo import _spy_margin_totals_external
+                        spy_total_margin, spy_call_margin, spy_put_margin = _spy_margin_totals_external(refresh_screened)
+                        update_spy_daily_snapshot(
+                            refresh_positions,
+                            spy_total_margin,
+                            spy_call_margin,
+                            spy_put_margin,
+                        )
+                    except Exception as tracker_err:
+                        print(f"[SPY Tracker] Warning: Could not update tracker during manual refresh: {tracker_err}")
+
+                    html_path = accounts.render_screened_option_pairs_html(
+                        refresh_screened,
+                        out_path="screened_option_pairs.html",
+                        order_instance=etrade_instance.order,
+                        show_refresh=False,
+                    )
+                    _finish_portfolio_refresh(refresh_generation)
+                    print(f"✅ [Manual Refresh] HTML updated: {html_path}")
+                except Exception as refresh_err:
+                    _finish_portfolio_refresh(refresh_generation, error=refresh_err)
+                    print(f"⚠️ [Manual Refresh] Error updating HTML: {refresh_err}")
+                    traceback.print_exc()
+                continue
             
             # --- MANUAL CLOSE ORDER HANDLING ---
             if is_manual_trade and MANUAL_TRADE_PARAMS.get('is_close'):
                 print("\n🔐 [Manual Trade] Processing CLOSE order from dashboard...")
                 data = MANUAL_TRADE_PARAMS
-                MANUAL_TRADE_REQUESTED.clear()
+                request_id = data.get("request_id")
                 
                 try:
                     ticker = data.get('ticker') or data.get('symbol')
@@ -2046,6 +4524,7 @@ if __name__ == "__main__":
                     short_strike = data.get('sell_strike') or data.get('short_strike') or data.get('strike')
                     long_strike = data.get('long_strike') # May be None for single leg
                     qty = int(data.get('pair_quantity') or data.get('quantity') or data.get('qty') or 1)
+                    position_qty = data.get('position_qty')
                     
                     exp_parts = exp.split('-')
                     # format: SYMBOL:YYYY:MM:DD:TYPE:STRIKE
@@ -2096,44 +4575,51 @@ if __name__ == "__main__":
                             limit_debit = 0.05 # Fallback
 
                     if limit_debit:
-                        from accounts.accounts_bo import StockPosition
-                        exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-                        s_leg = StockPosition(symbol=ticker, quantity=-qty, security_type="Option", 
-                                              strike_price=float(short_strike), call_put=cp, expiration_date=exp_date)
-                        
+                        close_order = build_close_order_payload(
+                            ticker=ticker,
+                            expiration=exp,
+                            call_put=cp,
+                            short_strike=short_strike,
+                            long_strike=long_strike,
+                            quantity=qty,
+                            limit_price=limit_debit,
+                            position_qty=position_qty,
+                        )
                         if long_strike:
-                            l_leg = StockPosition(symbol=ticker, quantity=qty, security_type="Option", 
-                                                  strike_price=float(long_strike), call_put=cp, expiration_date=exp_date)
-                            
-                            close_order = accounts.generate_option_order(
-                                single_leg_stock_position=None,
-                                action="SPREAD",
-                                spread_sell_option=l_leg,
-                                spread_buy_option=s_leg,
-                                priceType={'priceType': 'NET_DEBIT', 'limitPrice': round(limit_debit, 2)}
-                            )
                             print(f"   Submitting SPREAD close order for {ticker} {cp} {short_strike}/{long_strike} @ ${limit_debit:.2f} (Qty: {qty})")
                         else:
-                            close_order = accounts.generate_option_order(
-                                single_leg_stock_position=s_leg,
-                                action="BUY_TO_CLOSE",
-                                priceType={'priceType': 'LIMIT', 'limitPrice': round(limit_debit, 2)}
-                            )
-                            print(f"   Submitting SINGLE leg close order for {ticker} {cp} {short_strike} @ ${limit_debit:.2f} (Qty: {qty})")
-                        
-                        if isinstance(close_order, list): close_order = close_order[0]
-                        order_id = etrade_instance.order.place_order(close_order, preview_only=False)
-                        if order_id:
-                            print(f"   ✅ Close order submitted! ID: {order_id}")
-                            if ticker == 'SPY':
-                                try: record_closed_spy_gain(data)
-                                except: pass
-                        else:
-                            print(f"   ❌ Close order submission failed.")
+                            print(f"   Submitting SINGLE leg close order for {ticker} {cp} {short_strike} as {close_order['orderAction']} @ ${limit_debit:.2f} (Qty: {qty})")
+
+                        order_info = {
+                            "ticker": ticker,
+                            "type": "Close spread" if long_strike else "Close option",
+                            "order": close_order,
+                            "audit": {
+                                "ticker": ticker,
+                                "sell_strike": short_strike,
+                                "long_strike": long_strike,
+                                "qty": qty,
+                                "is_close": True,
+                            }
+                        }
+                        submit_order_async(
+                            etrade_instance,
+                            accounts,
+                            market,
+                            order_info,
+                            "Manual Dashboard Close",
+                            request_id=request_id,
+                            preview_only=False,
+                            max_checks=60,
+                            record_spy_close_payload=data,
+                        )
+                        print(f"   ✅ Close order scheduled for async execution (Request: {request_id})")
                     else:
                         print(f"   ❌ Could not fetch latest quotes for {symbols_to_quote}.")
+                        update_manual_trade_status(request_id, status="failed", message=f"Could not fetch latest quotes for {symbols_to_quote}")
                 except Exception as e:
                     print(f"   ❌ Error executing manual close: {e}")
+                    update_manual_trade_status(request_id, status="failed", message=str(e))
                     traceback.print_exc()
                 
                 REFRESH_REQUESTED.set()
@@ -2147,9 +4633,16 @@ if __name__ == "__main__":
                     print("🔄 [Manual Refresh] Fetching portfolio and updating HTML (market closed)...")
                     try:
                         accounts.account_list(1)
-                        all_positions = accounts.portfolio(print_enable=False)
+                        all_positions = accounts.portfolio(print_enable=False, require_success=True)
                         screened = accounts.screen_option(all_positions)
                         html_path = accounts.render_screened_option_pairs_html(screened, out_path="screened_option_pairs.html", order_instance=etrade_instance.order, show_refresh=False)
+                        CURRENT_NEUTRALIZE_PROPOSALS = build_neutralize_proposals(
+                            screened,
+                            accounts,
+                            market,
+                            live_settings,
+                            rejected_proposals_today
+                        )
                         print(f"✅ [Manual Refresh] HTML updated: {html_path}")
                     except Exception as refresh_err:
                         print(f"⚠️ [Manual Refresh] Error updating HTML: {refresh_err}")
@@ -2162,8 +4655,8 @@ if __name__ == "__main__":
                 seconds_until_next = (next_trade_time - now).total_seconds()
                 if seconds_until_next > 0:
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sleeping until next trading day: {next_trade_time}...")
-                    # Use interruptible sleep to allow manual refresh (check every second, max 10 min)
-                    for _ in range(min(600, int(seconds_until_next))):
+                    # Use interruptible sleep to allow manual refresh (check every second, max 5 min)
+                    for _ in range(_next_refresh_sleep_seconds(cycle_started_at, seconds_until_next)):
                         if REFRESH_REQUESTED.is_set() or MANUAL_TRADE_REQUESTED.is_set():
                             print("🔄 [Refresh Server] Processing manual request...")
                             break
@@ -2182,40 +4675,42 @@ if __name__ == "__main__":
             all_positions = accounts.portfolio(print_enable=True)  
 
             # --- EXTRINSIC VALUE ALERTS FOR ITM SHORT OPTIONS ---
-            try:
-                alerts_to_send = []
-                for pos in all_positions:
-                    if getattr(pos, "security_type", "") == "Option" and getattr(pos, "quantity", 0) < 0:
-                        ul = getattr(pos, "underlying_last_price", 0.0)
-                        strike = getattr(pos, "strike_price", 0.0)
-                        price = getattr(pos, "last_price", 0.0)
-                        cp = getattr(pos, "call_put", None)
-                        sym = getattr(pos, "symbol", "")
-                        exp = getattr(pos, "expiration_date", "")
-                        
-                        if ul and strike and price and cp:
-                            intrinsic = max(0.0, ul - strike) if cp == "CALL" else max(0.0, strike - ul)
-                            if intrinsic > 0:
-                                extrinsic = max(0.0, price - intrinsic)
-                                if extrinsic <= 1.0:
-                                    alert_id = f"{sym}_{strike}_{cp}_{exp}_{current_date}"
-                                    if alert_id not in extrinsic_alert_sent:
-                                        alerts_to_send.append(
-                                            f"<strong>{sym} {cp} ${strike}</strong> (Exp: {exp})<br>"
-                                            f"Underlying: ${ul:.2f} | Option Price: ${price:.2f}<br>"
-                                            f"Intrinsic: <span style='color:#d93025;'>${intrinsic:.2f}</span> | "
-                                            f"Extrinsic: <span style='color:#d93025;font-weight:bold;'>${extrinsic:.2f}</span>"
-                                        )
-                                        extrinsic_alert_sent.add(alert_id)
-                if alerts_to_send:
-                    send_extrinsic_value_alert(alerts_to_send)
-            except Exception as alert_e:
-                print(f"[Extrinsic Alert Check] Warning: {alert_e}")
+            # Skip this check outside regular market hours because option quotes can be stale.
+            if is_open:
+                try:
+                    alerts_to_send = []
+                    for pos in all_positions:
+                        if getattr(pos, "security_type", "") == "Option" and getattr(pos, "quantity", 0) < 0:
+                            ul = getattr(pos, "underlying_last_price", 0.0)
+                            strike = getattr(pos, "strike_price", 0.0)
+                            price = getattr(pos, "last_price", 0.0)
+                            cp = getattr(pos, "call_put", None)
+                            sym = getattr(pos, "symbol", "")
+                            exp = getattr(pos, "expiration_date", "")
+                            
+                            if ul and strike and price and cp:
+                                intrinsic = max(0.0, ul - strike) if cp == "CALL" else max(0.0, strike - ul)
+                                if intrinsic > 0:
+                                    extrinsic = max(0.0, price - intrinsic)
+                                    if extrinsic <= 1.0:
+                                        alert_id = f"{sym}_{strike}_{cp}_{exp}_{current_date}"
+                                        if alert_id not in extrinsic_alert_sent:
+                                            alerts_to_send.append(
+                                                f"<strong>{sym} {cp} ${strike}</strong> (Exp: {exp})<br>"
+                                                f"Underlying: ${ul:.2f} | Option Price: ${price:.2f}<br>"
+                                                f"Intrinsic: <span style='color:#d93025;'>${intrinsic:.2f}</span> | "
+                                                f"Extrinsic: <span style='color:#d93025;font-weight:bold;'>${extrinsic:.2f}</span>"
+                                            )
+                                            extrinsic_alert_sent.add(alert_id)
+                    if alerts_to_send:
+                        send_extrinsic_value_alert(alerts_to_send)
+                except Exception as alert_e:
+                    print(f"[Extrinsic Alert Check] Warning: {alert_e}")
     
             # Update SPY position tracker BEFORE screen_option (which modifies quantities in-place)
             try:
                 # Refresh portfolio right before snapshot to ensure fresh pricing
-                all_positions = accounts.portfolio(print_enable=False)
+                all_positions = accounts.portfolio(print_enable=False, require_success=True)
                 
                 # Need to call screen_option first just to get margin values, then restore quantities
                 from copy import deepcopy
@@ -2256,18 +4751,23 @@ if __name__ == "__main__":
                     print(f"🔄 [Manual Refresh] Fetching portfolio and updating HTML ({market_status})...")
                 else:
                     print(f"\n--- Updating screened_option_pairs.html ({market_status}) ---")
-                all_positions = accounts.portfolio(print_enable=False)
+                all_positions = accounts.portfolio(print_enable=False, require_success=True)
                 screened = accounts.screen_option(all_positions)
                 html_path = accounts.render_screened_option_pairs_html(screened, out_path="screened_option_pairs.html", order_instance=etrade_instance.order, show_refresh=False)
+                CURRENT_NEUTRALIZE_PROPOSALS = build_neutralize_proposals(
+                    screened,
+                    accounts,
+                    market,
+                    live_settings,
+                    rejected_proposals_today
+                )
                 print(f"HTML updated: {html_path}")
 
                 if market_status == "PRE_MARKET" and market_open_time is not None:
-                    # Sleep until market open (or our trade_start_time, whichever is later)
+                    # Wake at market open so read-only scans begin immediately.
                     import pytz
                     eastern = pytz.timezone('US/Eastern')
-                    trade_start_dt = eastern.localize(datetime.combine(now.date(), trade_start_time))
-                    wake_target = max(market_open_time, trade_start_dt)
-                    seconds_until_open = (wake_target - datetime.now(eastern)).total_seconds()
+                    seconds_until_open = (market_open_time - datetime.now(eastern)).total_seconds()
                 elif market_status == "AFTER_HOURS":
                     # Sleep until trade_start_time on the next trading day
                     next_day = now.date() + timedelta(days=1)
@@ -2280,7 +4780,7 @@ if __name__ == "__main__":
 
                 if seconds_until_open > 0:
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Market {market_status}. Sleeping {int(seconds_until_open)}s...")
-                    sleep_seconds = min(600, int(seconds_until_open))
+                    sleep_seconds = _next_refresh_sleep_seconds(cycle_started_at, seconds_until_open)
                     for _ in range(sleep_seconds):
                         if REFRESH_REQUESTED.is_set() or MANUAL_TRADE_REQUESTED.is_set():
                             print("🔄 [Refresh Server] Processing manual request...")
@@ -2289,14 +4789,27 @@ if __name__ == "__main__":
                 continue
 
             # ── Trading window check (market is OPEN, but are we within user's trading hours?) ──
-            is_manual_trade = MANUAL_TRADE_REQUESTED.is_set()
             if not (trade_start_time <= current_time <= trade_end_time) and not is_manual_trade:
-                print(f"\n⏰ Market is OPEN but outside trading window ({trade_start_time}–{trade_end_time}). Skipping position actions.")
-                # Still update the HTML so users can see current positions
-                print("--- Updating screened_option_pairs.html (outside trading window) ---")
-                all_positions = accounts.portfolio(print_enable=False)
+                print(f"\n⏰ Market is OPEN but outside trading window ({trade_start_time}–{trade_end_time}). Running read-only scans; skipping position actions.")
+                print("--- Updating positions and close candidates (outside trading window) ---")
+                all_positions = accounts.portfolio(print_enable=False, require_success=True)
                 screened = accounts.screen_option(all_positions)
                 html_path = accounts.render_screened_option_pairs_html(screened, out_path="screened_option_pairs.html", order_instance=etrade_instance.order, show_refresh=False)
+                accounts.option_value_final(all_positions)
+                CURRENT_CLOSE_PROPOSALS = build_close_proposals(
+                    screened,
+                    accounts,
+                    market,
+                    live_settings,
+                    rejected_proposals_today
+                )
+                CURRENT_NEUTRALIZE_PROPOSALS = build_neutralize_proposals(
+                    screened,
+                    accounts,
+                    market,
+                    live_settings,
+                    rejected_proposals_today
+                )
                 print(f"HTML updated: {html_path}")
 
                 # Calculate seconds until trading window starts
@@ -2316,8 +4829,8 @@ if __name__ == "__main__":
                     next_trade_time = datetime.combine(next_day, trade_start_time)
                 seconds_until_trade = (next_trade_time - now).total_seconds()
                 if seconds_until_trade > 0:
-                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sleeping until trading window: {next_trade_time}...")
-                    sleep_seconds = min(600, int(seconds_until_trade))
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Read-only scan complete. Next refresh in at most 5 minutes.")
+                    sleep_seconds = _next_refresh_sleep_seconds(cycle_started_at, seconds_until_trade)
                     for _ in range(sleep_seconds):
                         if REFRESH_REQUESTED.is_set() or MANUAL_TRADE_REQUESTED.is_set():
                             print("🔄 [Refresh Server] Processing manual request...")
@@ -2369,7 +4882,7 @@ if __name__ == "__main__":
             auto_open_enabled = live_settings.get('auto_open_enabled', False)
             if is_manual_trade:
                 print("\n⚡ [Main Loop] Manual trade request detected. Proceeding to execution logic...")
-                MANUAL_TRADE_REQUESTED.clear()
+                _sync_manual_trade_event()
             
             # --- OPENING EXECUTION GATE ---
             # Only search for new positions if it's an AUTO-OPEN or a MANUAL-OPEN request
@@ -2383,7 +4896,7 @@ if __name__ == "__main__":
                      print(f"🔄 [Manual Refresh] Re-evaluating candidates for dashboard...")
                 if is_manual_open:
                      print("\n⚡ [Main Loop] Manual OPEN request detected. Proceeding to execution logic...")
-                     MANUAL_TRADE_REQUESTED.clear()
+                     _sync_manual_trade_event()
                 cover_call_list = {}
                 # 'AAPL': 5,
                 # 'AMD': 1,
@@ -2413,15 +4926,39 @@ if __name__ == "__main__":
                 trade_side = live_settings.get('trade_side', 'BOTH')
                 
                 # Source of truth is now the dashboard settings
-                parameters = [{
-                    "ticker": "SPY",
-                    "pnl": 0,
-                    "target_premium_call": 0,
-                    "target_premium_put": 0,
-                    "hedge_ratio_call": 1 if trade_side in ['CALL', 'BOTH'] else 0,
-                    "hedge_ratio_put": 1 if trade_side in ['PUT', 'BOTH'] else 0,
-                    "qty": live_settings.get('pair_quantity', 1)
-                }]
+                parameters = [
+                    {
+                        "ticker": "SPY",
+                        "pnl": 0,
+                        "target_premium_call": 0,
+                        "target_premium_put": 0,
+                        "hedge_ratio_call": 1 if trade_side in ['CALL', 'BOTH'] else 0,
+                        "hedge_ratio_put": 1 if trade_side in ['PUT', 'BOTH'] else 0,
+                        "qty": live_settings.get('spy_pair_quantity', live_settings.get('pair_quantity', 15))
+                    },
+                    {
+                        "ticker": "SPX",
+                        "pnl": 0,
+                        "target_premium_call": 0,
+                        "target_premium_put": 0,
+                        "hedge_ratio_call": 1 if trade_side in ['CALL', 'BOTH'] else 0,
+                        "hedge_ratio_put": 1 if trade_side in ['PUT', 'BOTH'] else 0,
+                        "qty": live_settings.get('spx_pair_quantity', 1)
+                    }
+                ]
+
+                if is_manual_open:
+                    requested_ticker = (MANUAL_TRADE_PARAMS.get('ticker') or "").upper()
+                    if requested_ticker not in ("SPY", "SPX"):
+                        update_manual_trade_status(
+                            MANUAL_TRADE_PARAMS.get("request_id"),
+                            status="failed",
+                            message=f"Unsupported manual open ticker: {requested_ticker or 'missing'}"
+                        )
+                        parameters = []
+                    else:
+                        parameters = [p for p in parameters if p["ticker"] == requested_ticker]
+                        print(f"🎯 [Manual Trade] Restricting open search to {requested_ticker}")
                 
                 # Calculate days to next Friday
                 today = datetime.now()
@@ -2459,27 +4996,8 @@ if __name__ == "__main__":
                     target_premium_otm_put = 0.3
                     target_steer = 0.9
                     today_date = today.date()
-                    saved_expiry = live_settings.get('target_expiration')
-                    if saved_expiry:
-                        try:
-                            # Use saved expiration if valid and in future
-                            friday_date = datetime.strptime(saved_expiry, "%Y-%m-%d").date()
-                            if friday_date < today_date:
-                                raise ValueError("Past expiration")
-                            days_to_expire = (friday_date - today_date).days
-                        except Exception:
-                            # Fallback to weeks if saved expiry is invalid or past
-                            tw = live_settings.get('target_weeks', 6)
-                            target_date = today_date + timedelta(weeks=tw)
-                            days_until_friday = (4 - target_date.weekday()) % 7
-                            friday_date = target_date + timedelta(days=days_until_friday)
-                            days_to_expire = (friday_date - today_date).days
-                    else:
-                        tw = live_settings.get('target_weeks', 6)
-                        target_date = today_date + timedelta(weeks=tw)
-                        days_until_friday = (4 - target_date.weekday()) % 7
-                        friday_date = target_date + timedelta(days=days_until_friday)
-                        days_to_expire = (friday_date - today_date).days
+                    friday_date = _target_expiration_from_settings(accounts, ticker, live_settings, today_date)
+                    days_to_expire = (friday_date - today_date).days
         
                     print(f"Target Friday: {friday_date}, Days from today: {days_to_expire}")
         
@@ -2500,7 +5018,7 @@ if __name__ == "__main__":
                     target_premium_put = target_premium_put_baseline if trade_type != 'call_credit_spread' else 0
 
                     if is_manual_trade and MANUAL_TRADE_PARAMS:
-                        requested_side = MANUAL_TRADE_PARAMS.get('side', 'BOTH')
+                        requested_side = str(MANUAL_TRADE_PARAMS.get('side', 'BOTH')).upper()
                         if requested_side == 'CALL':
                             hedge_ratio_put = 0
                         elif requested_side == 'PUT':
@@ -2511,7 +5029,10 @@ if __name__ == "__main__":
                             parameter['qty'] = int(MANUAL_TRADE_PARAMS['qty'])
         
                     target_delta_val = live_settings.get('target_delta', 0.15)
-                    hedge_spread_val = live_settings.get('hedge_spread', 20)
+                    if ticker == 'SPX':
+                        hedge_spread_val = float(live_settings.get('spx_hedge_spread', live_settings.get('hedge_spread', 200.0)) or 200.0)
+                    else:
+                        hedge_spread_val = float(live_settings.get('spy_hedge_spread', live_settings.get('hedge_spread', 20.0)) or 20.0)
                     pair_qty = parameter['qty']
                     print(f"🎯 Searching for {ticker} spread candidates by Target Delta: {target_delta_val} (Width: ${hedge_spread_val}, Qty: {pair_qty})")
                     # Log target premiums only as secondary reference
@@ -2546,6 +5067,7 @@ if __name__ == "__main__":
                                 buy_opt.call_put = side.upper()
                                 buy_opt.quantity = parameter['qty']
                                 buy_opt.distance_to_strike = (buy_k - current_price) / current_price * 100 if current_price else 0
+                                buy_conflict_qty = check_manual_open_buy_conflict(accounts, ticker, buy_opt)
                                 
                                 profit = MANUAL_TRADE_PARAMS.get('premium')
                                 if profit is not None:
@@ -2558,9 +5080,15 @@ if __name__ == "__main__":
                                     'sell_option': sell_opt,
                                     'buy_option': buy_opt,
                                     'profit': profit,
-                                    'ticker': ticker
+                                    'ticker': ticker,
+                                    'buy_conflict_qty': buy_conflict_qty,
                                 }
                                 print(f"   ✅ Manual spread candidate created: {sell_k}/{buy_k} at net credit ${profit}")
+                                if buy_conflict_qty < 0:
+                                    update_manual_trade_status(
+                                        MANUAL_TRADE_PARAMS.get("request_id"),
+                                        message=f"Detected existing short {ticker} {side.upper()} {buy_k} qty {buy_conflict_qty}; using BUY_CLOSE on long leg"
+                                    )
                                 
                                 # Proceed with execution logic...
                                 print(f"   🚀 Executing manual trade for {ticker}...")
@@ -2579,19 +5107,23 @@ if __name__ == "__main__":
                                     
                                 print(f"✅ [Manual Trade] Successfully loaded specific spread. Net Credit: ${profit:.2f}")
                                 
-                                # Clear the manual trade flag so it doesn't run again next iteration
-                                MANUAL_TRADE_REQUESTED.clear()
-                                is_manual_trade = False
-                                MANUAL_TRADE_PARAMS = {}
                             else:
                                 print(f"⚠️ [Manual Trade] Could not retrieve quotes for both legs. Aborting manual execution.")
-                                # Clear the manual trade flag so it doesn't run again next iteration
-                                MANUAL_TRADE_REQUESTED.clear()
-                                is_manual_trade = False
-                                MANUAL_TRADE_PARAMS = {}
+                                update_manual_trade_status(
+                                    MANUAL_TRADE_PARAMS.get("request_id"),
+                                    status="failed",
+                                    message=f"Could not retrieve quotes for {ticker} {sell_k}/{buy_k}"
+                                )
+                                continue
                         except Exception as e:
-                            print(f"⚠️ [Manual Trade] Error loading specific strikes: {e}. Falling back to search.")
+                            print(f"⚠️ [Manual Trade] Error loading specific strikes: {e}. Aborting submitted dashboard order.")
+                            update_manual_trade_status(
+                                MANUAL_TRADE_PARAMS.get("request_id"),
+                                status="failed",
+                                message=f"Error loading requested {ticker} {side.upper()} {sell_k}/{buy_k} exp {target_exp}: {e}"
+                            )
                             traceback.print_exc()
+                            continue
 
                     while spread_options_call_candidate is None and spread_options_put_candidate is None:
                         # Use target_delta (sign-aware in accounts_bo.py) to determine the short leg
@@ -2633,7 +5165,36 @@ if __name__ == "__main__":
                     else:
                         put_action = "SPREAD"
         
-                    if spread_options_call_candidate is not None and spread_options_call_candidate['profit'] > 0.01:
+                    call_has_manual_conflict = (
+                        is_manual_open
+                        and spread_options_call_candidate
+                        and int(spread_options_call_candidate.get("buy_conflict_qty") or 0) < 0
+                    )
+                    put_has_manual_conflict = (
+                        is_manual_open
+                        and spread_options_put_candidate
+                        and int(spread_options_put_candidate.get("buy_conflict_qty") or 0) < 0
+                    )
+
+                    call_conflict_order = None
+                    if call_has_manual_conflict:
+                        call_conflict_order = build_manual_open_conflict_order(
+                            ticker,
+                            spread_options_call_candidate,
+                            parameter['qty'],
+                            MANUAL_TRADE_PARAMS.get("request_id"),
+                        )
+
+                    put_conflict_order = None
+                    if put_has_manual_conflict:
+                        put_conflict_order = build_manual_open_conflict_order(
+                            ticker,
+                            spread_options_put_candidate,
+                            parameter['qty'],
+                            MANUAL_TRADE_PARAMS.get("request_id"),
+                        )
+
+                    if spread_options_call_candidate is not None and spread_options_call_candidate['profit'] > 0.01 and not call_has_manual_conflict:
                         call_spread_orders = accounts.generate_option_order(
                             single_leg_stock_position=single_leg_stock_position_call,
                             action=call_action,
@@ -2643,7 +5204,7 @@ if __name__ == "__main__":
                             priceType={"priceType": "NET_CREDIT", "limitPrice": round(spread_options_call_candidate['profit'], 2)}
                         )
         
-                    if spread_options_put_candidate is not None and spread_options_put_candidate['profit'] > 0.01:
+                    if spread_options_put_candidate is not None and spread_options_put_candidate['profit'] > 0.01 and not put_has_manual_conflict:
                         put_spread_orders = accounts.generate_option_order(
                             single_leg_stock_position=single_leg_stock_position_put,
                             action=put_action,
@@ -2653,12 +5214,21 @@ if __name__ == "__main__":
                             priceType={"priceType": "NET_CREDIT", "limitPrice": round(spread_options_put_candidate['profit'], 2)}
                         )
         
-                    if call_spread_orders is not None and SKIP_CALL_FLAG is False:
+                    if call_conflict_order is not None and SKIP_CALL_FLAG is False:
+                        preview_orders.append(call_conflict_order)
+                    elif call_has_manual_conflict and SKIP_CALL_FLAG is False:
+                        update_manual_trade_status(
+                            MANUAL_TRADE_PARAMS.get("request_id"),
+                            status="failed",
+                            message="Could not build BUY_CLOSE-adjusted call spread order"
+                        )
+                    elif call_spread_orders is not None and SKIP_CALL_FLAG is False and not call_has_manual_conflict:
                         for call_spread_order in call_spread_orders:
                             if call_spread_order is None:
                                 continue
                             preview_orders.append({
                                 "ticker": ticker,
+                                "quote_ticker": spread_options_call_candidate['sell_option'].symbol,
                                 "type": "Call spread" if parameter.get('is_cover_call') is None else "Cover call",
                                 "order": call_spread_order,
                                 "spread_data": spread_options_call_candidate,
@@ -2672,12 +5242,21 @@ if __name__ == "__main__":
                     else:
                         print(f"No call_spread_orders for {ticker}")
         
-                    if put_spread_orders is not None and SKIP_PUT_FLAG is False:
+                    if put_conflict_order is not None and SKIP_PUT_FLAG is False:
+                        preview_orders.append(put_conflict_order)
+                    elif put_has_manual_conflict and SKIP_PUT_FLAG is False:
+                        update_manual_trade_status(
+                            MANUAL_TRADE_PARAMS.get("request_id"),
+                            status="failed",
+                            message="Could not build BUY_CLOSE-adjusted put spread order"
+                        )
+                    elif put_spread_orders is not None and SKIP_PUT_FLAG is False and not put_has_manual_conflict:
                         for put_spread_order in put_spread_orders:
                             if put_spread_order is None:
                                 continue
                             preview_orders.append({
                                 "ticker": ticker,
+                                "quote_ticker": spread_options_put_candidate['sell_option'].symbol,
                                 "type": "Put spread",
                                 "order": put_spread_order,
                                 "spread_data": spread_options_put_candidate,
@@ -2771,188 +5350,83 @@ if __name__ == "__main__":
                         "valid_orders": [o['ticker'] for o in preview_orders]
                     })
 
-                    print("✅ Executing orders...")
-                    any_executed = False
+                    print("✅ Scheduling orders for parallel execution...")
+                    scheduled_count = 0
+                    request_id = MANUAL_TRADE_PARAMS.get("request_id") if is_manual_open else None
                     for order_info in preview_orders:
-                        PREVIEW_ONLY = False
-
-                        # Re-fetch latest price after approval delay
                         spread_data = order_info.get('spread_data', {})
                         sell_opt = spread_data.get('sell_option')
                         buy_opt = spread_data.get('buy_option')
+                        refresh_spec = None
                         if sell_opt and buy_opt:
-                            is_valid, refreshed_price = refresh_spread_limit_price(
-                                market, sell_opt.symbol,
-                                sell_opt.strike_price, buy_opt.strike_price,
-                                sell_opt.call_put, sell_opt.expiration_date,
-                                order_info['order'], is_credit=True
-                            )
-                            if not is_valid:
-                                print(f"   ⏭️ Skipping {order_info['ticker']} {order_info['type']} — no longer profitable after price refresh.")
-                                continue
+                            refresh_spec = {
+                                "ticker": order_info.get("quote_ticker") or sell_opt.symbol,
+                                "sell_strike": sell_opt.strike_price,
+                                "buy_strike": buy_opt.strike_price,
+                                "call_put": sell_opt.call_put,
+                                "expiration_date": sell_opt.expiration_date,
+                                "is_credit": True,
+                            }
+                        submit_order_async(
+                            etrade_instance,
+                            accounts,
+                            market,
+                            order_info,
+                            open_reason,
+                            request_id=request_id,
+                            preview_only=False,
+                            max_checks=180,
+                            refresh_spec=refresh_spec,
+                            record_target=True,
+                            trade_date_to_mark=current_date,
+                        )
+                        scheduled_count += 1
 
-                        order_id = etrade_instance.order.place_order(order_info['order'], preview_only=PREVIEW_ONLY)
-                        while order_id == "INSUFFICIENT_FUNDS":
-                            all_positions = accounts.portfolio()
-                            positions_processed = release_margin(
-                                all_positions=all_positions,
-                                cover_call_list=None,
-                                etrade_instance=etrade_instance,
-                                max_positions=5
-                            )
-                            t.sleep(5)
-                            accounts.balance()
-                            order_id = etrade_instance.order.place_order(order_info['order'], preview_only=PREVIEW_ONLY)
-        
-                        if order_id is not None:
-                            print(f"Placed {order_info['ticker']} {order_info['type']} order - ID: {order_id}")
-                            try:
-                                print(f"Monitoring order {order_id} for execution and adjusting price by $0.01 every 30s if still open...")
-                                executed, final_order_id = etrade_instance.order.wait_and_adjust_until_filled(order_id, step=0.01, interval_sec=30, max_checks=180)
-                                if executed:
-                                    accounts.record_option_target(order_info['spread_data'], order_id=final_order_id, order_status="EXECUTED")
-                                    any_executed = True
-                                    
-                                    # Permanent Logging & Notification
-                                    order_audit = {
-                                        'ticker': order_info['ticker'],
-                                        'sell_strike': order_info['spread_data']['sell_option'].strike_price,
-                                        'long_strike': order_info['spread_data']['buy_option'].strike_price,
-                                        'qty': order_info['quantity'],
-                                        'order_id': final_order_id,
-                                        'is_close': False
-                                    }
-                                    log_order_execution(order_audit, open_reason, "FILLED")
-                                    send_trade_notification_email(order_audit, open_reason)
-                            except Exception as e:
-                                print(f"Auto-adjust loop for order {order_id} encountered an error: {e}")
-                        else:
-                            print(f"Failed to place {order_info['ticker']} {order_info['type']} order")
-                        t.sleep(5)
-                    print("All orders have been processed")
-                    # Mark trade as executed for today only if at least one order is executed
-                    if any_executed:
+                    if scheduled_count:
+                        update_manual_trade_status(
+                            request_id,
+                            message=f"Scheduled {scheduled_count} open order(s)"
+                        )
                         save_trade_status(current_date)
                         last_trade_date = current_date
                         trade_executed_flag = True
+                    print(f"Scheduled {scheduled_count} order(s) for async execution")
                 else:
                     if not execute_open_now:
                         print("Search complete. No orders executed (Refresh mode).")
                     else:
                         print("No valid orders found to execute.")
+                        if is_manual_open:
+                            req_ticker = MANUAL_TRADE_PARAMS.get("ticker") or "UNKNOWN"
+                            req_side = MANUAL_TRADE_PARAMS.get("side") or "UNKNOWN"
+                            req_sell = MANUAL_TRADE_PARAMS.get("sell_strike") or "?"
+                            req_buy = MANUAL_TRADE_PARAMS.get("buy_strike") or "?"
+                            req_exp = MANUAL_TRADE_PARAMS.get("expiration") or "?"
+                            request_id = MANUAL_TRADE_PARAMS.get("request_id")
+                            current_status = get_manual_trade_status_record(request_id).get("status")
+                            if current_status != "failed":
+                                update_manual_trade_status(
+                                    request_id,
+                                    status="failed",
+                                    message=f"No valid {req_ticker} {req_side} order found for {req_sell}/{req_buy} exp {req_exp}; order was not submitted"
+                                )
 
             # --- POSITION DETECTION & MANAGEMENT SECTION ---
             # Now refresh portfolio state to detect high-gain spreads or needed rolls
             print("\n--- Running Position Detection & Management ---")
-            all_positions = accounts.portfolio(print_enable=False)
+            all_positions = accounts.portfolio(print_enable=False, require_success=True)
             screened = accounts.screen_option(all_positions)
             html_path = accounts.render_screened_option_pairs_html(screened, out_path="screened_option_pairs.html", order_instance=etrade_instance.order, show_refresh=False)
             accounts.option_value_final(all_positions)
 
             # Propose closing high-gain spreads automatically (email approval)
-            close_proposals = []   # collect all close-worthy spreads first
-            for entry in screened:
-                if entry.get("is_spread") and entry.get("short_lot") and entry.get("long_lot"):
-                    short_lot = entry["short_lot"]
-                    long_lot = entry["long_lot"]
-                    
-                    try:
-                        # Construct OSI keys for quotes
-                        short_osi = f"{short_lot.symbol}:{short_lot.expiration_date.year}:{short_lot.expiration_date.month:02}:{short_lot.expiration_date.day:02}:{short_lot.call_put}:{short_lot.strike_price}"
-                        long_osi = f"{long_lot.symbol}:{long_lot.expiration_date.year}:{long_lot.expiration_date.month:02}:{long_lot.expiration_date.day:02}:{long_lot.call_put}:{long_lot.strike_price}"
-                        
-                        # Check if already rejected today to avoid redundant quotes/emails
-                        proposal_id = f"{short_lot.symbol}_{short_lot.strike_price}_{short_lot.call_put}_{short_lot.expiration_date}"
-                        if proposal_id in rejected_proposals_today:
-                            continue
-
-                        print(f"   Checking quote for {short_lot.symbol} close candidate...")
-                        resp = market.get_quote([short_osi, long_osi], resp_format="json")
-                        quote_data = resp.get("QuoteResponse", {}).get("QuoteData", [])
-                        
-                        quotes_dict = {}
-                        for q in quote_data:
-                            p = q.get("Product", {})
-                            ticker_resp = p.get("symbol")
-                            quotes_dict[ticker_resp] = q.get("All", {})
-                        
-                        short_q = quotes_dict.get(short_osi)
-                        long_q = quotes_dict.get(long_osi)
-                        
-                        # Fallback matching
-                        if not short_q or not long_q:
-                            for q in quote_data:
-                                all_q = q.get("All", {})
-                                prod = q.get("Product", {})
-                                if abs(float(prod.get("strikePrice", 0)) - float(short_lot.strike_price)) < 0.01 and prod.get("callPut") == short_lot.call_put:
-                                    short_q = all_q
-                                if abs(float(prod.get("strikePrice", 0)) - float(long_lot.strike_price)) < 0.01 and prod.get("callPut") == long_lot.call_put:
-                                    long_q = all_q
-
-                        if short_q and long_q:
-                            bid_s = float(short_q.get("bid", 0))
-                            ask_s = float(short_q.get("ask", 0))
-                            bid_l = float(long_q.get("bid", 0))
-                            ask_l = float(long_q.get("ask", 0))
-                            
-                            mid_s = (bid_s + ask_s) / 2
-                            mid_l = (bid_l + ask_l) / 2
-                            midpoint = mid_s - mid_l
-                            
-                            # NEW Threshold: Check closing cost midpoint AND profit percentage
-                            close_mid_threshold = live_settings.get('auto_close_midpoint_threshold', 0.30)
-                            target_gain_threshold = live_settings.get('auto_close_gain_threshold', 70.0)
-                            
-                            # Both conditions must be met:
-                            # 1. Gain must be >= target_gain (e.g. 70%)
-                            # 2. Closing cost must be <= threshold (e.g. $0.30)
-                            gain_val = entry.get('pair_gain_loss', 0)
-                            gain_met = gain_val >= target_gain_threshold
-                            cost_met = abs(midpoint) <= close_mid_threshold
-                            
-                            if gain_met and cost_met:
-                                print(f"\n🚀 DETECTION: Profit Target Met in {short_lot.symbol}")
-                                print(f"   Gain: {gain_val:.1f}% >= {target_gain_threshold}%")
-                                print(f"   Cost: ${abs(midpoint):.2f} <= ${close_mid_threshold:.2f}")
-                                print(f"   Pair Qty: {entry['pair_quantity']}")
-                                
-                                # Build the close order ahead of time
-                                from copy import copy
-                                s_lot = copy(short_lot)
-                                l_lot = copy(long_lot)
-                                s_lot.quantity = entry['pair_quantity']
-                                l_lot.quantity = entry['pair_quantity']
-                                
-                                close_order = accounts.generate_option_order(
-                                    single_leg_stock_position=None,
-                                    action="SPREAD",
-                                    spread_sell_option=l_lot,
-                                    spread_buy_option=s_lot,
-                                    priceType={'priceType': 'NET_DEBIT', 'limitPrice': abs(midpoint)}
-                                )
-                                
-                                expiry_str = short_lot.expiration_date.strftime('%Y-%m-%d') if hasattr(short_lot.expiration_date, 'strftime') else str(short_lot.expiration_date)
-                                close_proposals.append({
-                                    'ticker': short_lot.symbol,
-                                    'short_strike': short_lot.strike_price,
-                                    'long_strike': long_lot.strike_price,
-                                    'call_put': short_lot.call_put,
-                                    'expiration': expiry_str,
-                                    'pair_quantity': entry['pair_quantity'],
-                                    'gain_pct': short_lot.gain_loss_percentage if hasattr(short_lot, 'gain_loss_percentage') else entry.get('pair_gain_loss', 0),
-                                    'midpoint': midpoint,
-                                    'short_bid': bid_s, 'short_ask': ask_s,
-                                    'long_bid': bid_l, 'long_ask': ask_l,
-                                    'close_order': close_order,
-                                    'proposal_id': proposal_id
-                                })
-                        else:
-                            # print(f"   Warning: Could not fetch quotes for legs of {short_lot.symbol} spread.")
-                            pass
-                    except Exception as e:
-                        print(f"   Error in auto-close logic for {short_lot.symbol}: {e}")
-                        import traceback
-                        traceback.print_exc()
+            close_proposals = build_close_proposals(
+                screened,
+                accounts,
+                market,
+                live_settings,
+                rejected_proposals_today
+            )
 
             # Update global list for dashboard
             CURRENT_CLOSE_PROPOSALS = close_proposals
@@ -2975,14 +5449,20 @@ if __name__ == "__main__":
                         break
                 if not found:
                     print(f"⚠️ [Manual Trade] Position {req_ticker} (Strike {req_strike}) no longer qualifies for auto-close thresholds. Skipping execution.")
-                    MANUAL_TRADE_REQUESTED.clear()
+                    update_manual_trade_status(
+                        MANUAL_TRADE_PARAMS.get("request_id"),
+                        status="failed",
+                        message=f"Position {req_ticker} {req_strike} no longer qualifies for close"
+                    )
+                    _sync_manual_trade_event()
                     is_manual_close = False
 
             # --- Auto-approval (Guarded by master toggle OR manual override) ---
             if close_proposals:
                 if (auto_open_enabled and not is_manual_neutralize) or is_manual_close:
                     close_reason = "Manual Dashboard Close" if is_manual_close else "Automatic System Close"
-                    print(f"✅ Close-spread proposals approved ({close_reason}). Executing...")
+                    print(f"✅ Close-spread proposals approved ({close_reason}). Scheduling...")
+                    scheduled_close_count = 0
                     for cp in close_proposals:
                         # Massive Close Bug Fix: If manual close, only process the specific requested position
                         if is_manual_close:
@@ -2995,12 +5475,10 @@ if __name__ == "__main__":
                         if isinstance(close_order, list): 
                             close_order = close_order[0]
                             
-                        # Mark order as active for the frontend
                         proposal_id = cp.get('proposal_id')
-                        if proposal_id:
-                            ACTIVE_DASHBOARD_ORDERS.add(proposal_id)
 
                         # Limit Price Overwrite Bug Fix: Respect frontend price for manual trades
+                        refresh_spec = None
                         if is_manual_close and MANUAL_TRADE_PARAMS.get('midpoint') is not None:
                             frontend_price = abs(float(MANUAL_TRADE_PARAMS.get('midpoint')))
                             # Update the order limit price
@@ -3013,53 +5491,45 @@ if __name__ == "__main__":
                             limit_price_val = frontend_price
                             print(f"   [Manual Trade] Using frontend requested price: ${frontend_price:.2f}")
                         else:
-                            # Re-fetch latest price after approval delay (for automatic trades)
-                            _, refreshed_debit = refresh_spread_limit_price(
-                                market, cp['ticker'],
-                                cp['short_strike'], cp['long_strike'],
-                                cp['call_put'], cp['expiration'],
-                                close_order, is_credit=False
-                            )
+                            refresh_spec = {
+                                "ticker": cp['ticker'],
+                                "sell_strike": cp['short_strike'],
+                                "buy_strike": cp['long_strike'],
+                                "call_put": cp['call_put'],
+                                "expiration_date": cp['expiration'],
+                                "is_credit": False,
+                            }
                             limit_price_val = close_order.get('limitPrice', 'N/A')
 
-                        print(f"   Submitting close order for {cp['ticker']} {cp['call_put']} {cp['short_strike']}/{cp['long_strike']} @ ${limit_price_val}...")
-                        order_id = etrade_instance.order.place_order(close_order, preview_only=False)
-                        if order_id:
-                            print(f"   Order submitted! ID: {order_id}")
-                            try:
-                                executed, final_id = etrade_instance.order.wait_and_adjust_until_filled(
-                                    order_id, step=0.01, interval_sec=30, max_checks=60
-                                )
-                                if executed:
-                                    print(f"   ✅ Close order filled (ID: {final_id})")
-                                    try:
-                                        record_closed_spy_gain(cp)
-                                        
-                                        # Permanent Logging & Notification
-                                        order_audit = {
-                                            'ticker': cp['ticker'],
-                                            'sell_strike': cp['short_strike'],
-                                            'long_strike': cp['long_strike'],
-                                            'qty': cp.get('pair_quantity', 1),
-                                            'order_id': final_id,
-                                            'is_close': True
-                                        }
-                                        log_order_execution(order_audit, close_reason, "FILLED")
-                                        send_trade_notification_email(order_audit, close_reason)
-                                    except Exception:
-                                        pass
-                            except Exception as e:
-                                print(f"   Auto-adjust for close order {order_id} error: {e}")
-                        else:
-                            print(f"   ❌ Close order submission failed for {cp['ticker']}")
-                        
-                        # Remove from active orders after completion
-                        if proposal_id in ACTIVE_DASHBOARD_ORDERS:
-                            ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
-                            
-                        t.sleep(3)
-                    # Clear flags
-                    MANUAL_TRADE_REQUESTED.clear()
+                        print(f"   Scheduling close order for {cp['ticker']} {cp['call_put']} {cp['short_strike']}/{cp['long_strike']} @ ${limit_price_val}...")
+                        order_info = {
+                            "ticker": cp['ticker'],
+                            "type": "Close spread",
+                            "order": close_order,
+                            "audit": {
+                                'ticker': cp['ticker'],
+                                'sell_strike': cp['short_strike'],
+                                'long_strike': cp['long_strike'],
+                                'qty': cp.get('pair_quantity', 1),
+                                'is_close': True
+                            }
+                        }
+                        submit_order_async(
+                            etrade_instance,
+                            accounts,
+                            market,
+                            order_info,
+                            close_reason,
+                            request_id=MANUAL_TRADE_PARAMS.get("request_id") if is_manual_close else None,
+                            preview_only=False,
+                            max_checks=60,
+                            refresh_spec=refresh_spec,
+                            record_spy_close_payload=cp,
+                            active_proposal_id=proposal_id,
+                        )
+                        scheduled_close_count += 1
+                    print(f"Scheduled {scheduled_close_count} close order(s) for async execution")
+                    _sync_manual_trade_event()
                     is_manual_close = False
                 else:
                     wait_reason = "neutralize request in progress" if is_manual_neutralize else "Automatic Open is OFF"
@@ -3071,8 +5541,9 @@ if __name__ == "__main__":
             if is_manual_trade and MANUAL_TRADE_PARAMS.get('is_neutralize'):
                 print("\n🔐 [Manual Trade] Processing NEUTRALIZE request from dashboard...")
                 data = MANUAL_TRADE_PARAMS
-                MANUAL_TRADE_REQUESTED.clear()
+                _sync_manual_trade_event()
                 proposal_id = data.get('proposal_id')
+                request_id = data.get("request_id")
 
                 try:
                     target_proposal = None
@@ -3082,23 +5553,73 @@ if __name__ == "__main__":
                             break
                     if target_proposal is None:
                         print(f"   ❌ No matching neutralize proposal found for {proposal_id}.")
+                        update_manual_trade_status(request_id, status="failed", message=f"No matching neutralize proposal found for {proposal_id}")
                         REFRESH_REQUESTED.set()
                         continue
 
-                    close_order = _normalize_order_payload(target_proposal.get('orders', {}).get('close_order'))
-                    replacement_order = _normalize_order_payload(target_proposal.get('orders', {}).get('replacement_order'))
-                    offset_order = _normalize_order_payload(target_proposal.get('orders', {}).get('offset_order'))
-                    if not close_order or not replacement_order or not offset_order:
+                    template_close_order = _normalize_order_payload(target_proposal.get('orders', {}).get('close_order'))
+                    template_replacement_order = _normalize_order_payload(target_proposal.get('orders', {}).get('replacement_order'))
+                    template_offset_order = _normalize_order_payload(target_proposal.get('orders', {}).get('offset_order'))
+                    has_offset = bool(target_proposal.get('offset'))
+                    if not template_close_order or not template_replacement_order or (has_offset and not template_offset_order):
                         print("   ❌ Neutralize proposal is missing one or more orders.")
+                        update_manual_trade_status(request_id, status="failed", message="Neutralize proposal is missing one or more orders")
                         REFRESH_REQUESTED.set()
                         continue
 
-                    original = target_proposal.get('original', {})
-                    replacement = target_proposal.get('replacement', {})
-                    offset = target_proposal.get('offset', {})
-                    ticker = target_proposal.get('ticker')
-                    qty = int(target_proposal.get('qty', 1) or 1)
-                    print(f"   [Neutralize] {ticker} {original.get('call_put')} {original.get('short_strike')}/{original.get('long_strike')} -> 42 DTE roll + opposite spread")
+                    original = data.get('original') or target_proposal.get('original', {})
+                    replacement = data.get('replacement') or target_proposal.get('replacement', {})
+                    offset = data.get('offset') if data.get('offset') is not None else target_proposal.get('offset')
+                    ticker = data.get('ticker') or target_proposal.get('ticker')
+                    qty = int(data.get('qty') or target_proposal.get('qty', 1) or 1)
+
+                    close_order = _build_neutralize_spread_order(
+                        ticker,
+                        original,
+                        qty,
+                        "NET_DEBIT",
+                        original.get('midpoint_debit', target_proposal.get('estimated_close_debit', 0)),
+                        "BUY_CLOSE",
+                        "SELL_CLOSE",
+                        template_close_order,
+                    )
+                    replacement_order = _build_neutralize_spread_order(
+                        ticker,
+                        replacement,
+                        qty,
+                        "NET_CREDIT",
+                        replacement.get('credit', 0),
+                        "SELL_OPEN",
+                        "BUY_OPEN",
+                        template_replacement_order,
+                    )
+                    offset_order = None
+                    if has_offset and offset:
+                        offset_order = _build_neutralize_spread_order(
+                            ticker,
+                            offset,
+                            qty,
+                            "NET_CREDIT",
+                            offset.get('credit', 0),
+                            "SELL_OPEN",
+                            "BUY_OPEN",
+                            template_offset_order,
+                        )
+
+                    proposal_replacement = target_proposal.get('replacement', {})
+                    proposal_offset = target_proposal.get('offset') or {}
+                    if (
+                        replacement.get('short_strike') != proposal_replacement.get('short_strike') or
+                        replacement.get('long_strike') != proposal_replacement.get('long_strike') or
+                        (
+                            has_offset and offset and (
+                                offset.get('short_strike') != proposal_offset.get('short_strike') or
+                                offset.get('long_strike') != proposal_offset.get('long_strike')
+                            )
+                        )
+                    ):
+                        print("   [Neutralize] Using submitted proposal strikes instead of refreshed in-memory strikes.")
+                    print(f"   [Neutralize] {ticker} {original.get('call_put')} {original.get('short_strike')}/{original.get('long_strike')} -> target roll{' + opposite spread' if has_offset else ''}")
 
                     # Re-price the three orders immediately before sending.
                     refresh_spread_limit_price(
@@ -3121,28 +5642,34 @@ if __name__ == "__main__":
                         replacement_order,
                         is_credit=True
                     )
-                    refresh_spread_limit_price(
-                        market,
-                        ticker,
-                        offset.get('short_strike'),
-                        offset.get('long_strike'),
-                        offset.get('call_put'),
-                        offset.get('expiration'),
-                        offset_order,
-                        is_credit=True
-                    )
+                    if has_offset and offset_order and offset:
+                        refresh_spread_limit_price(
+                            market,
+                            ticker,
+                            offset.get('short_strike'),
+                            offset.get('long_strike'),
+                            offset.get('call_put'),
+                            offset.get('expiration'),
+                            offset_order,
+                            is_credit=True
+                        )
 
                     close_order = _normalize_order_payload(close_order)
                     replacement_order = _normalize_order_payload(replacement_order)
-                    offset_order = _normalize_order_payload(offset_order)
+                    offset_order = _normalize_order_payload(offset_order) if has_offset else None
 
-                    if not close_order or not replacement_order or not offset_order:
+                    if not close_order or not replacement_order or (has_offset and not offset_order):
                         print("   ❌ Neutralize order payload normalization failed.")
+                        update_manual_trade_status(request_id, status="failed", message="Neutralize order payload normalization failed")
                         REFRESH_REQUESTED.set()
                         continue
 
-                    if float(replacement_order.get('limitPrice', 0) or 0) <= 0.01 or float(offset_order.get('limitPrice', 0) or 0) <= 0.01:
+                    if (
+                        float(replacement_order.get('limitPrice', 0) or 0) <= 0.01 or
+                        (has_offset and float(offset_order.get('limitPrice', 0) or 0) <= 0.01)
+                    ):
                         print("   ❌ Neutralize replacement/offset credit no longer valid; skipping execution.")
+                        update_manual_trade_status(request_id, status="failed", message="Neutralize replacement/offset credit no longer valid")
                         REFRESH_REQUESTED.set()
                         continue
 
@@ -3153,43 +5680,45 @@ if __name__ == "__main__":
                     executed_orders = [
                         ("close", close_order, original.get('short_strike'), original.get('long_strike'), original.get('call_put')),
                         ("replacement", replacement_order, replacement.get('short_strike'), replacement.get('long_strike'), replacement.get('call_put')),
-                        ("offset", offset_order, offset.get('short_strike'), offset.get('long_strike'), offset.get('call_put')),
                     ]
+                    if has_offset and offset_order and offset:
+                        executed_orders.append(("offset", offset_order, offset.get('short_strike'), offset.get('long_strike'), offset.get('call_put')))
 
                     neutralize_failed = False
-                    for leg_name, order_to_send, short_strike, long_strike, call_put in executed_orders:
-                        if neutralize_failed:
-                            break
-                        print(f"   [Neutralize] Submitting {leg_name} order for {ticker} {call_put} {short_strike}/{long_strike}...")
-                        order_id = etrade_instance.order.place_order(order_to_send, preview_only=False)
-                        if not order_id:
-                            neutralize_failed = True
-                            print(f"   ❌ Neutralize {leg_name} order submission failed for {ticker}")
-                            break
-
-                        print(f"   [Neutralize] Order submitted! ID: {order_id}")
-                        try:
-                            executed, final_id = etrade_instance.order.wait_and_adjust_until_filled(
-                                order_id, step=0.01, interval_sec=30, max_checks=60
-                            )
-                            if executed:
-                                print(f"   ✅ Neutralize {leg_name} order filled (ID: {final_id})")
-                                order_audit = {
-                                    'ticker': ticker,
-                                    'sell_strike': short_strike,
-                                    'long_strike': long_strike,
-                                    'qty': qty,
-                                    'order_id': final_id,
-                                    'is_close': (leg_name == "close"),
-                                }
-                                log_order_execution(order_audit, close_reason, "FILLED")
-                                send_trade_notification_email(order_audit, close_reason)
-                            else:
+                    leg_results = []
+                    update_manual_trade_status(request_id, status="placing", message=f"Submitting neutralize legs for {ticker}")
+                    with ThreadPoolExecutor(max_workers=len(executed_orders)) as executor:
+                        future_map = {
+                            executor.submit(
+                                _execute_neutralize_leg,
+                                etrade_instance,
+                                ticker,
+                                leg_name,
+                                order_to_send,
+                                short_strike,
+                                long_strike,
+                                call_put,
+                                qty,
+                                close_reason,
+                            ): leg_name
+                            for leg_name, order_to_send, short_strike, long_strike, call_put in executed_orders
+                        }
+                        for future in as_completed(future_map):
+                            try:
+                                result = future.result()
+                            except Exception as e:
                                 neutralize_failed = True
-                                print(f"   ❌ Neutralize {leg_name} order did not fill for {ticker}")
-                        except Exception as e:
-                            neutralize_failed = True
-                            print(f"   Auto-adjust for neutralize {leg_name} order {order_id} error: {e}")
+                                print(f"   ❌ Neutralize leg worker failed: {e}")
+                                continue
+                            leg_results.append(result)
+                            if not result.get("submitted") or not result.get("executed"):
+                                neutralize_failed = True
+
+                    if neutralize_failed:
+                        print(f"   ❌ Neutralize request for {ticker} completed with one or more incomplete legs.")
+                        update_manual_trade_status(request_id, status="failed", message=f"Neutralize request for {ticker} completed with one or more incomplete legs")
+                    else:
+                        update_manual_trade_status(request_id, status="filled", message=f"Neutralize request for {ticker} filled")
 
                     if proposal_id in ACTIVE_DASHBOARD_ORDERS:
                         ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
@@ -3197,6 +5726,7 @@ if __name__ == "__main__":
                     if proposal_id in ACTIVE_DASHBOARD_ORDERS:
                         ACTIVE_DASHBOARD_ORDERS.remove(proposal_id)
                     print(f"   ❌ Error executing neutralize request: {e}")
+                    update_manual_trade_status(request_id, status="failed", message=str(e))
                     traceback.print_exc()
 
                 REFRESH_REQUESTED.set()
@@ -3221,29 +5751,25 @@ if __name__ == "__main__":
                     # breakpoint()
 
             # --- STALE ORDER MONITORING SECTION ---
-            if (datetime.now() - last_stale_check_time).total_seconds() >= 120:
+            if (datetime.now() - last_stale_check_time).total_seconds() >= 300:
                 print("\n--- Monitoring Stale Orders ---")
                 monitor_and_nudge_stale_orders(etrade_instance, market, dry_run=False)
                 last_stale_check_time = datetime.now()
 
             # End of detection loop, wait before next refresh if trade already executed
+            sleep_seconds = _next_refresh_sleep_seconds(cycle_started_at)
             if last_trade_date == current_date:
                 # Use shorter sleep intervals to allow manual refresh interruption
-                for _ in range(300):  # 300 x 1 second = 5 minutes max
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Tick complete. Next refresh in {sleep_seconds}s.")
+                for _ in range(sleep_seconds):
                     if REFRESH_REQUESTED.is_set() or MANUAL_TRADE_REQUESTED.is_set():
                         print("🔄 [Refresh Server] Processing manual request...")
                         break
-                    
-                    if (datetime.now() - last_stale_check_time).total_seconds() >= 120:
-                        print("\n--- Monitoring Stale Orders (Sleep) ---")
-                        monitor_and_nudge_stale_orders(etrade_instance, market, dry_run=False)
-                        last_stale_check_time = datetime.now()
 
                     t.sleep(1)
             else:
-                # Main Loop Tick: Every 60 seconds (when trade not yet executed)
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Tick complete. Sleeping 60s...")
-                for _ in range(60):
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Tick complete. Next refresh in {sleep_seconds}s.")
+                for _ in range(sleep_seconds):
                     if REFRESH_REQUESTED.is_set() or MANUAL_TRADE_REQUESTED.is_set():
                         break
                     t.sleep(1)

@@ -25,7 +25,7 @@ from live_trading.ev_engine import (
     fit_gmm, query_gmm, get_probability_engine, calculate_yield_metrics,
     _build_single_regime_prob_func, train_regime_hmm, calculate_probability_of_touch,
     calendar_days_to_trading_days,
-    get_regime_labels
+    get_regime_labels, select_gmm_by_bic
 )
 from live_trading.data_ingestion import DataIngestor
 import asyncio
@@ -70,7 +70,7 @@ def plot_regime_timeline(n_components=None):
         timeline_df['Raw_Regime_Label'] = timeline_df['Regime_Label']
         timeline_df['HMM_State'] = timeline_df['Detected_Regime_State']
         timeline_df['Regime_Label'] = timeline_df['Detected_Regime_Label']
-        best_k = int(timeline_df['HMM_State'].max()) + 1
+        best_k = 3
     if timeline_df.empty:
         print("ERROR: No data available for 2015 onwards.")
         return
@@ -114,10 +114,15 @@ def plot_regime_timeline(n_components=None):
     ax2.tick_params(axis='y', labelcolor=color_vix, labelsize=12)
 
     # --- Plot 2: Probability Stacked Area ---
-    prob_data = [timeline_df[f'prob_state_{i}'].values for i in range(best_k)]
-    state_labels = []
-    for i in range(best_k):
-        state_labels.append(stable_labels.get(i, f'State {i}'))
+    detected_prob_cols = [f'detected_prob_state_{i}' for i in range(3)]
+    if all(c in timeline_df.columns for c in detected_prob_cols):
+        prob_data = [timeline_df[c].values for c in detected_prob_cols]
+        state_labels = ['Expansion (0)', 'Cautious Decline (1)', 'Panic / Crisis (2)']
+    else:
+        prob_data = [timeline_df[f'prob_state_{i}'].values for i in range(best_k)]
+        state_labels = []
+        for i in range(best_k):
+            state_labels.append(stable_labels.get(i, f'State {i}'))
     ax3.stackplot(dates, prob_data, labels=state_labels, 
                   colors=colors_list[:best_k], alpha=0.8)
     ax3.set_ylabel('Regime Probability', fontsize=14, fontweight='bold')
@@ -297,7 +302,7 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     if diag_df.empty:
         print(f"ERROR: No diagnostic rows available from {start_date}.")
         return
-    best_k = int(diag_df['HMM_State'].max()) + 1
+    best_k = 3
 
     os.makedirs(output_dir, exist_ok=True)
     colors_list = plt.cm.Set3.colors
@@ -325,10 +330,15 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     ax_vix.set_ylabel('VIX')
     ax_price.grid(True, alpha=0.25, linestyle='--')
 
-    prob_cols = [f'prob_state_{i}' for i in range(best_k) if f'prob_state_{i}' in diag_df.columns]
-    prob_labels = []
-    for i in range(best_k):
-        prob_labels.append(stable_labels.get(i, f'State {i}'))
+    detected_prob_cols = [f'detected_prob_state_{i}' for i in range(3)]
+    if all(c in diag_df.columns for c in detected_prob_cols):
+        prob_cols = detected_prob_cols
+        prob_labels = ['Expansion (0)', 'Cautious Decline (1)', 'Panic / Crisis (2)']
+    else:
+        prob_cols = [f'prob_state_{i}' for i in range(best_k) if f'prob_state_{i}' in diag_df.columns]
+        prob_labels = []
+        for i in range(best_k):
+            prob_labels.append(stable_labels.get(i, f'State {i}'))
     ax_prob.stackplot(
         diag_df.index,
         [diag_df[c].values for c in prob_cols],
@@ -347,7 +357,7 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     ax_price.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, ncol=3)
     fig.suptitle(
         f"Causal Market Regime Timeline ({start_date} - present)\n"
-        f"GMMHMM K={best_k} | Signal timestamp: {diag_df.attrs.get('regime_signal_timestamp', 'close_T_for_next_session')}",
+        f"Gaussian HMM K=3 + stress overlay | Signal timestamp: {diag_df.attrs.get('regime_signal_timestamp', 'close_T_for_next_session')}",
         fontsize=16,
         fontweight='bold',
     )
@@ -382,8 +392,9 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
             ax.text(0.5, 0.5, "Not enough data", transform=ax.transAxes, ha='center', va='center')
             continue
 
-        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
-        gmm.fit(returns)
+        selected, candidates = select_gmm_by_bic(returns.flatten())
+        gmm = selected["model"]
+        selected_k = int(selected["k"])
         density = np.exp(gmm.score_samples(x_grid.reshape(-1, 1)))
         mu = float(np.mean(returns))
         sigma = float(np.std(returns, ddof=1))
@@ -392,13 +403,13 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
 
         ax.hist(returns.flatten(), bins=min(80, max(25, n // 20)), density=True,
                 alpha=0.62, color=color, edgecolor='black', linewidth=0.35, label='Empirical')
-        ax.plot(x_grid, density, color='black', linewidth=2.0, label='2-component GMM')
+        ax.plot(x_grid, density, color='black', linewidth=2.0, label=f'BIC-selected GMM (k={selected_k})')
         for comp_idx, (weight, mean, covar) in enumerate(zip(gmm.weights_, gmm.means_.flatten(), gmm.covariances_.reshape(-1))):
             comp_density = weight * stats.norm.pdf(x_grid, loc=mean, scale=np.sqrt(max(covar, 1e-12)))
             ax.plot(x_grid, comp_density, linestyle='--', linewidth=1.2, label=f'Comp {comp_idx + 1}')
 
-        bic = float(gmm.bic(returns))
-        ax.set_title(f"{label}\nn={n:,} | BIC={bic:.1f}")
+        bic = float(selected["bic"])
+        ax.set_title(f"{label}\nn={n:,} | GMM k={selected_k} | BIC={bic:.1f}")
         ax.set_xlabel("SPY daily log return")
         ax.set_ylabel("Density")
         ax.grid(True, alpha=0.25)
@@ -412,12 +423,15 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
             'std_log_return': sigma,
             'skew': skew,
             'excess_kurtosis': kurt,
+            'gmm_selected_k': selected_k,
             'gmm_bic': bic,
+            'gmm_aic': float(selected["aic"]),
+            'gmm_candidate_bic': json.dumps({int(c["k"]): float(c["bic"]) for c in candidates}),
             'gmm_weights': json.dumps([float(x) for x in gmm.weights_]),
             'gmm_means': json.dumps([float(x) for x in gmm.means_.flatten()]),
             'gmm_stds': json.dumps([float(np.sqrt(max(x, 1e-12))) for x in gmm.covariances_.reshape(-1)]),
         })
-        print(f"State {state} | {label} | n={n:,} | mean={mu:.6f} | std={sigma:.6f} | BIC={bic:.1f}")
+        print(f"State {state} | {label} | n={n:,} | mean={mu:.6f} | std={sigma:.6f} | GMM k={selected_k} | BIC={bic:.1f}")
 
     for ax in axes[best_k:]:
         ax.set_visible(False)
@@ -478,22 +492,26 @@ def plot_gmm_clusters(horizon=45):
         returns = sub_df['future_mae_return'].values
         x = returns.reshape(-1, 1)
 
-        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
-        labels = gmm.fit_predict(x)
+        selected, _ = select_gmm_by_bic(returns)
+        gmm = selected["model"]
+        labels = gmm.predict(x)
         weights = gmm.weights_
         means = gmm.means_.flatten()
 
         # Scatter plot
-        # component 0
-        idx0 = (labels == 0)
-        ax.scatter(sub_df.index[idx0], returns[idx0], s=10, alpha=0.6,
-                   label=f"Comp 0 (w={weights[0]:.2f}, μ={means[0]:.4f})", color='tab:cyan')
-        # component 1
-        idx1 = (labels == 1)
-        ax.scatter(sub_df.index[idx1], returns[idx1], s=10, alpha=0.6,
-                   label=f"Comp 1 (w={weights[1]:.2f}, μ={means[1]:.4f})", color='tab:purple')
+        component_colors = plt.cm.tab10.colors
+        for comp_idx in range(int(selected["k"])):
+            comp_mask = labels == comp_idx
+            ax.scatter(
+                sub_df.index[comp_mask],
+                returns[comp_mask],
+                s=10,
+                alpha=0.6,
+                label=f"Comp {comp_idx} (w={weights[comp_idx]:.2f}, μ={means[comp_idx]:.4f})",
+                color=component_colors[comp_idx % len(component_colors)],
+            )
 
-        ax.set_title(f"GMM Sub-Regimes ({horizon}d Horizon): {label}", fontsize=14, fontweight='bold')
+        ax.set_title(f"BIC-Selected GMM Sub-Regimes k={int(selected['k'])} ({horizon}d Horizon): {label}", fontsize=14, fontweight='bold')
         ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.2)
@@ -514,7 +532,7 @@ def plot_gmm_clusters(horizon=45):
 def plot_gmm_distributions(horizon=45):
     """
     Visualization: Histograms of horizon returns for each regime,
-    overlaid with the 2-component GMM probability density function.
+    overlaid with the BIC-selected GMM probability density function.
     """
     hist_df = fetch_historical_data()
     if hist_df.empty: return
@@ -546,22 +564,13 @@ def plot_gmm_distributions(horizon=45):
             ax.set_title(f"{label} (Insufficient Data)")
             continue
 
-        # Fit GMM (2 components)
         x_fitted = returns.reshape(-1, 1)
-        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
-        gmm.fit(x_fitted)
+        selected, candidates = select_gmm_by_bic(returns)
+        gmm = selected["model"]
         weights = gmm.weights_
         means = gmm.means_.flatten()
         stds = np.sqrt(gmm.covariances_.flatten())
-        
-        # Model Selection Statistics (k=2 vs k=1)
-        gmm1 = GaussianMixture(n_components=1, covariance_type='full', random_state=42)
-        gmm1.fit(x_fitted)
-        
-        ll2 = gmm.score(x_fitted) * n
-        ll1 = gmm1.score(x_fitted) * n
-        aic2, bic2 = gmm.aic(x_fitted), gmm.bic(x_fitted)
-        aic1, bic1 = gmm1.aic(x_fitted), gmm1.bic(x_fitted)
+        selected_k = int(selected["k"])
 
         # Histogram
         n_bins = min(100, max(40, n // 40))
@@ -571,37 +580,38 @@ def plot_gmm_distributions(horizon=45):
         xmin, xmax = ax.get_xlim()
         x_plot = np.linspace(xmin, xmax, 500)
         
-        # Component 0
-        pdf0 = weights[0] * stats.norm.pdf(x_plot, means[0], stds[0])
-        ax.plot(x_plot, pdf0, '--', color='cyan', linewidth=1.5,
-                label=f'Comp 0: w={weights[0]:.2f}, μ={means[0]:.4f}, σ={stds[0]:.4f}')
-        
-        # Component 1
-        pdf1 = weights[1] * stats.norm.pdf(x_plot, means[1], stds[1])
-        ax.plot(x_plot, pdf1, '--', color='magenta', linewidth=1.5,
-                label=f'Comp 1: w={weights[1]:.2f}, μ={means[1]:.4f}, σ={stds[1]:.4f}')
-        
-        # Total GMM PDF
-        ax.plot(x_plot, pdf0 + pdf1, color='black', linewidth=2.5, label='Total GMM Density')
+        total_pdf = np.zeros_like(x_plot)
+        component_colors = plt.cm.tab10.colors
+        for comp_idx, (weight, mean, std) in enumerate(zip(weights, means, stds)):
+            comp_pdf = weight * stats.norm.pdf(x_plot, mean, max(std, 1e-12))
+            total_pdf += comp_pdf
+            ax.plot(
+                x_plot,
+                comp_pdf,
+                '--',
+                color=component_colors[comp_idx % len(component_colors)],
+                linewidth=1.5,
+                label=f'Comp {comp_idx}: w={weight:.2f}, μ={mean:.4f}, σ={std:.4f}',
+            )
+
+        ax.plot(x_plot, total_pdf, color='black', linewidth=2.5, label=f'Total GMM Density (k={selected_k})')
 
         # Annotation Box with Stats
-        better_aic = "GMM (k=2)" if aic2 < aic1 else "Gaussian (k=1)"
+        candidate_lines = [
+            f"k={int(c['k'])}: BIC={float(c['bic']):,.0f}, AIC={float(c['aic']):,.0f}"
+            for c in candidates
+        ]
         stats_text = (
-            f"Log-Likelihood (k=2): {ll2:.1f}\n"
-            f"Log-Likelihood (k=1): {ll1:.1f}\n"
+            "BIC/AIC candidates\n"
+            f"{chr(10).join(candidate_lines)}\n"
             f"────────────────\n"
-            f"AIC (k=2): {aic2:,.0f} {'★' if aic2 < aic1 else ''}\n"
-            f"AIC (k=1): {aic1:,.0f}\n"
-            f"BIC (k=2): {bic2:,.0f} {'★' if bic2 < bic1 else ''}\n"
-            f"BIC (k=1): {bic1:,.0f}\n"
-            f"────────────────\n"
-            f"Winner: {better_aic}"
+            f"Winner: k={selected_k}"
         )
         props = dict(boxstyle='round', facecolor='white', alpha=0.8)
         ax.text(0.95, 0.45, stats_text, transform=ax.transAxes, fontsize=8,
                 verticalalignment='top', horizontalalignment='right', bbox=props, family='monospace')
 
-        ax.set_title(f"GMM Fit ({horizon}d Horizon): {label}", fontsize=14, fontweight='bold')
+        ax.set_title(f"BIC-Selected GMM Fit ({horizon}d Horizon): {label}", fontsize=14, fontweight='bold')
         ax.set_xlabel(f"{horizon}d Future MAE Return")
         ax.set_ylabel("Density")
         ax.legend(loc='upper left', fontsize=8)
@@ -1586,7 +1596,7 @@ if __name__ == "__main__":
     parser.add_argument('--panic-dte-target', help='Target DTE in panic regime', type=int, default=63)
     parser.add_argument('--panic-width-mult', help='Spread width multiplier in panic regime', type=float, default=2.0)
     parser.add_argument('--no-panic-swap', help='Disable closing all positions when entering panic regime', action='store_true')
-    parser.add_argument('--strategy-id', help='Load configuration from strategy_registry.md by ID', type=str)
+    parser.add_argument('--strategy-id', help='Load configuration from backtesting/strategies YAML by ID', type=str)
     parser.add_argument('--override-risk-gates', help='Allow live trade construction even when hard regime/GEX/vol gates fire', action='store_true')
     args = parser.parse_args()
 
@@ -1610,10 +1620,10 @@ if __name__ == "__main__":
         from backtesting.strategy_loader import load_strategy
         from live_trading.ev_engine import fetch_historical_data, train_regime_hmm
         
-        # Load from registry if ID provided, or default to first one if exactly one exists
+        # Load from strategy YAML if ID provided, or default to first one if exactly one exists
         strategy_config = {}
         if hasattr(args, 'strategy_id') and args.strategy_id:
-            print(f"  Loading strategy '{args.strategy_id}' from registry...")
+            print(f"  Loading strategy '{args.strategy_id}' from strategy YAML...")
             strategy_config = load_strategy(args.strategy_id)
         else:
             # Try to auto-load. Prefer 'dynamic_delta_variant' as a smart default.
@@ -1621,29 +1631,29 @@ if __name__ == "__main__":
                 from backtesting.strategy_loader import load_all_strategies
                 all_s = load_all_strategies()
                 if not all_s:
-                    print("  Note: Strategy registry is empty. Using CLI defaults.")
+                    print("  Note: Strategy directory is empty. Using CLI defaults.")
                 else:
                     # Smart Default: Prefer the dynamic_delta_variant
                     if "dynamic_delta_variant" in all_s:
                         sid = "dynamic_delta_variant"
-                        print(f"  No --strategy-id provided. Smart-defaulting to '{sid}' from registry...")
+                        print(f"  No --strategy-id provided. Smart-defaulting to '{sid}' from strategy YAML...")
                         strategy_config = all_s[sid]
                     elif len(all_s) == 1:
                         sid = list(all_s.keys())[0]
-                        print(f"  No --strategy-id provided. Auto-loading only strategy '{sid}' from registry...")
+                        print(f"  No --strategy-id provided. Auto-loading only strategy '{sid}' from strategy YAML...")
                         strategy_config = all_s[sid]
                     else:
                         available = list(all_s.keys())
-                        print(f"  Warning: Multiple strategies in registry {available}. Use --strategy-id to pick one. Using CLI defaults.")
+                        print(f"  Warning: Multiple strategy YAMLs {available}. Use --strategy-id to pick one. Using CLI defaults.")
             except Exception as e:
-                print(f"  Note: Could not auto-load from registry: {e}")
+                print(f"  Note: Could not auto-load strategy YAML: {e}")
         
-        # Apply registry overrides if a strategy was loaded
+        # Apply strategy overrides if a strategy was loaded
         if strategy_config:
             entry = strategy_config.get('entry', {})
             exit_cfg = strategy_config.get('exit', {})
             
-            # Override args with registry values
+            # Override args with strategy values
             args.target_dte = entry.get('target_dte', args.target_dte)
             args.close_dte = exit_cfg.get('close_dte', args.close_dte)
             args.short_delta = entry.get('short_delta', args.short_delta)
@@ -1652,11 +1662,11 @@ if __name__ == "__main__":
             args.panic_dte_target = entry.get('panic_dte_target', args.panic_dte_target)
             args.panic_width_mult = entry.get('panic_width_multiplier', args.panic_width_mult)
             
-            # New: support for explicit panic swap toggle in registry
+            # New: support for explicit panic swap toggle in strategy YAML
             if 'panic_swap_enabled' in entry:
                 args.no_panic_swap = not entry['panic_swap_enabled']
             
-            print(f"  [REGISTRY OVERRIDE] DTE={args.target_dte}, Delta={args.short_delta}, PanicMult={args.panic_delta_mult}, PanicSwap={not args.no_panic_swap}")
+            print(f"  [STRATEGY OVERRIDE] DTE={args.target_dte}, Delta={args.short_delta}, PanicMult={args.panic_delta_mult}, PanicSwap={not args.no_panic_swap}")
         
         print(f"\n  Generating non-anticipatory regimes for backtest period (Walk-Forward)...")
         df_hist = fetch_historical_data()

@@ -1,9 +1,6 @@
-"""
-Strategy loader: parses YAML blocks from strategy_registry.md
-and returns strategy configs as Python dicts.
-"""
+"""Load strategy YAML files from backtesting/strategies."""
 import os
-import re
+import glob
 from typing import Dict, Optional
 
 try:
@@ -12,9 +9,9 @@ try:
 except ImportError:
     HAS_YAML = False
 
-_REGISTRY_PATH = os.path.join(
+_STRATEGIES_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "strategy_registry.md",
+    "strategies",
 )
 
 def _simple_yaml_parse(text: str) -> dict:
@@ -54,51 +51,47 @@ def _simple_yaml_parse(text: str) -> dict:
                 result[current_key][key] = val
     return result
 
-def _parse_yaml_blocks(markdown_text: str) -> Dict[str, dict]:
-    """Extract all ```yaml ... ``` blocks from a markdown file."""
-    pattern = re.compile(r"```yaml\s*\n(.*?)```", re.DOTALL)
+def load_all_strategies(strategies_dir: str = _STRATEGIES_DIR) -> Dict[str, dict]:
+    """Load all strategies from the strategies directory."""
+    if not os.path.exists(strategies_dir):
+        return {}
+        
     strategies = {}
-    for match in pattern.finditer(markdown_text):
-        yaml_content = match.group(1)
+    for file_path in glob.glob(os.path.join(strategies_dir, "*.yaml")) + glob.glob(os.path.join(strategies_dir, "*.yml")):
         try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                
             if HAS_YAML:
-                parsed = yaml.safe_load(yaml_content)
+                parsed = yaml.safe_load(content)
             else:
-                parsed = _simple_yaml_parse(yaml_content)
+                parsed = _simple_yaml_parse(content)
                 
             if isinstance(parsed, dict) and "id" in parsed:
                 strategies[parsed["id"]] = parsed
-        except Exception:
+        except Exception as e:
+            print(f"Error parsing strategy file {file_path}: {e}")
             continue
     return strategies
 
 
-def load_all_strategies(registry_path: str = _REGISTRY_PATH) -> Dict[str, dict]:
-    """Load all strategies from the registry markdown file."""
-    if not os.path.exists(registry_path):
-        raise FileNotFoundError(f"Strategy registry not found: {registry_path}")
-    with open(registry_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    return _parse_yaml_blocks(content)
-
-
 def load_strategy(
     strategy_id: str,
-    registry_path: str = _REGISTRY_PATH,
+    strategies_dir: str = _STRATEGIES_DIR,
 ) -> dict:
-    """Load a single strategy by ID from the registry."""
-    strategies = load_all_strategies(registry_path)
+    """Load a single strategy by ID from the strategies directory."""
+    strategies = load_all_strategies(strategies_dir)
     if strategy_id not in strategies:
         available = list(strategies.keys())
         raise KeyError(
-            f"Strategy '{strategy_id}' not found. Available: {available}"
+            f"Strategy '{strategy_id}' not found in {strategies_dir}. Available: {available}"
         )
     return strategies[strategy_id]
 
 
-def list_strategies(registry_path: str = _REGISTRY_PATH) -> list:
+def list_strategies(strategies_dir: str = _STRATEGIES_DIR) -> list:
     """List all available strategy IDs and names."""
-    strategies = load_all_strategies(registry_path)
+    strategies = load_all_strategies(strategies_dir)
     return [
         {"id": s["id"], "name": s.get("name", s["id"]), "status": s.get("status", "implemented")}
         for s in strategies.values()
@@ -110,7 +103,10 @@ if __name__ == "__main__":
     for s in list_strategies():
         print(f"  [{s['status']}] {s['id']}: {s['name']}")
     print()
-    config = load_strategy("fixed_delta_put_spread")
-    print("Loaded config for 'fixed_delta_put_spread':")
-    for key, val in config.items():
-        print(f"  {key}: {val}")
+    try:
+        config = load_strategy("baseline_put_spread")
+        print("Loaded config for 'baseline_put_spread':")
+        for key, val in config.items():
+            print(f"  {key}: {val}")
+    except KeyError as e:
+        print(e)

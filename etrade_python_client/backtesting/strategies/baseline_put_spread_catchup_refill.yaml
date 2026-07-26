@@ -1,0 +1,55 @@
+id: baseline_put_spread_catchup_refill
+name: Baseline Put Credit Spread on SPX - Catch-Up Refill
+status: implemented
+regime_aware: false
+description: >
+  Baseline SPX put credit spread with a catch-up refill rule. It keeps the
+  50% profit exit, but when clustered profit exits drive margin utilization
+  below 60%, new-entry sizing may use up to four daily pacing slots until
+  utilization approaches 80%.
+instrument: put_credit_spread
+underlying: SPX
+
+entry:
+  method: fixed_delta
+  target_dte: 42
+  short_delta: -0.12
+  spread_width: 150.0
+  risk_free_rate: 0.05
+  dynamic_delta_method: null
+
+exit:
+  method: dynamic_dte + profit_target
+  close_dte: 0
+  early_profit_pct: 0.50
+  conditional_half_dte_exit: false
+  hold_itm_to_expiration: true
+
+sizing:
+  method: daily_pacing
+  initial_capital: 1000000.0
+  margin_limit_pct: 0.25
+  daily_pacing_slots: 15
+  catch_up_utilization_trigger: 0.60
+  catch_up_utilization_target: 0.80
+  catch_up_max_daily_slots: 4
+  catch_up_min_profit_exit_slots: 1
+
+rolling:
+  trigger: itm_at_expiration
+  enabled: true
+  roll_at_expiration: true
+  target_dte: 42
+  roll_strike_behavior: follow_underlying
+  roll_dte_multiplier: 2.0
+  spread_width_multiplier: 2.0
+  qty_reduction: half
+  repeat_itm_at_expiration: false
+  prefer_monthly_on_deviation: true
+  stop_when_chain_breakeven: false
+
+filters:
+  min_chain_strikes: 10
+  min_credit: 0.01
+  strike_tolerance_pct: 0.30
+  delta_tolerance_pct: 0.15

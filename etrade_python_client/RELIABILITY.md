@@ -1,0 +1,290 @@
+# Live Dashboard Reliability Ledger
+
+This is the evolving source of truth for failures that affect live E*TRADE data,
+derived calculations, generated dashboard HTML, or the page delivered to the
+browser. Read it before changing those paths and update it after a verified fix.
+
+## How to use this file
+
+For every reliability incident:
+
+1. Record the user-visible symptom and the exact affected artifact.
+2. Separate the triggering event from the architectural root cause.
+3. State the invariant that would have prevented the incident.
+4. Link the implementation and regression test.
+5. Verify the exact served dashboard, not only source code or an offline fixture.
+6. Keep unresolved risks explicit. Do not mark an incident resolved from a code
+   patch alone.
+
+## Non-negotiable invariants
+
+### External data
+
+- A failed, malformed, rate-limited, or partially paginated upstream response
+  must never delete previously confirmed data.
+- A range may replace cached history only after every page in that range has
+  completed successfully.
+- Every rendered market-price series must participate independently in
+  missing-date detection. Complete SPY or SPX history must not suppress a VIX
+  backfill.
+- Retried requests must be bounded and must preserve the last confirmed state
+  when retries are exhausted.
+- Avoid unused or duplicative upstream calls in a live refresh path. E*TRADE
+  request volume is part of the reliability budget.
+- Persist both the last attempt and the last successful synchronization. A
+  stale-but-confirmed result must be distinguishable from a fresh result.
+
+### Calculations
+
+- The green cash-flow series is cumulative **net cash flow**, not trade count or
+  gross trading activity. Offsetting buys and sells can legitimately make it
+  flat even when trades occurred.
+- A missing daily source value may be carried forward for plotting only when the
+  sync health is known. It must not silently disguise an incomplete destructive
+  refresh.
+- For a trading day under investigation, compare the rendered cumulative value
+  with the raw executions, the cached daily net flow, and the prior cumulative
+  value.
+
+### Delivery and verification
+
+- The live service must be restarted or reloaded after backend changes.
+- Regenerate the production HTML through the same endpoint used by the user.
+- Confirm cache headers/generations and reload the exact served artifact.
+- For charts, inspect the actual canvas at the user's time span and viewport.
+- Record the final rendered label and plotted values, and compare them with the
+  current cache/source of truth.
+
+## Data path
+
+```text
+E*TRADE executed Orders API
+  -> complete paginated range fetch
+  -> atomic recent-window reconciliation
+  -> spy_gains_cache.json (daily flows, trades, sync health)
+  -> get_spy_tracking_history_with_gains()
+  -> accounts/accounts_bo.py chart series
+  -> generated portfolio HTML
+  -> /api/positions
+  -> browser canvas
+```
+
+The generated HTML and the cache are artifacts, not independent sources of
+truth. A source patch is not live until this whole path has been exercised.
+
+## Incident ledger
+
+| ID | Status | Symptom | Root cause | Guardrail |
+|---|---|---|---|---|
+| INC-2026-07-17-01 | Resolved | Green cash-flow curve appeared flat for several recent trading days despite executions. | A partial Orders fetch was treated as complete, then the entire 14-day cache window was deleted and rebuilt from the partial response. Missing chart dates were carried forward, hiding the loss. Repeated per-chunk Orders and unused Transactions calls also increased rate-limit exposure. | One paginated range request, bounded transient retries, complete-fetch gate before reconciliation, atomic file write, persisted sync health, and a visible stale-data badge. |
+| INC-2026-07-17-02 | Resolved | Underlying quote shown from a position card could remain stale after Refresh Data. | Dashboard refresh and quote generation were not tied to a clearly observable fresh generation, and quote freshness was not exposed alongside the displayed value. | Refresh generation tracking, current E*TRADE quote metadata, no-store delivery, and visible quote timestamp/status. |
+| INC-2026-07-17-03 | Resolved | Mobile view fragmented each SPX position into separate cards, making portfolio-level action thresholds hard to scan. | Layout was organized around individual position cards instead of decision-making by underlying. | One responsive table per ticker, pair-level gain/loss, DTE, strikes, and action emphasis. |
+| INC-2026-07-18-01 | Resolved | A weekend Refresh Data request changed the live portfolio value and margin budget to zero. | The E*TRADE portfolio request returned 401 after OAuth expiry. `portfolio()` silently converted the failed response to an empty list, and the dashboard writer treated it as a confirmed empty portfolio and overwrote the production HTML. | Retry an expired-token portfolio request through the shared auth callback, and require every dashboard-producing portfolio fetch to succeed before replacing the served artifact. |
+| INC-2026-07-24-01 | Resolved | The orange VIX line in the one-month benchmark chart stopped after July 6 while SPY and option-value data continued through July 24. | Market-history refresh checked only SPY and SPX for missing cached dates, so a VIX-only gap never triggered a download. Yahoo also returned malformed responses when the corrected refresh attempted the backfill. | Include VIX in independent missing-date detection and fall back to Cboe's official daily VIX history when Yahoo does not return the requested closes. |
+
+## INC-2026-07-17-01 — Recent cash-flow history regressed
+
+### Evidence
+
+During repeated refreshes for the same July 3–17 range, logs showed the fetched
+order count changing from 22 to 25, then dropping to 16, and later recovering to
+27. The cache simultaneously shrank from 344 to 341 days before recovering.
+An E*TRADE rate-limit response occurred in the same refresh cycle.
+
+The code previously broke out of a request loop on any non-200 response, retained
+the orders fetched so far, deleted all cached flows/trades/close-days in the
+lookback window, and merged only that partial set. The chart then carried the
+last cumulative value forward across dates that still existed in other series.
+
+For July 13–17, a subsequent complete response produced these confirmed daily net
+cash flows:
+
+| Date | Daily net cash flow | Cumulative cash flow |
+|---|---:|---:|
+| 2026-07-13 | $2,050.00 | $268,509.45 |
+| 2026-07-14 | $2,050.00 | $270,559.45 |
+| 2026-07-15 | $1,295.00 | $271,854.45 |
+| 2026-07-16 | $2,080.00 | $273,934.45 |
+| 2026-07-17 | $1,435.00 | $275,369.45 |
+
+The screenshot's flat level matched the July 14 cumulative value, consistent
+with the recent window having been partially erased and then carried forward.
+
+### Implementation
+
+- `live_trading/spy_position_tracker.py`
+  - Fetches the whole lookback window with pagination instead of many date
+    chunks.
+  - Retries transient/rate-limit failures with bounded backoff.
+  - Discards all pages from an incomplete fetch.
+  - Reconciles the recent cache window only after complete pagination.
+  - Preserves confirmed flows, trades, close days, and `last_update_date` after
+    a failed attempt.
+  - Writes the cache with `os.replace`.
+  - Persists `sync_health` with attempt time, last success, range, page/order
+    counts, and error.
+  - Removes unused Transactions API traffic from this calculation path.
+- `accounts/accounts_bo.py`
+  - Displays whether cash-flow history is freshly synchronized or is showing the
+    last confirmed history after a delayed sync.
+- `tests/test_spy_position_tracker_sync.py`
+  - Covers complete pagination, transient retry, failure after a successful
+    first page, and preservation of confirmed cache data.
+
+### Remaining risk
+
+E*TRADE or the network can still be temporarily unavailable. In that case, new
+activity cannot appear until a later successful refresh. The corrected behavior
+is deliberately stale-but-confirmed: history no longer regresses, the failure is
+recorded, and the dashboard labels the delayed sync. A truly flat green line can
+also be legitimate when same-day inflows and outflows net to zero; inspect trade
+details or add a separate gross-activity series if trade frequency itself needs
+to be visualized.
+
+### Verification record
+
+- Unit regression suite: 7 tests passed in both the system Python and project
+  virtualenv runtimes on 2026-07-17.
+- Live service: launchd generation restarted successfully and loaded the new
+  code. Its startup refresh fetched 27 orders in one complete page, retained 344
+  cached days and 181 close-event days, and persisted `sync_health.status=ok`.
+- Exact `/api/positions` artifact: opened through the authenticated in-app
+  browser. Response delivery was `no-store`; served HTML contained the
+  `data-sync-status="ok"` badge reading “Cash-flow orders synced Jul 17, 2026
+  12:12 PM ET · 27 orders.”
+- Three-month canvas: visually inspected with the 3month control active. It
+  rendered 63 points from 2026-04-17 through `2026-07-17 (Live)`. The final
+  plotted values were cumulative cash flow $275,369.45, realized gain
+  $242,843.45, and margin $662,000.00.
+- Final five cash-flow values in the exact served chart matched the cache:
+  $268,509.45, $270,559.45, $271,854.45, $273,934.45, and $275,369.45 for
+  July 13–17 respectively.
+
+## INC-2026-07-18-01 — Failed portfolio fetch published as zero
+
+### Evidence
+
+The exact live dashboard showed a `2026-07-18 (Live)` portfolio point of $0.00,
+a current calculated margin of $0.00, and no positions. The comparison panel in
+the same served artifact still showed the last confirmed July 17 snapshot:
+30 tracked positions, option value -$36,250.00, and margin $662,000.00.
+
+The service log for the refresh recorded `oauth_problem=token_expired`, followed
+by a successful HTML write. `Accounts.portfolio()` stopped pagination on the
+non-200 response and returned the empty accumulator. The refresh path then
+screened that false-empty result and replaced `screened_option_pairs.html`.
+
+### Implementation
+
+- `accounts/accounts_bo.py`
+  - Retries a token-expired portfolio page after invoking the shared E*TRADE
+    authentication refresh callback.
+  - Supports `require_success=True`, which raises on a non-200 portfolio page
+    instead of returning a false empty result.
+- `live_trading/etrade_cover_call_new.py`
+  - Uses the required-success mode for manual, startup, after-hours, outside
+    trading-window, tracker, and position-management portfolio refreshes that
+    can lead to a production dashboard write.
+- `tests/test_dashboard_quotes.py`
+  - Covers successful portfolio retry after OAuth expiry and fail-closed
+    behavior when an unsuccessful portfolio response remains.
+
+### Remaining risk
+
+If OAuth renewal or E*TRADE remains unavailable, the refresh reports an error
+and cannot show new portfolio activity until a later successful attempt. The
+intended behavior is to keep serving the last confirmed HTML rather than publish
+zero. A successful 200 response containing a genuinely empty portfolio remains
+valid and can still render zero.
+
+### Verification record
+
+- Regression suite: 9 focused dashboard/reliability tests passed in the project
+  virtualenv on 2026-07-18; the changed Python files also compiled successfully.
+- Live service: launchd restarted from PID 2184 to PID 66689 after the source
+  changes. Both its startup refresh and a second Refresh Data request completed
+  with `CLOSED_HOLIDAY` and regenerated the production artifact.
+- Exact served dashboard: after the post-restart refresh, the portfolio table
+  showed total option price -$51,442.00 and calculated margin $662,000.00. The
+  tracked benchmark's final label was `2026-07-18 (Live)` with option value
+  -$31,347.50; SPY and VIX values were null rather than fabricated weekend
+  quotes.
+- Benchmark canvas: visually inspected with 1month active. Hovering the final
+  plotted point displayed `2026-07-18 (Live)` and -$31,347.50.
+- Cash-flow/margin canvas: visually inspected with 1month active. Hovering the
+  final point displayed `2026-07-18 (Live)`, cumulative cash flow $275,369.45,
+  realized gain $246,298.45, and total margin $662,000.00. These matched the
+  generated chart arrays, `spy_gains_cache.json` (complete 28-order sync and
+  cumulative cash flow), and `spy_tracking_data.json` (realized gain and the
+  confirmed $662,000 margin).
+
+## INC-2026-07-24-01 — VIX benchmark history stopped early
+
+### Evidence
+
+The authenticated one-month `SPY Benchmark Performance` chart showed SPY and
+option-value points through July 24, but its orange VIX line stopped after July
+6. The production `spy_vix_price_cache.json` confirmed the split: SPY and SPX
+had closes through July 23, while the last non-null VIX close was July 6.
+
+The refresh decision in `accounts/accounts_bo.py` considered only missing SPY
+and SPX dates. Because those two series were complete, the VIX-only gap was
+reported as fully cached and no history request ran. After VIX was added to the
+missing-date check, Yahoo returned malformed responses and zero VIX rows,
+showing that a second independent source was also required.
+
+### Implementation
+
+- `accounts/accounts_bo.py`
+  - Adds `_missing_market_close_dates()` so SPY, SPX, and VIX each participate
+    in the refresh decision.
+  - Preserves the existing cache when a source fails.
+  - Uses Cboe's official daily VIX history CSV for requested VIX closes that
+    Yahoo did not return.
+  - Parses and merges only the requested Cboe dates.
+- `tests/test_dashboard_quotes.py`
+  - Covers a VIX-only cache gap when SPY and SPX are complete.
+  - Covers parsing a requested close from the Cboe history format.
+
+### Remaining risk
+
+If both Yahoo and Cboe are temporarily unavailable, the dashboard continues to
+show the last confirmed VIX history until a later successful refresh. The
+intraday live label may legitimately have null SPY/VIX closes because the chart
+uses confirmed daily closes; it must not fabricate a value for that point.
+
+### Verification record
+
+- Focused regression suite: 11 tests passed; the changed Python files also
+  compiled successfully.
+- Live service: launchd generation restarted on PID 67172 and completed refresh
+  generation 4 without an error. The refresh detected 13 missing VIX trading
+  dates and populated all 13 through July 23.
+- Exact `/api/positions` artifact: authenticated response returned 200 with
+  `Cache-Control: no-store, max-age=0`; all four benchmark arrays contained 309
+  aligned entries.
+- Source comparison: rendered and cached VIX closes for every restored date
+  from July 7 through July 23 matched the Cboe daily history with zero
+  mismatches. The restored values were 16.13, 16.90, 15.84, 15.03, 17.16,
+  16.50, 15.67, 16.73, 18.77, 18.65, 17.05, 16.64, and 18.70.
+- One-month canvas: visually inspected in the authenticated live dashboard with
+  `1month` active. The dashed orange line visibly continued through the latest
+  historical point. Hovering that point displayed `2026-07-23`, option value
+  -$42,787.50, SPY close $738.18, and VIX close 18.70.
+- Final chart label: `2026-07-24 (Live)` displayed option value -$39,100.00 with
+  SPY and VIX null, as expected for an intraday live point without confirmed
+  closes.
+
+## Checklist for future dashboard incidents
+
+- [ ] Capture the exact URL, selected time span, viewport, and screenshot.
+- [ ] Identify the authoritative upstream data for the incorrect element.
+- [ ] Check the latest successful sync separately from the latest attempted sync.
+- [ ] Check counts and pagination completeness before comparing calculations.
+- [ ] Confirm that cache rows never decrease after an incomplete fetch.
+- [ ] Compare raw executions -> daily net -> cumulative values.
+- [ ] Regenerate through the live endpoint.
+- [ ] Verify response caching/generation behavior.
+- [ ] Inspect the rendered DOM/canvas and record the final values.
+- [ ] Add or update a regression test.
+- [ ] Update this ledger with evidence, invariant, fix, residual risk, and result.

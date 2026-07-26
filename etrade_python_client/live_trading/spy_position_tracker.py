@@ -1,7 +1,7 @@
 """
 SPY Position Tracker Module
 
-Tracks daily SPY option position snapshots including:
+Tracks daily SPY and SPX option position snapshots including:
 - Total option price
 - Total margin required
 - Individual position details with full greeks
@@ -18,6 +18,12 @@ from datetime import datetime, date, time
 from typing import List, Dict, Any, Optional
 
 TRACKER_FILE = "spy_tracking_data.json"
+TRACKED_OPTION_SYMBOLS = {"SPY", "SPX", "SPXW"}
+
+
+def _aggregate_option_symbol(symbol: str) -> str:
+    symbol = (symbol or "").upper()
+    return "SPX" if symbol == "SPXW" else symbol
 
 
 def _load_tracker_data() -> Dict[str, Any]:
@@ -46,9 +52,9 @@ def _save_tracker_data(data: Dict[str, Any]) -> bool:
 
 
 
-def _extract_spy_positions(all_positions: List[Any]) -> List[Dict[str, Any]]:
+def _extract_tracked_option_positions(all_positions: List[Any]) -> List[Dict[str, Any]]:
     """
-    Extract SPY option positions from the full position list.
+    Extract SPY and SPX option positions from the full position list.
     
     Args:
         all_positions: List of StockPosition objects from accounts.portfolio()
@@ -56,18 +62,21 @@ def _extract_spy_positions(all_positions: List[Any]) -> List[Dict[str, Any]]:
     Returns:
         List of dictionaries with position details and greeks
     """
-    spy_positions = []
+    tracked_positions = []
     
     for pos in all_positions:
-        symbol = getattr(pos, 'symbol', '') or ''
-        if symbol.upper() != 'SPY':
+        raw_symbol = getattr(pos, 'symbol', '') or ''
+        symbol = raw_symbol.upper()
+        if symbol not in TRACKED_OPTION_SYMBOLS:
             continue
         if getattr(pos, 'security_type', '') != 'Option':
             continue
+        aggregate_symbol = _aggregate_option_symbol(symbol)
             
         # Extract all relevant fields including greeks
         position_data = {
-            "symbol": symbol,
+            "symbol": aggregate_symbol,
+            "contract_symbol": symbol,
             "call_put": getattr(pos, 'call_put', None),
             "strike_price": _to_float(getattr(pos, 'strike_price', None)),
             "expiration_date": str(getattr(pos, 'expiration_date', None)),
@@ -86,9 +95,59 @@ def _extract_spy_positions(all_positions: List[Any]) -> List[Dict[str, Any]]:
             "days_to_expiration": _to_int(getattr(pos, 'days_to_expiration', None)),
             "distance_to_strike": _to_float(getattr(pos, 'distance_to_strike', None)),
         }
-        spy_positions.append(position_data)
+        tracked_positions.append(position_data)
     
-    return spy_positions
+    return tracked_positions
+
+
+def _calculate_total_option_price(positions: List[Dict[str, Any]]) -> float:
+    """Calculate signed value for short positions and their matched long legs."""
+    from collections import defaultdict
+
+    type_groups = defaultdict(list)
+    for pos in positions:
+        qty = pos.get('quantity', 0) or 0
+        if qty == 0:
+            continue
+        symbol = _aggregate_option_symbol(pos.get('symbol', '') or pos.get('contract_symbol', ''))
+        expiry = pos.get('expiration_date', '') or pos.get('expiry_date', '')
+        call_put = pos.get('call_put', '') or pos.get('option_type', '')
+        key = (symbol, str(expiry), str(call_put).upper())
+        type_groups[key].append({
+            'qty': qty,
+            'price': pos.get('last_price', 0) or pos.get('price', 0) or 0,
+            'strike': pos.get('strike_price', 0) or pos.get('strike', 0) or 0
+        })
+
+    total_option_price = 0.0
+    for key, group in type_groups.items():
+        shorts = [p for p in group if p['qty'] < 0]
+        longs = [p for p in group if p['qty'] > 0]
+
+        opt_type = key[2]
+        if opt_type == 'PUT':
+            longs.sort(key=lambda x: x['strike'], reverse=True)
+            shorts.sort(key=lambda x: x['strike'], reverse=True)
+        else:
+            longs.sort(key=lambda x: x['strike'])
+            shorts.sort(key=lambda x: x['strike'])
+
+        for short in shorts:
+            total_option_price += short['qty'] * short['price'] * 100.0
+
+            short_qty_abs = abs(short['qty'])
+            for long in longs:
+                if long['qty'] <= 0:
+                    continue
+                matched_qty = min(short_qty_abs, long['qty'])
+                if matched_qty > 0:
+                    total_option_price += matched_qty * long['price'] * 100.0
+                    short_qty_abs -= matched_qty
+                    long['qty'] -= matched_qty
+                if short_qty_abs <= 0:
+                    break
+
+    return total_option_price
 
 
 def _to_float(val) -> Optional[float]:
@@ -132,8 +191,49 @@ def _parse_option_symbol(symbol: str) -> Dict[str, Any]:
     return result
 
 
-def _reconstruct_historical_positions(all_trades: List[Dict], current_positions: List[Dict], 
-                                       start_date: str, end_date: str) -> Dict[str, List[Dict]]:
+def _format_option_symbol(underlying: str, expiry: str, option_type: str, strike) -> str:
+    strike_val = float(strike or 0)
+    strike_text = str(int(strike_val)) if strike_val.is_integer() else str(strike_val)
+    return f"{_aggregate_option_symbol(underlying)}_{expiry}_{option_type.upper()}_{strike_text}"
+
+
+def _normalized_option_symbol(symbol: str) -> str:
+    parsed = _parse_option_symbol(str(symbol or ""))
+    if parsed.get("underlying") and parsed.get("expiry_date") and parsed.get("option_type") and parsed.get("strike") is not None:
+        return _format_option_symbol(
+            parsed["underlying"],
+            parsed["expiry_date"],
+            parsed["option_type"],
+            parsed["strike"],
+        )
+    return str(symbol or "")
+
+
+def _merge_reconstructed_position(position_map: Dict[str, Dict[str, Any]], symbol: str, quantity_delta: float,
+                                  strike, option_type: str, expiry: str, source: Optional[Dict[str, Any]] = None) -> None:
+    if symbol not in position_map:
+        position_map[symbol] = {
+            "symbol": symbol,
+            "quantity": 0.0,
+            "strike": float(strike or 0),
+            "option_type": (option_type or "").upper(),
+            "expiry_date": expiry or ""
+        }
+    position_map[symbol]["quantity"] += float(quantity_delta or 0)
+
+    if source:
+        for field in ("last_price", "price", "underlying_last_price", "contract_symbol"):
+            val = source.get(field)
+            if val is not None:
+                position_map[symbol][field] = val
+
+    if abs(position_map[symbol]["quantity"]) < 0.01:
+        del position_map[symbol]
+
+
+def _reconstruct_historical_positions(all_trades: List[Dict], current_positions: List[Dict],
+                                       start_date: str, end_date: str,
+                                       record_dates: Optional[List[str]] = None) -> Dict[str, List[Dict]]:
     """
     Reconstruct SPY option positions for historical dates by working backward from current positions.
     
@@ -148,7 +248,6 @@ def _reconstruct_historical_positions(all_trades: List[Dict], current_positions:
     
     Returns: Dict mapping date -> list of positions on that date
     """
-    from datetime import datetime, timedelta
     from copy import deepcopy
     
     # Start with current positions (keyed by symbol)
@@ -162,27 +261,22 @@ def _reconstruct_historical_positions(all_trades: List[Dict], current_positions:
         # Check if it's snapshot format (has call_put field)
         if pos.get("call_put") and pos.get("strike_price") and pos.get("expiration_date"):
             # Convert snapshot format to trade symbol format
+            underlying = _aggregate_option_symbol(raw_symbol or pos.get("contract_symbol") or "SPY")
             opt_type = pos.get("call_put", "").upper()
             strike = float(pos.get("strike_price", 0))
             expiry = pos.get("expiration_date", "")
-            symbol = f"SPY_{expiry}_{opt_type}_{int(strike)}"
-            position_map[symbol] = {
-                "symbol": symbol,
-                "quantity": pos.get("quantity", 0),
-                "strike": strike,
-                "option_type": opt_type,
-                "expiry_date": expiry
-            }
-        elif raw_symbol and "SPY" in str(raw_symbol).upper() and "_" in str(raw_symbol):
+            symbol = _format_option_symbol(underlying, expiry, opt_type, strike)
+            _merge_reconstructed_position(
+                position_map, symbol, pos.get("quantity", 0), strike, opt_type, expiry, pos
+            )
+        elif raw_symbol and any(s in str(raw_symbol).upper() for s in ("SPY", "SPX")) and "_" in str(raw_symbol):
             # Trade symbol format
             parsed = _parse_option_symbol(raw_symbol)
-            position_map[raw_symbol] = {
-                "symbol": raw_symbol,
-                "quantity": pos.get("quantity", 0),
-                "strike": parsed.get("strike", 0),
-                "option_type": parsed.get("option_type", ""),
-                "expiry_date": parsed.get("expiry_date", "")
-            }
+            symbol = _normalized_option_symbol(raw_symbol)
+            _merge_reconstructed_position(
+                position_map, symbol, pos.get("quantity", 0), parsed.get("strike", 0),
+                parsed.get("option_type", ""), parsed.get("expiry_date", ""), pos
+            )
     
     # Sort trades by date descending
     dated_trades = []
@@ -198,27 +292,33 @@ def _reconstruct_historical_positions(all_trades: List[Dict], current_positions:
     for trade in dated_trades:
         trades_by_date[trade.get("date", "")].append(trade)
     
-    # Build historical positions
+    # Build historical positions for every requested source date, not only dates
+    # with trades. Otherwise the chart alternates between reconstructed and
+    # stored margin methods and creates artificial jumps.
     historical_positions = {}
-    
-    # Record today's positions FIRST (this is our starting point)
-    today = datetime.now().strftime("%Y-%m-%d")
-    historical_positions[today] = deepcopy(list(position_map.values()))
-    
-    # Process dates in descending order (newest to oldest)
-    for trade_date in sorted(trades_by_date.keys(), reverse=True):
-        trades_for_date = trades_by_date[trade_date]
-        
+    timeline_dates = set(trades_by_date.keys()) | set(record_dates or []) | {end_date}
+    timeline_dates = {
+        day for day in timeline_dates
+        if day and start_date <= day <= end_date
+    }
+
+    # Process dates in descending order (newest to oldest). At each date the
+    # position map represents that day's end-of-day state; then reverse that
+    # day's trades to obtain the prior day's state.
+    for trade_date in sorted(timeline_dates, reverse=True):
+        historical_positions[trade_date] = deepcopy(list(position_map.values()))
+
         # Process ALL trades for this date (reverse their effects)
-        for trade in trades_for_date:
+        for trade in trades_by_date.get(trade_date, []):
             action = trade.get("action", "")
             symbol = trade.get("symbol", "")
             quantity = abs(float(trade.get("quantity", 0)))
             
-            if not symbol or "SPY" not in symbol.upper():
+            if not symbol or not any(s in symbol.upper() for s in ("SPY", "SPX")):
                 continue
             
             parsed = _parse_option_symbol(symbol)
+            symbol = _normalized_option_symbol(symbol)
             
             if action in ["SELL_OPEN", "BUY_OPEN"]:
                 # Position was opened, so it didn't exist before - remove/reduce
@@ -238,11 +338,76 @@ def _reconstruct_historical_positions(all_trades: List[Dict], current_positions:
                     }
                 position_map[symbol]["quantity"] += (-quantity if action == "BUY_CLOSE" else quantity)
         
-        # Record positions AFTER reversing all trades for this date
-        # This represents what positions existed at START of this trade date
-        historical_positions[trade_date] = deepcopy(list(position_map.values()))
-    
     return historical_positions
+
+
+def _reconstruct_positions_forward(snapshots: Dict[str, Dict[str, Any]],
+                                   cached_trades: Dict[str, List[Dict]],
+                                   target_date: str) -> Optional[List[Dict]]:
+    """Replay trades from the nearest earlier frozen snapshot to a missing date."""
+    prior_dates = [
+        day for day, snapshot in snapshots.items()
+        if day < target_date and snapshot.get("positions") is not None
+    ]
+    if not prior_dates:
+        return None
+
+    prior_date = max(prior_dates)
+    position_map = {}
+    for position in snapshots[prior_date].get("positions", []):
+        underlying = position.get("symbol") or position.get("contract_symbol") or ""
+        expiry = position.get("expiration_date") or position.get("expiry_date") or ""
+        option_type = position.get("call_put") or position.get("option_type") or ""
+        strike = position.get("strike_price") or position.get("strike")
+        if not underlying or not expiry or not option_type or strike is None:
+            continue
+        symbol = _format_option_symbol(underlying, expiry, option_type, strike)
+        _merge_reconstructed_position(
+            position_map,
+            symbol,
+            position.get("quantity", 0),
+            strike,
+            option_type,
+            expiry,
+            position,
+        )
+
+    replay_dates = sorted(
+        day for day in cached_trades
+        if prior_date < day <= target_date
+    )
+    for replay_date in replay_dates:
+        # Contracts that expired before this session are no longer positions.
+        for symbol, position in list(position_map.items()):
+            if position.get("expiry_date") and position["expiry_date"] < replay_date:
+                del position_map[symbol]
+
+        for trade in cached_trades.get(replay_date, []):
+            action = str(trade.get("action") or "").upper()
+            if action not in ("BUY_OPEN", "BUY_CLOSE", "SELL_OPEN", "SELL_CLOSE"):
+                continue
+            raw_symbol = str(trade.get("symbol") or "")
+            parsed = _parse_option_symbol(raw_symbol)
+            if not parsed.get("underlying") or parsed.get("strike") is None:
+                continue
+            quantity = abs(float(trade.get("quantity") or 0))
+            quantity_delta = quantity if action.startswith("BUY_") else -quantity
+            symbol = _normalized_option_symbol(raw_symbol)
+            _merge_reconstructed_position(
+                position_map,
+                symbol,
+                quantity_delta,
+                parsed.get("strike"),
+                parsed.get("option_type"),
+                parsed.get("expiry_date"),
+                trade,
+            )
+
+    for symbol, position in list(position_map.items()):
+        if position.get("expiry_date") and position["expiry_date"] < target_date:
+            del position_map[symbol]
+
+    return list(position_map.values())
 
 
 def _calculate_margin_from_spreads(positions: List[Dict]) -> float:
@@ -252,60 +417,118 @@ def _calculate_margin_from_spreads(positions: List[Dict]) -> float:
     For credit spreads, margin = max spread width × contracts × 100
     
     Logic:
-    1. Group positions by expiry_date and option_type
+    1. Group positions by underlying symbol, expiry_date and option_type
     2. Within each group, find short + long pairs (opposite signs)
     3. Spread width = abs(short_strike - long_strike)
     4. Margin = width × min(short_qty, long_qty) × 100
     """
     from collections import defaultdict
     
-    # Group by expiry_date
-    expiry_groups = defaultdict(lambda: {"CALL": 0.0, "PUT": 0.0})
-    
-    # Pre-group by expiry and type to match correctly
-    type_groups = defaultdict(list)
+    def _naked_margin_reconstructed(short_leg, qty_abs):
+        cp = (short_leg.get("option_type") or short_leg.get("call_put") or "").upper()
+        strike = float(short_leg.get("strike", 0))
+        if strike <= 0:
+            return 0.0
+        if cp == "CALL":
+            return strike * 100.0 * qty_abs
+        if cp == "PUT":
+            underlying = short_leg.get("underlying_last_price")
+            if underlying is None:
+                underlying = strike
+            else:
+                try:
+                    underlying = float(underlying)
+                    if underlying <= 0.0:
+                        underlying = strike
+                except (ValueError, TypeError):
+                    underlying = strike
+            premium = float(short_leg.get("last_price") or short_leg.get("price") or 0.0)
+            calc1 = 0.2 * underlying - (strike - underlying) + premium
+            calc2 = 0.1 * strike + premium
+            margin_per_contract = max(calc1, calc2, 0.0)
+            return margin_per_contract * 100.0 * qty_abs
+        return 0.0
+
+    # Normalize positions to standard format
+    normalized_positions = []
     for pos in positions:
         qty = pos.get("quantity", 0)
         if qty == 0:
             continue
-        key = (pos.get("expiry_date", ""), pos.get("option_type", ""))
+        sym = pos.get("symbol", "") or pos.get("ticker", "")
+        parsed = _parse_option_symbol(sym)
+        underlying = _aggregate_option_symbol(parsed.get("underlying") or sym.split("_")[0] or "SPY")
+        expiry = parsed.get("expiry_date") or pos.get("expiry_date") or pos.get("expiration_date") or ""
+        opt_type = parsed.get("option_type") or pos.get("option_type") or pos.get("call_put") or ""
+        strike = parsed.get("strike") or pos.get("strike_price") or pos.get("strike") or 0.0
+        
+        normalized_positions.append({
+            "symbol": sym,
+            "underlying": underlying.upper(),
+            "expiry_date": str(expiry),
+            "option_type": str(opt_type).upper(),
+            "strike": float(strike),
+            "quantity": float(qty),
+            "last_price": pos.get("last_price"),
+            "underlying_last_price": pos.get("underlying_last_price")
+        })
+
+    # Group by (symbol, expiry_date) -> {"CALL": 0.0, "PUT": 0.0}
+    expiry_groups = defaultdict(lambda: {"CALL": 0.0, "PUT": 0.0})
+    
+    # Pre-group by (symbol, expiry, type) to match correctly
+    type_groups = defaultdict(list)
+    for pos in normalized_positions:
+        key = (pos["underlying"], pos["expiry_date"], pos["option_type"])
         type_groups[key].append(pos)
 
-    # Process each expiry
-    expiries = set(k[0] for k in type_groups.keys())
-    for expiry in expiries:
-        for opt_type in ["CALL", "PUT"]:
-            group_positions = type_groups.get((expiry, opt_type), [])
-            # Separate shorts (negative qty) and longs (positive qty)
-            shorts = [p for p in group_positions if p.get("quantity", 0) < 0]
-            longs = [p for p in group_positions if p.get("quantity", 0) > 0]
+    # Process each group
+    for (underlying, expiry, opt_type), group_positions in type_groups.items():
+        # Separate shorts (negative qty) and longs (positive qty)
+        shorts = [p for p in group_positions if p.get("quantity", 0) < 0]
+        longs = [p for p in group_positions if p.get("quantity", 0) > 0]
+        
+        type_margin = 0.0
+        # Match shorts with longs to form spreads
+        reverse = True if opt_type == "PUT" else False
+        shorts.sort(key=lambda p: p.get("strike", 0), reverse=reverse)
+        longs.sort(key=lambda p: p.get("strike", 0), reverse=reverse)
+        
+        for short in shorts:
+            short_strike = short.get("strike", 0)
+            short_qty = abs(short.get("quantity", 0))
             
-            type_margin = 0.0
-            # Match shorts with longs to form spreads
-            for short in shorts:
-                short_strike = short.get("strike", 0)
-                short_qty = abs(short.get("quantity", 0))
+            while short_qty > 0 and longs:
+                # Find best long leg to pair with (closest strike)
+                best_idx = min(
+                    range(len(longs)),
+                    key=lambda idx: abs(short_strike - longs[idx].get("strike", 0))
+                )
+                long = longs[best_idx]
+                long_strike = long.get("strike", 0)
+                long_qty = long.get("quantity", 0)
                 
-                for long in longs:
-                    long_strike = long.get("strike", 0)
-                    long_qty = long.get("quantity", 0)
-                    
+                matched_qty = min(short_qty, long_qty)
+                if matched_qty <= 0:
                     if long_qty <= 0:
-                        continue
-                    
-                    matched_qty = min(short_qty, long_qty)
-                    if matched_qty > 0:
-                        spread_width = abs(short_strike - long_strike)
-                        type_margin += spread_width * matched_qty * 100
-                        
-                        short_qty -= matched_qty
-                        long["quantity"] -= matched_qty
-                        
-                        if short_qty <= 0:
-                            break
-            expiry_groups[expiry][opt_type] = type_margin
+                        longs.pop(best_idx)
+                    continue
+                
+                spread_width = abs(short_strike - long_strike)
+                type_margin += spread_width * matched_qty * 100
+                
+                short_qty -= matched_qty
+                long["quantity"] -= matched_qty
+                
+                if long["quantity"] <= 0:
+                    longs.pop(best_idx)
+            
+            if short_qty > 0:
+                type_margin += _naked_margin_reconstructed(short, short_qty)
+                
+        expiry_groups[(underlying, expiry)][opt_type] = type_margin
     
-    # Total margin is the sum of max(CALL, PUT) for each expiry
+    # Total margin is the sum of max(CALL, PUT) for each symbol + expiry
     total_margin = sum(max(v["CALL"], v["PUT"]) for v in expiry_groups.values())
     return total_margin
 
@@ -374,57 +597,10 @@ def update_spy_daily_snapshot(
             print(f"[SPY Tracker] Pre-market (ET: {now_et.strftime('%H:%M:%S')}) and no snapshot for {today_key} exists. Skipping to avoid empty snapshot.")
             return True
 
-    # Extract SPY positions
-    spy_positions = _extract_spy_positions(all_positions)
+    # Extract SPY and SPX positions
+    tracked_positions = _extract_tracked_option_positions(all_positions)
     
-    # Calculate total option price (signed quantity * price * 100)
-    # Filter out long-only positions (only include shorts and matched longs)
-    from collections import defaultdict
-    type_groups = defaultdict(list)
-    for pos in spy_positions:
-        qty = pos.get('quantity', 0) or 0
-        if qty == 0: continue
-        # Handle both formats: snapshot format and trade object format
-        expiry = pos.get('expiration_date', '') or pos.get('expiry_date', '')
-        call_put = pos.get('call_put', '') or pos.get('option_type', '')
-        key = (str(expiry), str(call_put).upper())
-        type_groups[key].append({
-            'qty': qty,
-            'price': pos.get('last_price', 0) or pos.get('price', 0) or 0,
-            'strike': pos.get('strike_price', 0) or pos.get('strike', 0) or 0
-        })
-
-    total_option_price = 0.0
-    for key, group in type_groups.items():
-        shorts = [p for p in group if p['qty'] < 0]
-        longs = [p for p in group if p['qty'] > 0]
-        
-        opt_type = key[1]
-        # Sort to match spread legs appropriately
-        # For PUTs, higher strike matches to short first
-        if opt_type == 'PUT':
-            longs.sort(key=lambda x: x['strike'], reverse=True)
-            shorts.sort(key=lambda x: x['strike'], reverse=True)
-        else:
-            longs.sort(key=lambda x: x['strike'])
-            shorts.sort(key=lambda x: x['strike'])
-
-        for short in shorts:
-            # Add short position value (qty is negative, so value is negative)
-            total_option_price += short['qty'] * short['price'] * 100.0
-            
-            # Match longs to this short to form a spread
-            short_qty_abs = abs(short['qty'])
-            for long in longs:
-                if long['qty'] <= 0: continue
-                matched_qty = min(short_qty_abs, long['qty'])
-                if matched_qty > 0:
-                    # Add matched long position value (positive)
-                    total_option_price += matched_qty * long['price'] * 100.0
-                    short_qty_abs -= matched_qty
-                    long['qty'] -= matched_qty
-                if short_qty_abs <= 0:
-                    break
+    total_option_price = _calculate_total_option_price(tracked_positions)
     
     # Total margin
     total_margin = spy_total_margin
@@ -440,8 +616,9 @@ def update_spy_daily_snapshot(
         "total_margin": round(total_margin, 2),
         "spy_call_margin": round(spy_call_margin, 2),
         "spy_put_margin": round(spy_put_margin, 2),
-        "position_count": len(spy_positions),
-        "positions": spy_positions,
+        "position_count": len(tracked_positions),
+        "tracked_symbols": sorted(TRACKED_OPTION_SYMBOLS),
+        "positions": tracked_positions,
         "ytd_realized_gain": round(ytd_gain, 2)
     }
     
@@ -476,6 +653,22 @@ def record_closed_spy_gain(gain_amount: float, description: str = "") -> bool:
     print(f"[SPY Tracker] Recorded closed gain: ${gain_amount:,.2f} "
           f"(YTD total: ${new_ytd:,.2f}) {description}")
     
+    return _save_tracker_data(data)
+
+
+def set_ytd_realized_gain(new_ytd: float) -> bool:
+    """
+    Set the cumulative YTD realized gain to a specific value.
+    
+    Args:
+        new_ytd: The new total YTD realized gain
+        
+    Returns:
+        True if saved successfully
+    """
+    data = _load_tracker_data()
+    data["ytd_realized_gain"] = round(new_ytd, 2)
+    print(f"[SPY Tracker] Set YTD Realized Gain to: ${new_ytd:,.2f}")
     return _save_tracker_data(data)
 
 
@@ -533,6 +726,8 @@ def reset_ytd_gain() -> bool:
 
 
 SPY_GAINS_CACHE_FILE = "spy_gains_cache.json"
+ORDER_FETCH_MAX_ATTEMPTS = 3
+ORDER_FETCH_RETRY_DELAYS = (0.5, 1.0)
 
 
 def _load_gains_cache() -> Dict[str, Any]:
@@ -550,17 +745,186 @@ def _load_gains_cache() -> Dict[str, Any]:
 
 
 def _save_gains_cache(data: Dict[str, Any]) -> bool:
-    """Save gains cache to file."""
+    """Save gains cache atomically so an interrupted write cannot corrupt it."""
+    temp_file = f"{SPY_GAINS_CACHE_FILE}.tmp"
     try:
-        with open(SPY_GAINS_CACHE_FILE, 'w') as f:
+        with open(temp_file, 'w') as f:
             json.dump(data, f, indent=2)
+        os.replace(temp_file, SPY_GAINS_CACHE_FILE)
         return True
     except IOError as e:
         print(f"[SPY Tracker] Error saving gains cache: {e}")
+        try:
+            os.remove(temp_file)
+        except OSError:
+            pass
         return False
 
 
-def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") -> Dict[str, float]:
+def _response_error_summary(response) -> str:
+    """Return a short, non-sensitive error summary for logs and sync metadata."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            error = payload.get("Error") or payload.get("error") or payload
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("Message")
+                if message:
+                    return str(message)[:300]
+    except Exception:
+        pass
+
+    text = str(getattr(response, "text", "") or "").strip()
+    return text[:300] or f"HTTP {getattr(response, 'status_code', 'unknown')}"
+
+
+def _is_retryable_order_response(response, error_summary: str) -> bool:
+    status_code = getattr(response, "status_code", None)
+    if status_code in {408, 429} or (status_code is not None and status_code >= 500):
+        return True
+    if status_code == 400:
+        message = error_summary.lower()
+        return any(token in message for token in ("rate limit", "temporar", "try again", "too many"))
+    return False
+
+
+def _fetch_executed_orders(
+    session,
+    url: str,
+    headers: Dict[str, str],
+    fetch_start,
+    fetch_end,
+    sleep_fn=None,
+    max_attempts: int = ORDER_FETCH_MAX_ATTEMPTS,
+):
+    """
+    Fetch one complete, paginated order window.
+
+    The caller must not reconcile cached history unless ``complete`` is True.
+    """
+    if sleep_fn is None:
+        import time as time_module
+        sleep_fn = time_module.sleep
+
+    all_orders = []
+    marker = None
+    pages_fetched = 0
+    from_date = fetch_start.strftime('%m%d%Y')
+    to_date = fetch_end.strftime('%m%d%Y')
+
+    while True:
+        params = {
+            "status": "EXECUTED",
+            "count": 100,
+            "fromDate": from_date,
+            "toDate": to_date,
+        }
+        if marker:
+            params["marker"] = marker
+
+        response = None
+        error_summary = None
+        for attempt in range(max_attempts):
+            try:
+                response = session.get(url, params=params, headers=headers)
+                if response.status_code == 200:
+                    break
+                error_summary = _response_error_summary(response)
+                retryable = _is_retryable_order_response(response, error_summary)
+            except Exception as exc:
+                error_summary = f"{type(exc).__name__}: {exc}"[:300]
+                retryable = True
+
+            if not retryable or attempt == max_attempts - 1:
+                return [], False, {
+                    "pages_fetched": pages_fetched,
+                    "error": error_summary,
+                }
+
+            delay = ORDER_FETCH_RETRY_DELAYS[min(attempt, len(ORDER_FETCH_RETRY_DELAYS) - 1)]
+            print(
+                f"[SPY Tracker] Orders fetch attempt {attempt + 1} failed "
+                f"({error_summary}); retrying in {delay:.1f}s"
+            )
+            sleep_fn(delay)
+
+        if response is None or response.status_code != 200:
+            return [], False, {
+                "pages_fetched": pages_fetched,
+                "error": error_summary or "Orders request did not return a response",
+            }
+
+        try:
+            chunk_data = response.json()
+        except Exception as exc:
+            return [], False, {
+                "pages_fetched": pages_fetched,
+                "error": f"Invalid Orders JSON: {exc}"[:300],
+            }
+
+        orders_response = chunk_data.get("OrdersResponse")
+        if not isinstance(orders_response, dict):
+            return [], False, {
+                "pages_fetched": pages_fetched,
+                "error": "Orders response was missing OrdersResponse",
+            }
+
+        orders = orders_response.get("Order", [])
+        if isinstance(orders, dict):
+            orders = [orders]
+        if not isinstance(orders, list):
+            return [], False, {
+                "pages_fetched": pages_fetched,
+                "error": "OrdersResponse.Order was not a list",
+            }
+
+        all_orders.extend(orders)
+        pages_fetched += 1
+        marker = orders_response.get("marker")
+        if not marker:
+            return all_orders, True, {
+                "pages_fetched": pages_fetched,
+                "error": None,
+            }
+
+
+def _failed_sync_result(
+    cache: Dict[str, Any],
+    cached_flows: Dict[str, float],
+    cached_trades: Dict[str, Any],
+    cached_close_days,
+    start_date: str,
+    fetch_start,
+    fetch_end,
+    error: str,
+    pages_fetched: int,
+) -> Dict[str, Any]:
+    """Record a failed attempt without replacing any confirmed trading history."""
+    attempted_at = datetime.now(pytz.timezone('US/Eastern')).isoformat()
+    previous_health = cache.get("sync_health", {})
+    cache["sync_health"] = {
+        "status": "error",
+        "attempted_at": attempted_at,
+        "last_successful_at": previous_health.get("last_successful_at"),
+        "range_start": fetch_start.isoformat(),
+        "range_end": fetch_end.isoformat(),
+        "orders_fetched": 0,
+        "pages_fetched": pages_fetched,
+        "error": error,
+    }
+    _save_gains_cache(cache)
+    print(f"[SPY Tracker] Orders sync incomplete; preserved confirmed cache: {error}")
+
+    all_gains = _recalculate_gains_fifo(cached_trades)
+    return {
+        "cash_flows": _calculate_cumulative_from_flows(cached_flows, start_date),
+        "realized_gains": all_gains,
+        "days_with_close_events": list(cached_close_days),
+        "sync_health": cache["sync_health"],
+    }
+
+
+def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") -> Dict[str, Any]:
     """
     Calculate daily cumulative SPY option gains from executed orders.
     
@@ -615,151 +979,56 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
             return {
                 "cash_flows": _calculate_cumulative_from_flows(cached_flows, start_date),
                 "realized_gains": {},
-                "days_with_close_events": list(cached_close_days)
+                "days_with_close_events": list(cached_close_days),
+                "sync_health": cache.get("sync_health", {}),
             }
 
-    
-    # ===== CHECK FOR RAW API CACHE =====
-    # If spy_raw_api_debug.json exists, use it instead of re-polling E*TRADE
-    raw_cache_file = os.path.join(os.path.dirname(__file__), "spy_raw_api_debug.json")
-    all_orders = []
-    all_transactions = []
-    use_raw_cache = False
-    
-    if os.path.exists(raw_cache_file):
-        try:
-            with open(raw_cache_file, 'r') as f:
-                raw_cache = json.load(f)
-            
-            # Check if raw cache covers our date range
-            raw_start = raw_cache.get("fetch_start_date", "")
-            raw_end = raw_cache.get("fetch_end_date", "")
-            
-            if raw_start and raw_end:
-                raw_start_dt = datetime.strptime(raw_start, '%Y-%m-%d').date()
-                raw_end_dt = datetime.strptime(raw_end, '%Y-%m-%d').date()
-                
-                # Use raw cache if it covers the date range we need
-                if raw_start_dt <= fetch_start and raw_end_dt >= today:
-                    all_orders = raw_cache.get("raw_orders", [])
-                    use_raw_cache = True
-                    print(f"[SPY Tracker] Using raw API cache ({len(all_orders)} orders from {raw_start} to {raw_end})")
-        except Exception as e:
-            print(f"[SPY Tracker] Could not load raw cache: {e}")
-    
-    if not use_raw_cache:
-        print(f"[SPY Tracker] Fetching new data from {fetch_start} to {today}")
-    if not use_raw_cache:
-        # Get the session and base_url from order instance
-        base_url = order_instance.base_url
-        session = order_instance.session
-        account_key = order_instance.account['accountIdKey']
-        consumer_key = order_instance.consumer_key
-        
-        # Build date ranges for new data only (1-day chunks)
-        date_ranges = []
-        current_start = fetch_start
-        while current_start <= today:
-            current_end = min(current_start + timedelta(days=1), today)
-            date_ranges.append((current_start.strftime('%m%d%Y'), current_end.strftime('%m%d%Y')))
-            current_start = current_end + timedelta(days=1)
-        
-        # Fetch executed orders for new date range
-        url = f"{base_url}/v1/accounts/{account_key}/orders.json"
-        headers = {"consumerKey": consumer_key}
-        
-        for start, end in date_ranges:
-            marker = None
-            while True:
-                params = {
-                    "status": "EXECUTED",
-                    "count": 100,
-                    "fromDate": start,
-                    "toDate": end,
-                }
-                if marker:
-                    params['marker'] = marker
-                
-                try:
-                    response = session.get(url, params=params, headers=headers)
-                    if response.status_code != 200:
-                        break
-                    
-                    chunk_data = response.json()
-                    if "OrdersResponse" in chunk_data and "Order" in chunk_data["OrdersResponse"]:
-                        orders = chunk_data["OrdersResponse"]["Order"]
-                        if orders:
-                            all_orders.extend(orders)
-                            if "marker" in chunk_data["OrdersResponse"] and chunk_data["OrdersResponse"]["marker"]:
-                                marker = chunk_data["OrdersResponse"]["marker"]
-                            else:
-                                break
-                        else:
-                            break
-                    else:
-                        break
-                except Exception as e:
-                    print(f"[SPY Tracker] Error fetching orders: {e}")
-                    break
-        
-        # ===== DEBUG: Save raw API response for offline analysis =====
-        debug_cache_file = os.path.join(os.path.dirname(__file__), "spy_raw_api_debug.json")
-        try:
-            debug_data = {
-                "fetch_timestamp": datetime.now().isoformat(),
-                "fetch_start_date": fetch_start.strftime('%Y-%m-%d'),
-                "fetch_end_date": today.strftime('%Y-%m-%d'),
-                "total_orders_fetched": len(all_orders),
-                "raw_orders": all_orders
-            }
-            with open(debug_cache_file, 'w') as f:
-                json.dump(debug_data, f, indent=2, default=str)
-            print(f"[SPY Tracker DEBUG] Saved {len(all_orders)} raw orders to {debug_cache_file}")
-        except Exception as e:
-            print(f"[SPY Tracker DEBUG] Failed to save debug cache: {e}")
-        
-        # ===== FETCH TRANSACTIONS API (for UNSOLICITED TRADE orders) =====
-        # The Orders API doesn't return all trades - some like broker-initiated sells
-        # only appear in the Transactions API
-        transactions_url = f"{base_url}/v1/accounts/{account_key}/transactions.json"
-        
-        for start, end in date_ranges:
-            try:
-                # Convert date format from MMDDYYYY to MM/DD/YYYY for transactions API
-                start_formatted = f"{start[:2]}/{start[2:4]}/{start[4:]}"
-                end_formatted = f"{end[:2]}/{end[2:4]}/{end[4:]}"
-                
-                trans_params = {
-                    "startDate": start_formatted,
-                    "endDate": end_formatted,
-                    "count": 50,  # Max allowed
-                }
-                
-                response = session.get(transactions_url, params=trans_params, headers=headers)
-                if response.status_code == 200:
-                    trans_data = response.json()
-                    if "TransactionListResponse" in trans_data:
-                        txns = trans_data["TransactionListResponse"].get("Transaction", [])
-                        if txns:
-                            all_transactions.extend(txns)
-            except Exception as e:
-                print(f"[SPY Tracker] Error fetching transactions: {e}")
-        
-        print(f"[SPY Tracker] Fetched {len(all_transactions)} transactions from Transactions API")
-        
-        # Save transactions to debug file as well
-        try:
-            trans_debug_file = os.path.join(os.path.dirname(__file__), "spy_raw_transactions_debug.json")
-            trans_debug_data = {
-                "fetch_timestamp": datetime.now().isoformat(),
-                "total_transactions": len(all_transactions),
-                "transactions": all_transactions
-            }
-            with open(trans_debug_file, 'w') as f:
-                json.dump(trans_debug_data, f, indent=2, default=str)
-            print(f"[SPY Tracker DEBUG] Saved {len(all_transactions)} transactions to {trans_debug_file}")
-        except Exception as e:
-            print(f"[SPY Tracker DEBUG] Failed to save transactions debug: {e}")
+    print(f"[SPY Tracker] Fetching complete order window from {fetch_start} to {today}")
+    base_url = order_instance.base_url
+    session = order_instance.session
+    account_key = order_instance.account['accountIdKey']
+    consumer_key = order_instance.consumer_key
+    url = f"{base_url}/v1/accounts/{account_key}/orders.json"
+    headers = {"consumerKey": consumer_key}
+
+    all_orders, orders_fetch_complete, fetch_metadata = _fetch_executed_orders(
+        session,
+        url,
+        headers,
+        fetch_start,
+        today,
+    )
+    if not orders_fetch_complete:
+        return _failed_sync_result(
+            cache,
+            cached_flows,
+            cached_trades,
+            cached_close_days,
+            start_date,
+            fetch_start,
+            today,
+            fetch_metadata.get("error") or "Unknown Orders API failure",
+            fetch_metadata.get("pages_fetched", 0),
+        )
+
+    # Save debug evidence only after a complete fetch. A partial response must
+    # never replace the last complete diagnostic artifact.
+    debug_cache_file = os.path.join(os.path.dirname(__file__), "spy_raw_api_debug.json")
+    try:
+        debug_data = {
+            "fetch_timestamp": datetime.now().isoformat(),
+            "fetch_start_date": fetch_start.strftime('%Y-%m-%d'),
+            "fetch_end_date": today.strftime('%Y-%m-%d'),
+            "fetch_complete": True,
+            "pages_fetched": fetch_metadata.get("pages_fetched", 0),
+            "total_orders_fetched": len(all_orders),
+            "raw_orders": all_orders,
+        }
+        with open(debug_cache_file, 'w') as f:
+            json.dump(debug_data, f, indent=2, default=str)
+        print(f"[SPY Tracker DEBUG] Saved {len(all_orders)} complete raw orders to {debug_cache_file}")
+    except Exception as e:
+        print(f"[SPY Tracker DEBUG] Failed to save debug cache: {e}")
     
     # Calculate daily cash flows and gains for SPY only from new orders
     # cash_flows = all inflows/outflows when positions are opened/closed
@@ -783,25 +1052,6 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
             for instrument in detail.get("Instrument", []):
                 sec_type = instrument['Product']['securityType']
                 raw_symbol = instrument['Product']['symbol']
-                
-                # Construct unique symbol for Options to ensure FIFO works
-                if sec_type == 'OPTN':
-                    prod = instrument['Product']
-                    # Try to get details
-                    year = prod.get('expiryYear', '')
-                    month = prod.get('expiryMonth', '')
-                    day = prod.get('expiryDay', '')
-                    strike = prod.get('strikePrice', 0)
-                    cp = prod.get('callPut', '') # CALL or PUT
-                    
-                    if year and month and day and strike:
-                         # Format: SPY_2025-01-17_P_500.0
-                         option_ticker = f"SPY_{year}-{month:02d}-{day:02d}_{cp}_{strike}"
-                    else:
-                         option_ticker = raw_symbol
-                else:
-                    option_ticker = raw_symbol
-
                 # Extract underlying asset from option ticker
                 underlying_asset = raw_symbol
                 try:
@@ -813,9 +1063,27 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
                 except:
                     pass
                 
-                # Only process SPY
-                if underlying_asset.upper() != "SPY":
+                # Only process tracked SPY/SPX option families, including SPXW weeklies.
+                if underlying_asset.upper() not in TRACKED_OPTION_SYMBOLS:
                     continue
+
+                # Construct unique symbol for Options to ensure FIFO works
+                if sec_type == 'OPTN':
+                    prod = instrument['Product']
+                    # Try to get details
+                    year = prod.get('expiryYear', '')
+                    month = prod.get('expiryMonth', '')
+                    day = prod.get('expiryDay', '')
+                    strike = prod.get('strikePrice', 0)
+                    cp = prod.get('callPut', '') # CALL or PUT
+                    
+                    if year and month and day and strike:
+                         # Format: SPY_2025-01-17_P_500.0 or SPX_2025-01-17_P_5000.0
+                         option_ticker = f"{underlying_asset.upper()}_{year}-{month:02d}-{day:02d}_{cp}_{strike}"
+                    else:
+                         option_ticker = raw_symbol
+                else:
+                    option_ticker = raw_symbol
                 
                 executed_time = datetime.fromtimestamp(detail.get('executedTime') / 1000)
                 executed_date = executed_time.strftime('%Y-%m-%d')
@@ -906,7 +1174,8 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
             "quantity": filled_quantity,
             "price": avg_price,
             "cash_impact": round(cash_impact, 2),
-            "order_id": order_id
+            "order_id": order_id,
+            "sec_type": sec_type
         }
         if executed_date not in new_trade_details:
             new_trade_details[executed_date] = []
@@ -949,7 +1218,7 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
             "price": avg_price,
             "cash_impact": round(cash_impact, 2),
             "order_id": order_id,
-            "sec_type": "EQ"  # Mark as equity for FIFO multiplier
+            "sec_type": "EQ"
         }
         if executed_date not in new_trade_details:
             new_trade_details[executed_date] = []
@@ -958,8 +1227,8 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
         if order_action in ["SELL", "SELL_TO_COVER"]:
             days_with_close_events.add(executed_date)
     
-    # RECONCILIATION: Clear existing cache entries for the sync window
-    # to avoid double-counting or keeping stale records.
+    # ATOMIC RECONCILIATION: This block is reached only after every Orders API
+    # page succeeded. Incomplete fetches return above and preserve this window.
     sync_date_str = fetch_start.strftime('%Y-%m-%d')
     print(f"[SPY Tracker] Syncing cache for dates >= {sync_date_str}")
     
@@ -982,7 +1251,7 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
     # Update cache
     cache["daily_cash_flows"] = cached_flows
     cache["trade_details"] = cached_trades
-    cache["days_with_close_events"] = list(cached_close_days)
+    cache["days_with_close_events"] = sorted(cached_close_days)
     # Only mark today as fully fetched AFTER market close (4:30 PM ET)
     # Before that, set to yesterday so today's trades get re-fetched next run
     import pytz as _pytz
@@ -998,16 +1267,40 @@ def calculate_spy_daily_gains(order_instance, start_date: str = "2025-01-01") ->
         yesterday = today - timedelta(days=1)
         cache["last_update_date"] = yesterday.strftime('%Y-%m-%d')
         print(f"[SPY Tracker] Market still open — will re-fetch today's trades next run")
+
+    completed_at = _now_et.isoformat()
+    cache["sync_health"] = {
+        "status": "ok",
+        "attempted_at": completed_at,
+        "last_successful_at": completed_at,
+        "range_start": fetch_start.isoformat(),
+        "range_end": today.isoformat(),
+        "orders_fetched": len(all_orders),
+        "pages_fetched": fetch_metadata.get("pages_fetched", 0),
+        "error": None,
+    }
     _save_gains_cache(cache)
-    
     print(f"[SPY Tracker] Cached {len(cached_flows)} days of SPY data ({len(cached_close_days)} close days)")
+
+    # Re-calculate realized gains from full history to get current YTD total
+    all_gains = _recalculate_gains_fifo(cached_trades)
+    current_ytd = 0.0
+    if all_gains:
+        latest_date = max(all_gains.keys())
+        current_ytd = all_gains[latest_date]
     
+    # Update spy_tracking_data.json with the latest YTD realized gain
+    set_ytd_realized_gain(current_ytd)
+    print(f"[SPY Tracker] Updated YTD Realized Gain in tracking data: ${current_ytd:,.2f}")
+
     # Return cumulative cash flows and realized gains on close days
     return {
         "cash_flows": _calculate_cumulative_from_flows(cached_flows, start_date),
-        "realized_gains": {},
-        "days_with_close_events": list(cached_close_days)
+        "realized_gains": all_gains,
+        "days_with_close_events": sorted(cached_close_days),
+        "sync_health": cache["sync_health"],
     }
+
 
 
 def _calculate_cumulative_from_flows(daily_flows: Dict[str, float], start_date: str) -> Dict[str, float]:
@@ -1061,9 +1354,8 @@ def _recalculate_gains_fifo(trade_list: List[Dict[str, Any]]) -> Dict[str, float
         is_open = 'OPEN' in action
         is_close = 'CLOSE' in action
         
-        # Map SPY Equity actions (Assignment/Liquidation)
-        if 'SPY' == symbol and 'OPTN' not in str(trade.get('sec_type', '')): 
-             # If symbol is exactly "SPY", assume Equity.
+        # Map SPY/SPX equity actions even for cached records saved with a bad sec_type.
+        if symbol in ('SPY', 'SPX'):
              if action == 'BUY':
                  is_open = True
                  is_close = False
@@ -1076,7 +1368,8 @@ def _recalculate_gains_fifo(trade_list: List[Dict[str, Any]]) -> Dict[str, float
                 'qty': qty,
                 'price': price,
                 'action': action,
-                'date': date
+                'date': date,
+                'sec_type': trade.get('sec_type')
             })
             
         elif is_close:
@@ -1090,9 +1383,10 @@ def _recalculate_gains_fifo(trade_list: List[Dict[str, Any]]) -> Dict[str, float
                 entry_price = match['price']
                 exit_price = price
                 
-                # Check multiplier: 100 for Options, 1 for Equity (SPY)
-                # If symbol is exactly "SPY", assume multiplier 1
-                multiplier = 100 if symbol != 'SPY' else 1
+                # Option records use reconstructed symbols like SPY_YYYY-MM-DD_CALL_...
+                # Older cached records may not have sec_type, so keep symbol-based fallback.
+                multiplier = 1 if symbol in ('SPY', 'SPX') else 100
+
                 
                 if 'SELL' in match['action']: # We were Short
                     # Profit = Entry - Exit
@@ -1117,7 +1411,7 @@ def _recalculate_gains_fifo(trade_list: List[Dict[str, Any]]) -> Dict[str, float
     today = datetime.now().date()
     
     for symbol, legs in list(open_positions.items()):
-        if symbol == 'SPY':
+        if symbol in ('SPY', 'SPX'):
             continue  # Skip equity - don't auto-settle
         
         # Parse expiration from symbol (SPY_2025-02-21_CALL_619)
@@ -1179,7 +1473,7 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
     """
     Get SPY tracking history merged with historical gains from E*TRADE.
     Uses FIFO logic for Realized Gains.
-    Uses backward position reconstruction for historical margin calculation.
+    Replays trades forward from frozen snapshots for dates missing positions.
     """
     data = _load_tracker_data()
     snapshots = data.get("daily_snapshots", {})
@@ -1191,6 +1485,9 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
     # Calculate Realized Gains using FIFO on trade details
     # We need access to cache's trade_details
     cache = _load_gains_cache()
+    if not historical_cash_flows and cache.get("daily_cash_flows"):
+        historical_cash_flows = _calculate_cumulative_from_flows(cache["daily_cash_flows"], start_date)
+        
     cached_trades = cache.get("trade_details", {})
     
     if cached_trades:
@@ -1198,31 +1495,19 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
     else:
         historical_realized_gains = {}
     
-    # ===== RECONSTRUCT HISTORICAL POSITIONS FOR MARGIN =====
-    # Build flat list of all trades for position reconstruction
-    all_trades_list = []
-    for date_key, trades in cached_trades.items():
-        for trade in trades:
-            trade_copy = dict(trade)
-            trade_copy["date"] = date_key
-            all_trades_list.append(trade_copy)
-    
-    # Get current positions from latest snapshot or empty
-    today = datetime.now().strftime("%Y-%m-%d")
-    latest_snapshot = snapshots.get(today, {})
-    current_positions = latest_snapshot.get("positions", [])
-    
-    # Reconstruct historical positions
-    historical_positions = {}
-    if all_trades_list and current_positions:
-        historical_positions = _reconstruct_historical_positions(
-            all_trades_list, current_positions, start_date, today
-        )
-    
-    # Combine all dates
+    # Combine all source dates before filling dates missing frozen positions.
     all_dates = set(snapshots.keys()) | set(historical_cash_flows.keys()) | set(historical_realized_gains.keys())
     sorted_dates = sorted(all_dates)
-    
+
+    # Backward reconstruction from today's portfolio loses contracts that have
+    # since expired. Missing days must instead be replayed causally from the
+    # nearest earlier frozen snapshot.
+    forward_positions = {
+        day: _reconstruct_positions_forward(snapshots, cached_trades, day)
+        for day in sorted_dates
+        if snapshots.get(day, {}).get("positions") is None
+    }
+        
     dates = []
     total_option_prices = []
     total_margins = []
@@ -1230,6 +1515,7 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
     realized_gains = []
     
     # Determine the latest values to carry forward
+    latest_option_price = None
     latest_realized_gain = 0.0
     latest_cash_flow = 0.0
     
@@ -1238,16 +1524,21 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
         
         # Snapshot data
         snap = snapshots.get(date_key, {})
-        total_option_prices.append(snap.get("total_option_price", None))
+        if snap.get("total_option_price") is not None:
+            latest_option_price = snap.get("total_option_price")
+        total_option_prices.append(latest_option_price)
         
-        # Margin: use stored value if available, otherwise calculate from reconstructed positions
-        stored_margin = snap.get("total_margin")
-        if stored_margin is not None:
-            total_margins.append(stored_margin)
-        elif date_key in historical_positions:
-            # Calculate margin from reconstructed positions
-            reconstructed_margin = _calculate_margin_from_spreads(historical_positions[date_key])
+        # Margin: frozen snapshot positions are the source of truth for dates
+        # that have them. Reconstruct only dates with no saved snapshot.
+        snap_positions = snap.get("positions")
+        if snap_positions is not None:
+            reconstructed_margin = _calculate_margin_from_spreads(snap_positions)
             total_margins.append(reconstructed_margin)
+        elif forward_positions.get(date_key) is not None:
+            reconstructed_margin = _calculate_margin_from_spreads(forward_positions[date_key])
+            total_margins.append(reconstructed_margin)
+        elif snap.get("total_margin") is not None:
+            total_margins.append(snap.get("total_margin"))
         else:
             total_margins.append(None)
         
@@ -1278,6 +1569,7 @@ def get_spy_tracking_history_with_gains(order_instance=None, start_date: str = "
         "total_margins": total_margins,
         "cash_flows": cash_flows,
         "realized_gains": realized_gains,
-        "ytd_current": latest_realized_gain
+        "cash_flow_current": latest_cash_flow,
+        "ytd_current": latest_realized_gain,
+        "sync_health": cache.get("sync_health", historical_data.get("sync_health", {})),
     }
-

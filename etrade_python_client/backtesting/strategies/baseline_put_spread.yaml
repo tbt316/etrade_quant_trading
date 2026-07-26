@@ -1,0 +1,52 @@
+id: baseline_put_spread
+name: Baseline Put Credit Spread on SPX
+status: implemented
+regime_aware: false
+description: >
+  Sells a daily put credit spread on SPX at -0.12 delta with $150 spread width.
+  $1M initial capital with 25% max margin. Daily margin is paced at
+  total_capital * 0.25 / 15 to spread entries across ~15 trading days.
+  Close at 50% profit target. If not closed early, hold to expiration.
+  At expiration, if the spread is ITM, roll it to a new 42 DTE (doubled on roll to 84 DTE) position with the long leg ATM and the short leg $150 ITM.
+instrument: put_credit_spread
+underlying: SPX
+
+entry:
+  method: fixed_delta
+  target_dte: 42
+  short_delta: -0.12
+  spread_width: 150.0
+  risk_free_rate: 0.05
+  dynamic_delta_method: null
+
+exit:
+  method: dynamic_dte + profit_target
+  close_dte: 0
+  early_profit_pct: 0.50
+  conditional_half_dte_exit: false
+  hold_itm_to_expiration: true
+
+sizing:
+  method: daily_pacing
+  initial_capital: 1000000.0
+  margin_limit_pct: 0.25
+  daily_pacing_slots: 15
+
+rolling:
+  trigger: itm_at_expiration
+  enabled: true
+  roll_at_expiration: true
+  target_dte: 42
+  roll_strike_behavior: follow_underlying
+  roll_dte_multiplier: 2.0
+  spread_width_multiplier: 2.0
+  qty_reduction: half
+  repeat_itm_at_expiration: false
+  prefer_monthly_on_deviation: true
+  stop_when_chain_breakeven: false
+
+filters:
+  min_chain_strikes: 10
+  min_credit: 0.01
+  strike_tolerance_pct: 0.30
+  delta_tolerance_pct: 0.15

@@ -5,6 +5,7 @@ Supports batch request aggregation with semaphore-based concurrency.
 """
 import asyncio
 import logging
+import os
 import ssl
 import time
 from datetime import datetime
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 CLR_YEL = "\033[93m"
 CLR_RST = "\033[0m"
 
+# Massive/Polygon documents OPRA options quote flat-file history starting on
+# 2022-03-07, while options trades are available much further back. Allow an
+# override for accounts/data products with different historical coverage.
+OPTION_QUOTE_HISTORY_START_DATE = os.environ.get(
+    "MASSIVE_OPTION_QUOTES_START_DATE",
+    "2022-03-07",
+)
+OPTION_TRADE_HISTORY_START_DATE = os.environ.get(
+    "MASSIVE_OPTION_TRADES_START_DATE",
+    "2014-06-02",
+)
+
 
 class MassiveAPIClient:
     """Async client for Massive/Polygon API with integrated caching."""
@@ -36,9 +49,15 @@ class MassiveAPIClient:
         max_retries: int = 5,
         backoff_factor: float = 0.5,
         requests_per_second: float = 50.0,
+        offline_only: bool = False,
     ):
         self.api_key = api_key
         self.cache = cache
+        self.offline_only = bool(
+            offline_only
+            or os.environ.get("MASSIVE_OFFLINE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+            or not api_key
+        )
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
@@ -55,6 +74,8 @@ class MassiveAPIClient:
         self.cache_hits = 0
 
     async def __aenter__(self):
+        if self.offline_only:
+            return self
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             connector=aiohttp.TCPConnector(ssl=self.ssl_ctx, limit=20),
@@ -71,6 +92,84 @@ class MassiveAPIClient:
         print(f"  API calls: {self.api_calls:,} | Cache hits: {self.cache_hits:,} | "
               f"Hit rate: {hit_rate:.1f}%")
 
+    @staticmethod
+    def _format_timestamp(value) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            raw = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if raw > 1e18:
+            seconds = raw / 1e9
+        elif raw > 1e15:
+            seconds = raw / 1e6
+        elif raw > 1e12:
+            seconds = raw / 1e3
+        else:
+            seconds = raw
+        try:
+            return datetime.fromtimestamp(seconds, tz=pytz.utc).isoformat()
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _date_before(value: str, boundary: str) -> bool:
+        try:
+            return value[:10] < boundary
+        except Exception:
+            return False
+
+    def _cached_price_result(
+        self,
+        option_ticker: str,
+        date: str,
+        allow_trade_fallback: bool = True,
+    ) -> Optional[dict]:
+        """Return cached quote, OHLCV close, or trade midpoint for this option/date."""
+        cached = self.cache.get_ohlcv(option_ticker, date)
+        if not cached:
+            return None
+
+        bid = cached.get("bid")
+        ask = cached.get("ask")
+        if bid is not None and ask is not None and bid > 0 and ask > 0 and bid != ask:
+            self.cache_hits += 1
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": cached.get("mid") or round((bid + ask) / 2.0, 4),
+                "bid_size": cached.get("bid_size") or 0,
+                "ask_size": cached.get("ask_size") or 0,
+                "source": "quote_cache",
+            }
+
+        close_price = cached.get("close")
+        if close_price is not None and close_price > 0:
+            self.cache_hits += 1
+            return {
+                "bid": close_price,
+                "ask": close_price,
+                "mid": close_price,
+                "bid_size": 0,
+                "ask_size": 0,
+                "source": "ohlcv_close_cache",
+            }
+
+        mid = cached.get("mid")
+        if allow_trade_fallback and mid is not None and mid > 0:
+            self.cache_hits += 1
+            return {
+                "bid": mid,
+                "ask": mid,
+                "mid": mid,
+                "bid_size": cached.get("bid_size") or 0,
+                "ask_size": cached.get("ask_size") or 0,
+                "source": "trade_cache",
+            }
+
+        return None
+
     async def _rate_limit(self):
         """Token-bucket style rate limiter."""
         async with self._rate_lock:
@@ -82,6 +181,9 @@ class MassiveAPIClient:
 
     async def _get(self, url: str, params: dict) -> Optional[dict]:
         """Make a GET request with retry and rate limiting."""
+        if self.offline_only:
+            return None
+
         params["apiKey"] = self.api_key
 
         for attempt in range(1, self.max_retries + 1):
@@ -154,7 +256,7 @@ class MassiveAPIClient:
     async def fetch_contracts_list(
         self,
         underlying: str,
-        expiration: str,
+        expiration: Optional[str],
         contract_type: str,
         as_of: str,
     ) -> List[dict]:
@@ -170,44 +272,63 @@ class MassiveAPIClient:
             self.cache_hits += 1
             return cached
 
+        if self.offline_only:
+            self.cache.mark_fetch_complete(underlying, as_of, expiration, contract_type, "contracts")
+            return []
+
         # Fetch from API with pagination
         print(f"{CLR_YEL}  [API FETCH] {underlying} contracts for {expiration} (as_of {as_of}){CLR_RST}")
         all_contracts = []
-        url = f"{BASE_URL}/v3/reference/options/contracts"
-        params = {
-            "underlying_ticker": underlying,
-            "expiration_date": expiration,
-            "contract_type": contract_type,
-            "as_of": as_of,
-            "limit": 1000,
-            "order": "asc",
-            "sort": "strike_price",
-        }
+        
+        # If underlying is SPX, query both SPX and SPXW (weekly) options
+        underlyings_to_query = [underlying]
+        if underlying == "SPX":
+            underlyings_to_query = ["SPX", "SPXW"]
+            
+        for und in underlyings_to_query:
+            url = f"{BASE_URL}/v3/reference/options/contracts"
+            params = {
+                "underlying_ticker": und,
+                "contract_type": contract_type,
+                "as_of": as_of,
+                "limit": 1000,
+                "order": "asc",
+                "sort": "strike_price",
+            }
+            if expiration:
+                params["expiration_date"] = expiration
 
-        while url:
-            data = await self._get(url, params)
-            if not data or "results" not in data:
-                break
+            while url:
+                data = await self._get(url, params)
+                if not data or "results" not in data:
+                    break
 
-            for item in data["results"]:
-                all_contracts.append({
-                    "option_ticker": item["ticker"],
-                    "strike": item["strike_price"],
-                })
+                for item in data["results"]:
+                    parsed = self._parse_ticker(item["ticker"])
+                    if parsed.get("contract_type") != contract_type:
+                        continue
+                    if expiration and parsed.get("expiration") != expiration:
+                        continue
+                    all_contracts.append({
+                        "option_ticker": item["ticker"],
+                        "strike": item["strike_price"],
+                        "contract_type": contract_type,
+                    })
 
-            # Handle pagination
-            next_url = data.get("next_url")
-            if next_url:
-                url = next_url
-                params = {}  # next_url includes all params
-            else:
-                break
+                # Handle pagination
+                next_url = data.get("next_url")
+                if next_url:
+                    url = next_url
+                    params = {}  # next_url includes all params
+                else:
+                    break
 
         # Save to cache
         if all_contracts:
             self.cache.save_contracts(
                 underlying, expiration, contract_type, as_of, all_contracts
             )
+        self.cache.mark_fetch_complete(underlying, as_of, expiration, contract_type, "contracts")
 
         return all_contracts
 
@@ -222,22 +343,21 @@ class MassiveAPIClient:
         contract_type: str = "",
         strike: float = 0.0,
         expiration: str = "",
+        force: bool = False,
     ) -> List[dict]:
         """
         Fetch daily OHLCV bars for a single contract over a date range.
         Checks cache and fetch log before calling API.
         """
-        # 1. Check if already cached (has actual data)
-        cached = self.cache.get_ohlcv_range(option_ticker, from_date, to_date)
-        if cached:
-            # Check if we have the full range (simple check: count days)
-            # For simplicity, if we have any data, we trust it for now
+        # 1. Check completed range cache. Partial cached rows are not enough:
+        # a previous narrow fetch may have only one date and would otherwise make
+        # the caller believe the whole requested range had been populated.
+        if not force and self.cache.is_ticker_range_fetched(option_ticker, from_date, to_date):
             self.cache_hits += 1
-            return cached
+            return self.cache.get_ohlcv_range(option_ticker, from_date, to_date)
 
-        # 2. Check negative cache
-        if self.cache.is_ticker_range_fetched(option_ticker, from_date, to_date):
-            self.cache_hits += 1
+        if self.offline_only:
+            self.cache.mark_ticker_range_fetched(option_ticker, from_date, to_date, bar_count=0)
             return []
 
         print(f"{CLR_YEL}  [API FETCH] OHLCV for {option_ticker} from {from_date} to {to_date}{CLR_RST}")
@@ -294,32 +414,58 @@ class MassiveAPIClient:
         self,
         option_ticker: str,
         date: str,
+        allow_trade_fallback: bool = True,
     ) -> Optional[dict]:
         """
         Get end-of-day NBBO quote for a contract on a specific date.
         Returns {"bid": float, "ask": float, "mid": float, ...} or None.
         """
-        # 1. Check negative cache first (did we already try and find nothing?)
+        cached_price = self._cached_price_result(
+            option_ticker,
+            date,
+            allow_trade_fallback=allow_trade_fallback,
+        )
+        if cached_price:
+            return cached_price
+
+        if self.offline_only:
+            return None
+
+        quote_available = not self._date_before(date, OPTION_QUOTE_HISTORY_START_DATE)
+
+        # For historical dates before quote coverage starts, do not waste an API
+        # request on /v3/quotes. Go directly to trades when fallback is allowed.
+        if not quote_available:
+            if not allow_trade_fallback:
+                return None
+            print(
+                f"{CLR_YEL}  [API FETCH] Quote history unavailable before "
+                f"{OPTION_QUOTE_HISTORY_START_DATE}; fetching TRADES for {option_ticker} on {date}{CLR_RST}"
+            )
+            trade = await self.fetch_latest_trade(option_ticker, date)
+            if not trade:
+                return None
+            return {
+                "bid": trade["price"],
+                "ask": trade["price"],
+                "mid": trade["price"],
+                "bid_size": trade.get("size", 0),
+                "ask_size": trade.get("size", 0),
+                "source": "trade",
+                "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
+            }
+
+        # Check negative quote cache after checking actual cached prices. A prior
+        # failed quote fetch may still have a cached trade midpoint for the day.
         if self.cache.is_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="quote"):
             self.cache_hits += 1
             return None
-
-        # 2. Check cache for actual data
-        cached = self.cache.get_ohlcv(option_ticker, date)
-        if cached and cached.get("mid") is not None:
-            self.cache_hits += 1
-            return {
-                "bid": cached.get("bid"),
-                "ask": cached.get("ask"),
-                "mid": cached["mid"],
-                "bid_size": cached.get("bid_size", 0),
-                "ask_size": cached.get("ask_size", 0),
-            }
 
         # 3. Fetch from API
         print(f"{CLR_YEL}  [API FETCH] EOD Quote for {option_ticker} on {date}{CLR_RST}")
         url = f"{BASE_URL}/v3/quotes/{option_ticker}"
         params = {
+            "timestamp.gte": f"{date}T00:00:00Z",
             "timestamp.lte": f"{date}T23:59:59Z", # Search up to end of day
             "order": "desc",
             "sort": "timestamp",
@@ -345,11 +491,17 @@ class MassiveAPIClient:
                         "mid": round((bid + ask) / 2.0, 4),
                         "bid_size": quote.get("bid_size", 0),
                         "ask_size": quote.get("ask_size", 0),
+                        "source": "quote",
+                        "quote_timestamp": self._format_timestamp(
+                            quote.get("participant_timestamp")
+                            or quote.get("sip_timestamp")
+                            or quote.get("timestamp")
+                        ),
                     }
                     break
 
         # 4. Fallback to Actual Trades if Quote is missing or bad
-        if not quote_result:
+        if not quote_result and allow_trade_fallback:
             print(f"{CLR_YEL}  [API FETCH] No valid quote for {option_ticker} on {date}, trying TRADES...{CLR_RST}")
             trade = await self.fetch_latest_trade(option_ticker, date)
             if trade:
@@ -360,25 +512,110 @@ class MassiveAPIClient:
                     "mid": trade["price"],
                     "bid_size": trade.get("size", 0),
                     "ask_size": trade.get("size", 0),
+                    "source": "trade",
+                    "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
                 }
 
         # 5. Save to cache if found
         if quote_result:
             meta = self._parse_ticker(option_ticker)
-            self.cache.upsert_full_record({
+            record = {
                 "option_ticker": option_ticker,
                 "pricing_date": date,
-                "bid": quote_result["bid"],
-                "ask": quote_result["ask"],
                 "mid": quote_result["mid"],
                 "bid_size": quote_result.get("bid_size"),
                 "ask_size": quote_result.get("ask_size"),
                 "fetched_at": datetime.now().isoformat(),
                 **meta
-            })
+            }
+            if quote_result.get("source") == "quote":
+                record["bid"] = quote_result["bid"]
+                record["ask"] = quote_result["ask"]
+            self.cache.upsert_full_record(record)
         else:
             # Mark as empty result so we don't try again
             self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="quote")
+
+        return quote_result
+
+    async def fetch_quote_at_timestamp(
+        self,
+        option_ticker: str,
+        timestamp,
+        allow_trade_fallback: bool = True,
+    ) -> Optional[dict]:
+        """
+        Get the latest quote at or before a specific execution timestamp.
+
+        The timestamp should be timezone-aware whenever possible. This is used
+        for execution-quality analysis where the fill must be compared against
+        the quote stream closest to the actual order timestamp.
+        """
+        if isinstance(timestamp, str):
+            ts_text = timestamp.replace("Z", "+00:00")
+            try:
+                ts_dt = datetime.fromisoformat(ts_text)
+            except ValueError:
+                return None
+        elif isinstance(timestamp, datetime):
+            ts_dt = timestamp
+        else:
+            return None
+
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=pytz.utc)
+        ts_utc = ts_dt.astimezone(pytz.utc)
+        ts_iso = ts_utc.isoformat().replace("+00:00", "Z")
+        day_start = ts_utc.strftime("%Y-%m-%dT00:00:00Z")
+
+        print(f"{CLR_YEL}  [API FETCH] Quote at {ts_iso} for {option_ticker}{CLR_RST}")
+        url = f"{BASE_URL}/v3/quotes/{option_ticker}"
+        params = {
+            "timestamp.gte": day_start,
+            "timestamp.lte": ts_iso,
+            "order": "desc",
+            "sort": "timestamp",
+            "limit": 100,
+        }
+
+        data = await self._get(url, params)
+        quote_result = None
+        if data and "results" in data and data["results"]:
+            for quote in data["results"]:
+                bid = quote.get("bid_price", 0)
+                ask = quote.get("ask_price", 0)
+                if bid > 0 and ask > 0:
+                    spread_ratio = (ask - bid) / bid if bid else float("inf")
+                    if spread_ratio > 2.0:
+                        continue
+                    quote_result = {
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": round((bid + ask) / 2.0, 4),
+                        "bid_size": quote.get("bid_size", 0),
+                        "ask_size": quote.get("ask_size", 0),
+                        "source": "quote",
+                        "quote_timestamp": self._format_timestamp(
+                            quote.get("participant_timestamp")
+                            or quote.get("sip_timestamp")
+                            or quote.get("timestamp")
+                        ),
+                    }
+                    break
+
+        if not quote_result and allow_trade_fallback:
+            print(f"{CLR_YEL}  [API FETCH] No valid quote at {ts_iso} for {option_ticker}, trying TRADES...{CLR_RST}")
+            trade = await self.fetch_latest_trade_at_timestamp(option_ticker, ts_iso)
+            if trade:
+                quote_result = {
+                    "bid": trade["price"],
+                    "ask": trade["price"],
+                    "mid": trade["price"],
+                    "bid_size": trade.get("size", 0),
+                    "ask_size": trade.get("size", 0),
+                    "source": "trade",
+                    "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
+                }
 
         return quote_result
 
@@ -390,14 +627,47 @@ class MassiveAPIClient:
         """
         Fetch the last trade for a contract on a specific date.
         """
-        # Check cache first
+        trade_fetch_complete = self.cache.is_fetch_complete(
+            underlying="",
+            pricing_date=date,
+            expiration=option_ticker,
+            data_type="trade",
+        )
         cached = self.cache.get_ohlcv(option_ticker, date)
-        if cached and cached.get("mid") is not None:
+        if cached:
+            close_price = cached.get("close")
+            if close_price is not None and close_price > 0:
+                self.cache_hits += 1
+                return {
+                    "price": close_price,
+                    "size": cached.get("volume") or 0,
+                    "timestamp": None,
+                    "source": "ohlcv_close_cache",
+                }
+            mid = cached.get("mid")
+            if trade_fetch_complete and mid is not None and mid > 0:
+                self.cache_hits += 1
+                return {
+                    "price": mid,
+                    "size": cached.get("bid_size") or cached.get("ask_size") or 0,
+                    "timestamp": None,
+                    "source": "trade_cache",
+                }
+
+        if self._date_before(date, OPTION_TRADE_HISTORY_START_DATE):
+            return None
+
+        if trade_fetch_complete:
             self.cache_hits += 1
-            return {"price": cached["mid"], "timestamp": cached.get("fetched_at")}
+            return None
+
+        if self.offline_only:
+            self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
+            return None
 
         url = f"{BASE_URL}/v3/trades/{option_ticker}"
         params = {
+            "timestamp.gte": f"{date}T00:00:00Z",
             "timestamp.lte": f"{date}T23:59:59Z",
             "order": "desc",
             "sort": "timestamp",
@@ -409,9 +679,11 @@ class MassiveAPIClient:
             res = {
                 "price": t.get("price"),
                 "size": t.get("size"),
-                "timestamp": t.get("participant_timestamp"),
+                "timestamp": self._format_timestamp(
+                    t.get("participant_timestamp") or t.get("sip_timestamp") or t.get("timestamp")
+                ),
             }
-            # Cache this as a mid-point quote
+            # Cache this as the latest trade midpoint for EOD fallback reuse.
             meta = self._parse_ticker(option_ticker)
             self.cache.upsert_full_record({
                 "option_ticker": option_ticker,
@@ -420,7 +692,57 @@ class MassiveAPIClient:
                 "fetched_at": datetime.now().isoformat(),
                 **meta
             })
+            self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
             return res
+        self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
+        return None
+
+    async def fetch_latest_trade_at_timestamp(
+        self,
+        option_ticker: str,
+        timestamp,
+    ) -> Optional[dict]:
+        """
+        Fetch the latest trade at or before a specific timestamp.
+        """
+        if isinstance(timestamp, str):
+            ts_text = timestamp.replace("Z", "+00:00")
+            try:
+                ts_dt = datetime.fromisoformat(ts_text)
+            except ValueError:
+                return None
+        elif isinstance(timestamp, datetime):
+            ts_dt = timestamp
+        else:
+            return None
+
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=pytz.utc)
+        ts_utc = ts_dt.astimezone(pytz.utc)
+        ts_iso = ts_utc.isoformat().replace("+00:00", "Z")
+        day_start = ts_utc.strftime("%Y-%m-%dT00:00:00Z")
+
+        if self.offline_only:
+            return None
+
+        url = f"{BASE_URL}/v3/trades/{option_ticker}"
+        params = {
+            "timestamp.gte": day_start,
+            "timestamp.lte": ts_iso,
+            "order": "desc",
+            "sort": "timestamp",
+            "limit": 1,
+        }
+        data = await self._get(url, params)
+        if data and "results" in data and data["results"]:
+            t = data["results"][0]
+            return {
+                "price": t.get("price"),
+                "size": t.get("size"),
+                "timestamp": self._format_timestamp(
+                    t.get("participant_timestamp") or t.get("sip_timestamp") or t.get("timestamp")
+                ),
+            }
         return None
 
     # ── Batch Operations ────────────────────────────────────────────
@@ -444,13 +766,8 @@ class MassiveAPIClient:
             ticker = c["option_ticker"]
             strike = c["strike"]
 
-            # Check if already cached for this range (has actual data)
-            cached = self.cache.get_ohlcv_range(ticker, from_date, to_date)
-            if cached:
-                self.cache_hits += 1
-                continue
-
-            # Check negative cache: already fetched but API returned empty
+            # Skip only if the requested range was explicitly fetched before.
+            # Existing rows alone may represent a partial range from a prior run.
             if self.cache.is_ticker_range_fetched(ticker, from_date, to_date):
                 self.cache_hits += 1
                 continue
@@ -476,121 +793,138 @@ class MassiveAPIClient:
         ticker_a: str,
         ticker_b: str,
         date: str,
+        max_time_delta_minutes: float = 5.0,
     ) -> Optional[Tuple[dict, dict]]:
         """
-        Fetch 1-minute aggregates for both legs and find the latest minute where both traded.
+        Fetch 1-minute aggregates for both legs and find the latest minute where both traded
+        within max_time_delta_minutes of each other.
         Returns (quote_a, quote_b) where each is {"bid", "ask", "mid", "timestamp"} or None.
         """
-        # Check cache for both legs first
+        # Check cache first for both tickers on this date
         cached_a = self.cache.get_ohlcv(ticker_a, date)
         cached_b = self.cache.get_ohlcv(ticker_b, date)
-        
-        if cached_a and cached_a.get("mid") is not None and cached_b and cached_b.get("mid") is not None:
+
+        # If either ticker was already queried and found to have no daily bar (empty day),
+        # or if the cached record has no daily close and no bid/ask quote (not traded),
+        # we can't possibly have synchronized 1-minute bars, so skip API calls entirely.
+        if (cached_a is None and self.cache.is_ticker_range_fetched(ticker_a, date, date)) or \
+           (cached_a is not None and (cached_a.get("close") is None or cached_a.get("close") == 0) and cached_a.get("bid") is None):
+            return None
+        if (cached_b is None and self.cache.is_ticker_range_fetched(ticker_b, date, date)) or \
+           (cached_b is not None and (cached_b.get("close") is None or cached_b.get("close") == 0) and cached_b.get("bid") is None):
+            return None
+
+        if self.offline_only:
+            return None
+
+        def is_sync(rec):
+            if not rec:
+                return False
+            # Check explicit flag
+            if rec.get("is_synchronized") == 1:
+                return True
+            # Check if valid EOD quote
+            bid = rec.get("bid")
+            ask = rec.get("ask")
+            if bid is not None and ask is not None and bid > 0 and ask > 0 and bid != ask:
+                return True
+            # Check if valid daily OHLCV close
+            if rec.get("close") is not None and rec.get("close") > 0:
+                return True
+            return False
+
+        if cached_a and cached_b and is_sync(cached_a) and is_sync(cached_b):
             self.cache_hits += 1
+            mid_a = cached_a.get("mid") or cached_a.get("close")
+            mid_b = cached_b.get("mid") or cached_b.get("close")
             return (
-                {"bid": None, "ask": None, "mid": cached_a["mid"], "timestamp": cached_a.get("fetched_at")},
-                {"bid": None, "ask": None, "mid": cached_b["mid"], "timestamp": cached_b.get("fetched_at")}
+                {
+                    "bid": cached_a.get("bid") or mid_a,
+                    "ask": cached_a.get("ask") or mid_a,
+                    "mid": mid_a,
+                    "timestamp": 0,
+                },
+                {
+                    "bid": cached_b.get("bid") or mid_b,
+                    "ask": cached_b.get("ask") or mid_b,
+                    "mid": mid_b,
+                    "timestamp": 0,
+                }
             )
 
         print(f"{CLR_YEL}  [API FETCH] Synchronizing 1m bars for {ticker_a} & {ticker_b} on {date}{CLR_RST}")
         
-        # 1. Fetch 1m aggs for missing legs
+        # 1. Fetch both 1m aggregate streams. A cached daily mid, quote, or
+        # theoretical price is not enough to prove the two legs are synchronized.
         url_a = f"{BASE_URL}/v2/aggs/ticker/{ticker_a}/range/1/minute/{date}/{date}"
         url_b = f"{BASE_URL}/v2/aggs/ticker/{ticker_b}/range/1/minute/{date}/{date}"
         params = {"adjusted": "false", "sort": "desc", "limit": 1440}
 
-        tasks = []
-        if cached_a and cached_a.get("mid") is not None:
-            tasks.append(asyncio.sleep(0)) # Placeholder
-            results_a = [{"t": int(time.time()*1000), "c": cached_a["mid"]}] # Simulated single bar
+        data_a, data_b = await asyncio.gather(
+            self._get(url_a, params),
+            self._get(url_b, params),
+            return_exceptions=True,
+        )
+        if isinstance(data_a, Exception) or not data_a:
+            results_a = []
         else:
-            tasks.append(self._get(url_a, params))
-            
-        if cached_b and cached_b.get("mid") is not None:
-            tasks.append(asyncio.sleep(0))
-            results_b = [{"t": int(time.time()*1000), "c": cached_b["mid"]}]
+            results_a = data_a.get("results", [])
+        if isinstance(data_b, Exception) or not data_b:
+            results_b = []
         else:
-            tasks.append(self._get(url_b, params))
-
-        api_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Update results from API if needed
-        if not (cached_a and cached_a.get("mid") is not None):
-            data_a = api_results[0]
-            if isinstance(data_a, Exception) or not data_a: results_a = []
-            else: results_a = data_a.get("results", [])
-            
-        if not (cached_b and cached_b.get("mid") is not None):
-            # If both were missing, api_results[1] is data_b. 
-            # If only B was missing, api_results[1] is data_b.
-            # If only A was missing, api_results[1] is sleep(0).
-            data_b = api_results[1]
-            if isinstance(data_b, Exception) or not data_b: results_b = []
-            else: results_b = data_b.get("results", [])
+            results_b = data_b.get("results", [])
 
         if not results_a or not results_b:
             return None
 
-        # 2. Find latest common minute
-        # Map timestamp -> close price
-        if not results_a or not results_b:
-            return None
-            
-        # If one leg was simulated from cache (length 1), use it as the master price
-        if len(results_a) == 1 and not (cached_a and cached_a.get("mid") is not None):
-             # This case shouldn't happen with current logic, but for safety:
-             pass
-        
-        # Standard matching logic
-        map_b = {bar["t"]: bar["c"] for bar in results_b}
-        
-        # Special case: if one results list has only 1 entry (cached simulated), 
-        # we can't match timestamps, so we just take the latest from the other leg.
-        if len(results_a) == 1 and cached_a:
-            price_a = results_a[0]["c"]
-            price_b = results_b[0]["c"] # results_b is already sorted desc
-            return ({"bid": price_a, "ask": price_a, "mid": price_a, "timestamp": date},
-                    {"bid": price_b, "ask": price_b, "mid": price_b, "timestamp": date})
-        
-        if len(results_b) == 1 and cached_b:
-            price_b = results_b[0]["c"]
-            price_a = results_a[0]["c"]
-            return ({"bid": price_a, "ask": price_a, "mid": price_a, "timestamp": date},
-                    {"bid": price_b, "ask": price_b, "mid": price_b, "timestamp": date})
-
+        # 2. Find valid pairs within max_time_delta_minutes.
+        max_delta_ms = max_time_delta_minutes * 60.0 * 1000.0
+        valid_pairs = []
         for bar_a in results_a:
-            ts = bar_a["t"]
-            if ts in map_b:
-                # Found a match!
-                price_a = bar_a["c"]
-                price_b = map_b[ts]
-                
-                # Treat OHLCV close as mid for both
-                quote_a = {"bid": price_a, "ask": price_a, "mid": price_a, "timestamp": ts}
-                quote_b = {"bid": price_b, "ask": price_b, "mid": price_b, "timestamp": ts}
-                
-                # Cache them (upsert style)
-                meta_a = self._parse_ticker(ticker_a)
-                meta_b = self._parse_ticker(ticker_b)
-                
-                self.cache.upsert_full_record({
-                    "option_ticker": ticker_a, 
-                    "pricing_date": date, 
-                    "mid": price_a, 
-                    "fetched_at": datetime.now().isoformat(),
-                    **meta_a
-                })
-                self.cache.upsert_full_record({
-                    "option_ticker": ticker_b, 
-                    "pricing_date": date, 
-                    "mid": price_b, 
-                    "fetched_at": datetime.now().isoformat(),
-                    **meta_b
-                })
+            ts_a = bar_a["t"]
+            for bar_b in results_b:
+                ts_b = bar_b["t"]
+                delta_ms = abs(ts_a - ts_b)
+                if delta_ms <= max_delta_ms:
+                    valid_pairs.append((bar_a, bar_b, ts_a, ts_b))
 
-                return (quote_a, quote_b)
+        if not valid_pairs:
+            return None
 
-        return None
+        # Sort valid pairs by average timestamp descending (latest time in day / closest to close)
+        valid_pairs.sort(key=lambda x: (x[2] + x[3]) / 2.0, reverse=True)
+        best_pair = valid_pairs[0]
+        bar_a, bar_b, ts_a, ts_b = best_pair
+
+        price_a = bar_a["c"]
+        price_b = bar_b["c"]
+        
+        # Treat OHLCV close as mid for both
+        quote_a = {"bid": price_a, "ask": price_a, "mid": price_a, "timestamp": ts_a}
+        quote_b = {"bid": price_b, "ask": price_b, "mid": price_b, "timestamp": ts_b}
+        
+        # Cache them (upsert style)
+        meta_a = self._parse_ticker(ticker_a)
+        meta_b = self._parse_ticker(ticker_b)
+        
+        self.cache.upsert_full_record({
+            "option_ticker": ticker_a, 
+            "pricing_date": date, 
+            "mid": price_a, 
+            "is_synchronized": 1,
+            "fetched_at": datetime.now().isoformat(),
+            **meta_a
+        })
+        self.cache.upsert_full_record({
+            "option_ticker": ticker_b, 
+            "pricing_date": date, 
+            "mid": price_b, 
+            "is_synchronized": 1,
+            "fetched_at": datetime.now().isoformat(),
+            **meta_b
+        })
+
+        return (quote_a, quote_b)
 
     async def fetch_theoretical_price(
         self,
@@ -612,6 +946,9 @@ class MassiveAPIClient:
         if cached and cached.get("mid") is not None:
             self.cache_hits += 1
             return cached["mid"]
+
+        if self.offline_only:
+            return None
 
         from backtesting.greeks_calculator import implied_volatility, bs_put_price
         
@@ -657,6 +994,7 @@ class MassiveAPIClient:
         Returns {strike: {"bid", "ask", "mid"}} dict.
         """
         results = {}
+        update_rows = []
 
         async def _fetch_one(c):
             ticker = c["option_ticker"]
@@ -676,18 +1014,22 @@ class MassiveAPIClient:
             quote = await self.fetch_eod_quote(ticker, date)
             if quote:
                 results[strike] = quote
-                # Update cache with quote data
-                self.cache.conn.execute(
-                    """UPDATE option_prices SET bid=?, ask=?, mid=?, bid_size=?, ask_size=?
-                       WHERE option_ticker=? AND pricing_date=?""",
-                    (quote["bid"], quote["ask"], quote["mid"],
-                     quote.get("bid_size"), quote.get("ask_size"),
-                     ticker, date),
+                update_rows.append(
+                    (
+                        quote["bid"],
+                        quote["ask"],
+                        quote["mid"],
+                        quote.get("bid_size"),
+                        quote.get("ask_size"),
+                        ticker,
+                        date,
+                    )
                 )
 
         tasks = [_fetch_one(c) for c in contracts]
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.cache.conn.commit()
+        if update_rows:
+            self.cache.bulk_update_quotes(update_rows)
 
         return results
     async def fetch_option_snapshot(self, underlying: str) -> List[dict]:
@@ -695,6 +1037,9 @@ class MassiveAPIClient:
         Fetch full snapshot for all options of an underlying.
         Includes Greeks, IV, and Open Interest if available.
         """
+        if self.offline_only:
+            return []
+
         print(f"{CLR_YEL}  [API FETCH] Full Option Snapshot for {underlying}{CLR_RST}")
         url = f"{BASE_URL}/v3/snapshot/options/{underlying}"
         params = {"limit": 250, "order": "asc", "sort": "ticker"}

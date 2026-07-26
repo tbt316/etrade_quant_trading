@@ -33,12 +33,12 @@ new_data_entry_count = 0
 option_count = 0
 
 # Configure logging
-logging.basicConfig(
-    filename='backtest_debug.log',
-    filemode='a',
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.CRITICAL
-)
+# logging.basicConfig(
+#     filename='backtest_debug.log',
+#     filemode='a',
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     level=logging.CRITICAL
+# )
 
 # SSL Context for aiohttp
 ssl_context = ssl.create_default_context(cafile=certifi.where())
