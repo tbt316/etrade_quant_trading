@@ -33,6 +33,15 @@ For every reliability incident:
   request volume is part of the reliability budget.
 - Persist both the last attempt and the last successful synchronization. A
   stale-but-confirmed result must be distinguishable from a fresh result.
+- Regime inputs must persist provider/field identity, exchange event time,
+  `available_at`, `ingested_at`, finality, and a payload checksum. A caller-
+  supplied provenance flag or filesystem modification time is not evidence;
+  verified status additionally requires a durable raw response and parser
+  receipt linked to the selected observation.
+- A regime-data range is complete only when every expected NYSE session has
+  one independent final SPY close and one independent final VIX close. A
+  partial leg, holiday-only row, or conflicting correction must not overwrite
+  the last confirmed snapshot.
 
 ### Calculations
 

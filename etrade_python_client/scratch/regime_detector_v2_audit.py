@@ -1,36 +1,65 @@
 """Read-only audit for the causal two-timescale regime detector.
 
-The script combines the longer local SPY/VIX Parquet history with the fresher
-dashboard cache, preferring the dashboard value on overlapping dates.  It never
-downloads or writes data.
+The source-free legacy caches are wrapped in an explicitly unverified snapshot.
+That preserves their usefulness for research replay without allowing normalized
+local artifacts or assumed timestamps to masquerade as production provenance.
+The script never downloads or writes data.
 """
 
+import hashlib
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
 import pandas as pd
-import pandas_market_calendars as mcal
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from live_trading.regime_detector_v2 import RegimeDetectorConfig, detect_regimes
+from live_trading.regime_detector_v2 import (
+    RegimeDetectorConfig,
+    detect_regimes_from_snapshot,
+)
+from live_trading.regime_market_data import (
+    AVAILABILITY_HISTORICAL_ASSUMPTION,
+    PAYLOAD_NORMALIZED_ONLY,
+    MarketObservation,
+    RegimeMarketDataSnapshot,
+    SourceIdentity,
+    regime_market_schedule,
+)
 
-NYSE = mcal.get_calendar("NYSE")
+SPY_LEGACY_IDENTITY = SourceIdentity(
+    provider="local_artifact",
+    dataset="derived_cache",
+    provider_symbol="SPY",
+    canonical_instrument="SPY",
+    field="close",
+    adjustment="unknown",
+    unit="usd",
+)
+VIX_LEGACY_IDENTITY = SourceIdentity(
+    provider="local_artifact",
+    dataset="derived_cache",
+    provider_symbol="VIX",
+    canonical_instrument="VIX",
+    field="close",
+    adjustment="unknown",
+    unit="index_points",
+)
 
 
-def _load_prices() -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
+def _load_prices() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     spy_path = PROJECT_ROOT / "s_and_p_data" / "api_cache" / "SPY.parquet"
     vix_path = PROJECT_ROOT / "s_and_p_data" / "api_cache" / "INDEX_VIX.parquet"
     live_path = PROJECT_ROOT / "spy_vix_price_cache.json"
 
     spy = pd.read_parquet(spy_path)["Close"].rename("SPY_Close")
     vix = pd.read_parquet(vix_path)["Close"].rename("VIX_Close")
-    historical = pd.concat([spy, vix], axis=1)
+    historical = pd.concat([spy, vix], axis=1).sort_index()
 
     with live_path.open("r", encoding="utf-8") as handle:
         cache = json.load(handle)
@@ -43,26 +72,119 @@ def _load_prices() -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
     )
     live.index = pd.to_datetime(live.index)
 
+    conflicts = []
+    for column in ("SPY_Close", "VIX_Close"):
+        overlap = pd.concat(
+            [
+                historical[column].rename("parquet"),
+                live[column].rename("dashboard_cache"),
+            ],
+            axis=1,
+            join="inner",
+        ).dropna()
+        mismatch = overlap[
+            ~np.isclose(
+                overlap["parquet"],
+                overlap["dashboard_cache"],
+                rtol=0.0,
+                atol=0.005,
+            )
+        ].copy()
+        mismatch = mismatch.reset_index(names="session")
+        mismatch["instrument"] = column.removesuffix("_Close")
+        mismatch["absolute_difference"] = (
+            mismatch["dashboard_cache"] - mismatch["parquet"]
+        ).abs()
+        conflicts.append(mismatch)
+    conflicts = (
+        pd.concat(conflicts, ignore_index=True).sort_values(["session", "instrument"])
+        if conflicts
+        else pd.DataFrame()
+    )
+
+    # This precedence reproduces the old audit for comparison only.  The
+    # resulting snapshot remains explicitly unverified and execution-ineligible.
     combined = pd.concat([historical, live]).sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
 
     observed_rows = combined.dropna(how="all")
-    full_schedule = NYSE.schedule(
-        start_date=observed_rows.index.min(),
-        end_date=observed_rows.index.max(),
+    full_schedule = regime_market_schedule(
+        observed_rows.index.min().date(),
+        observed_rows.index.max().date(),
     )
     full_sessions = pd.DatetimeIndex(full_schedule.index).tz_localize(None).normalize()
     unexpected = observed_rows.index.difference(full_sessions)
     quarantined = observed_rows.loc[unexpected].copy()
 
     common_start = max(combined[column].first_valid_index() for column in combined.columns)
-    common_end = max(combined[column].last_valid_index() for column in combined.columns)
-    common_schedule = NYSE.schedule(start_date=common_start, end_date=common_end)
+    common_end = min(combined[column].last_valid_index() for column in combined.columns)
+    common_schedule = regime_market_schedule(
+        common_start.date(),
+        common_end.date(),
+    )
     common_sessions = pd.DatetimeIndex(common_schedule.index).tz_localize(None).normalize()
     combined = combined.reindex(common_sessions)
+    if combined.isna().any().any():
+        missing = combined[combined.isna().any(axis=1)].index
+        raise ValueError(
+            "Legacy replay has missing SPY/VIX sessions: "
+            f"{[item.date().isoformat() for item in missing[:5]]}"
+        )
 
-    file_modified_at = pd.Timestamp(live_path.stat().st_mtime, unit="s", tz="UTC")
-    return combined, file_modified_at, quarantined
+    return combined, quarantined, conflicts
+
+
+def _legacy_snapshot(prices: pd.DataFrame) -> RegimeMarketDataSnapshot:
+    schedule = regime_market_schedule(
+        prices.index.min().date(),
+        prices.index.max().date(),
+    )
+    observations = []
+    for session, row in prices.iterrows():
+        session_date = session.date()
+        clocks = schedule.loc[session]
+        for identity, close, event_column in (
+            (SPY_LEGACY_IDENTITY, row["SPY_Close"], "spy_event_at"),
+            (VIX_LEGACY_IDENTITY, row["VIX_Close"], "vix_event_at"),
+        ):
+            event_at = pd.Timestamp(clocks[event_column])
+            normalized_payload = json.dumps(
+                {
+                    "instrument": identity.canonical_instrument,
+                    "session": session_date.isoformat(),
+                    "selected_close": float(close),
+                    "source_class": "legacy_derived_artifact",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            observations.append(
+                MarketObservation(
+                    session=session_date,
+                    identity=identity,
+                    close=close,
+                    event_at=event_at,
+                    available_at=event_at,
+                    ingested_at=event_at,
+                    request_id=(
+                        f"legacy-replay:{identity.canonical_instrument.lower()}:"
+                        f"{session_date.isoformat()}"
+                    ),
+                    raw_payload_sha256=hashlib.sha256(
+                        normalized_payload
+                    ).hexdigest(),
+                    payload_kind=PAYLOAD_NORMALIZED_ONLY,
+                    availability_basis=AVAILABILITY_HISTORICAL_ASSUMPTION,
+                    is_final=True,
+                )
+            )
+    as_of = pd.Timestamp(
+        schedule.loc[prices.index.max(), "joint_finalization_at"]
+    ) + pd.Timedelta(minutes=1)
+    return RegimeMarketDataSnapshot(
+        as_of=as_of,
+        observations=tuple(observations),
+    )
 
 
 def _legacy_overlay(prices: pd.DataFrame) -> pd.Series:
@@ -108,43 +230,11 @@ def _term_structure_cache_status() -> str:
     return f"not_identically_copied; VIX3M ends {vix3m.index.max().date()}"
 
 
-def _availability_proxies(
-    prices: pd.DataFrame,
-    file_modified_at: pd.Timestamp,
-) -> tuple[pd.Series, pd.Series]:
-    schedule = NYSE.schedule(start_date=prices.index.min(), end_date=prices.index.max())
-    sessions = pd.DatetimeIndex(schedule.index).tz_localize(None).normalize()
-    spy_available_at = pd.Series(
-        pd.DatetimeIndex(schedule["market_close"]) + pd.Timedelta(minutes=1),
-        index=sessions,
-    )
-    vix_available_at = pd.Series(
-        (
-            sessions.tz_localize("America/New_York")
-            + pd.Timedelta(hours=16, minutes=16)
-        ).tz_convert("UTC"),
-        index=sessions,
-    )
-    spy_available_at.iloc[-1] = max(spy_available_at.iloc[-1], file_modified_at)
-    vix_available_at.iloc[-1] = max(vix_available_at.iloc[-1], file_modified_at)
-    return spy_available_at, vix_available_at
-
-
 def main():
-    prices, file_modified_at, quarantined = _load_prices()
+    prices, quarantined, conflicts = _load_prices()
     config = RegimeDetectorConfig()
-    spy_available_at, vix_available_at = _availability_proxies(
-        prices,
-        file_modified_at,
-    )
-    result = detect_regimes(
-        prices,
-        config,
-        as_of=pd.Timestamp.now(tz="UTC"),
-        spy_available_at=spy_available_at,
-        vix_available_at=vix_available_at,
-        source_provenance_verified=False,
-    )
+    snapshot = _legacy_snapshot(prices)
+    result = detect_regimes_from_snapshot(snapshot, config)
     result["Legacy_Overlay"] = _legacy_overlay(prices)
 
     print("CAUSAL SHADOW AUDIT")
@@ -160,12 +250,26 @@ def main():
     print(f"Threshold status: {result.attrs['threshold_status']}")
     print(f"Signal time: {result.attrs['regime_signal_timestamp']}")
     print(f"As-of: {result.attrs['as_of']}")
-    print(f"SPY available-at proxy: {result.attrs['spy_available_at']}")
-    print(f"VIX available-at proxy: {result.attrs['vix_available_at']}")
+    print(f"Input snapshot SHA-256: {snapshot.snapshot_sha256}")
+    print(f"Calendar schedule SHA-256: {snapshot.schedule_sha256}")
+    print(f"Input schema: {snapshot.schema_version}")
+    print(
+        "Source policy: "
+        f"{snapshot.source_policy_version} / {snapshot.source_policy_sha256}"
+    )
     print(
         "Source provenance: UNVERIFIED "
-        "(nominal historical cutoffs; latest filesystem mtime proxy)"
+        "(normalized legacy artifacts; historical finalization assumptions)"
     )
+    print(
+        "Provenance failure codes: "
+        f"{result.attrs['input_provenance_failure_codes']}"
+    )
+    print(
+        "Provenance metadata complete: "
+        f"{result.attrs['input_provenance_evidence_complete']}"
+    )
+    print(f"Execution eligible: {result.attrs['execution_eligible']}")
     print(
         "Latest jointly finalized session: "
         f"{result.attrs['latest_jointly_finalized_session']}"
@@ -173,6 +277,10 @@ def main():
     print(
         "Quarantined non-NYSE source rows: "
         f"{quarantined.to_dict(orient='index') if len(quarantined) else 'none'}"
+    )
+    print(
+        "Conflicting overlapping legacy values: "
+        f"{conflicts.to_dict(orient='records') if len(conflicts) else 'none'}"
     )
     print("Regime lag for trade entry: one trading session required")
     print("Return buckets: not used by this detector")

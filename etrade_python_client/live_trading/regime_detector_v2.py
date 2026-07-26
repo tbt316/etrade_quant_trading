@@ -16,9 +16,15 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 
+from live_trading.regime_market_data import (
+    CALENDAR_POLICY_VERSION,
+    RegimeMarketDataSnapshot,
+    regime_market_schedule,
+)
+
 
 SIGNAL_TIMESTAMP = "after_spy_vix_finalization_T_for_next_session"
-DETECTOR_VERSION = "regime_v2_shadow_0.1.0"
+DETECTOR_VERSION = "regime_v2_shadow_0.2.0"
 BACKGROUND_UNAVAILABLE = "unavailable"
 BACKGROUND_CALM = "calm"
 BACKGROUND_ELEVATED = "elevated"
@@ -159,13 +165,25 @@ def _as_aware_utc(value, field_name: str) -> pd.Timestamp:
 
 
 def _vix_finalization_times(session_dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """Return Cboe's nominal 4:15 p.m. ET VIX calculation cutoff."""
+    """Return the versioned Cboe Index Options close for each NYSE session."""
 
     dates = pd.DatetimeIndex(session_dates)
     if dates.tz is not None:
         dates = dates.tz_convert("America/New_York").tz_localize(None)
-    eastern_midnights = dates.normalize().tz_localize("America/New_York")
-    return eastern_midnights + pd.Timedelta(hours=16, minutes=15)
+    dates = dates.normalize()
+    if dates.empty:
+        return pd.DatetimeIndex([], dtype="datetime64[ns, UTC]")
+    schedule = regime_market_schedule(
+        dates.min().date(),
+        dates.max().date(),
+    )
+    missing = dates.difference(schedule.index)
+    if len(missing):
+        raise ValueError(
+            "Could not resolve Cboe finalization times for sessions: "
+            f"{[item.date().isoformat() for item in missing[:5]]}"
+        )
+    return pd.DatetimeIndex(schedule.loc[dates, "vix_event_at"])
 
 
 def _normalize_availability(
@@ -231,16 +249,10 @@ def _validate_latest_session(
     as_of_eastern = as_of_utc.tz_convert("America/New_York")
     start_date = (as_of_eastern.normalize() - pd.Timedelta(days=31)).date()
     end_date = as_of_eastern.normalize().date()
-    recent_schedule = NYSE.schedule(start_date=start_date, end_date=end_date)
-    vix_finalization_utc = pd.Series(
-        _vix_finalization_times(recent_schedule.index).tz_convert("UTC"),
-        index=recent_schedule.index,
-    )
-    joint_finalization_utc = pd.concat(
-        [recent_schedule["market_close"], vix_finalization_utc],
-        axis=1,
-    ).max(axis=1)
-    completed = recent_schedule[joint_finalization_utc <= as_of_utc]
+    recent_schedule = regime_market_schedule(start_date, end_date)
+    completed = recent_schedule[
+        recent_schedule["joint_finalization_at"] <= as_of_utc
+    ]
     if completed.empty:
         raise ValueError("No jointly finalized SPY/VIX session is available at as_of")
 
@@ -264,7 +276,7 @@ def _validate_latest_session(
     if early_vix.any():
         first_session = early_vix[early_vix].index[0]
         raise ValueError(
-            "VIX observation was available before the Cboe 4:15 p.m. ET cutoff: "
+            "VIX observation was available before the official Cboe close: "
             f"{first_session.date()}"
         )
     return as_of_utc, spy_available_utc, vix_available_utc
@@ -274,18 +286,21 @@ def _session_finalization_metadata(
     index: pd.DatetimeIndex,
 ) -> tuple[pd.Series, pd.Series]:
     extended_end = index.max() + pd.Timedelta(days=31)
-    schedule = NYSE.schedule(start_date=index.min(), end_date=extended_end)
+    schedule = regime_market_schedule(
+        index.min().date(),
+        extended_end.date(),
+    )
     sessions = pd.DatetimeIndex(schedule.index).tz_localize(None).normalize()
     positions = sessions.get_indexer(index)
     if np.any(positions < 0):
         raise ValueError("Could not resolve exact NYSE finalization metadata")
 
     closes = pd.Series(
-        pd.DatetimeIndex(schedule.iloc[positions]["market_close"].to_numpy()),
+        pd.DatetimeIndex(schedule.iloc[positions]["spy_event_at"]),
         index=index,
     )
     vix_finalizations = pd.Series(
-        _vix_finalization_times(sessions)[positions].tz_convert("UTC"),
+        pd.DatetimeIndex(schedule.iloc[positions]["vix_event_at"]),
         index=index,
     )
     return closes, vix_finalizations
@@ -472,7 +487,7 @@ def _reason_codes(row: pd.Series, config: RegimeDetectorConfig) -> str:
     return "|".join(reasons) if reasons else "no_stress_evidence"
 
 
-def detect_regimes(
+def _detect_regimes_from_arrays(
     prices: pd.DataFrame,
     config: RegimeDetectorConfig | None = None,
     *,
@@ -481,7 +496,7 @@ def detect_regimes(
     vix_available_at,
     source_provenance_verified: bool,
 ) -> pd.DataFrame:
-    """Return a causal background regime and an orthogonal shock state.
+    """Low-level detector core for already validated array inputs.
 
     Required input columns are ``SPY_Close`` and ``VIX_Close``. Source
     availability must be supplied as timezone-aware Series aligned one-to-one
@@ -621,5 +636,103 @@ def detect_regimes(
     result.attrs["latest_jointly_finalized_session"] = (
         frame.index.max().date().isoformat()
     )
-    result.attrs["exchange_calendar"] = "NYSE"
+    result.attrs["exchange_calendars"] = ("NYSE", "CBOE_Index_Options")
+    result.attrs["calendar_policy_version"] = CALENDAR_POLICY_VERSION
+    return result
+
+
+def detect_regimes(
+    prices: pd.DataFrame,
+    config: RegimeDetectorConfig | None = None,
+    *,
+    as_of,
+    spy_available_at,
+    vix_available_at,
+    source_provenance_verified: bool = False,
+) -> pd.DataFrame:
+    """Research-only compatibility interface for loose array inputs.
+
+    Loose DataFrames cannot prove source identity or raw lineage.  They may be
+    used for diagnostics with explicitly unverified provenance, but callers
+    cannot promote them by passing a trusted Boolean.  Production/shadow
+    ingestion must use :func:`detect_regimes_from_snapshot`.
+    """
+
+    if source_provenance_verified:
+        raise ValueError(
+            "Verified provenance requires RegimeMarketDataSnapshot; "
+            "loose array inputs are research-only"
+        )
+    result = _detect_regimes_from_arrays(
+        prices,
+        config,
+        as_of=as_of,
+        spy_available_at=spy_available_at,
+        vix_available_at=vix_available_at,
+        source_provenance_verified=False,
+    )
+    result["Detector_Stage"] = "research_raw_inputs"
+    result["Execution_Eligible"] = False
+    result.attrs["detector_stage"] = "research_raw_inputs"
+    result.attrs["execution_eligible"] = False
+    result.attrs["input_contract"] = "loose_arrays_unverified"
+    return result
+
+
+def detect_regimes_from_snapshot(
+    snapshot: RegimeMarketDataSnapshot,
+    config: RegimeDetectorConfig | None = None,
+) -> pd.DataFrame:
+    """Run the shadow detector from an immutable evidence-backed snapshot."""
+
+    if not isinstance(snapshot, RegimeMarketDataSnapshot):
+        raise TypeError("snapshot must be a RegimeMarketDataSnapshot")
+    inputs = snapshot.detector_inputs()
+    result = _detect_regimes_from_arrays(
+        inputs.pop("prices"),
+        config,
+        **inputs,
+    )
+    original_attrs = result.attrs.copy()
+    metadata = snapshot.source_metadata_frame()
+    if not metadata.index.equals(result.index):
+        raise ValueError("Snapshot source metadata does not align with detector output")
+    result = result.join(metadata)
+    result.attrs.update(original_attrs)
+
+    provenance_failure_codes = sorted(
+        {
+            failure.rsplit(":", 1)[-1]
+            for failure in snapshot.provenance_failures
+        }
+    )
+    result["Input_Snapshot_SHA256"] = snapshot.snapshot_sha256
+    result["Input_Schema_Version"] = snapshot.schema_version
+    result["Calendar_Policy_Version"] = CALENDAR_POLICY_VERSION
+    result["Calendar_Schedule_SHA256"] = snapshot.schedule_sha256
+    result["Source_Policy_Version"] = snapshot.source_policy_version
+    result["Source_Policy_SHA256"] = snapshot.source_policy_sha256
+    result["Input_Provenance_Status"] = (
+        "verified" if snapshot.provenance_verified else "unverified"
+    )
+    result["Input_Provenance_Evidence"] = (
+        "complete_but_not_durably_verified"
+        if snapshot.provenance_evidence_complete
+        else "incomplete"
+    )
+    result["Detector_Stage"] = "shadow"
+    result["Execution_Eligible"] = False
+
+    result.attrs["detector_stage"] = "shadow"
+    result.attrs["execution_eligible"] = False
+    result.attrs["input_contract"] = snapshot.schema_version
+    result.attrs["input_snapshot_sha256"] = snapshot.snapshot_sha256
+    result.attrs["calendar_policy_version"] = CALENDAR_POLICY_VERSION
+    result.attrs["calendar_schedule_sha256"] = snapshot.schedule_sha256
+    result.attrs["source_policy_version"] = snapshot.source_policy_version
+    result.attrs["source_policy_sha256"] = snapshot.source_policy_sha256
+    result.attrs["input_provenance_evidence_complete"] = (
+        snapshot.provenance_evidence_complete
+    )
+    result.attrs["input_provenance_failure_codes"] = provenance_failure_codes
     return result

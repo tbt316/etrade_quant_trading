@@ -1,7 +1,8 @@
 # Regime Detection V2: Persistent Climate + Event Shock
 
-**Review date:** 2026-07-25  
-**Status:** shadow-mode prototype; not connected to order execution  
+**Review date:** 2026-07-26
+
+**Status:** shadow-mode detector plus evidence contract; not connected to order execution
 **Related roadmap:** `docs/production_readiness_upgrade_plan.md`
 
 ## Decision
@@ -44,17 +45,17 @@ dashboard cache and gives the dashboard cache priority on overlapping dates.
 The latest observation is the July 24, 2026 close.
 
 The cache does not persist trustworthy per-symbol `available_at` provenance.
-The replay therefore uses nominal historical finalization cutoffs and the
-latest file modification time only as timing proxies, and marks source
-provenance `UNVERIFIED`; its results are diagnostic, not eligible to drive a
-live order.
+The replay therefore wraps normalized cache values and historical finalization
+assumptions in an immutable evidence snapshot marked `UNVERIFIED`; its results
+are diagnostic and explicitly ineligible to drive a live order. A filesystem
+modification time is never treated as market-data provenance.
 
 | Window | Observed behavior | Legacy overlay | V2 shadow result |
 |---|---|---|---|
 | Mar 20–Apr 7, 12 sessions | VIX median 25.97, maximum 31.05; mean V2 background score 0.916 | 9 `cautious_decline`, 3 `expansion` | 12/12 `persistent_stress`; 3 fresh shocks |
 | Full April, 21 sessions | VIX median 18.92; early stress followed by rapid normalization | 20 `expansion`, 1 `cautious_decline` | 18 `persistent_stress`, then 3 `elevated` because exit requires confirmation |
 | Jun 15–Jul 24, 28 sessions | VIX median 16.81, maximum 19.49; five VIX increases above 10% | 28/28 `expansion` | 22 `elevated`, 6 `calm`; all five jumps detected |
-| Jul 9–Jul 24, 12 sessions | Mean background score 0.493; three VIX increases above 10% | 12/12 `expansion` | Jul 17 and Jul 23 were `calm + active`; Jul 24 was `calm + aftershock` |
+| Jul 9–Jul 24, 12 sessions | Mean background score 0.494; three VIX increases above 10% | 12/12 `expansion` | Jul 17 and Jul 23 were `calm + active`; Jul 24 was `calm + aftershock` |
 
 The recent raw shock dates were:
 
@@ -334,20 +335,36 @@ Each row contains:
   "VIX_Finalization_At": "2026-07-23T20:15:00+00:00",
   "Signal_Available_At": "2026-07-23T20:16:00+00:00",
   "Tradable_Session": "2026-07-24",
-  "Detector_Version": "regime_v2_shadow_0.1.0",
+  "Detector_Version": "regime_v2_shadow_0.2.0",
   "Config_Hash": "<sha256>",
+  "Input_Snapshot_SHA256": "<sha256>",
+  "Input_Schema_Version": "regime_market_data.v2",
+  "Calendar_Policy_Version": "nyse+cboe_index_options.v1",
+  "Source_Policy_Version": "regime_source_identity.v1",
+  "Source_Policy_SHA256": "<sha256>",
+  "Input_Provenance_Status": "unverified",
+  "Input_Provenance_Evidence": "complete_but_not_durably_verified",
+  "Detector_Stage": "shadow",
+  "Execution_Eligible": false,
   "Reason_Codes": "vix_daily_change_extreme",
   "Regime_Signal_Timestamp": "after_spy_vix_finalization_T_for_next_session"
 }
 ```
 
-The function requires timezone-aware, per-session `spy_available_at` and
-`vix_available_at` series, a timezone-aware run `as_of`, and an explicit
-source-provenance status. It verifies that every row is an exact, contiguous
-NYSE session, that availability metadata aligns one-to-one with those rows,
-that the final row is the latest jointly finalized session at `as_of`, that SPY
-is no earlier than the official NYSE close, and that VIX is no earlier than
-Cboe's nominal 4:15 p.m. ET calculation cutoff.
+The typed shadow entry point accepts only a
+`RegimeMarketDataSnapshot`. It derives provenance from immutable source
+metadata rather than accepting a caller-supplied Boolean. Each observation
+carries provider/dataset/symbol/field identity, payload checksum and kind,
+event time, availability time, ingestion time, request ID, finality, and a
+frozen source-policy verdict. The snapshot binds the version and hash of that
+policy, verifies exact contiguous NYSE sessions, one independent SPY and VIX
+observation per session, recognized identities, deterministic input and
+calendar hashes, and timezone-aware clock ordering.
+
+SPY event time comes from the versioned NYSE schedule. VIX event time comes
+from the versioned `CBOE_Index_Options` schedule, including shortened sessions;
+the paired publication boundary is the later of the two exchange closes. The
+final row must be the latest jointly finalized session at `as_of`.
 
 `Signal_Available_At` is the cumulative maximum of both source timestamps
 through T. This dependency watermark matters because returns, rolling features,
@@ -357,15 +374,43 @@ watermark. If either the current row or a required historical row arrives after
 the next session has opened, the signal rolls to the following session instead
 of being backdated into that morning.
 
-The calling market-data gateway must still provide truthful source provenance;
-a timestamp supplied by a caller—or a filesystem modification time—cannot prove
-where the values came from. Unverified provenance is carried in
+The compatibility entry point for loose arrays is research-only and rejects
+any attempt to claim verified provenance. Unverified provenance is carried in
 `Data_Quality`, makes `freshness_assessed=false`, and must hard-block any
-regime-dependent execution. Invalid, missing, non-finite, nonpositive,
-non-session, stale, or premature required data raise an error. Insufficient
-calibration history returns `unavailable`, and the first row's shock state is
-`unavailable` because a daily change cannot yet be observed. None of these
-cases silently produces `calm` or `none`.
+regime-dependent execution. Both entry points currently emit
+`Execution_Eligible=false`; promotion requires a later, separately reviewed
+risk-policy release. Invalid, missing, non-finite, nonpositive, non-session,
+stale, premature, duplicated, or tampered required data fail closed.
+Insufficient calibration history returns `unavailable`, and the first row's
+shock state is `unavailable` because a daily change cannot yet be observed.
+None of these cases silently produces `calm` or `none`.
+
+R1 intentionally does **not** call a checksum “verified provenance.” The
+current snapshot retains a digest but not the provider response bytes or a
+trusted parser receipt, so even structurally complete source metadata is
+labeled `complete_but_not_durably_verified`. No current R1 path emits
+`Input_Provenance_Status=verified`. A later provider-adapter release must store
+content-addressed raw responses, link each chosen observation revision to the
+fetch attempt and parser version, and re-derive the parsed close before this
+gate can be promoted.
+
+### R1 evidence persistence
+
+`live_trading/regime_evidence_store.py` provides the first durable manifest
+boundary. It stores source attempts, source health, append-only observation
+revisions, and channel-scoped, content-addressed input snapshots in SQLite with WAL,
+`synchronous=FULL`, foreign keys, restrictive file permissions, and immediate
+write transactions. Failed or time-inconsistent attempts roll back without
+advancing last-success state. A successful range must include exactly one
+currently ingested observation for every requested NYSE session. Snapshot
+reload verifies its canonical hash before returning data, and an older
+backfill cannot replace a newer-as-of snapshot in the same channel.
+
+This store is not yet wired into the live collection worker. That adapter and
+the raw-payload/parser receipts and two-leg retry/publication scheduler belong
+to the later live-shadow phase.
+The legacy JSON and Parquet caches remain research/display artifacts and cannot
+be promoted into verified evidence.
 
 ## Why not another single HMM
 
@@ -517,6 +562,14 @@ and skipped-trade effects must be included.
 - A delayed historical dependency propagates its availability watermark to
   every later signal that consumes it.
 - Filesystem modification time never upgrades source provenance to verified.
+- A checksum without retained raw bytes and a linked parser receipt remains
+  unverified.
+- Source-policy version, hash, and frozen verdict are bound into the snapshot
+  identity.
+- A stale observation from an older attempt cannot advance last-success
+  freshness for a new attempt.
+- Publishing an older backfill cannot regress the latest-as-of snapshot in the
+  research or shadow channel.
 - Invalid VIX3M cannot enter a term-structure calculation.
 - A probabilistic challenger is rejected if any state exceeds 95% OOS
   occupancy, centroids duplicate, posterior entropy collapses, or minimum
@@ -570,7 +623,11 @@ and skipped-trade effects must be included.
 ## Prototype artifacts and verification
 
 - Detector: `live_trading/regime_detector_v2.py`
-- Focused tests: `tests/test_regime_detector_v2.py`
+- Evidence contract: `live_trading/regime_market_data.py`
+- Evidence store: `live_trading/regime_evidence_store.py`
+- Focused tests: `tests/test_regime_detector_v2.py`,
+  `tests/test_regime_market_data.py`, and
+  `tests/test_regime_evidence_store.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
 
 The focused tests verify:
@@ -583,6 +640,10 @@ The focused tests verify:
 - No `calm` label while absolute stress evidence is present.
 - Explicit market-close timestamp and exact next tradable NYSE session.
 - Per-session source availability and delayed-delivery rollover.
+- Actual NYSE/Cboe regular and shortened-session clocks.
+- Deterministic snapshot, calendar, and source-policy hashes.
+- Exact requested-range coverage and transactional failure rollback.
+- Stale-attempt rejection and channel-scoped, monotonic snapshot publication.
 - Unavailable first-return shock evidence.
 
 The read-only replay prints the causal record and reproduces the 2026 comparison
@@ -594,6 +655,12 @@ without downloading or mutating data.
   <https://www.cboe.com/tradable-products/vix/term-structure>
 - Cboe, VIX calculation and trading-hour specification:
   <https://www.cboe.com/tradable-products/vix/vix-options/specifications/>
+- Cboe, current VIX methodology:
+  <https://cdn.cboe.com/api/global/us_indices/governance/VIX_Methodology.pdf>
+- Cboe, exchange hours and shortened sessions:
+  <https://www.cboe.com/about/hours/us-options>
+- Cboe DataShop, VIX end-of-day calculation inputs and early-close timing:
+  <https://datashop.cboe.com/vix-index-eod-calculation-inputs>
 - Cboe, March 2026 volatility and hedging-demand decomposition:
   <https://www.cboe.com/insights/posts/stagflation-fears-drive-widening-volatility-risk-premium>
 - Cboe, June 2026 volatility spike:
