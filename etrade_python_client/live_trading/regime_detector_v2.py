@@ -187,7 +187,12 @@ def regime_detector_config_sha256(config: RegimeDetectorConfig) -> str:
 
 
 def regime_detector_code_sha256() -> str:
-    """Bind calibration to detector, clock policy, and runtime dependencies."""
+    """Return the portable identity of the detector and market-clock source.
+
+    The algorithm identity must be stable across machines running the same
+    committed source. Runtime package versions are recorded separately so a
+    Python patch release cannot silently invalidate a frozen research plan.
+    """
 
     components = {
         "detector_source_sha256": hashlib.sha256(
@@ -196,6 +201,20 @@ def regime_detector_code_sha256() -> str:
         "market_data_source_sha256": hashlib.sha256(
             inspect.getsource(regime_market_data_module).encode("utf-8")
         ).hexdigest(),
+    }
+    payload = json.dumps(
+        components,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def regime_detector_runtime_fingerprint() -> str:
+    """Return the exact runtime identity for diagnostics and promotion gates."""
+
+    components = {
         "numpy_version": np.__version__,
         "pandas_market_calendars_version": getattr(
             mcal,
@@ -731,6 +750,10 @@ def _detect_regimes_from_arrays(
     result.attrs["regime_signal_timestamp"] = SIGNAL_TIMESTAMP
     result.attrs["detector_version"] = DETECTOR_VERSION
     result.attrs["config_hash"] = config_hash
+    result.attrs["detector_code_sha256"] = regime_detector_code_sha256()
+    result.attrs["runtime_fingerprint_sha256"] = (
+        regime_detector_runtime_fingerprint()
+    )
     result.attrs["threshold_status"] = "research_baseline_unverified"
     result.attrs["inference_mode"] = "causal_transparent_shadow"
     result.attrs["freshness_assessed"] = bool(source_provenance_verified)

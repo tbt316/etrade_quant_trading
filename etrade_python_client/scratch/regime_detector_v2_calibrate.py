@@ -115,7 +115,7 @@ def build_preregistered_plan(
     )
     max_outcome_resolution_lag = 21
     return RegimeCalibrationPlan(
-        protocol_id="regime_v2_b0_c1_c3_c4_20260726",
+        protocol_id="regime_v2_b0_c1_c3_c4_20260726_portable_build",
         candidates=candidates,
         control_candidate_id="b0_baseline",
         selection_folds=tuple(
@@ -222,10 +222,23 @@ def main() -> None:
         type=Path,
         help="Optional destination for the canonical pre-registration plan.",
     )
+    parser.add_argument(
+        "--refresh-frozen-plan",
+        action="store_true",
+        help=(
+            "Explicitly rebuild the pre-registration plan after a reviewed "
+            "protocol-ID change; requires --plan-output."
+        ),
+    )
     args = parser.parse_args()
 
     prices, quarantined, conflicts = _load_prices()
-    plan = load_frozen_plan(prices)
+    if args.refresh_frozen_plan:
+        if args.plan_output is None:
+            parser.error("--refresh-frozen-plan requires --plan-output")
+        plan = build_preregistered_plan(prices)
+    else:
+        plan = load_frozen_plan(prices)
     artifact = run_research_calibration(prices, plan)
 
     print("REGIME V2 CAUSAL CALIBRATION")

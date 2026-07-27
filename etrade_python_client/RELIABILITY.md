@@ -312,8 +312,8 @@ decision-time receipts, so it cannot establish production provenance.
   - Separates `calm/elevated/persistent_stress` background state from
     `none/active/aftershock` event state.
   - Uses causal prior-only percentiles, explicit next-session availability,
-    immutable configuration hashes, and a detector/build hash covering the
-    calendar implementation and runtime dependency versions.
+    immutable configuration hashes, a portable detector/clock source hash,
+    and a separate exact runtime fingerprint.
 - `live_trading/regime_calibration.py`
   - Freezes a small candidate grid and rejects shock-lane tuning.
   - Uses purged 2016–2024 folds and only fully resolved post-lag future-risk
@@ -342,9 +342,9 @@ and `Execution_Eligible=false`.
 ### Verification record
 
 - Plan SHA-256:
-  `f4373e6e3049fd289a8e27f319644cc4c2194fe3c89f8a77e68ae5699f5f6b7b`.
+  `e40f762f8adadd871ec0a6919fc6e6e2e99ef800a39bad365e88e00c862c2299`.
 - Artifact SHA-256:
-  `a010fea66633bb1b75b83b95c0f57364a44288d60c7cfe24c7f6bf13fab24230`.
+  `95bd8b003a7b4e3ed13ab077031b392e679dc6aaf007131a07b0d0980fa55de4`.
 - Selection retained `b0_baseline`: score 0.3810, 100% evaluation coverage,
   6.01 switches per 252 sessions, maximum aggregate occupancy 0.516, and two
   false persistent transitions across 60 qualifying isolated shocks.
@@ -354,6 +354,18 @@ and `Execution_Eligible=false`.
 - Unit coverage includes canonical/tamper checks, strict purging, exact
   post-lag outcomes, prefix invariance, stale build/data/pin rejection, and
   binding coverage/chatter/false-persistence guards.
+
+### CI portability incident
+
+The first R3 draft bound the detector/build hash to exact Python and dependency
+versions. The frozen plan was generated under Python 3.10.5 and therefore
+failed deterministically on GitHub's Python 3.10.20 runner even though the
+committed algorithm and market-clock source were identical. Build identity is
+now the portable hash of those two source modules; the exact Python, NumPy,
+pandas, and calendar versions remain recorded in a separate runtime
+fingerprint. A future promotion gate must validate both a reviewed source hash
+and an approved runtime/lockfile identity, but a patch release cannot rewrite
+the research protocol identity.
 
 ## Checklist for future dashboard incidents
 

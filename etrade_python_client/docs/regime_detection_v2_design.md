@@ -477,8 +477,15 @@ unless it produces a material improvement. The immutable protocol is
 `research_reports/regime_v2_calibration_artifact.json`. Both documents use
 canonical strict-schema JSON and content hashes. Runtime research inference
 also requires an externally supplied expected artifact hash and verifies the
-exact historical price prefix, detector/build hash, calibration-engine hash,
+exact historical price prefix, detector/clock source hash, calibration-engine hash,
 exchange schedule, calendar policy, and source policy.
+
+The detector source identity is intentionally portable across machines: it
+hashes the detector and market-clock implementation, not the interpreter patch
+release. Every output separately records an exact runtime fingerprint covering
+Python, NumPy, pandas, and `pandas_market_calendars`. Research replay may run
+under a different recorded runtime; any future executable promotion must bind
+an approved runtime or lockfile in addition to the portable source identity.
 
 The predeclared candidate set is deliberately small:
 
