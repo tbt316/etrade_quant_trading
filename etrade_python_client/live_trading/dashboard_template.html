@@ -1,0 +1,2064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#ffffff">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Antigravity Trader">
+    <title>E*TRADE Live Dashboard</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg: #ffffff;
+            --card-bg: rgba(255, 255, 255, 0.8);
+            --accent: #0284c7;
+            --accent-glow: rgba(2, 132, 199, 0.1);
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --text: #0f172a;
+            --text-muted: #64748b;
+            --border: rgba(0, 0, 0, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        body {
+            background: var(--bg);
+            background-image:
+                radial-gradient(at 0% 0%, rgba(2, 132, 199, 0.05) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.05) 0px, transparent 50%);
+            color: var(--text);
+            min-height: 100vh;
+            padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+            overflow-x: hidden;
+        }
+
+        @media (max-width: 600px) {
+            body { padding: 10px; }
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.03);
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text);
+        }
+
+        .logo span { color: var(--accent); }
+
+        .header-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+
+        .status-badge {
+            padding: 6px 16px;
+            border-radius: 99px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-open { background: rgba(16, 185, 129, 0.1); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.2); }
+        .status-closed { background: rgba(239, 68, 68, 0.1); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); }
+        .manual-order-status {
+            margin-bottom: 15px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--card-bg);
+            color: var(--text);
+            font-size: 0.9rem;
+        }
+        .manual-order-status strong {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .manual-order-status.failed {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.35);
+            color: var(--danger);
+        }
+        .manual-order-status.success {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.35);
+            color: var(--success);
+        }
+        .manual-order-status.pending {
+            background: rgba(245, 158, 11, 0.1);
+            border-color: rgba(245, 158, 11, 0.35);
+            color: var(--warning);
+        }
+        .manual-order-list {
+            display: grid;
+            gap: 6px;
+        }
+        .manual-order-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            line-height: 1.35;
+        }
+        .manual-order-row.success {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.35);
+            color: var(--success);
+        }
+        .manual-order-row.pending {
+            background: rgba(245, 158, 11, 0.12);
+            border-color: rgba(245, 158, 11, 0.4);
+            color: var(--warning);
+        }
+        .manual-order-row.failed {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.35);
+            color: var(--danger);
+        }
+        .manual-order-meta {
+            opacity: 0.9;
+            color: inherit;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 20px;
+        }
+
+        .mobile-nav,
+        .mobile-section-heading {
+            display: none;
+        }
+
+        .portfolio-header h2 {
+            margin: 0;
+        }
+
+        @media (max-width: 1100px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+
+        @media (max-width: 768px) {
+            html { scroll-behavior: smooth; }
+            body {
+                padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+            }
+            header {
+                flex-direction: column;
+                gap: 12px;
+                align-items: center;
+                padding: 15px;
+                text-align: center;
+            }
+            .header-info {
+                width: 100%;
+                justify-content: center;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .mobile-nav {
+                position: sticky;
+                top: max(8px, env(safe-area-inset-top));
+                z-index: 1000;
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 4px;
+                margin-bottom: 12px;
+                padding: 5px;
+                border: 1px solid var(--border);
+                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.94);
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+                backdrop-filter: blur(14px);
+                -webkit-backdrop-filter: blur(14px);
+            }
+            .mobile-nav a {
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 10px;
+                color: var(--text-muted);
+                font-size: 0.72rem;
+                font-weight: 600;
+                text-decoration: none;
+            }
+            .mobile-nav a:active,
+            .mobile-nav a:focus-visible {
+                color: var(--accent);
+                background: var(--accent-glow);
+                outline: none;
+            }
+            .grid {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .right-column {
+                order: 1;
+                gap: 12px !important;
+            }
+            #settings { order: 2; }
+            #portfolio { order: 1; }
+            #actions { order: 2; }
+            #high-gain-card { order: 3; }
+            #neutralize-card { order: 4; }
+            #analytics { order: 5; }
+            #gex-card { order: 6; }
+            #portfolio,
+            #actions,
+            #analytics,
+            #settings { scroll-margin-top: 72px; }
+            .mobile-section-heading {
+                display: block;
+                padding: 4px 4px 0;
+                color: var(--text-muted);
+                font-size: 0.72rem;
+                font-weight: 600;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }
+            .card { padding: 15px; border-radius: 16px; }
+            .logo { font-size: 1.25rem; }
+            .portfolio-header {
+                flex-wrap: wrap;
+                gap: 10px;
+                padding: 15px !important;
+            }
+            .portfolio-tools {
+                width: 100%;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .positions-frame {
+                height: 560px;
+                min-height: 320px;
+                overflow: hidden;
+                border-radius: 0;
+            }
+            #gex-card > div[style*="height: 320px"] { height: 260px !important; }
+        }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border-radius: 24px;
+            padding: 25px;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04);
+            height: fit-content;
+        }
+
+        h2 {
+            font-size: 1.25rem;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--accent);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        label span { color: var(--accent); font-weight: 600; }
+
+        input[type="number"], input[type="time"], input[type="password"], select {
+            width: 100%;
+            background: #f8fafc;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 16px;
+            color: var(--text);
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        input[type="number"]:focus, input[type="time"]:focus, input[type="password"]:focus, select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 4px var(--accent-glow);
+        }
+
+        /* Slider Styles */
+        input[type="range"] {
+            width: 100%;
+            height: 6px;
+            background: #e2e8f0;
+            border-radius: 5px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 0 10px var(--accent-glow);
+        }
+
+        /* Toggle Styles */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 26px;
+        }
+
+        .switch input { opacity: 0; width: 0; height: 0; }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background-color: #e2e8f0;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider { background-color: var(--success); }
+        input:checked + .slider:before { transform: translateX(24px); }
+
+        .btn {
+            width: 100%;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 14px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            filter: brightness(1.1);
+            box-shadow: 0 4px 20px var(--accent-glow);
+        }
+
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-secondary { background: #f1f5f9; color: var(--text); border: 1px solid var(--border); }
+        .btn-secondary:hover { background: #e2e8f0; }
+        .btn-danger { background: var(--danger); color: white; }
+
+        .preview-card {
+            background: #f8fafc;
+            border-radius: 16px;
+            padding: 15px;
+            margin-top: 20px;
+            border: 1px dashed var(--border);
+        }
+
+        .preview-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            font-size: 0.85rem;
+        }
+
+        .preview-label { color: var(--text-muted); }
+        .preview-value { color: var(--text); font-weight: 600; text-align: right; }
+
+        .positions-frame {
+            width: 100%;
+            height: 1000px;
+            border: none;
+            border-radius: 16px;
+            background: #ffffff;
+        }
+
+        #auth-overlay {
+            position: fixed;
+            inset: 0;
+            background: var(--bg);
+            z-index: 2000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .hidden { display: none !important; }
+
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            padding: 16px 24px;
+            border-radius: 12px;
+            background: var(--success);
+            color: white;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            transform: translateY(100px);
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            z-index: 3000;
+        }
+
+        .toast.show { transform: translateY(0); }
+
+        .last-update { font-size: 0.75rem; color: var(--text-muted); margin-top: 10px; text-align: center; }
+
+        .confirm-dialog {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: var(--bg);
+            padding: 30px;
+            border-radius: 24px;
+            border: 1px solid var(--accent);
+            z-index: 4000;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 0 50px rgba(0,0,0,0.8);
+        }
+    </style>
+</head>
+<body>
+    <form id="auth-overlay" onsubmit="event.preventDefault(); verifyPin();">
+        <h2 style="color: var(--text);">Enter Dashboard PIN</h2>
+        <input type="password" id="pin-field" name="dashboard-pin" aria-label="4-digit dashboard PIN" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" autocapitalize="off" spellcheck="false" style="width: 200px; text-align: center; font-size: 2rem; letter-spacing: 0.5em;" maxlength="4">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Use the 4-digit dashboard PIN, not your iPhone passcode.</div>
+        <div id="pin-error" role="alert" style="min-height: 20px; color: var(--danger); font-weight: 600;"></div>
+        <button id="pin-submit" class="btn" type="submit" style="width: 200px;">Unlock</button>
+    </form>
+
+    <div id="confirm-overlay" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 3500;">
+        <div class="confirm-dialog">
+            <h2 style="color: var(--warning);">⚠️ Confirm Execution</h2>
+            <div id="confirm-details" class="preview-card" style="margin-bottom: 20px; border-style: solid;"></div>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-secondary" onclick="closeConfirm()">Cancel</button>
+                <button class="btn btn-danger" onclick="executeNow()">Execute Trade</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div id="server-status-warning" class="hidden" style="background: var(--danger); color: white; padding: 10px; border-radius: 12px; margin-bottom: 15px; text-align: center; font-weight: 600;"></div>
+        <div id="manual-order-status" class="manual-order-status hidden">
+            <strong>Manual Order Status</strong>
+            <div id="manual-order-status-body"></div>
+        </div>
+
+        <header>
+            <div class="logo">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                    <path d="M16 4L4 10L16 16L28 10L16 4Z" fill="url(#grad)" />
+                    <path d="M4 22L16 28L28 22M4 16L16 22L28 16" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                    <defs>
+                        <linearGradient id="grad" x1="4" y1="4" x2="28" y2="16" gradientUnits="userSpaceOnUse">
+                            <stop stop-color="#38bdf8" />
+                            <stop offset="1" stop-color="#10b981" />
+                        </linearGradient>
+                    </defs>
+                </svg>
+                Antigravity <span>Trader</span>
+            </div>
+            <div class="header-info">
+                <div id="server-status" class="status-badge status-open">
+                    <div style="width:8px; height:8px; border-radius:50%; background:currentColor;"></div>
+                    Server: Connected
+                </div>
+                <div id="account-info" style="font-size: 0.85rem; color: var(--text-muted); background: var(--accent-glow); padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border);">Account: --</div>
+                <div id="target-exp" style="font-size: 0.85rem; color: var(--text-muted);">Exp: --</div>
+                <div id="market-status" class="status-badge">Loading...</div>
+                <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem;" onclick="clearPin()" title="Lock Dashboard">🔒</button>
+                <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem; background: var(--accent-glow); border-color: rgba(2, 132, 199, 0.2);" onclick="window.location.href='/logout'" title="Logout Session">🚪 Logout</button>
+            </div>
+        </header>
+
+        <nav class="mobile-nav" aria-label="Dashboard sections">
+            <a href="#portfolio">Portfolio</a>
+            <a href="#actions">Actions</a>
+            <a href="#analytics">Analytics</a>
+            <a href="#settings">Settings</a>
+        </nav>
+
+        <div class="grid">
+            <div id="settings" class="card">
+                <h2>Settings</h2>
+                <div id="settings-form">
+                    <div class="form-group">
+                        <label>Target Delta <span id="delta-val">0.13</span></label>
+                        <input type="range" id="target_delta" step="0.01" min="0.01" max="0.50" value="0.13" oninput="updateRangeLabel('target_delta', 'delta-val'); debouncedPreview();">
+                    </div>
+                    <div class="form-group">
+                        <label>SPY Spread Width ($)</label>
+                        <input type="number" id="spy_hedge_spread" step="1" onchange="debouncedPreview()">
+                    </div>
+                    <div class="form-group">
+                        <label>SPX Spread Width ($)</label>
+                        <input type="number" id="spx_hedge_spread" step="1" onchange="debouncedPreview()">
+                    </div>
+                    <div class="form-group">
+                        <label>SPY Pair Quantity</label>
+                        <input type="number" id="spy_pair_quantity" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>SPX Pair Quantity</label>
+                        <input type="number" id="spx_pair_quantity" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>Trading Side</label>
+                        <select id="trade_side" onchange="debouncedPreview()">
+                            <option value="PUT">Put Credit Spread</option>
+                            <option value="CALL">Call Credit Spread</option>
+                            <option value="BOTH">Iron Condor (Both)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Target Weeks <span id="weeks-val">6</span></label>
+                        <input type="range" id="target_weeks" step="1" min="1" max="12" value="6" oninput="updateRangeLabel('target_weeks', 'weeks-val'); debouncedPreview();">
+                    </div>
+                    <div class="form-group">
+                        <label>SPY Target Expiration</label>
+                        <select id="spy_target_expiration" onchange="debouncedPreview()"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>SPX Target Expiration</label>
+                        <select id="spx_target_expiration" onchange="debouncedPreview()"></select>
+                    </div>
+
+                    <div class="form-group" style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.03); padding: 12px; border-radius: 12px;">
+                        <label style="margin: 0;">Automatic Open Position</label>
+                        <label class="switch">
+                            <input type="checkbox" id="auto_open_enabled">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Auto-Close Threshold (Cost $)</label>
+                        <input type="number" id="auto_close_midpoint_threshold" step="0.05">
+                    </div>
+                    <div class="form-group">
+                        <label>Auto-Close Threshold (Gain %)</label>
+                        <input type="number" id="auto_close_gain_threshold" step="5">
+                    </div>
+
+                    <div class="form-group" style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 20px;">
+                        <h3 style="font-size: 0.85rem; margin-bottom: 10px; color: var(--accent);">Dashboard Remote Access (Basic Auth)</h3>
+                        <label>Dashboard Username</label>
+                        <input type="text" id="dashboard_user" placeholder="e.g. admin">
+                        <label style="margin-top: 10px;">Dashboard Password</label>
+                        <input type="password" id="dashboard_pass" placeholder="Enter secure password">
+                        <p style="font-size: 0.7rem; color: var(--text-muted); margin-top: 5px;">Required for external access (ngrok). Leave either empty to disable.</p>
+                    </div>
+
+                    <div class="preview-card" style="margin-top: 15px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div id="spy-preview-title" style="font-size: 0.75rem; color: var(--accent); font-weight: 600; text-transform: uppercase;">SPY LIVE PREVIEW</div>
+                            <div id="spy-mock-badge" class="hidden" style="font-size: 0.65rem; background: var(--warning); color: var(--bg); padding: 2px 6px; border-radius: 4px; font-weight: 800;">TEST DATA</div>
+                        </div>
+                        <div class="preview-grid" style="margin-bottom: 10px;">
+                            <div class="preview-label">Strikes:</div><div class="preview-value" id="spy-pre-strikes">-- / --</div>
+                            <div class="preview-label">Expiration:</div><div class="preview-value" id="spy-pre-expiry">--</div>
+                            <div class="preview-label">Net Credit:</div><div class="preview-value" id="spy-pre-credit">--</div>
+                            <div class="preview-label">Delta:</div><div class="preview-value" id="spy-pre-delta">--</div>
+                            <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spy-pre-otm">--</div>
+                        </div>
+                        <button id="spy-exec-btn" class="btn btn-secondary" style="margin-top: 5px; font-size: 0.85rem; padding: 8px 12px; background: var(--accent); color: white;" onclick="openConfirmForTicker('SPY')">🚀 Execute SPY Spread</button>
+                    </div>
+
+                    <div class="preview-card" style="margin-top: 15px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div id="spx-preview-title" style="font-size: 0.75rem; color: var(--accent); font-weight: 600; text-transform: uppercase;">SPX LIVE PREVIEW</div>
+                            <div id="spx-mock-badge" class="hidden" style="font-size: 0.65rem; background: var(--warning); color: var(--bg); padding: 2px 6px; border-radius: 4px; font-weight: 800;">TEST DATA</div>
+                        </div>
+                        <div class="preview-grid" style="margin-bottom: 10px;">
+                            <div class="preview-label">Strikes:</div><div class="preview-value" id="spx-pre-strikes">-- / --</div>
+                            <div class="preview-label">Expiration:</div><div class="preview-value" id="spx-pre-expiry">--</div>
+                            <div class="preview-label">Net Credit:</div><div class="preview-value" id="spx-pre-credit">--</div>
+                            <div class="preview-label">Delta:</div><div class="preview-value" id="spx-pre-delta">--</div>
+                            <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spx-pre-otm">--</div>
+                        </div>
+                        <button id="spx-exec-btn" class="btn btn-secondary" style="margin-top: 5px; font-size: 0.85rem; padding: 8px 12px; background: var(--accent); color: white;" onclick="openConfirmForTicker('SPX')">🚀 Execute SPX Spread</button>
+                    </div>
+
+                    <button class="btn btn-secondary" style="margin-top: 15px;" onclick="saveSettings()">Save Configuration</button>
+                    <div class="last-update" id="last-save">Settings loaded</div>
+                </div>
+            </div>
+
+            <div class="right-column" style="display: flex; flex-direction: column; gap: 20px;">
+                <div id="actions" class="mobile-section-heading">Actions</div>
+                <div id="high-gain-card" class="card hidden">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 style="color: var(--success); margin: 0;">🎯 High Gain Spreads to Close</h2>
+                        <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshHighGain()">Force Update</button>
+                    </div>
+                    <div id="high-gain-list" style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                            <thead>
+                                <tr style="text-align: left; color: var(--text-muted); border-bottom: 1px solid var(--border);">
+                                    <th style="padding: 10px;">Symbol</th>
+                                    <th style="padding: 10px;">Exp</th>
+                                    <th style="padding: 10px;">Strikes</th>
+                                    <th style="padding: 10px;">Gain</th>
+                                    <th style="padding: 10px;">Cost (Mid)</th>
+                                    <th style="padding: 10px;">QTY</th>
+                                    <th style="padding: 10px;">Status</th>
+                                    <th style="padding: 10px;">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="high-gain-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="neutralize-card" class="card hidden">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 style="color: var(--warning); margin: 0;">Neutralize Assignment Risk</h2>
+                        <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshNeutralize()">Force Update</button>
+                    </div>
+                    <div id="neutralize-list" style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                            <thead>
+                                <tr style="text-align: left; color: var(--text-muted); border-bottom: 1px solid var(--border);">
+                                    <th style="padding: 10px;">Symbol</th>
+                                    <th style="padding: 10px;">Original</th>
+                                    <th style="padding: 10px;">Risk</th>
+                                    <th style="padding: 10px;">Close</th>
+                                    <th style="padding: 10px;">Roll To Target</th>
+                                    <th style="padding: 10px;">Offset Spread</th>
+                                    <th style="padding: 10px;">Target Exp</th>
+                                    <th style="padding: 10px;">Net</th>
+                                    <th style="padding: 10px;">QTY</th>
+                                    <th style="padding: 10px;">Status</th>
+                                    <th style="padding: 10px;">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="neutralize-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="analytics" class="mobile-section-heading">Analytics</div>
+                <div id="gex-card" class="card" style="margin-bottom: 0px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 style="color: var(--accent); margin: 0;">📊 SPY Gamma Exposure (GEX) Profile</h2>
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <span id="gex-badge" style="font-size: 0.7rem; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: uppercase;">LOADING GEX</span>
+                            <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="fetchGexData()">Refresh GEX</button>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Total Net GEX</div>
+                            <div id="total-net-gex" style="font-size: 1.25rem; font-weight: 600; color: var(--accent);">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Zero Gamma Level (Flip)</div>
+                            <div id="zero-gamma-level" style="font-size: 1.25rem; font-weight: 600; color: var(--warning);">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">SPY Spot Price</div>
+                            <div id="spy-spot-price" style="font-size: 1.25rem; font-weight: 600; color: var(--text);">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Call Wall / Put Wall</div>
+                            <div id="gex-walls" style="font-size: 1.1rem; font-weight: 600; color: var(--success); line-height: 1.2;">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Legacy Regime (action context)</div>
+                            <div id="hmm-regime" style="font-size: 1.1rem; font-weight: 600; color: var(--text); line-height: 1.2;">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Raw HMM State</div>
+                            <div id="hmm-raw-state" style="font-size: 1.1rem; font-weight: 600; color: var(--text); line-height: 1.2;">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">HMM Confidence</div>
+                            <div id="hmm-confidence" style="font-size: 1.1rem; font-weight: 600; color: var(--accent); line-height: 1.2;">--</div>
+                        </div>
+                        <div style="background: rgba(0, 0, 0, 0.02); padding: 12px; border-radius: 12px; border: 1px solid var(--border);">
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Regime Signal Date</div>
+                            <div id="hmm-signal-date" style="font-size: 1.1rem; font-weight: 600; color: var(--text); line-height: 1.2;">--</div>
+                        </div>
+                    </div>
+
+                    <div id="regime-v2-shadow-card" style="background: rgba(99, 102, 241, 0.06); padding: 14px; border-radius: 12px; border: 1px solid rgba(99, 102, 241, 0.25); margin-bottom: 20px;">
+                        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px;">
+                            <div>
+                                <div style="font-size: 0.9rem; font-weight: 700; color: var(--accent);">Regime V2 Shadow — Advisory Only</div>
+                                <div style="font-size: 0.72rem; color: var(--text-muted);">Persistent market backdrop and short-lived volatility shock are reported separately.</div>
+                            </div>
+                            <div id="regime-v2-execution-lock" style="font-size: 0.68rem; padding: 4px 8px; border-radius: 6px; font-weight: 700; color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.35);">CANNOT AUTHORIZE EXECUTION</div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px;">
+                            <div>
+                                <div style="font-size: 0.72rem; color: var(--text-muted);">Background state</div>
+                                <div id="regime-v2-background" style="font-size: 1.05rem; font-weight: 650; color: var(--text);">Unavailable</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 0.72rem; color: var(--text-muted);">Shock state</div>
+                                <div id="regime-v2-shock" style="font-size: 1.05rem; font-weight: 650; color: var(--text);">Unavailable</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 0.72rem; color: var(--text-muted);">Effective NYSE session</div>
+                                <div id="regime-v2-effective-session" style="font-size: 1.05rem; font-weight: 650; color: var(--text);">--</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 0.72rem; color: var(--text-muted);">Shadow status</div>
+                                <div id="regime-v2-status" style="font-size: 1.05rem; font-weight: 650; color: var(--text-muted);">Unavailable</div>
+                            </div>
+                        </div>
+                        <div id="regime-v2-reasons" style="font-size: 0.72rem; color: var(--text-muted); margin-top: 10px;">Waiting for a verified shadow snapshot.</div>
+                    </div>
+
+                    <div style="position: relative; height: 320px; width: 100%; padding: 5px;">
+                        <canvas id="gexChart"></canvas>
+                    </div>
+
+                    <div class="last-update" id="gex-last-update">Loading GEX profile...</div>
+                </div>
+
+                <div id="portfolio" class="card" style="padding: 0; display: flex; flex-direction: column;">
+                    <div class="portfolio-header" style="padding: 25px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border);">
+                        <h2>Active Portfolio</h2>
+                        <div class="portfolio-tools" style="display: flex; gap: 10px;">
+                            <span id="portfolio-status" style="font-size: 0.75rem; color: var(--accent);"></span>
+                            <form action="/refresh" method="post" target="refresh-fallback-frame"
+                                  onsubmit="if (typeof triggerRefresh === 'function') { triggerRefresh(); return false; }"
+                                  style="margin: 0;">
+                                <button type="submit" class="btn btn-secondary" style="width: auto; margin: 0; padding: 8px 16px;">Refresh Data</button>
+                            </form>
+                            <iframe name="refresh-fallback-frame" title="Refresh request status" hidden></iframe>
+                        </div>
+                    </div>
+                    <div id="iframe-container" style="position: relative;">
+                        <div id="iframe-loader" class="hidden" style="position: absolute; inset: 0; background: var(--bg); display: flex; justify-content: center; align-items: center; z-index: 10;">
+                            <span>Loading Portfolio...</span>
+                        </div>
+                        <iframe id="positions-frame" class="positions-frame" src="/api/positions" title="Active portfolio"></iframe>
+                    </div>
+                    <div class="last-update" id="last-update" style="padding: 10px;">Updates every 5 min</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast">Settings Saved</div>
+
+    <script>
+        let currentPin = '';
+        let previewTimer = null;
+        let lastPreviewData = null;
+        let currentNeutralizeData = [];
+        let pendingNeutralizeData = null;
+        let settingsInitialized = false;
+        let portfolioFrameResizeObserver = null;
+        let portfolioFrameResizeTimer = null;
+        const portfolioMobileQuery = window.matchMedia('(max-width: 768px)');
+
+        function disconnectPortfolioFrameObserver() {
+            if (portfolioFrameResizeObserver) {
+                portfolioFrameResizeObserver.disconnect();
+                portfolioFrameResizeObserver = null;
+            }
+            if (portfolioFrameResizeTimer) {
+                clearTimeout(portfolioFrameResizeTimer);
+                portfolioFrameResizeTimer = null;
+            }
+        }
+
+        function syncPortfolioFrameHeight() {
+            const frame = document.getElementById('positions-frame');
+            if (!frame) return;
+
+            disconnectPortfolioFrameObserver();
+            if (!portfolioMobileQuery.matches) {
+                frame.style.removeProperty('height');
+                return;
+            }
+
+            try {
+                const frameDocument = frame.contentDocument || frame.contentWindow.document;
+                const measure = () => {
+                    if (!portfolioMobileQuery.matches || !frameDocument.body) return;
+                    const height = Math.max(
+                        320,
+                        frameDocument.body.scrollHeight,
+                        frameDocument.body.offsetHeight,
+                        frameDocument.documentElement.scrollHeight,
+                        frameDocument.documentElement.offsetHeight
+                    );
+                    frame.style.height = `${Math.ceil(height)}px`;
+                };
+
+                measure();
+                portfolioFrameResizeObserver = new ResizeObserver(() => window.requestAnimationFrame(measure));
+                portfolioFrameResizeObserver.observe(frameDocument.documentElement);
+                if (frameDocument.body) portfolioFrameResizeObserver.observe(frameDocument.body);
+                portfolioFrameResizeTimer = setTimeout(measure, 500);
+            } catch (error) {
+                console.warn('Portfolio auto-height requires same-origin /api/positions content.', error);
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            const portfolioFrame = document.getElementById('positions-frame');
+            portfolioFrame.addEventListener('load', syncPortfolioFrameHeight);
+            syncPortfolioFrameHeight();
+            if (portfolioMobileQuery.addEventListener) {
+                portfolioMobileQuery.addEventListener('change', syncPortfolioFrameHeight);
+            } else {
+                portfolioMobileQuery.addListener(syncPortfolioFrameHeight);
+            }
+
+            localStorage.removeItem('dashboard_pin');
+            const savedPin = sessionStorage.getItem('dashboard_pin');
+            if (savedPin) {
+                document.getElementById('pin-field').value = savedPin;
+                verifyPin();
+            }
+        });
+
+        async function verifyPin() {
+            const pinField = document.getElementById('pin-field');
+            const pinError = document.getElementById('pin-error');
+            const pinSubmit = document.getElementById('pin-submit');
+            const pin = pinField.value;
+            pinError.textContent = '';
+
+            if (!pin) {
+                pinError.textContent = 'Enter the dashboard PIN.';
+                pinField.focus();
+                return false;
+            }
+            if (pin.length !== 4) {
+                pinError.textContent = 'Enter all 4 digits of the dashboard PIN.';
+                pinField.focus();
+                return false;
+            }
+
+            pinSubmit.disabled = true;
+            pinSubmit.textContent = 'Checking…';
+            try {
+                const response = await fetch('/api/verify_pin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pin })
+                });
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return false;
+                }
+                if (!response.ok) {
+                    currentPin = '';
+                    window.currentDashboardPin = '';
+                    sessionStorage.removeItem('dashboard_pin');
+                    pinError.textContent = 'Incorrect dashboard PIN. This is not your iPhone passcode.';
+                    pinField.focus();
+                    pinField.select();
+                    return false;
+                }
+
+                currentPin = pin;
+                window.currentDashboardPin = pin;
+                sessionStorage.setItem('dashboard_pin', pin);
+                document.getElementById('auth-overlay').classList.add('hidden');
+                loadData();
+                return true;
+            } catch (error) {
+                pinError.textContent = 'Unable to verify PIN. Check the connection and retry.';
+                pinField.focus();
+                return false;
+            } finally {
+                pinSubmit.disabled = false;
+                pinSubmit.textContent = 'Unlock';
+            }
+        }
+
+        function clearPin() {
+            localStorage.removeItem('dashboard_pin');
+            sessionStorage.removeItem('dashboard_pin');
+            currentPin = '';
+            window.currentDashboardPin = '';
+            document.getElementById('pin-field').value = '';
+            document.getElementById('pin-error').textContent = '';
+            document.getElementById('auth-overlay').classList.remove('hidden');
+        }
+
+        async function fetchHighGainSpreads() {
+            try {
+                const res = await fetch('/api/high_gain_spreads');
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    const body = document.getElementById('high-gain-body');
+                    const card = document.getElementById('high-gain-card');
+
+                    if (data.length > 0) {
+                        card.classList.remove('hidden');
+                        body.innerHTML = '';
+                        data.forEach((p, i) => {
+                            const row = document.createElement('tr');
+                            row.style.borderBottom = '1px solid var(--border)';
+
+                            let actionCell = '';
+                            const statusCell = p.has_open_order
+                                ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
+                                : `<span style="color: var(--success); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(16, 185, 129, 0.1); border-radius: 6px;">Ready</span>`;
+                            if (p.has_open_order) {
+                                actionCell = `<span style="color: var(--warning); font-weight: 600; font-size: 0.85rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order Pending</span>`;
+                            } else {
+                                actionCell = `<button class="btn" style="width: auto; padding: 6px 16px; margin: 0; background: var(--success);" onclick="confirmClose(${i}, ${JSON.stringify(p).replace(/"/g, '&quot;')})">Close</button>`;
+                            }
+
+                            row.innerHTML = `
+                                <td style="padding: 10px; font-weight: 600;">${p.ticker}</td>
+                                <td style="padding: 10px;">${p.expiration}</td>
+                                <td style="padding: 10px;">${p.short_strike}/${p.long_strike} (${p.call_put})</td>
+                                <td style="padding: 10px; color: var(--success); font-weight: 600;">${p.gain_pct.toFixed(1)}%</td>
+                                <td style="padding: 10px;">$${Math.abs(p.midpoint).toFixed(2)}</td>
+                                <td style="padding: 10px;">
+                                    <input type="number" id="qty-${i}" value="${p.pair_quantity}" style="width: 60px; padding: 4px 8px; border-radius: 6px;" min="1" max="${p.pair_quantity}" ${p.has_open_order ? 'disabled' : ''}>
+                                </td>
+                                <td style="padding: 10px;">${statusCell}</td>
+                                <td style="padding: 10px;">
+                                    ${actionCell}
+                                </td>
+                            `;
+                            body.appendChild(row);
+                        });
+                    } else {
+                        card.classList.add('hidden');
+                    }
+                }
+            } catch (err) { console.error("Failed to fetch high gain spreads", err); }
+        }
+
+        function renderNeutralizeRisk() {
+            const body = document.getElementById('neutralize-body');
+            const card = document.getElementById('neutralize-card');
+            body.innerHTML = '';
+
+            if (currentNeutralizeData.length > 0) {
+                card.classList.remove('hidden');
+                currentNeutralizeData.forEach((p, i) => {
+                    const row = document.createElement('tr');
+                    row.style.borderBottom = '1px solid var(--border)';
+
+                    let actionCell = '';
+                    const statusCell = p.has_open_order
+                        ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
+                        : `<span style="color: var(--success); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(16, 185, 129, 0.1); border-radius: 6px;">Ready</span>`;
+                    if (p.has_open_order) {
+                        actionCell = `<span style="color: var(--warning); font-weight: 600; font-size: 0.85rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order Pending</span>`;
+                    } else {
+                        actionCell = `<button class="btn" style="width: auto; padding: 6px 16px; margin: 0; background: var(--warning); color: #111827;" onclick="confirmNeutralize(${i}, ${JSON.stringify(p).replace(/"/g, '&quot;')})">Neutralize</button>`;
+                    }
+
+                    let triggerHtml = '';
+                    if (p.trigger) {
+                        const triggers = p.trigger.split(' & ');
+                        triggerHtml = '<div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;">' +
+                            triggers.map(t => {
+                                let bg = 'rgba(239, 68, 68, 0.1)';
+                                let color = '#ef4444';
+                                let border = '1px solid rgba(239, 68, 68, 0.2)';
+                                if (t.includes('Orphan')) {
+                                    bg = 'rgba(139, 92, 246, 0.1)';
+                                    color = '#8b5cf6';
+                                    border = '1px solid rgba(139, 92, 246, 0.2)';
+                                }
+                                return `<span style="padding: 2px 6px; font-size: 0.65rem; font-weight: 600; background: ${bg}; color: ${color}; border: ${border}; border-radius: 4px; text-transform: uppercase; display: inline-block;">${t}</span>`;
+                            }).join('') + '</div>';
+                    }
+
+                    const offset = p.offset || null;
+                    const offsetCell = offset
+                        ? `${offset.call_put} ${offset.short_strike}/${offset.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${offset.expiration}<br>Credit $${Number(offset.credit).toFixed(2)} / Target $${Number(offset.target_credit || offset.target_delta || 0).toFixed(3)}</span>`
+                        : `<span style="color: var(--text-muted);">No call leg</span>`;
+                    const targetCell = offset
+                        ? `${p.replacement.expiration}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Offset ${offset.expiration}</span>`
+                        : `${p.replacement.expiration}<br><span style="color: var(--text-muted); font-size: 0.75rem;">No offset</span>`;
+
+                    row.innerHTML = `
+                        <td style="padding: 10px; font-weight: 600;">${p.ticker}</td>
+                        <td style="padding: 10px;">${p.original.call_put} ${p.original.short_strike}/${p.original.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${p.original.expiration}</span>${triggerHtml}</td>
+                        <td style="padding: 10px;">Δ ${Number(p.original.delta).toFixed(3)}<br><span style="color: var(--text-muted); font-size: 0.75rem;">${p.original.dte} DTE</span></td>
+                        <td style="padding: 10px;">$${Math.abs(Number(p.original.midpoint_debit)).toFixed(2)}</td>
+                        <td style="padding: 10px;">${p.replacement.call_put} ${p.replacement.short_strike}/${p.replacement.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${p.replacement.expiration}<br>Credit $${Number(p.replacement.credit).toFixed(2)}</span></td>
+                        <td style="padding: 10px;">${offsetCell}</td>
+                        <td style="padding: 10px;">${targetCell}</td>
+                        <td style="padding: 10px; color: ${Number(p.estimated_net_credit) >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 600;">$${Number(p.estimated_net_credit).toFixed(2)}</td>
+                        <td style="padding: 10px;">${p.qty}</td>
+                        <td style="padding: 10px;">${statusCell}</td>
+                        <td style="padding: 10px;">${actionCell}</td>
+                    `;
+                    body.appendChild(row);
+                });
+            } else {
+                card.classList.add('hidden');
+            }
+        }
+
+        async function fetchNeutralizeRisk() {
+            try {
+                const res = await fetch('/api/neutralize_risk');
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    currentNeutralizeData = await res.json();
+                    renderNeutralizeRisk();
+                }
+            } catch (err) {
+                console.error("Failed to fetch neutralize risk", err);
+            }
+        }
+
+        async function forceRefreshNeutralize() {
+            showToast("Force checking neutralize candidates... (Takes ~10s)");
+            try {
+                const res = await fetch('/refresh', { method: 'POST' });
+                if (res.ok) {
+                    setTimeout(() => {
+                        fetchNeutralizeRisk();
+                        showToast("Neutralize candidates updated");
+                    }, 8000);
+                } else {
+                    showToast("Failed to trigger update", true);
+                }
+            } catch (err) {
+                showToast("Error triggering update", true);
+            }
+        }
+
+        function confirmNeutralize(index, data) {
+            pendingNeutralizeData = { ...data, idx: index };
+            const offsetText = data.offset
+                ? `${data.offset.call_put} ${data.offset.short_strike}/${data.offset.long_strike} | Exp ${data.offset.expiration}`
+                : 'No call leg';
+
+            const details = `
+                    <div class="preview-grid">
+                        <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
+                        <div class="preview-label">Original:</div><div class="preview-value">${data.original.call_put} ${data.original.short_strike}/${data.original.long_strike}</div>
+                        <div class="preview-label">Trigger:</div><div class="preview-value">${data.trigger || 'Delta risk'} | Δ ${Number(data.original.delta).toFixed(3)} | ${data.original.dte} DTE</div>
+                        <div class="preview-label">Close:</div><div class="preview-value">$${Math.abs(Number(data.original.midpoint_debit)).toFixed(2)} debit</div>
+                        <div class="preview-label">Roll To:</div><div class="preview-value">${data.replacement.call_put} ${data.replacement.short_strike}/${data.replacement.long_strike} | Exp ${data.replacement.expiration}</div>
+                        <div class="preview-label">Offset:</div><div class="preview-value">${offsetText}</div>
+                        <div class="preview-label">Estimated Net:</div><div class="preview-value">${Number(data.estimated_net_credit) >= 0 ? '+' : ''}$${Number(data.estimated_net_credit).toFixed(2)}</div>
+                        <div class="preview-label">Quantity:</div><div class="preview-value">${data.qty}</div>
+                    </div>
+            `;
+            document.getElementById('confirm-details').innerHTML = details;
+
+            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
+            execBtn.innerText = "Execute Neutralize";
+            execBtn.onclick = executeNeutralize;
+
+            document.getElementById('confirm-overlay').classList.remove('hidden');
+        }
+
+        async function executeNeutralize() {
+            if (!pendingNeutralizeData) return;
+            closeConfirm();
+            showToast("Sending Neutralize Order...");
+
+            try {
+                const res = await fetch('/api/execute_neutralize_order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pin: currentPin,
+                        proposal_id: pendingNeutralizeData.proposal_id,
+                        ticker: pendingNeutralizeData.ticker,
+                        qty: pendingNeutralizeData.qty,
+                        original: pendingNeutralizeData.original,
+                        replacement: pendingNeutralizeData.replacement,
+                        offset: pendingNeutralizeData.offset
+                    })
+                });
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast("Neutralize Order Queued");
+                    if (data.request_id) pollManualOrderStatus(data.request_id);
+                    setTimeout(fetchNeutralizeRisk, 15000);
+                } else {
+                    if (res.status === 403) clearPin();
+                    alert("Failed to execute neutralize order.");
+                }
+            } catch (err) { alert("Error: " + err); }
+        }
+
+        async function forceRefreshHighGain() {
+            showToast("Force checking candidates... (Takes ~10s)");
+            try {
+                const res = await fetch('/refresh', { method: 'POST' });
+                if (res.ok) {
+                    showToast("Scanning market... Please wait.");
+                    // The backend takes ~5-10s to fetch portfolio and screen options
+                    setTimeout(() => {
+                        fetchHighGainSpreads();
+                        showToast("Candidates Updated");
+                    }, 8000);
+                } else {
+                    showToast("Failed to trigger update", true);
+                }
+            } catch (err) {
+                showToast("Error triggering update", true);
+            }
+        }
+
+        let pendingCloseData = null;
+        function confirmClose(index, data) {
+            const qty = document.getElementById(`qty-${index}`).value;
+            pendingCloseData = { ...data, qty: parseInt(qty) };
+
+            const details = `
+                <div class="preview-grid">
+                    <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
+                    <div class="preview-label">Expiration:</div><div class="preview-value">${data.expiration}</div>
+                    <div class="preview-label">Strikes:</div><div class="preview-value">${data.short_strike} / ${data.long_strike}</div>
+                    <div class="preview-label">Current Gain:</div><div class="preview-value" style="color: var(--success);">${data.gain_pct.toFixed(1)}%</div>
+                    <div class="preview-label">Qty to Close:</div><div class="preview-value">${qty} Pairs</div>
+                    <div class="preview-label">Est. Debit:</div><div class="preview-value">$${(Math.abs(data.midpoint) * qty).toFixed(2)}</div>
+                </div>
+            `;
+            document.getElementById('confirm-details').innerHTML = details;
+
+            // Change button text/action for this specific confirm
+            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
+            execBtn.innerText = "Execute Close";
+            execBtn.onclick = executeClose;
+
+            document.getElementById('confirm-overlay').classList.remove('hidden');
+        }
+
+        async function executeClose() {
+            if (!pendingCloseData) return;
+            closeConfirm();
+            showToast("Sending Close Order...");
+
+            try {
+                const res = await fetch('/api/execute_close_order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pin: currentPin,
+                        ...pendingCloseData,
+                        midpoint: pendingCloseData.midpoint // Ensure it's explicitly included
+                    })
+                });
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast("Close Order Queued");
+                    if (data.request_id) pollManualOrderStatus(data.request_id);
+                    setTimeout(fetchHighGainSpreads, 15000);
+                } else {
+                    if (res.status === 403) clearPin();
+                    alert("Failed to execute close order.");
+                }
+            } catch (err) { alert("Error: " + err); }
+        }
+
+        function updateRangeLabel(id, labelId) {
+            document.getElementById(labelId).innerText = document.getElementById(id).value;
+        }
+
+        function expirationTypeLabel(expiration, listedExpirations = []) {
+            const parts = String(expiration).split('-').map(Number);
+            if (parts.length !== 3 || parts.some(Number.isNaN)) return "Unknown";
+
+            const date = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+            const dayOfWeek = date.getUTCDay();
+            const dayOfMonth = date.getUTCDate();
+            const listedSet = new Set(listedExpirations);
+            const nextDay = new Date(date);
+            nextDay.setUTCDate(date.getUTCDate() + 1);
+            const nextDayKey = nextDay.toISOString().slice(0, 10);
+            if (dayOfWeek === 5 && dayOfMonth >= 15 && dayOfMonth <= 21) return "Monthly";
+            if (dayOfWeek === 4 && nextDay.getUTCDay() === 5 && nextDay.getUTCDate() >= 15 && nextDay.getUTCDate() <= 21 && !listedSet.has(nextDayKey)) return "Monthly";
+            if (dayOfWeek === 5) return "Weekly";
+            return "Daily";
+        }
+
+        function formatExpirationOption(expiration, listedExpirations = []) {
+            return `${expiration} [${expirationTypeLabel(expiration, listedExpirations)}]`;
+        }
+
+        function populateExpirationSelect(selectId, expirations, savedExpiration, allowedLabels = ["Weekly", "Monthly"]) {
+            const select = document.getElementById(selectId);
+            if (!select || select.options.length > 0 || !expirations || expirations.length === 0) return;
+
+            const visibleExpirations = expirations.filter(exp => {
+                const label = expirationTypeLabel(exp, expirations);
+                return !allowedLabels || allowedLabels.includes(label);
+            });
+            const hasSavedExpiration = visibleExpirations.includes(savedExpiration);
+
+            const autoOpt = document.createElement('option');
+            autoOpt.value = "";
+            autoOpt.innerText = "Automatic (Use Target Weeks)";
+            if (!savedExpiration || !hasSavedExpiration) autoOpt.selected = true;
+            select.appendChild(autoOpt);
+
+            visibleExpirations.forEach(exp => {
+                const opt = document.createElement('option');
+                opt.value = exp;
+                opt.innerText = formatExpirationOption(exp, expirations);
+                if (savedExpiration && exp === savedExpiration) opt.selected = true;
+                select.appendChild(opt);
+            });
+        }
+
+        function debouncedPreview() {
+            clearTimeout(previewTimer);
+            previewTimer = setTimeout(fetchPreview, 800);
+        }
+
+        let spyPreviewData = null;
+        let spxPreviewData = null;
+
+        async function fetchPreview() {
+            const delta = document.getElementById('target_delta').value;
+            const spyWidth = document.getElementById('spy_hedge_spread').value;
+            const spxWidth = document.getElementById('spx_hedge_spread').value;
+            const weeks = document.getElementById('target_weeks').value;
+            const spyExpiry = document.getElementById('spy_target_expiration').value;
+            const spxExpiry = document.getElementById('spx_target_expiration').value;
+            const side = document.getElementById('trade_side').value;
+
+            // Fetch SPY Preview
+            try {
+                const res = await fetch(`/api/preview_spread?ticker=SPY&delta=${delta}&width=${spyWidth}&weeks=${weeks}&expiration=${spyExpiry}&side=${side}`);
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    spyPreviewData = data;
+                    document.getElementById('spy-pre-strikes').innerText = `${data.sell_strike} / ${data.buy_strike}`;
+                    document.getElementById('spy-pre-expiry').innerText = data.expiration || "N/A";
+                    document.getElementById('spy-pre-credit').innerText = data.premium != null ? `$${data.premium.toFixed(2)}` : "--";
+                    document.getElementById('spy-pre-delta').innerText = data.delta != null ? data.delta.toFixed(3) : "--";
+                    document.getElementById('spy-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
+
+                    document.getElementById('spy-preview-title').innerText = `SPY LIVE PREVIEW (${side} SPREAD)`;
+                    document.getElementById('spy-exec-btn').disabled = false;
+
+                    if (data.is_mock) {
+                        document.getElementById('spy-mock-badge').classList.remove('hidden');
+                    } else {
+                        document.getElementById('spy-mock-badge').classList.add('hidden');
+                    }
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    spyPreviewData = null;
+                    document.getElementById('spy-pre-strikes').innerText = err.error || "Live data unavailable";
+                    document.getElementById('spy-pre-expiry').innerText = "--";
+                    document.getElementById('spy-pre-credit').innerText = "--";
+                    document.getElementById('spy-pre-delta').innerText = "--";
+                    document.getElementById('spy-pre-otm').innerText = "--";
+                    document.getElementById('spy-exec-btn').disabled = true;
+                    document.getElementById('spy-mock-badge').classList.add('hidden');
+                }
+            } catch (err) {
+                console.error("SPY Preview Error:", err);
+            }
+
+            // Fetch SPX Preview
+            try {
+                const res = await fetch(`/api/preview_spread?ticker=SPX&delta=${delta}&width=${spxWidth}&weeks=${weeks}&expiration=${spxExpiry}&side=${side}`);
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    spxPreviewData = data;
+                    document.getElementById('spx-pre-strikes').innerText = `${data.sell_strike} / ${data.buy_strike}`;
+                    document.getElementById('spx-pre-expiry').innerText = data.expiration || "N/A";
+                    document.getElementById('spx-pre-credit').innerText = data.premium != null ? `$${data.premium.toFixed(2)}` : "--";
+                    document.getElementById('spx-pre-delta').innerText = data.delta != null ? data.delta.toFixed(3) : "--";
+                    document.getElementById('spx-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
+
+                    document.getElementById('spx-preview-title').innerText = `SPX LIVE PREVIEW (${side} SPREAD)`;
+                    document.getElementById('spx-exec-btn').disabled = false;
+
+                    if (data.is_mock) {
+                        document.getElementById('spx-mock-badge').classList.remove('hidden');
+                    } else {
+                        document.getElementById('spx-mock-badge').classList.add('hidden');
+                    }
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    spxPreviewData = null;
+                    document.getElementById('spx-pre-strikes').innerText = err.error || "Live data unavailable";
+                    document.getElementById('spx-pre-expiry').innerText = "--";
+                    document.getElementById('spx-pre-credit').innerText = "--";
+                    document.getElementById('spx-pre-delta').innerText = "--";
+                    document.getElementById('spx-pre-otm').innerText = "--";
+                    document.getElementById('spx-exec-btn').disabled = true;
+                    document.getElementById('spx-mock-badge').classList.add('hidden');
+                }
+            } catch (err) {
+                console.error("SPX Preview Error:", err);
+            }
+        }
+
+        const PORTFOLIO_REFRESH_INTERVAL_MS = 300000;
+        let lastIframeLoad = 0;
+        let lastPortfolioRefreshRequested = 0;
+        let latestMarketStatus = null;
+        function reloadPositionsFrame() {
+            const iframe = document.getElementById('positions-frame');
+            const loader = document.getElementById('iframe-loader');
+            loader.classList.remove('hidden');
+
+            return new Promise(resolve => {
+                let settled = false;
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    loader.classList.add('hidden');
+                    lastIframeLoad = Date.now();
+                    resolve();
+                };
+                const timeout = setTimeout(finish, 15000);
+                iframe.addEventListener('load', finish, { once: true });
+                iframe.src = '/api/positions?t=' + Date.now();
+            });
+        }
+
+        async function loadData(forceIframe = false) {
+            // Prevent multiple rapid calls
+            if (window.isLoadingData) return;
+            window.isLoadingData = true;
+
+            try {
+                const [settingsRes, statusRes, positionsVersionRes] = await Promise.all([
+                    fetch('/api/settings').catch(e => ({ json: () => ({}) })),
+                    fetch('/api/status').catch(e => ({ json: () => ({}) })),
+                    fetch(`/api/positions_version?t=${Date.now()}`, { cache: 'no-store' })
+                        .catch(e => ({ json: () => ({}) }))
+                ]);
+
+                if (settingsRes.status === 401 || statusRes.status === 401 || positionsVersionRes.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                const settings = await settingsRes.json();
+                const status = await statusRes.json();
+                const positionsVersion = await positionsVersionRes.json();
+                latestMarketStatus = status.market_status || null;
+                if (!lastPortfolioRefreshRequested) {
+                    const generatedAt = Number(positionsVersion.positions_version) / 1e6;
+                    lastPortfolioRefreshRequested = Number.isFinite(generatedAt) && generatedAt > 0 ? generatedAt : 0;
+                }
+
+                const serverBadge = document.getElementById('server-status');
+                if (Object.keys(status).length > 0) {
+                    serverBadge.className = 'status-badge status-open';
+                    serverBadge.innerHTML = '<div style="width:8px; height:8px; border-radius:50%; background:currentColor;"></div> Server: Connected';
+                } else {
+                    serverBadge.className = 'status-badge status-closed';
+                    serverBadge.innerHTML = '<div style="width:8px; height:8px; border-radius:50%; background:currentColor;"></div> Server: Unreachable';
+                }
+
+                if (Object.keys(settings).length === 0) {
+                    console.error("Failed to load settings");
+                    window.isLoadingData = false;
+                    return;
+                }
+
+                // Fill form only once per page load. Periodic refreshes must not overwrite in-progress edits.
+                if (!settingsInitialized) {
+                    for (let key in settings) {
+                        const el = document.getElementById(key);
+                        if (!el) continue;
+                        if (el.type === 'checkbox') el.checked = settings[key];
+                        else if (key === 'dashboard_pass') el.value = ''; // Never re-populate password
+                        else el.value = settings[key];
+                    }
+
+                    updateRangeLabel('target_delta', 'delta-val');
+                    updateRangeLabel('target_weeks', 'weeks-val');
+                    settingsInitialized = true;
+                }
+
+                // Update status
+                const badge = document.getElementById('market-status');
+                badge.className = 'status-badge ' + (status.is_open ? 'status-open' : 'status-closed');
+                badge.innerText = status.market_status || "Unknown";
+                document.getElementById('target-exp').innerText = `SPY: ${status.spy_target_expiration || status.target_expiration || "--"} | SPX: ${status.spx_target_expiration || "--"}`;
+                document.getElementById('account-info').innerText = `Account: ${status.account_id || "N/A"}`;
+                renderManualOrderStatus(status);
+
+                populateExpirationSelect(
+                    'spy_target_expiration',
+                    status.spy_available_expirations || status.available_expirations,
+                    settings.spy_target_expiration || settings.target_expiration
+                );
+                populateExpirationSelect(
+                    'spx_target_expiration',
+                    status.spx_available_expirations,
+                    settings.spx_target_expiration || settings.target_expiration
+                );
+
+                document.getElementById('last-update').innerText = positionsVersion.updated_at
+                    ? 'Portfolio generated: ' + new Date(positionsVersion.updated_at).toLocaleTimeString()
+                    : 'Portfolio generation time unavailable';
+
+                // Refresh iframe only if forced or every 5 mins
+                if (forceIframe || (Date.now() - lastIframeLoad > 300000)) {
+                    await reloadPositionsFrame();
+                }
+
+                fetchPreview();
+                fetchHighGainSpreads();
+                fetchNeutralizeRisk();
+                void fetchRegimeV2Shadow();
+                maybeFetchGexData(status);
+
+                // Clear any previous error
+                document.getElementById('server-status-warning')?.classList.add('hidden');
+            } catch (err) {
+                console.error("Failed to load data", err);
+                // Show warning if fetch fails
+                const warn = document.getElementById('server-status-warning');
+                if (warn) {
+                    warn.classList.remove('hidden');
+                    warn.innerText = "⚠️ Server Connection Lost. Check if Python script is running.";
+                }
+            } finally {
+                window.isLoadingData = false;
+                maybeAutoRefreshPortfolio(true);
+            }
+        }
+
+        async function saveSettings() {
+            const keys = ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'auto_close_midpoint_threshold', 'auto_close_gain_threshold', 'spy_pair_quantity', 'spx_pair_quantity', 'target_weeks', 'spy_target_expiration', 'spx_target_expiration', 'auto_open_enabled', 'trade_side', 'dashboard_user', 'dashboard_pass'];
+            const data = { pin: currentPin };
+            keys.forEach(key => {
+                const el = document.getElementById(key);
+                if (!el) return;
+                if (el.type === 'checkbox') data[key] = el.checked;
+                else data[key] = isNaN(el.value) || el.value === "" ? el.value : parseFloat(el.value);
+            });
+
+            try {
+                const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (res.status === 401) { window.location.href = '/login'; return; }
+
+                if (res.ok) {
+                    showToast("Configuration Saved");
+                    document.getElementById('last-save').innerText = 'Last saved: ' + new Date().toLocaleTimeString();
+                    // Clear security fields for privacy after save
+                    document.getElementById('dashboard_user').value = '';
+                    document.getElementById('dashboard_pass').value = '';
+                    fetchPreview();
+                } else {
+                    if (res.status === 403) clearPin();
+                    const err = await res.json();
+                    alert("Error: " + (err.error || "Unknown error"));
+                }
+            } catch (err) { alert("Failed to save: " + err); }
+        }
+
+        function openConfirmForTicker(ticker) {
+            const data = ticker === 'SPX' ? spxPreviewData : spyPreviewData;
+            if (!data) {
+                alert(`No spread found for ${ticker} to execute. Adjust settings.`);
+                return;
+            }
+            lastPreviewData = data;
+            const qtyInput = ticker === 'SPX' ? document.getElementById('spx_pair_quantity').value : document.getElementById('spy_pair_quantity').value;
+            const qty = qtyInput || 1;
+            const premiumDisp = data.premium != null ? `$${data.premium.toFixed(2)}` : "N/A";
+            const details = `
+                <div class="preview-grid">
+                    <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
+                    <div class="preview-label">Side:</div><div class="preview-value">${data.side} SPREAD</div>
+                    <div class="preview-label">Expiration:</div><div class="preview-value">${data.expiration}</div>
+                    <div class="preview-label">Strikes:</div><div class="preview-value">${data.sell_strike} / ${data.buy_strike}</div>
+                    <div class="preview-label">Quantity:</div><div class="preview-value">${qty} Pairs</div>
+                    <div class="preview-label">Limit Credit:</div><div class="preview-value">${premiumDisp}</div>
+                </div>
+            `;
+            document.getElementById('confirm-details').innerHTML = details;
+            document.getElementById('confirm-overlay').classList.remove('hidden');
+        }
+
+        function closeConfirm() {
+            document.getElementById('confirm-overlay').classList.add('hidden');
+            // Reset button to default
+            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
+            execBtn.innerText = "Execute Trade";
+            execBtn.onclick = executeNow;
+        }
+
+        async function executeNow() {
+            closeConfirm();
+            showToast("Sending Order...");
+            try {
+                const qtyInput = lastPreviewData.ticker === 'SPX' ? document.getElementById('spx_pair_quantity').value : document.getElementById('spy_pair_quantity').value;
+                const qty = qtyInput || 1;
+                const selectedExpiry = document.getElementById(lastPreviewData.ticker === 'SPX' ? 'spx_target_expiration' : 'spy_target_expiration').value;
+                if (selectedExpiry && lastPreviewData.expiration !== selectedExpiry) {
+                    alert(`Preview expiration ${lastPreviewData.expiration} does not match selected expiration ${selectedExpiry}. Refresh preview before executing.`);
+                    return;
+                }
+                const res = await fetch('/api/execute_manual_order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pin: currentPin,
+                        ticker: lastPreviewData.ticker,
+                        side: lastPreviewData.side,
+                        sell_strike: lastPreviewData.sell_strike,
+                        buy_strike: lastPreviewData.buy_strike,
+                        expiration: lastPreviewData.expiration,
+                        qty: parseInt(qty) || 1,
+                        premium: lastPreviewData.premium, // Send price for consistency
+                        delta: lastPreviewData.delta      // Send delta for reference
+                    })
+                });
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast("Order Queued Successfully");
+                    renderManualOrderStatus({
+                        manual_order: {
+                            request_id: data.request_id,
+                            request_type: 'open',
+                            status: 'queued',
+                            ticker: lastPreviewData.ticker,
+                            side: lastPreviewData.side,
+                            message: data.message || 'Order request queued.'
+                        }
+                    });
+                    if (data.request_id) pollManualOrderStatus(data.request_id);
+                }
+                else {
+                    if (res.status === 403) clearPin();
+                    const err = await res.json().catch(() => ({}));
+                    alert("Execution failed: " + (err.error || "Check PIN."));
+                }
+            } catch (err) { alert("Execution error: " + err); }
+        }
+
+        async function pollManualOrderStatus(requestId) {
+            for (let i = 0; i < 90; i++) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                try {
+                    const res = await fetch('/api/status');
+                    if (res.status === 401) { window.location.href = '/login'; return; }
+                    if (!res.ok) continue;
+                    const status = await res.json();
+                    const requests = status.manual_orders?.requests || [];
+                    const manual = requests.find(r => r.request_id === requestId) || status.manual_order || {};
+                    if (manual.request_id !== requestId) continue;
+                    renderManualOrderStatus(status);
+
+                    if (manual.status === 'failed') {
+                        alert("Manual order failed: " + (manual.message || "Unknown error"));
+                        return;
+                    }
+                    if (manual.status === 'placed' || manual.status === 'filled') {
+                        showToast(manual.message || "Manual order submitted");
+                        return;
+                    }
+                } catch (err) {
+                    console.error("Manual order status poll failed", err);
+                }
+            }
+            showToast("Order status still pending. Check dashboard logs.");
+        }
+
+        function renderManualOrderStatus(statusPayload) {
+            const box = document.getElementById('manual-order-status');
+            const body = document.getElementById('manual-order-status-body');
+            if (!box || !body) return;
+
+            const todayPrefix = String(statusPayload?.server_time || new Date().toISOString()).slice(0, 10);
+            const requests = statusPayload?.manual_orders?.today
+                || (statusPayload?.manual_orders?.requests || []).filter(r => String(r.created_at || '').startsWith(todayPrefix));
+            if (!requests.length) {
+                box.classList.add('hidden');
+                return;
+            }
+
+            const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[ch]));
+            const statusClass = (statusValue) => {
+                const status = String(statusValue || 'unknown').toLowerCase();
+                if (status === 'failed' || status === 'rejected' || status === 'cancelled') return 'failed';
+                if (status === 'filled' || status === 'executed') return 'success';
+                return 'pending';
+            };
+            const statusLabel = (statusValue) => {
+                const status = String(statusValue || 'unknown').toLowerCase();
+                if (status === 'cancelled') return 'CANCELLED';
+                if (status === 'failed' || status === 'rejected') return 'FAILED';
+                if (status === 'filled' || status === 'executed') return 'EXECUTED';
+                if (status === 'placed') return 'OPEN';
+                return status.toUpperCase();
+            };
+
+            box.classList.remove('hidden', 'failed', 'success', 'pending');
+            body.innerHTML = `<div class="manual-order-list">${
+                requests.map(order => {
+                    const labelParts = [
+                        order.ticker,
+                        order.side,
+                        order.request_type ? order.request_type.toUpperCase() : null
+                    ].filter(Boolean);
+                    const label = labelParts.length ? labelParts.join(' ') : 'Manual order';
+                    const message = order.message || 'Waiting for backend update';
+                    const quantity = order.quantity != null ? `Qty ${order.quantity}` : '';
+                    const orderIds = order.order_ids?.length ? `Order ID ${order.order_ids.join(', ')}` : 'No order ID yet';
+                    const updatedAt = order.updated_at ? `Updated ${order.updated_at}` : '';
+                    return `<div class="manual-order-row ${statusClass(order.status)}">
+                        <strong>${escapeHtml(label)}: ${escapeHtml(statusLabel(order.status))}</strong>
+                        <span class="manual-order-meta">- ${escapeHtml(message)}</span>
+                        ${quantity ? `<span class="manual-order-meta">| ${escapeHtml(quantity)}</span>` : ''}
+                        <span class="manual-order-meta">| ${escapeHtml(orderIds)}</span>
+                        ${updatedAt ? `<span class="manual-order-meta">| ${escapeHtml(updatedAt)}</span>` : ''}
+                    </div>`;
+                }).join('')
+            }</div>`;
+        }
+
+        async function triggerRefresh(silent = false) {
+            if (window.isPortfolioRefreshing) return;
+            window.isPortfolioRefreshing = true;
+            lastPortfolioRefreshRequested = Date.now();
+            if (!silent) showToast("Refreshing Portfolio...");
+            const status = document.getElementById('portfolio-status');
+            status.innerText = silent ? 'Updating prices...' : 'Refreshing...';
+            try {
+                const response = await fetch('/refresh', { method: 'POST' });
+                if (!response.ok) throw new Error(`Refresh request failed (${response.status})`);
+                const refreshInfo = await response.json();
+                const previousVersion = refreshInfo.positions_version;
+                const requestedGeneration = Number(refreshInfo.refresh_generation || 0);
+                const deadline = Date.now() + 300000;
+
+                while (Date.now() < deadline) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    const versionResponse = await fetch(`/api/positions_version?t=${Date.now()}`, {
+                        cache: 'no-store'
+                    });
+                    if (!versionResponse.ok) continue;
+                    const versionInfo = await versionResponse.json();
+                    const refreshState = versionInfo.refresh || {};
+                    const completedGeneration = Number(refreshState.completed_generation || 0);
+                    const refreshCompleted = requestedGeneration
+                        ? completedGeneration >= requestedGeneration
+                        : versionInfo.positions_version && versionInfo.positions_version !== previousVersion;
+
+                    if (
+                        requestedGeneration
+                        && refreshCompleted
+                        && Number(refreshState.last_error_generation || 0) === requestedGeneration
+                    ) {
+                        throw new Error(refreshState.last_error || 'Portfolio refresh failed');
+                    }
+
+                    if (refreshCompleted && versionInfo.positions_version) {
+                        await reloadPositionsFrame();
+                        await loadData(false);
+                        const updatedAt = versionInfo.updated_at
+                            ? new Date(versionInfo.updated_at).toLocaleTimeString()
+                            : new Date().toLocaleTimeString();
+                        status.innerText = 'Updated ' + updatedAt;
+                        if (!silent) showToast("Portfolio Updated");
+                        return;
+                    }
+                }
+
+                status.innerText = 'Refresh timed out';
+                if (!silent) showToast("Portfolio refresh is still processing");
+            } catch (err) {
+                status.innerText = 'Refresh failed';
+                if (silent) console.warn("Automatic portfolio refresh failed", err);
+                else alert("Refresh failed: " + err.message);
+            } finally {
+                window.isPortfolioRefreshing = false;
+            }
+        }
+
+        function maybeAutoRefreshPortfolio(notify = false) {
+            if (document.hidden || latestMarketStatus !== 'OPEN') return;
+            if (Date.now() - lastPortfolioRefreshRequested < PORTFOLIO_REFRESH_INTERVAL_MS) return;
+            triggerRefresh(!notify);
+        }
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 3000);
+        }
+
+        let gexChartInstance = null;
+        let autoFetchedAfterHoursGex = false;
+
+        function maybeFetchGexData(status) {
+            const marketStatus = status?.market_status;
+            if (marketStatus !== 'AFTER_HOURS') {
+                autoFetchedAfterHoursGex = false;
+                fetchGexData();
+                return;
+            }
+
+            if (!gexChartInstance && !autoFetchedAfterHoursGex) {
+                autoFetchedAfterHoursGex = true;
+                fetchGexData();
+                return;
+            }
+
+            const lastUpdate = document.getElementById('gex-last-update');
+            if (lastUpdate && !lastUpdate.innerText.includes('auto-refresh paused')) {
+                lastUpdate.innerText = `${lastUpdate.innerText} (auto-refresh paused after hours)`;
+            }
+        }
+
+        function regimeColor(label) {
+            const text = String(label || '').toLowerCase();
+            if (text.includes('panic') || text.includes('turmoil')) return 'var(--danger)';
+            if (text.includes('decline') || text.includes('cautious')) return 'var(--warning)';
+            if (text.includes('expansion')) return 'var(--success)';
+            return 'var(--text)';
+        }
+
+        function formatPercent(value) {
+            const num = Number(value);
+            if (!Number.isFinite(num)) return '--';
+            return `${(num * 100).toFixed(0)}%`;
+        }
+
+        function renderRegimeStatus(regime) {
+            const regimeEl = document.getElementById('hmm-regime');
+            const rawEl = document.getElementById('hmm-raw-state');
+            const confidenceEl = document.getElementById('hmm-confidence');
+            const signalDateEl = document.getElementById('hmm-signal-date');
+
+            if (!regime || !regime.available) {
+                regimeEl.innerText = 'Unavailable';
+                regimeEl.style.color = 'var(--text-muted)';
+                rawEl.innerText = '--';
+                confidenceEl.innerText = '--';
+                signalDateEl.innerText = '--';
+                return;
+            }
+
+            const finalLabel = regime.detected_regime_label || 'Unknown';
+            const rawLabel = regime.raw_hmm_label || `State ${regime.raw_hmm_state ?? '--'}`;
+            const sourceSuffix = regime.stale ? ' (stale)' : '';
+
+            regimeEl.innerHTML = `${finalLabel}<br><span style="font-size: 0.75rem; color: var(--text-muted);">${regime.stress_overlay || 'none'}${sourceSuffix}</span>`;
+            regimeEl.style.color = regimeColor(finalLabel);
+
+            rawEl.innerHTML = `${rawLabel}<br><span style="font-size: 0.75rem; color: var(--text-muted);">state ${regime.raw_hmm_state ?? '--'}</span>`;
+            rawEl.style.color = regimeColor(rawLabel);
+
+            confidenceEl.innerHTML = `${formatPercent(regime.raw_hmm_confidence)}<br><span style="font-size: 0.75rem; color: var(--text-muted);">raw posterior</span>`;
+            signalDateEl.innerHTML = `${regime.as_of_date || '--'}<br><span style="font-size: 0.75rem; color: var(--text-muted);">${regime.signal_timestamp || 'close_T_for_next_session'}</span>`;
+        }
+
+        function renderRegimeV2ShadowStatus(payload) {
+            const backgroundEl = document.getElementById('regime-v2-background');
+            const shockEl = document.getElementById('regime-v2-shock');
+            const sessionEl = document.getElementById('regime-v2-effective-session');
+            const statusEl = document.getElementById('regime-v2-status');
+            const reasonsEl = document.getElementById('regime-v2-reasons');
+            const backgroundLabels = Object.freeze({
+                calm: 'Calm',
+                elevated: 'Elevated',
+                persistent_stress: 'Persistent stress'
+            });
+            const shockLabels = Object.freeze({
+                none: 'None',
+                active: 'Active news/volatility shock',
+                aftershock: 'Aftershock'
+            });
+            const unavailableLabels = Object.freeze({
+                missing: 'No verified shadow snapshot has been published.',
+                invalid: 'The shadow snapshot failed validation.',
+                stale: 'The shadow snapshot is no longer effective.',
+                not_yet_available: 'The next shadow signal is not available yet.'
+            });
+
+            const backgroundLabel = backgroundLabels[payload?.background_state];
+            const shockLabel = shockLabels[payload?.shock_state];
+            const isAdvisory = Boolean(
+                payload
+                && payload.available === true
+                && payload.status === 'advisory'
+                && payload.may_authorize_execution === false
+                && backgroundLabel
+                && shockLabel
+                && /^\d{4}-\d{2}-\d{2}$/.test(String(payload.effective_session || ''))
+            );
+
+            if (!isAdvisory) {
+                backgroundEl.textContent = 'Unavailable';
+                backgroundEl.style.color = 'var(--text-muted)';
+                shockEl.textContent = 'Unavailable';
+                shockEl.style.color = 'var(--text-muted)';
+                sessionEl.textContent = '--';
+                statusEl.textContent = 'Unavailable';
+                statusEl.style.color = 'var(--text-muted)';
+                const reason = Array.isArray(payload?.reason_codes)
+                    ? payload.reason_codes[0]
+                    : null;
+                reasonsEl.textContent = unavailableLabels[reason]
+                    || 'No valid shadow advisory is available.';
+                return;
+            }
+
+            backgroundEl.textContent = backgroundLabel;
+            backgroundEl.style.color = payload.background_state === 'persistent_stress'
+                ? 'var(--danger)'
+                : payload.background_state === 'elevated'
+                    ? 'var(--warning)'
+                    : 'var(--success)';
+            shockEl.textContent = shockLabel;
+            shockEl.style.color = payload.shock_state === 'active'
+                ? 'var(--danger)'
+                : payload.shock_state === 'aftershock'
+                    ? 'var(--warning)'
+                    : 'var(--success)';
+            sessionEl.textContent = payload.effective_session;
+            statusEl.textContent = 'Shadow advisory';
+            statusEl.style.color = 'var(--accent)';
+            reasonsEl.textContent = 'Close-T signal for the exact next NYSE session; execution remains disabled.';
+        }
+
+        async function fetchRegimeV2Shadow() {
+            try {
+                const response = await fetch('/api/regime_v2_shadow', {
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                });
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                const payload = await response.json().catch(() => null);
+                renderRegimeV2ShadowStatus(payload);
+            } catch (error) {
+                renderRegimeV2ShadowStatus({
+                    available: false,
+                    reason_codes: ['invalid'],
+                    may_authorize_execution: false
+                });
+            }
+        }
+
+        async function fetchGexData() {
+            const badge = document.getElementById('gex-badge');
+            try {
+                const res = await fetch('/api/gex');
+                if (res.status === 401) { window.location.href = '/login'; return; }
+                if (res.ok) {
+                    const data = await res.json();
+
+                    // 1. Update text metrics
+                    const totalNet = Number(data.total_net_gex);
+                    const netEl = document.getElementById('total-net-gex');
+                    netEl.innerText = `${totalNet >= 0 ? '+' : ''}$${totalNet.toFixed(1)}M`;
+                    netEl.style.color = totalNet >= 0 ? 'var(--success)' : 'var(--danger)';
+
+                    document.getElementById('zero-gamma-level').innerText = `$${Number(data.zero_gamma).toFixed(2)}`;
+                    document.getElementById('spy-spot-price').innerText = `$${Number(data.spot_price).toFixed(2)}`;
+                    document.getElementById('gex-walls').innerHTML = `Call: $${Number(data.call_wall).toFixed(0)}<br>Put: $${Number(data.put_wall).toFixed(0)}`;
+                    renderRegimeStatus(data.regime);
+
+                    document.getElementById('gex-last-update').innerText = `Last updated: ${data.timestamp}`;
+
+                    // 2. Update badge
+                    badge.className = ''; // Reset classes
+                    if (data.is_mock) {
+                        badge.innerText = "MOCK DATA";
+                        badge.style.background = 'rgba(245, 158, 11, 0.1)';
+                        badge.style.color = 'var(--warning)';
+                        badge.style.border = '1px solid rgba(245, 158, 11, 0.2)';
+                        badge.style.padding = '4px 8px';
+                        badge.style.borderRadius = '6px';
+                    } else {
+                        badge.innerText = "LIVE DATA";
+                        badge.style.background = 'rgba(16, 185, 129, 0.1)';
+                        badge.style.color = 'var(--success)';
+                        badge.style.border = '1px solid rgba(16, 185, 129, 0.2)';
+                        badge.style.padding = '4px 8px';
+                        badge.style.borderRadius = '6px';
+                    }
+
+                    // 3. Render Chart.js
+                    renderGexChart(data.chart_data, Number(data.spot_price), Number(data.zero_gamma));
+                } else {
+                    document.getElementById('gex-last-update').innerText = "⚠️ Failed to fetch GEX profile";
+                }
+            } catch (err) {
+                console.error("Error fetching GEX data:", err);
+                document.getElementById('gex-last-update').innerText = "⚠️ Connection error fetching GEX";
+            }
+        }
+
+        function renderGexChart(chartData, spotPrice, zeroGamma) {
+            const ctx = document.getElementById('gexChart').getContext('2d');
+
+            const labels = chartData.strikes;
+            const netGex = chartData.net_gex;
+
+            // Set up dynamic bar colors (emerald for positive GEX, crimson for negative GEX)
+            const backgroundColors = netGex.map(val => val >= 0 ? 'rgba(16, 185, 129, 0.6)' : 'rgba(239, 68, 68, 0.6)');
+            const borderColors = netGex.map(val => val >= 0 ? 'rgb(16, 185, 129)' : 'rgb(239, 68, 68)');
+
+            if (gexChartInstance) {
+                gexChartInstance.destroy();
+            }
+
+            gexChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Net GEX ($ Millions / Point)',
+                        data: netGex,
+                        backgroundColor: backgroundColors,
+                        borderColor: borderColors,
+                        borderWidth: 1,
+                        borderRadius: 3,
+                        barPercentage: 0.8
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `Net GEX: ${context.raw >= 0 ? '+' : ''}${context.raw.toFixed(2)}M`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { display: false },
+                            ticks: {
+                                font: { family: 'Outfit', size: 10 },
+                                maxTicksLimit: 20
+                            },
+                            title: {
+                                display: true,
+                                text: 'Strike Price ($)',
+                                font: { family: 'Outfit', size: 11, weight: 'bold' }
+                            }
+                        },
+                        y: {
+                            grid: { color: 'rgba(0, 0, 0, 0.05)' },
+                            ticks: {
+                                font: { family: 'Outfit', size: 10 },
+                                callback: function(value) { return value + 'M'; }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Exposure ($ Millions)',
+                                font: { family: 'Outfit', size: 11, weight: 'bold' }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        document.getElementById('pin-field').addEventListener('input', (event) => {
+            event.target.value = event.target.value.replace(/\D/g, '').slice(0, 4);
+            document.getElementById('pin-error').textContent = '';
+        });
+        setInterval(() => maybeAutoRefreshPortfolio(false), 30000);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) maybeAutoRefreshPortfolio(true);
+        });
+        window.addEventListener('pageshow', () => maybeAutoRefreshPortfolio(true));
+    </script>
+</body>
+</html>

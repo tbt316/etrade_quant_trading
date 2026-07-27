@@ -2,8 +2,8 @@
 
 **Review date:** 2026-07-26
 
-**Status:** R4 typed shadow contract with causal backtest/live semantics;
-not connected to order execution
+**Status:** R5 entitlement-gated shadow publisher and visually verified
+dashboard read model; not connected to order execution
 **Related roadmap:** `docs/production_readiness_upgrade_plan.md`
 
 ## Decision
@@ -611,6 +611,55 @@ build verified provider history, finish the prospective holdout, define a
 separate monotonic risk policy, and pass paper/canary gates before V2 can veto
 or resize an opening order.
 
+### R5 shadow publication and dashboard isolation
+
+R5 adds an end-to-end advisory publication path without connecting V2 to the
+legacy HMM, EV, GEX, account, or order paths:
+
+1. `regime_shadow_publish.py` requires an explicit entitlement capability
+   before its first provider refresh.
+2. The provider gateway must publish a new, verified `shadow` snapshot and the
+   returned hash must exactly equal the current verified channel head.
+3. The detector must emit a decision-time-eligible, non-unavailable row for the
+   requested close session. Only that final row is adapted to a
+   `RegimeSignal`.
+4. `regime_shadow_store.py` seals the canonical signal to an owner-only file
+   using descriptor-relative, no-follow, atomic replacement.
+5. The dashboard reads only that file through
+   `/api/regime_v2_shadow`. The endpoint is authenticated, same-origin,
+   no-store, and separate from `/api/gex`.
+
+The dashboard response is a fixed redacted view model. It exposes only the two
+closed state axes, close/effective sessions, whitelisted reason codes, advisory
+status, and the literal `may_authorize_execution=false`. It never exposes raw
+prices, provider bytes, filesystem paths, evidence hashes, artifact hashes, or
+internal exceptions. The renderer uses `textContent`, keeps the legacy lane
+unchanged, and displays a permanent `CANNOT AUTHORIZE EXECUTION` badge.
+
+Publication and display both fail closed. A missing, tampered, unsafe,
+not-yet-available, or stale signal returns an explicit unavailable model; no
+last-good signal is reused. A Friday-close signal remains displayable during
+the weekend for Monday, then expires exactly at the Monday SPY/VIX joint
+finalization boundary. Failed entitlement, provider, evidence, detector, or
+seal checks leave any prior file untouched.
+
+The workspace has no current verified evidence database, and the provider
+entitlement gate remains unresolved. Once deployed, this source correctly
+displays `Unavailable`; it must not manufacture a current signal from the
+unverified legacy caches. An isolated actual-handler browser verification used
+a sealed synthetic Friday-to-Monday fixture and confirmed both rendered
+states:
+
+- available fixture: `Elevated` background, `Active news/volatility shock`,
+  effective session `2026-07-27`, `Shadow advisory`, and the permanent
+  execution lock;
+- absent fixture: both axes and status `Unavailable`, no effective session,
+  and `No verified shadow snapshot has been published.`
+
+The isolated server did not initialize an E*TRADE session or trading loop.
+Deploying the source to the user's running dashboard and accumulating real
+verified history remain separate operational gates.
+
 ## Why not another single HMM
 
 A single latent state must choose among three bad behaviors:
@@ -830,6 +879,11 @@ and skipped-trade effects must be included.
 - Provider gateway: `live_trading/regime_market_data_gateway.py`
 - Calibration engine: `live_trading/regime_calibration.py`
 - Typed shadow contract: `live_trading/regime_signal.py`
+- Entitlement-gated publisher: `live_trading/regime_shadow_publish.py`
+- Atomic dashboard read model: `live_trading/regime_shadow_store.py`
+- Authenticated dashboard consumer:
+  `live_trading/etrade_cover_call_new.py` and
+  `live_trading/dashboard_template.html`
 - Frozen calibration plan: `docs/regime_v2_calibration_plan.json`
 - Research artifact:
   `research_reports/regime_v2_calibration_artifact.json`
@@ -840,7 +894,10 @@ and skipped-trade effects must be included.
   `tests/test_regime_market_data_gateway.py`,
   `tests/test_regime_calibration.py`,
   `tests/test_regime_signal.py`, and
-  `tests/test_regime_backtest_parity.py`
+  `tests/test_regime_backtest_parity.py`,
+  `tests/test_regime_shadow_publish.py`,
+  `tests/test_regime_shadow_store.py`, and
+  `tests/test_regime_shadow_dashboard.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
 - Deterministic calibration runner:
   `scratch/regime_detector_v2_calibrate.py`

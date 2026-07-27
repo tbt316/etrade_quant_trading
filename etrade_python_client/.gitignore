@@ -26,6 +26,7 @@ dashboard_requests.log
 
 # Plots and HTML outputs
 *.html
+!live_trading/dashboard_template.html
 *.png
 option_value_plot/
 

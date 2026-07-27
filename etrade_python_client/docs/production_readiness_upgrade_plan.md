@@ -277,6 +277,13 @@ Use immutable records such as `PortfolioSnapshot`, `QuoteSnapshot`,
 Dashboard requests read snapshots. They do not trigger broker work or mutate the
 source of truth.
 
+R5 implements this boundary narrowly for the Regime V2 shadow lane: the
+authenticated dashboard reads one descriptor-validated, owner-only sealed
+signal through a separate same-origin endpoint. It cannot call the provider
+gateway, detector, HMM/EV/GEX paths, account objects, refresh queues, or order
+code. The rest of the dashboard still violates this target boundary and
+remains in scope for Phase 2.
+
 ### Boundary 4: pure risk decision
 
 Every manual and automatic intent calls:
@@ -614,8 +621,11 @@ The repository is production-ready only when:
 This review used static source/configuration inspection and the existing focused
 offline reliability tests. It did not call E*TRADE, Massive, Yahoo, or Cboe; did
 not submit or alter orders; did not run a full historical backtest; did not
-inspect the deployed Pi; and did not verify a live dashboard/browser artifact.
-Those actions belong to the staged acceptance gates above.
+inspect the deployed Pi; and did not restart the user's deployed dashboard.
+R5 later added an isolated browser verification of the actual dashboard handler
+and source template for both a sealed synthetic advisory and the missing-signal
+failure state. That proves the code/HTML path, not deployment or live provider
+operation. The remaining actions belong to the staged acceptance gates above.
 
 The working tree was already heavily modified and contains important untracked
 runtime sources. This review intentionally adds only this plan and does not

@@ -24,6 +24,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import timedelta
 from datetime import datetime, date
+from pathlib import Path
 from logging.handlers import RotatingFileHandler
 import logging
 import pandas as pd
@@ -56,6 +57,10 @@ from data_and_research.polygonio_improvequery import get_earnings_dates
 from data_and_research.option_assign_probability import calculate_probability
 from backtesting.polygonio_dailytrade import fetch_yfinance_data
 from pandas_market_calendars import get_calendar
+from live_trading.regime_shadow_store import (
+    RegimeShadowStore,
+    unavailable_dashboard_payload,
+)
 from live_trading.spy_position_tracker import update_spy_daily_snapshot, record_closed_spy_gain
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -66,6 +71,27 @@ DASHBOARD_LOG_FILE = "dashboard_requests.log"
 AUDIT_LOG_FILE = "order_audit_log.csv"
 MANUAL_TRADE_STATUS_FILE = "manual_order_status.json"
 ETRADE_SESSION_REFRESH_LOCK = threading.RLock()
+REGIME_V2_SHADOW_PATH = (
+    Path(__file__).resolve().parent
+    / "runtime"
+    / "regime_v2_shadow.json"
+)
+REGIME_V2_SHADOW_STORE = RegimeShadowStore(REGIME_V2_SHADOW_PATH)
+REGIME_V2_PUBLIC_DASHBOARD_FIELDS = frozenset({
+    "available",
+    "status",
+    "source_family",
+    "as_of_session",
+    "effective_session",
+    "background_state",
+    "shock_state",
+    "composite_label",
+    "availability",
+    "reason_codes",
+    "abstain_reasons",
+    "stale",
+    "may_authorize_execution",
+})
 
 def log_order_execution(order_info, reason, status="PLACED"):
     """Log order execution details to a permanent CSV file."""
@@ -1752,6 +1778,24 @@ def calculate_spy_regime_status(hmm_model):
         spy_regime_cache = {"timestamp": now, "data": data}
         return data
 
+
+def calculate_regime_v2_shadow_status():
+    """Read the sealed V2 advisory snapshot without touching trading state."""
+
+    try:
+        payload = REGIME_V2_SHADOW_STORE.dashboard_payload()
+    except Exception:
+        print("⚠️ Regime V2 shadow status is unavailable.")
+        return unavailable_dashboard_payload("invalid")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != REGIME_V2_PUBLIC_DASHBOARD_FIELDS
+        or payload.get("may_authorize_execution") is not False
+    ):
+        return unavailable_dashboard_payload("invalid")
+    return payload
+
+
 def fetch_option_chain_for_gex(accounts_instance, symbol, expiration, allow_auth_refresh=True):
     """
     Fetch the option chain for a given symbol and expiration, near the spot price.
@@ -2127,9 +2171,43 @@ class RefreshHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"⚠️ Error sending response: {e}")
 
+    def _send_private_json_response(self, code, content):
+        """Send authenticated same-origin JSON without permissive CORS."""
+
+        try:
+            encoded = json.dumps(
+                content,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(code)
+            self.send_header(
+                "Content-Type",
+                "application/json; charset=utf-8",
+            )
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Vary", "Authorization, Cookie")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            print("⚠️ Error sending private dashboard response.")
+
     def do_OPTIONS(self):
         """Handle CORS preflight requests."""
         try:
+            if self.path.split("?", 1)[0] == "/api/regime_v2_shadow":
+                self._send_private_json_response(
+                    405,
+                    {"error": "Method not allowed"},
+                )
+                return
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -2442,22 +2520,36 @@ class RefreshHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
+            if self.path.split("?", 1)[0] == "/api/regime_v2_shadow":
+                print("⚠️ Regime V2 shadow request failed.")
+                self._send_private_json_response(
+                    500,
+                    unavailable_dashboard_payload("invalid"),
+                )
+                return
             print(f"⚠️ GET Handler Error: {e}")
             traceback.print_exc()
             self._send_safe_response(500, {"error": str(e)})
 
     def _do_GET_logic(self):
-        if self.path == '/manifest.webmanifest':
+        request_path = self.path.split("?", 1)[0]
+
+        if request_path == '/manifest.webmanifest':
             self._send_safe_response(200, _dashboard_manifest(), 'application/manifest+json')
             return
 
-        if self.path == '/login':
+        if request_path == '/login':
             self._send_safe_response(200, _dashboard_login_html(), 'text/html')
             return
 
         # Security: Check Basic Auth
         if not self.check_auth(self.headers.get('Authorization')):
-            if self.path == '/dashboard' or self.path == '/':
+            if request_path == "/api/regime_v2_shadow":
+                self._send_private_json_response(
+                    401,
+                    {"error": "Authentication required"},
+                )
+            elif request_path == '/dashboard' or request_path == '/':
                 self.send_response(302)
                 self.send_header('Location', '/login')
                 self.end_headers()
@@ -2465,13 +2557,13 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 self._send_unauthorized()
             return
 
-        if self.path == '/':
+        if request_path == '/':
             self.send_response(302)
             self.send_header('Location', '/dashboard')
             self.end_headers()
             return
         
-        elif self.path == '/dashboard':
+        elif request_path == '/dashboard':
             template_path = os.path.join(os.path.dirname(__file__), "dashboard_template.html")
             if not os.path.exists(template_path):
                 template_path = "live_trading/dashboard_template.html"
@@ -2479,6 +2571,11 @@ class RefreshHandler(BaseHTTPRequestHandler):
             with open(template_path, "r") as f:
                 html = f.read()
             self._send_safe_response(200, html, 'text/html')
+
+        elif request_path == "/api/regime_v2_shadow":
+            payload = calculate_regime_v2_shadow_status()
+            status = 200 if payload.get("available") else 503
+            self._send_private_json_response(status, payload)
 
         elif self.path.startswith('/api/settings'):
             settings = load_live_settings()

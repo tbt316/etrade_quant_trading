@@ -339,15 +339,32 @@ decision-time receipts, so it cannot establish production provenance.
   - No longer backfills later HMM probabilities into earlier dates.
   - Requires empirical forward-return outcomes to resolve strictly before the
     entry session.
+- `live_trading/regime_shadow_publish.py`
+  - Requires an explicit entitlement capability before provider I/O.
+  - Publishes only the exact newly verified decision-time channel head and a
+    non-unavailable tail signal; all failures preserve the prior sealed file.
+- `live_trading/regime_shadow_store.py`
+  - Uses owner-only, descriptor-relative, no-follow reads and atomic
+    replacement for the sealed V2 dashboard read model.
+  - Expires the signal at its exact effective-session joint finalization and
+    emits only a fixed redacted, non-authoritative dashboard schema.
+- `live_trading/etrade_cover_call_new.py` and `dashboard_template.html`
+  - Add a separate authenticated, same-origin, no-store
+    `/api/regime_v2_shadow` endpoint.
+  - Render the V2 background and shock axes with text-only DOM updates and a
+    permanent `CANNOT AUTHORIZE EXECUTION` label; the endpoint never enters
+    GEX, HMM, EV, account, refresh-queue, or order paths.
 
 ### Remaining risk
 
 The selected profile is not approved for E*TRADE orders. Its calibration data
 are explicitly `legacy_normalized_unverified`; the provider entitlement gate is
-unresolved; the prospective window has not accumulated; the live dashboard has
-not yet published the R4 typed lane; and no centralized fail-closed risk engine
-consumes the signal. The correct operational result remains
-`Calibration_Abstain=true` and `Execution_Eligible=false`.
+unresolved; the prospective window has not accumulated; no current verified
+evidence database or sealed production signal exists in this workspace; the
+user's deployed dashboard process has not been restarted and inspected with
+this source; and no centralized fail-closed risk engine consumes the signal.
+The correct operational result remains `Unavailable`,
+`Calibration_Abstain=true`, and `Execution_Eligible=false`.
 
 ### Verification record
 
@@ -368,6 +385,21 @@ consumes the signal. The correct operational result remains
   artifact pins, stripped-attribute rejection, exact Friday-to-Monday mapping,
   no-fill lookup, numeric-HMM separation, audit serialization, and strictly
   prior return-bucket resolution.
+- R5 focused coverage verifies entitlement-before-network, exact verified-head
+  publication, old-file preservation, descriptor/race/path protections,
+  tamper and fixed-schema redaction, exact effective-session staleness,
+  authentication, restrictive CORS, endpoint isolation, and text-only DOM
+  rendering.
+- An isolated instance of the actual `RefreshHandler` and source-served
+  `dashboard_template.html` was inspected in the in-app browser on
+  2026-07-26. A sealed synthetic Friday-to-Monday fixture visibly rendered
+  `Elevated`, `Active news/volatility shock`, effective session `2026-07-27`,
+  `Shadow advisory`, and `CANNOT AUTHORIZE EXECUTION`. Restarting the isolated
+  handler without a signal visibly rendered both axes and status as
+  `Unavailable`, no effective date, and
+  `No verified shadow snapshot has been published.` The isolated process did
+  not start the trading loop or create an E*TRADE session. This verifies the
+  code path and HTML, not deployment into the user's currently running service.
 
 ### CI portability incident
 
