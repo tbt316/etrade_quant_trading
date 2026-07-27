@@ -15,6 +15,7 @@ include = ["polygonio*", "strategies*", "yfinance*", "accounts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["etrade_python_client/tests"]
+addopts = ["--import-mode=importlib"]
 markers = [
     "integration: tests that require live external services",
 ]
