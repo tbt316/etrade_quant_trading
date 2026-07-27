@@ -26,6 +26,8 @@ from live_trading.order_intent_ledger import (
     BrokerReadManifestEvidence,
     BrokerReadManifestMember,
     BrokerReadResponseEvidence,
+    CancellationRequestEvidence,
+    CancellationResponseEvidence,
     OrderIntent,
     OrderIntentIntegrityError,
     OrderIntentLedger,
@@ -34,6 +36,7 @@ from live_trading.order_intent_ledger import (
     OrderIntentReservationError,
     OrderIntentValidationError,
     RiskEvidence,
+    _cancel_order_xml,
     _validate_capacity_manifest_result,
     canonical_order_payload_hash,
 )
@@ -174,8 +177,7 @@ def _portfolio_raw(
                 "symbol": product["product_id"]["symbol"],
                 "typeCode": product["product_id"]["type_code"],
             }
-        raw_positions.append(
-            {
+        raw_position = {
                 "positionId": position["position_id"],
                 "accountId": position["account_id"],
                 "Product": raw_product,
@@ -199,7 +201,16 @@ def _portfolio_raw(
                     for lot in position.get("lots", [])
                 ],
             }
-        )
+        if product["security_type"] == "OPTN":
+            raw_position.update(
+                {
+                    "optionMultiplier": position["option_multiplier"],
+                    "optionsAdjustedFlag":
+                        position["options_adjusted_flag"],
+                    "deliverablesStr": position["deliverables"],
+                }
+            )
+        raw_positions.append(raw_position)
     return _canonical_json(
         {
             "PortfolioResponse": {
@@ -382,6 +393,9 @@ def _filled_vertical_positions(
             "position_type": "SHORT",
             "position_indicator": "TYPE1",
             "osi_key": "SPY---260821P00620000",
+            "option_multiplier": "100",
+            "options_adjusted_flag": False,
+            "deliverables": "100 shares of SPY",
             "lots": [
                 {
                     "position_id": "101",
@@ -403,6 +417,9 @@ def _filled_vertical_positions(
             "position_type": "LONG",
             "position_indicator": "TYPE1",
             "osi_key": "SPY---260821P00615000",
+            "option_multiplier": "100",
+            "options_adjusted_flag": False,
+            "deliverables": "100 shares of SPY",
             "lots": [
                 {
                     "position_id": "102",
@@ -529,10 +546,14 @@ class BrokerReadLedgerTests(unittest.TestCase):
         if schema not in {
             "etrade-capacity.v1",
             "etrade-capacity.v2",
+            "etrade-capacity.v3",
         }:
             raise AssertionError("unsupported capacity test schema")
         normalized_positions = positions or []
-        lots_required = schema == "etrade-capacity.v2"
+        lots_required = schema in {
+            "etrade-capacity.v2",
+            "etrade-capacity.v3",
+        }
         buying_power_as_of = str(
             int(
                 (
@@ -642,9 +663,13 @@ class BrokerReadLedgerTests(unittest.TestCase):
         economic_state.pop("broker_buying_power_as_of")
         state_sha256 = _domain_json_sha256(
             (
-                b"etrade-capacity-state.v2\0"
-                if lots_required
-                else b"etrade-capacity-state.v1\0"
+                b"etrade-capacity-state.v3\0"
+                if schema == "etrade-capacity.v3"
+                else (
+                    b"etrade-capacity-state.v2\0"
+                    if schema == "etrade-capacity.v2"
+                    else b"etrade-capacity-state.v1\0"
+                )
             ),
             economic_state,
         )
@@ -796,6 +821,59 @@ class BrokerReadLedgerTests(unittest.TestCase):
         )
         return record, decision
 
+    def _authorize_submitted_cancellation(
+        self,
+        *,
+        broker_order_id: str = "9000100",
+        idempotency_key: str = "cancel-query-provenance",
+    ):
+        record, _ = self._create_reserved_unknown_intent()
+        open_read, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+        )
+        open_evidence = self.ledger.broker_evidence_from_read(
+            record.intent_id,
+            open_read,
+            operation="ORDER_QUERY",
+        )
+        self.assertIsNotNone(open_evidence)
+        submitted = self.ledger.reconcile_open(
+            record.intent_id, open_evidence
+        )
+        self.assertEqual(submitted.state, "SUBMITTED")
+        authorization = self.ledger.authorize_cancellation(
+            record.intent_id,
+            idempotency_key,
+            "cancel-worker",
+            30,
+            open_read,
+        )
+        return record, authorization
+
+    @staticmethod
+    def _cancel_request(authorization):
+        body = _cancel_order_xml(authorization.broker_order_id)
+        return CancellationRequestEvidence(
+            account_id=authorization.account_id,
+            account_id_key=authorization.account_id_key,
+            institution_type=authorization.institution_type,
+            environment=authorization.environment,
+            intent_id=authorization.intent_id,
+            owner=authorization.owner,
+            idempotency_key=authorization.idempotency_key,
+            fencing_token=authorization.fencing_token,
+            broker_order_id=authorization.broker_order_id,
+            authorization_sha256=authorization.authorization_sha256,
+            http_method="PUT",
+            route=(
+                f"/v1/accounts/{authorization.account_id_key}"
+                "/orders/cancel"
+            ),
+            final_xml_bytes=body,
+            final_xml_sha256=hashlib.sha256(body).hexdigest(),
+        )
+
     def test_self_attested_capacity_cannot_set_an_opening_cap(self) -> None:
         with self.assertRaises(OrderIntentValidationError):
             self.ledger.set_reservation_cap(
@@ -809,13 +887,13 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 )
             )
 
-    def test_capacity_v2_rejects_position_from_different_account(
+    def test_capacity_v3_rejects_position_from_different_account(
         self,
     ) -> None:
         positions = _filled_vertical_positions("9000000")
         positions[0]["account_id"] = "999999999"
         state = {
-            "schema": "etrade-capacity.v2",
+            "schema": "etrade-capacity.v3",
             "account_status": "ACTIVE",
             "account_mode": "MARGIN",
             "account_type": "INDIVIDUAL",
@@ -827,7 +905,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
             **state,
             "broker_buying_power_as_of": "1785167970000",
             "state_sha256": _domain_json_sha256(
-                b"etrade-capacity-state.v2\0", state
+                b"etrade-capacity-state.v3\0", state
             ),
         }
         with self.assertRaisesRegex(
@@ -1067,6 +1145,192 @@ class BrokerReadLedgerTests(unittest.TestCase):
             valid_query.evidence_sha256,
         )
 
+    def test_cancellation_is_one_shot_across_restart_and_ack_is_pending(
+        self,
+    ) -> None:
+        record, authorization = (
+            self._authorize_submitted_cancellation()
+        )
+        request = self._cancel_request(authorization)
+
+        claimed = self.ledger.claim_cancellation_send(
+            request, authorization
+        )
+        self.assertEqual(claimed.state, "SEND_UNKNOWN")
+
+        restarted = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="cancel-restart",
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            restarted.claim_cancellation_send(request, authorization)
+
+        response = CancellationResponseEvidence(
+            disposition="REQUEST_ACCEPTED",
+            http_status=200,
+            message_codes=(5011,),
+            message_types=("WARNING",),
+            message_description_digests=("a" * 64,),
+            raw_response_digest="b" * 64,
+            observed_at=self.clock.now,
+            unknown_reason=None,
+        )
+        accepted = restarted.record_cancellation_response(
+            request, response
+        )
+        replayed = restarted.record_cancellation_response(
+            request, response
+        )
+        self.assertEqual(accepted.state, "REQUEST_ACCEPTED")
+        self.assertEqual(replayed, accepted)
+        self.assertEqual(
+            restarted.get_margin_reservation(record.intent_id).state,
+            "ACTIVE",
+        )
+        self.assertEqual(
+            restarted.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            ),
+            Decimal("500"),
+        )
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM cancel_send_attempts
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM cancel_response_receipts
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_cancellation_requires_terminal_read_before_risk_release(
+        self,
+    ) -> None:
+        record, authorization = (
+            self._authorize_submitted_cancellation(
+                broker_order_id="9000101"
+            )
+        )
+        request = self._cancel_request(authorization)
+        self.ledger.claim_cancellation_send(request, authorization)
+        self.ledger.record_cancellation_response(
+            request,
+            CancellationResponseEvidence(
+                disposition="REQUEST_ACCEPTED",
+                http_status=200,
+                message_codes=(5011,),
+                message_types=("WARNING",),
+                message_description_digests=("c" * 64,),
+                raw_response_digest="d" * 64,
+                observed_at=self.clock.now,
+                unknown_reason=None,
+            ),
+        )
+
+        self.clock.now += timedelta(seconds=1)
+        pending_read, _ = self._order_query_manifest(
+            broker_order_id=authorization.broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="CANCEL_REQUESTED",
+        )
+        pending = self.ledger.classify_cancellation_read(
+            record.intent_id, pending_read
+        )
+        self.assertEqual(pending.outcome, "PENDING")
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            self.ledger.complete_cancellation(
+                record.intent_id, pending_read
+            )
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "ACTIVE",
+        )
+
+        self.clock.now += timedelta(seconds=1)
+        terminal_read, _ = self._order_query_manifest(
+            broker_order_id=authorization.broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="CANCELLED",
+        )
+        terminal = self.ledger.classify_cancellation_read(
+            record.intent_id, terminal_read
+        )
+        self.assertEqual(terminal.outcome, "CANCELLED")
+        evidence = self.ledger.broker_evidence_from_read(
+            record.intent_id,
+            terminal_read,
+            operation="ORDER_QUERY",
+        )
+        self.assertIsNotNone(evidence)
+        self.ledger.reconcile_terminal(
+            record.intent_id, "CANCELLED", evidence
+        )
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        completed = self.ledger.complete_cancellation(
+            record.intent_id, terminal_read
+        )
+        self.assertEqual(completed.state, "TERMINAL")
+        self.assertEqual(
+            completed.terminal_evidence_sha256,
+            terminal_read.evidence_sha256,
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            ),
+            Decimal("500"),
+        )
+
+        absorbed = self.ledger.absorb_terminal_reservation(
+            record.intent_id, terminal_read
+        )
+        self.assertEqual(absorbed.classification, "ZERO_FILL")
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            ),
+            Decimal("0"),
+        )
+
+    def test_cancellation_idempotency_key_cannot_be_rebound(
+        self,
+    ) -> None:
+        record, _ = self._authorize_submitted_cancellation(
+            broker_order_id="9000102"
+        )
+        fresh_read, _ = self._order_query_manifest(
+            broker_order_id="9000102",
+            payload_hashes=(record.envelope.payload_hash,),
+        )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.authorize_cancellation(
+                record.intent_id,
+                "different-cancel-key",
+                "cancel-worker",
+                30,
+                fresh_read,
+            )
+
     def test_latest_head_verification_does_not_replay_older_history(
         self,
     ) -> None:
@@ -1169,7 +1433,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         self.clock.now += timedelta(seconds=1)
         overlapping_capacity, _, _ = self._capacity_manifest(
             positions=positions,
-            schema="etrade-capacity.v2",
+            schema="etrade-capacity.v3",
         )
         overlapping_post = self.ledger.set_reservation_cap_from_read(
             overlapping_capacity, risk_budget=Decimal("750")
@@ -1211,7 +1475,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         self.clock.now += timedelta(seconds=1)
         capacity, _, _ = self._capacity_manifest(
             positions=conflicting_positions,
-            schema="etrade-capacity.v2",
+            schema="etrade-capacity.v3",
         )
         conflicting_post = self.ledger.set_reservation_cap_from_read(
             capacity, risk_budget=Decimal("750")
@@ -1230,7 +1494,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         self.clock.now += timedelta(seconds=1)
         superseded_capacity, _, _ = self._capacity_manifest(
             positions=positions,
-            schema="etrade-capacity.v2",
+            schema="etrade-capacity.v3",
         )
         superseded_post = self.ledger.set_reservation_cap_from_read(
             superseded_capacity, risk_budget=Decimal("750")
@@ -1238,7 +1502,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         self.clock.now += timedelta(seconds=1)
         compatible_capacity, _, _ = self._capacity_manifest(
             positions=positions,
-            schema="etrade-capacity.v2",
+            schema="etrade-capacity.v3",
         )
         post = self.ledger.set_reservation_cap_from_read(
             compatible_capacity, risk_budget=Decimal("750")
@@ -1402,7 +1666,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         self.clock.now += timedelta(seconds=31)
         capacity, _, _ = self._capacity_manifest(
             positions=_filled_vertical_positions(broker_order_id),
-            schema="etrade-capacity.v2",
+            schema="etrade-capacity.v3",
         )
         post = self.ledger.set_reservation_cap_from_read(
             capacity, risk_budget=Decimal("750")

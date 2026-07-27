@@ -24,9 +24,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
 from urllib.parse import quote
 
+from live_trading.etrade_order_protocol import (
+    cancel_order_route as _cancel_order_route,
+    cancel_order_xml as _cancel_order_xml,
+)
 
-SCHEMA_VERSION = 12
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11})
+
+SCHEMA_VERSION = 13
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11, 12})
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
@@ -73,6 +78,10 @@ _RESERVATION_ABSORPTION_HASH_DOMAIN = (
     b"etrade-reservation-absorption.v1\0"
 )
 _LOT_PROOF_HASH_DOMAIN = b"etrade-reservation-lot-proof.v1\0"
+_CANCEL_AUTHORIZATION_HASH_DOMAIN = (
+    b"etrade-cancel-authorization.v1\0"
+)
+_CANCEL_RESOLUTION_HASH_DOMAIN = b"etrade-cancel-resolution.v1\0"
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
 _TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"})
@@ -224,6 +233,105 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON transport_response_receipts
         BEGIN
             SELECT RAISE(ABORT, 'transport response receipts are immutable');
+        END
+    """,
+    "prevent_order_cancellation_delete": """
+        CREATE TRIGGER prevent_order_cancellation_delete
+        BEFORE DELETE ON order_cancellations
+        BEGIN
+            SELECT RAISE(ABORT, 'order cancellations are durable');
+        END
+    """,
+    "prevent_order_cancellation_identity_update": """
+        CREATE TRIGGER prevent_order_cancellation_identity_update
+        BEFORE UPDATE ON order_cancellations
+        WHEN OLD.intent_id IS NOT NEW.intent_id
+          OR OLD.account_id IS NOT NEW.account_id
+          OR OLD.environment IS NOT NEW.environment
+          OR OLD.broker_order_id IS NOT NEW.broker_order_id
+          OR OLD.idempotency_key IS NOT NEW.idempotency_key
+          OR OLD.order_payload_hash IS NOT NEW.order_payload_hash
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'order cancellation identity is immutable');
+        END
+    """,
+    "prevent_order_cancellation_invalid_transition": """
+        CREATE TRIGGER prevent_order_cancellation_invalid_transition
+        BEFORE UPDATE ON order_cancellations
+        WHEN NOT (
+            OLD.state = NEW.state
+            OR (
+                OLD.state = 'LEASED'
+                AND NEW.state IN ('SEND_UNKNOWN','TERMINAL')
+            )
+            OR (
+                OLD.state = 'SEND_UNKNOWN'
+                AND NEW.state IN ('REQUEST_ACCEPTED','TERMINAL')
+            )
+            OR (
+                OLD.state = 'REQUEST_ACCEPTED'
+                AND NEW.state = 'TERMINAL'
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid order cancellation transition');
+        END
+    """,
+    "prevent_cancel_authorization_update": """
+        CREATE TRIGGER prevent_cancel_authorization_update
+        BEFORE UPDATE ON cancel_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel authorizations are append-only');
+        END
+    """,
+    "prevent_cancel_authorization_delete": """
+        CREATE TRIGGER prevent_cancel_authorization_delete
+        BEFORE DELETE ON cancel_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel authorizations are append-only');
+        END
+    """,
+    "prevent_cancel_send_attempt_update": """
+        CREATE TRIGGER prevent_cancel_send_attempt_update
+        BEFORE UPDATE ON cancel_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel send attempts are append-only');
+        END
+    """,
+    "prevent_cancel_send_attempt_delete": """
+        CREATE TRIGGER prevent_cancel_send_attempt_delete
+        BEFORE DELETE ON cancel_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel send attempts are append-only');
+        END
+    """,
+    "prevent_cancel_response_receipt_update": """
+        CREATE TRIGGER prevent_cancel_response_receipt_update
+        BEFORE UPDATE ON cancel_response_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel response receipts are append-only');
+        END
+    """,
+    "prevent_cancel_response_receipt_delete": """
+        CREATE TRIGGER prevent_cancel_response_receipt_delete
+        BEFORE DELETE ON cancel_response_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel response receipts are append-only');
+        END
+    """,
+    "prevent_cancel_resolution_update": """
+        CREATE TRIGGER prevent_cancel_resolution_update
+        BEFORE UPDATE ON cancel_resolutions
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel resolutions are append-only');
+        END
+    """,
+    "prevent_cancel_resolution_delete": """
+        CREATE TRIGGER prevent_cancel_resolution_delete
+        BEFORE DELETE ON cancel_resolutions
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel resolutions are append-only');
         END
     """,
     "prevent_broker_order_history_update": """
@@ -941,6 +1049,101 @@ class TransportResponseReceipt:
     target_broker_order_id: str | None = field(repr=False)
     response: TransportResponseEvidence
     recorded_at: datetime
+
+
+@dataclass(frozen=True, repr=False)
+class CancellationAuthorization:
+    """One expiring ledger authorization for an exact known order cancel."""
+
+    intent_id: str
+    account_id: str
+    account_id_key: str
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    owner: str
+    idempotency_key: str
+    fencing_token: int
+    broker_order_id: str
+    order_evidence_sha256: str
+    order_payload_hash: str
+    authorization_sha256: str
+    authorized_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, repr=False)
+class CancellationRequestEvidence:
+    """Exact cancel request claimed durably before its only network send."""
+
+    account_id: str
+    account_id_key: str
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    intent_id: str
+    owner: str
+    idempotency_key: str
+    fencing_token: int
+    broker_order_id: str
+    authorization_sha256: str
+    http_method: Literal["PUT"]
+    route: str
+    final_xml_bytes: bytes
+    final_xml_sha256: str
+
+
+@dataclass(frozen=True)
+class CancellationResponseEvidence:
+    """Parsed result of the one claimed cancel request."""
+
+    disposition: Literal["REQUEST_ACCEPTED", "UNKNOWN"]
+    http_status: int | None
+    message_codes: tuple[int, ...]
+    message_types: tuple[str, ...]
+    message_description_digests: tuple[str, ...]
+    raw_response_digest: str | None
+    observed_at: datetime
+    unknown_reason: str | None
+
+
+@dataclass(frozen=True)
+class CancellationRecord:
+    """Durable cancellation state; acceptance is never terminal proof."""
+
+    intent_id: str
+    account_id: str
+    environment: Literal["sandbox", "production"]
+    broker_order_id: str
+    idempotency_key: str
+    state: Literal[
+        "LEASED", "SEND_UNKNOWN", "REQUEST_ACCEPTED", "TERMINAL"
+    ]
+    owner: str
+    fencing_token: int
+    authorization_sha256: str
+    order_evidence_sha256: str
+    order_payload_hash: str
+    expires_at: datetime
+    terminal_evidence_sha256: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class CancellationObservation:
+    """Classification of one exact direct order read during cancellation."""
+
+    intent_id: str
+    broker_order_id: str
+    outcome: Literal[
+        "PENDING",
+        "FILLED",
+        "CANCELLED",
+        "REJECTED",
+        "EXPIRED",
+        "UNRESOLVED",
+    ]
+    evidence_sha256: str
+    observed_at: datetime
 
 
 @dataclass(frozen=True, repr=False)
@@ -2199,6 +2402,731 @@ class OrderIntentLedger:
             order_payload_hashes=tuple(result["order_payload_hashes"]),
         )
 
+    def authorize_cancellation(
+        self,
+        intent_id: str,
+        idempotency_key: str,
+        owner: str,
+        lease_seconds: float,
+        order_evidence: BrokerReadEvidenceRef,
+    ) -> CancellationAuthorization:
+        """Authorize one exact cancel after a fresh zero-fill OPEN read."""
+
+        _validate_identity("intent_id", intent_id)
+        _validate_identity(
+            "cancellation idempotency key", idempotency_key
+        )
+        _validate_identity("cancellation owner", owner)
+        if (
+            type(order_evidence) is not BrokerReadEvidenceRef
+            or order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "cancellation requires exact ORDER_QUERY evidence"
+            )
+        now = self._now_us()
+        expires_at = self._lease_expiry_us(lease_seconds, now)
+        authorization: CancellationAuthorization | None = None
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, intent_id)
+            if (
+                intent["intent_kind"] != "OPENING"
+                or intent["state"] != "SUBMITTED"
+                or intent["pending_operation"] is not None
+                or intent["broker_order_id"] is None
+            ):
+                raise OrderIntentTransitionError(
+                    "only a known submitted opening order may be cancelled"
+                )
+            existing = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                self._verify_cancellation_row(conn, existing)
+                if existing["idempotency_key"] != idempotency_key:
+                    raise OrderIntentIntegrityError(
+                        "cancellation idempotency key cannot be rebound"
+                    )
+                if existing["state"] != "LEASED":
+                    raise OrderIntentReconciliationRequired(
+                        "cancellation was already sent; it cannot be resent"
+                    )
+                if (
+                    existing["owner"] != owner
+                    and int(existing["expires_at"]) > now
+                ):
+                    raise OrderIntentLeaseConflict(
+                        "cancellation lease is owned by another worker"
+                    )
+                if conn.execute(
+                    """
+                    SELECT 1 FROM cancel_send_attempts
+                    WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone() is not None:
+                    raise OrderIntentIntegrityError(
+                        "leased cancellation already has a send attempt"
+                    )
+            if self._blocker_rows(
+                conn,
+                intent["account_id"],
+                intent["environment"],
+                exclude_intent_id=intent_id,
+            ) or self._amendment_blocker_rows(
+                conn,
+                intent["account_id"],
+                intent["environment"],
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "account has unresolved broker work during cancellation"
+                )
+            manifest, result = self._verified_cancellation_order_read(
+                conn,
+                intent,
+                order_evidence,
+                now=now,
+                require_open=True,
+            )
+            expected_payload_hash = (
+                self._expected_order_payload_hash_conn(conn, intent)
+            )
+            fence = (
+                int(existing["fencing_token"]) + 1
+                if existing is not None
+                else 1
+            )
+            material = {
+                "intent_id": intent_id,
+                "account_id": intent["account_id"],
+                "account_id_key": manifest["account_id_key"],
+                "institution_type": manifest["institution_type"],
+                "environment": intent["environment"],
+                "owner": owner,
+                "idempotency_key": idempotency_key,
+                "fencing_token": fence,
+                "broker_order_id": intent["broker_order_id"],
+                "order_evidence_sha256":
+                    order_evidence.evidence_sha256,
+                "order_payload_hash": expected_payload_hash,
+                "authorized_at": now,
+                "expires_at": expires_at,
+            }
+            authorization_sha256 = _domain_json_hash(
+                _CANCEL_AUTHORIZATION_HASH_DOMAIN,
+                material,
+            )
+            conn.execute(
+                """
+                INSERT INTO cancel_authorizations (
+                    authorization_sha256, intent_id, account_id,
+                    account_id_key, institution_type, environment,
+                    owner, idempotency_key, fencing_token,
+                    broker_order_id, order_evidence_sha256,
+                    order_payload_hash, authorized_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    authorization_sha256,
+                    intent_id,
+                    intent["account_id"],
+                    manifest["account_id_key"],
+                    manifest["institution_type"],
+                    intent["environment"],
+                    owner,
+                    idempotency_key,
+                    fence,
+                    intent["broker_order_id"],
+                    order_evidence.evidence_sha256,
+                    expected_payload_hash,
+                    now,
+                    expires_at,
+                ),
+            )
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO order_cancellations (
+                        intent_id, account_id, environment,
+                        broker_order_id, idempotency_key, state,
+                        owner, fencing_token, authorization_sha256,
+                        order_evidence_sha256, order_payload_hash,
+                        expires_at, terminal_evidence_sha256,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, 'LEASED', ?, ?, ?, ?, ?, ?,
+                        NULL, ?, ?
+                    )
+                    """,
+                    (
+                        intent_id,
+                        intent["account_id"],
+                        intent["environment"],
+                        intent["broker_order_id"],
+                        idempotency_key,
+                        owner,
+                        fence,
+                        authorization_sha256,
+                        order_evidence.evidence_sha256,
+                        expected_payload_hash,
+                        expires_at,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE order_cancellations
+                    SET owner = ?, fencing_token = ?,
+                        authorization_sha256 = ?,
+                        order_evidence_sha256 = ?,
+                        expires_at = ?, updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        owner,
+                        fence,
+                        authorization_sha256,
+                        order_evidence.evidence_sha256,
+                        expires_at,
+                        now,
+                        intent_id,
+                    ),
+                )
+            authorization = CancellationAuthorization(
+                intent_id=intent_id,
+                account_id=intent["account_id"],
+                account_id_key=manifest["account_id_key"],
+                institution_type=manifest["institution_type"],
+                environment=intent["environment"],
+                owner=owner,
+                idempotency_key=idempotency_key,
+                fencing_token=fence,
+                broker_order_id=result["broker_order_id"],
+                order_evidence_sha256=order_evidence.evidence_sha256,
+                order_payload_hash=expected_payload_hash,
+                authorization_sha256=authorization_sha256,
+                authorized_at=_from_us(now),
+                expires_at=_from_us(expires_at),
+            )
+        assert authorization is not None
+        return authorization
+
+    def get_cancellation(
+        self, intent_id: str
+    ) -> CancellationRecord | None:
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            self._require_intent(conn, intent_id)
+            row = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._verify_cancellation_row(conn, row)
+            return self._cancellation_from_row(row)
+
+    def cancellation_blockers(
+        self, account_id: str, environment: str
+    ) -> tuple[CancellationRecord, ...]:
+        _validate_identity("account_id", account_id)
+        _validate_identity("environment", environment)
+        with self._connection() as conn:
+            rows = self._cancellation_blocker_rows(
+                conn, account_id, environment
+            )
+            for row in rows:
+                self._verify_cancellation_row(conn, row)
+            return tuple(
+                self._cancellation_from_row(row) for row in rows
+            )
+
+    def claim_cancellation_send(
+        self,
+        request: CancellationRequestEvidence,
+        authorization: CancellationAuthorization,
+    ) -> CancellationRecord:
+        """Claim the cancellation's sole network send before socket I/O."""
+
+        _validate_cancellation_request(request)
+        _validate_cancellation_authorization(authorization)
+        now = self._now_us()
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, request.intent_id)
+            cancellation = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            if cancellation is None:
+                raise OrderIntentTransitionError(
+                    "cancel send lacks a durable cancellation"
+                )
+            self._verify_cancellation_row(conn, cancellation)
+            authorization_row = self._require_cancel_authorization(
+                conn, authorization.authorization_sha256
+            )
+            if self._cancellation_authorization_from_row(
+                authorization_row
+            ) != authorization:
+                raise OrderIntentIntegrityError(
+                    "cancellation authorization conflicts with durable bytes"
+                )
+            expected_request = (
+                authorization.account_id,
+                authorization.account_id_key,
+                authorization.institution_type,
+                authorization.environment,
+                authorization.intent_id,
+                authorization.owner,
+                authorization.idempotency_key,
+                authorization.fencing_token,
+                authorization.broker_order_id,
+                authorization.authorization_sha256,
+            )
+            actual_request = (
+                request.account_id,
+                request.account_id_key,
+                request.institution_type,
+                request.environment,
+                request.intent_id,
+                request.owner,
+                request.idempotency_key,
+                request.fencing_token,
+                request.broker_order_id,
+                request.authorization_sha256,
+            )
+            if actual_request != expected_request:
+                raise OrderIntentIntegrityError(
+                    "cancel request is not bound to its authorization"
+                )
+            if (
+                intent["state"] != "SUBMITTED"
+                or intent["pending_operation"] is not None
+                or intent["broker_order_id"] != request.broker_order_id
+                or cancellation["state"] != "LEASED"
+                or cancellation["authorization_sha256"]
+                != authorization.authorization_sha256
+                or cancellation["owner"] != authorization.owner
+                or int(cancellation["fencing_token"])
+                != authorization.fencing_token
+                or int(cancellation["expires_at"]) <= now
+                or _to_us(authorization.expires_at) <= now
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "cancel authorization is stale or no longer sendable"
+                )
+            expected_route = _cancel_order_route(
+                request.account_id_key
+            )
+            expected_xml = _cancel_order_xml(request.broker_order_id)
+            if (
+                request.http_method != "PUT"
+                or request.route != expected_route
+                or request.final_xml_bytes != expected_xml
+                or not hmac.compare_digest(
+                    hashlib.sha256(expected_xml).hexdigest(),
+                    request.final_xml_sha256,
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel request route or XML is not exact"
+                )
+            if conn.execute(
+                """
+                SELECT 1 FROM cancel_send_attempts
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone() is not None:
+                raise OrderIntentReconciliationRequired(
+                    "cancellation already has its one network send"
+                )
+            conn.execute(
+                """
+                INSERT INTO cancel_send_attempts (
+                    intent_id, authorization_sha256, account_id,
+                    account_id_key, institution_type, environment,
+                    owner, idempotency_key, fencing_token,
+                    broker_order_id, http_method, route,
+                    final_xml_bytes, final_xml_sha256, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.intent_id,
+                    request.authorization_sha256,
+                    request.account_id,
+                    request.account_id_key,
+                    request.institution_type,
+                    request.environment,
+                    request.owner,
+                    request.idempotency_key,
+                    request.fencing_token,
+                    request.broker_order_id,
+                    request.http_method,
+                    request.route,
+                    request.final_xml_bytes,
+                    request.final_xml_sha256,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE order_cancellations
+                SET state = 'SEND_UNKNOWN', updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (now, request.intent_id),
+            )
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET last_reconciled_run = NULL, updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (now, request.intent_id),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            self._verify_cancellation_row(conn, row)
+            return self._cancellation_from_row(row)
+
+    def record_cancellation_response(
+        self,
+        request: CancellationRequestEvidence,
+        response: CancellationResponseEvidence,
+    ) -> CancellationRecord:
+        """Persist the cancel response without treating acceptance as terminal."""
+
+        _validate_cancellation_request(request)
+        _validate_cancellation_response(response)
+        now = self._now_us()
+        observed_at = _to_us(response.observed_at)
+        with self._transaction() as conn:
+            attempt = conn.execute(
+                """
+                SELECT * FROM cancel_send_attempts
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            if attempt is None or not _cancel_attempt_matches_request(
+                attempt, request
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel response lacks its exact durable send attempt"
+                )
+            cancellation = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            if (
+                cancellation is None
+                or cancellation["state"]
+                not in {"SEND_UNKNOWN", "REQUEST_ACCEPTED"}
+            ):
+                raise OrderIntentTransitionError(
+                    "cancel response does not match an unresolved send"
+                )
+            if (
+                observed_at < int(attempt["claimed_at"])
+                or observed_at > now + 5_000_000
+                or now - observed_at
+                > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentValidationError(
+                    "cancel response time is stale or inconsistent"
+                )
+            messages_json = _canonical_read_json(
+                [
+                    {
+                        "code": code,
+                        "type": message_type,
+                        "description_sha256": description_sha256,
+                    }
+                    for code, message_type, description_sha256 in zip(
+                        response.message_codes,
+                        response.message_types,
+                        response.message_description_digests,
+                        strict=True,
+                    )
+                ]
+            )
+            values = (
+                request.intent_id,
+                response.disposition,
+                response.http_status,
+                messages_json,
+                response.raw_response_digest,
+                observed_at,
+                response.unknown_reason,
+                now,
+            )
+            existing = conn.execute(
+                """
+                SELECT * FROM cancel_response_receipts
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO cancel_response_receipts (
+                        intent_id, disposition, http_status,
+                        messages_json, raw_response_digest,
+                        observed_at, unknown_reason, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            elif tuple(
+                existing[name]
+                for name in (
+                    "intent_id",
+                    "disposition",
+                    "http_status",
+                    "messages_json",
+                    "raw_response_digest",
+                    "observed_at",
+                    "unknown_reason",
+                )
+            ) != values[:-1]:
+                raise OrderIntentIntegrityError(
+                    "cancel response receipt cannot be rewritten"
+                )
+            if response.disposition == "REQUEST_ACCEPTED":
+                conn.execute(
+                    """
+                    UPDATE order_cancellations
+                    SET state = 'REQUEST_ACCEPTED', updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (now, request.intent_id),
+                )
+            row = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (request.intent_id,),
+            ).fetchone()
+            self._verify_cancellation_row(conn, row)
+            return self._cancellation_from_row(row)
+
+    def classify_cancellation_read(
+        self,
+        intent_id: str,
+        order_evidence: BrokerReadEvidenceRef,
+    ) -> CancellationObservation:
+        """Classify a fresh direct read without releasing any reservation."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(order_evidence) is not BrokerReadEvidenceRef
+            or order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "cancellation reconciliation requires ORDER_QUERY evidence"
+            )
+        now = self._now_us()
+        with self._connection() as conn:
+            intent = self._require_intent(conn, intent_id)
+            cancellation = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if cancellation is None:
+                raise OrderIntentTransitionError(
+                    "intent has no durable cancellation"
+                )
+            self._verify_cancellation_row(conn, cancellation)
+            manifest, result = self._verified_cancellation_order_read(
+                conn,
+                intent,
+                order_evidence,
+                now=now,
+                require_open=False,
+            )
+            outcome: str
+            if result["outcome"] in {
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+            }:
+                outcome = result["outcome"]
+            elif (
+                result["outcome"] == "OPEN"
+                or _is_zero_fill_cancel_pending(result)
+            ):
+                outcome = "PENDING"
+            else:
+                outcome = "UNRESOLVED"
+            return CancellationObservation(
+                intent_id=intent_id,
+                broker_order_id=cancellation["broker_order_id"],
+                outcome=outcome,
+                evidence_sha256=order_evidence.evidence_sha256,
+                observed_at=_from_us(manifest["observed_at"]),
+            )
+
+    def complete_cancellation(
+        self,
+        intent_id: str,
+        order_evidence: BrokerReadEvidenceRef,
+    ) -> CancellationRecord:
+        """Bind a terminal intent to the exact terminal cancel read."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(order_evidence) is not BrokerReadEvidenceRef
+            or order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "cancellation completion requires ORDER_QUERY evidence"
+            )
+        now = self._now_us()
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, intent_id)
+            cancellation = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if cancellation is None:
+                raise OrderIntentTransitionError(
+                    "intent has no durable cancellation"
+                )
+            self._verify_cancellation_row(conn, cancellation)
+            if cancellation["state"] == "TERMINAL":
+                if (
+                    cancellation["terminal_evidence_sha256"]
+                    != order_evidence.evidence_sha256
+                ):
+                    raise OrderIntentIntegrityError(
+                        "terminal cancellation evidence cannot change"
+                    )
+                return self._cancellation_from_row(cancellation)
+            manifest, result = self._verified_cancellation_order_read(
+                conn,
+                intent,
+                order_evidence,
+                now=now,
+                require_open=False,
+            )
+            terminal_outcome = result["outcome"]
+            if terminal_outcome not in {
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+            }:
+                raise OrderIntentReconciliationRequired(
+                    "cancellation is not terminal at the broker"
+                )
+            observed_at = int(manifest["observed_at"])
+            if intent["state"] != terminal_outcome:
+                raise OrderIntentReconciliationRequired(
+                    "terminal cancellation must follow terminal intent reconciliation"
+                )
+            material = {
+                "intent_id": intent_id,
+                "broker_order_id": cancellation["broker_order_id"],
+                "terminal_outcome": terminal_outcome,
+                "order_evidence_sha256":
+                    order_evidence.evidence_sha256,
+                "observed_at": observed_at,
+                "recorded_at": now,
+            }
+            resolution_sha256 = _domain_json_hash(
+                _CANCEL_RESOLUTION_HASH_DOMAIN, material
+            )
+            existing = conn.execute(
+                """
+                SELECT * FROM cancel_resolutions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            values = (
+                resolution_sha256,
+                intent_id,
+                cancellation["broker_order_id"],
+                terminal_outcome,
+                order_evidence.evidence_sha256,
+                observed_at,
+                now,
+            )
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO cancel_resolutions (
+                        resolution_sha256, intent_id, broker_order_id,
+                        terminal_outcome, order_evidence_sha256,
+                        observed_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            elif tuple(existing) != values:
+                if (
+                    existing["terminal_outcome"] != terminal_outcome
+                    or existing["order_evidence_sha256"]
+                    != order_evidence.evidence_sha256
+                ):
+                    raise OrderIntentIntegrityError(
+                        "terminal cancellation resolution changed"
+                    )
+            if cancellation["state"] != "TERMINAL":
+                conn.execute(
+                    """
+                    UPDATE order_cancellations
+                    SET state = 'TERMINAL',
+                        terminal_evidence_sha256 = ?,
+                        updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        order_evidence.evidence_sha256,
+                        now,
+                        intent_id,
+                    ),
+                )
+            row = conn.execute(
+                """
+                SELECT * FROM order_cancellations
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            self._verify_cancellation_row(conn, row)
+            return self._cancellation_from_row(row)
+
     def set_reservation_cap(self, evidence: AccountCapacityEvidence) -> Decimal:
         """Compatibility wrapper that still requires durable broker evidence."""
 
@@ -2439,7 +3367,17 @@ class OrderIntentLedger:
                 failure = OrderIntentReservationError(
                     "closing submission requires typed position and open-order capacity evidence"
                 )
-            elif self._blocker_rows(conn, intent["account_id"], intent["environment"]) or self._amendment_blocker_rows(conn, intent["account_id"], intent["environment"]):
+            elif (
+                self._blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+                or self._amendment_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+                or self._cancellation_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+            ):
                 failure = OrderIntentReconciliationRequired("account/environment has unresolved broker intents")
             else:
                 if intent["intent_kind"] == "OPENING":
@@ -2484,8 +3422,14 @@ class OrderIntentLedger:
                 self._require_submission_fence(intent, owner, fencing_token)
                 if intent["intent_kind"] == "OPENING":
                     self._require_active_opening_reservation(conn, intent, now)
-                if self._amendment_blocker_rows(conn, intent["account_id"], intent["environment"]):
-                    raise OrderIntentReconciliationRequired("account/environment has an unresolved amendment")
+                if self._amendment_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                ) or self._cancellation_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "account/environment has unresolved broker work"
+                    )
                 conn.execute(
                     "UPDATE order_intents SET submission_lease_expires_at = ?, updated_at = ? WHERE intent_id = ?",
                     (expires_at, now, intent_id),
@@ -2950,8 +3894,14 @@ class OrderIntentLedger:
                 )
                 if intent["intent_kind"] == "OPENING":
                     self._require_active_opening_reservation(conn, intent, now)
-                if self._amendment_blocker_rows(conn, intent["account_id"], intent["environment"]):
-                    raise OrderIntentReconciliationRequired("account/environment has an unresolved amendment")
+                if self._amendment_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                ) or self._cancellation_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "account/environment has unresolved broker work"
+                    )
                 self._record_outbound_authorization(conn, validated_authorization, now)
                 conn.execute(
                     """
@@ -3405,7 +4355,7 @@ class OrderIntentLedger:
             evidence, _from_us(self._now_us())
         )
         raise OrderIntentReconciliationRequired(
-            "use durable terminal order and schema-v2 capacity evidence"
+            "use durable terminal-order and position-lot capacity evidence"
         )
 
     def reconciliation_blockers(self, account_id: str, environment: str) -> tuple[IntentRecord, ...]:
@@ -3452,7 +4402,23 @@ class OrderIntentLedger:
             intent = self._require_intent(conn, intent_id)
             self._expire_claimed_leases(conn, intent["account_id"], intent["environment"], now)
             self._expire_amendment_leases(conn, intent["account_id"], intent["environment"], now)
-            if self._blocker_rows(conn, intent["account_id"], intent["environment"], exclude_intent_id=intent_id) or self._amendment_blocker_rows(conn, intent["account_id"], intent["environment"], exclude_intent_id=intent_id):
+            if (
+                self._blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
+                )
+                or self._amendment_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
+                )
+                or self._cancellation_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+            ):
                 failure = OrderIntentReconciliationRequired("account/environment has unresolved broker intents")
             else:
                 intent = self._require_intent(conn, intent_id)
@@ -3569,7 +4535,23 @@ class OrderIntentLedger:
                     client_order_id=amendment["client_order_id"],
                     payload=payload,
                 )
-                if self._blocker_rows(conn, intent["account_id"], intent["environment"], exclude_intent_id=intent_id) or self._amendment_blocker_rows(conn, intent["account_id"], intent["environment"], exclude_intent_id=intent_id):
+                if (
+                    self._blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=intent_id,
+                    )
+                    or self._amendment_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=intent_id,
+                    )
+                    or self._cancellation_blocker_rows(
+                        conn, intent["account_id"], intent["environment"]
+                    )
+                ):
                     raise OrderIntentReconciliationRequired("account/environment has unresolved broker work")
                 if intent["intent_kind"] == "OPENING":
                     self._require_opening_amendment_reservation(conn, intent, amendment["wire_payload"], now)
@@ -3994,6 +4976,135 @@ class OrderIntentLedger:
                     CHECK (raw_response_digest IS NULL OR length(raw_response_digest) = 64),
                     CHECK ((disposition = 'UNKNOWN') = (unknown_reason IS NOT NULL))
                 );
+                CREATE TABLE IF NOT EXISTS cancel_authorizations (
+                    authorization_sha256 TEXT PRIMARY KEY
+                        CHECK (length(authorization_sha256) = 64),
+                    intent_id TEXT NOT NULL
+                        REFERENCES order_intents(intent_id),
+                    account_id TEXT NOT NULL,
+                    account_id_key TEXT NOT NULL,
+                    institution_type TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    owner TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL
+                        CHECK (fencing_token > 0),
+                    broker_order_id TEXT NOT NULL,
+                    order_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    order_payload_hash TEXT NOT NULL
+                        CHECK (length(order_payload_hash) = 64),
+                    authorized_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    UNIQUE (intent_id, fencing_token),
+                    CHECK (expires_at > authorized_at)
+                );
+                CREATE TABLE IF NOT EXISTS order_cancellations (
+                    intent_id TEXT PRIMARY KEY
+                        REFERENCES order_intents(intent_id),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    broker_order_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'LEASED','SEND_UNKNOWN',
+                            'REQUEST_ACCEPTED','TERMINAL'
+                        )
+                    ),
+                    owner TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL
+                        CHECK (fencing_token > 0),
+                    authorization_sha256 TEXT NOT NULL
+                        REFERENCES cancel_authorizations(
+                            authorization_sha256
+                        ),
+                    order_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    order_payload_hash TEXT NOT NULL
+                        CHECK (length(order_payload_hash) = 64),
+                    expires_at INTEGER NOT NULL,
+                    terminal_evidence_sha256 TEXT
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    CHECK (
+                        (state = 'TERMINAL') =
+                        (terminal_evidence_sha256 IS NOT NULL)
+                    )
+                );
+                CREATE TABLE IF NOT EXISTS cancel_send_attempts (
+                    intent_id TEXT PRIMARY KEY
+                        REFERENCES order_cancellations(intent_id),
+                    authorization_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES cancel_authorizations(
+                            authorization_sha256
+                        ),
+                    account_id TEXT NOT NULL,
+                    account_id_key TEXT NOT NULL,
+                    institution_type TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    owner TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL
+                        CHECK (fencing_token > 0),
+                    broker_order_id TEXT NOT NULL,
+                    http_method TEXT NOT NULL CHECK (http_method = 'PUT'),
+                    route TEXT NOT NULL,
+                    final_xml_bytes BLOB NOT NULL,
+                    final_xml_sha256 TEXT NOT NULL
+                        CHECK (length(final_xml_sha256) = 64),
+                    claimed_at INTEGER NOT NULL,
+                    CHECK (length(final_xml_bytes) > 0)
+                );
+                CREATE TABLE IF NOT EXISTS cancel_response_receipts (
+                    intent_id TEXT PRIMARY KEY
+                        REFERENCES cancel_send_attempts(intent_id),
+                    disposition TEXT NOT NULL CHECK (
+                        disposition IN ('REQUEST_ACCEPTED','UNKNOWN')
+                    ),
+                    http_status INTEGER,
+                    messages_json TEXT NOT NULL,
+                    raw_response_digest TEXT,
+                    observed_at INTEGER NOT NULL,
+                    unknown_reason TEXT,
+                    recorded_at INTEGER NOT NULL,
+                    CHECK (
+                        http_status IS NULL
+                        OR http_status BETWEEN 100 AND 599
+                    ),
+                    CHECK (
+                        raw_response_digest IS NULL
+                        OR length(raw_response_digest) = 64
+                    ),
+                    CHECK (
+                        (disposition = 'UNKNOWN') =
+                        (unknown_reason IS NOT NULL)
+                    ),
+                    CHECK (
+                        disposition != 'REQUEST_ACCEPTED'
+                        OR http_status = 200
+                    )
+                );
+                CREATE TABLE IF NOT EXISTS cancel_resolutions (
+                    resolution_sha256 TEXT PRIMARY KEY
+                        CHECK (length(resolution_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES order_cancellations(intent_id),
+                    broker_order_id TEXT NOT NULL,
+                    terminal_outcome TEXT NOT NULL CHECK (
+                        terminal_outcome IN (
+                            'FILLED','CANCELLED','REJECTED','EXPIRED'
+                        )
+                    ),
+                    order_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS order_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
@@ -4027,6 +5138,8 @@ class OrderIntentLedger:
                 ON reservation_absorptions(
                     account_id, environment, classification
                 );
+                CREATE INDEX IF NOT EXISTS idx_order_cancellations_account
+                ON order_cancellations(account_id, environment, state);
                 CREATE TABLE IF NOT EXISTS broker_order_history (
                     broker_order_id TEXT PRIMARY KEY,
                     intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
@@ -4458,6 +5571,75 @@ class OrderIntentLedger:
                 "observed_at",
                 "recorded_at",
             },
+            "cancel_authorizations": {
+                "authorization_sha256",
+                "intent_id",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "owner",
+                "idempotency_key",
+                "fencing_token",
+                "broker_order_id",
+                "order_evidence_sha256",
+                "order_payload_hash",
+                "authorized_at",
+                "expires_at",
+            },
+            "order_cancellations": {
+                "intent_id",
+                "account_id",
+                "environment",
+                "broker_order_id",
+                "idempotency_key",
+                "state",
+                "owner",
+                "fencing_token",
+                "authorization_sha256",
+                "order_evidence_sha256",
+                "order_payload_hash",
+                "expires_at",
+                "terminal_evidence_sha256",
+                "created_at",
+                "updated_at",
+            },
+            "cancel_send_attempts": {
+                "intent_id",
+                "authorization_sha256",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "owner",
+                "idempotency_key",
+                "fencing_token",
+                "broker_order_id",
+                "http_method",
+                "route",
+                "final_xml_bytes",
+                "final_xml_sha256",
+                "claimed_at",
+            },
+            "cancel_response_receipts": {
+                "intent_id",
+                "disposition",
+                "http_status",
+                "messages_json",
+                "raw_response_digest",
+                "observed_at",
+                "unknown_reason",
+                "recorded_at",
+            },
+            "cancel_resolutions": {
+                "resolution_sha256",
+                "intent_id",
+                "broker_order_id",
+                "terminal_outcome",
+                "order_evidence_sha256",
+                "observed_at",
+                "recorded_at",
+            },
         }
         table_columns: dict[str, dict[str, sqlite3.Row]] = {}
         for table, required in required_columns.items():
@@ -4530,6 +5712,16 @@ class OrderIntentLedger:
             ("reservation_absorptions", "order_intents"),
             ("reservation_absorptions", "broker_read_manifests"),
             ("reservation_absorptions", "capacity_decisions"),
+            ("cancel_authorizations", "order_intents"),
+            ("cancel_authorizations", "broker_read_manifests"),
+            ("order_cancellations", "order_intents"),
+            ("order_cancellations", "cancel_authorizations"),
+            ("order_cancellations", "broker_read_manifests"),
+            ("cancel_send_attempts", "order_cancellations"),
+            ("cancel_send_attempts", "cancel_authorizations"),
+            ("cancel_response_receipts", "cancel_send_attempts"),
+            ("cancel_resolutions", "order_cancellations"),
+            ("cancel_resolutions", "broker_read_manifests"),
         }
         actual_foreign_keys = {
             (table, row["table"])
@@ -4725,6 +5917,29 @@ class OrderIntentLedger:
             SELECT * FROM order_intents WHERE account_id = ? AND environment = ?
               AND state IN ('CLAIMED', 'SUBMISSION_UNKNOWN', 'SUBMITTED')
               AND (last_reconciled_run IS NULL OR last_reconciled_run != ?){exclusion}
+            ORDER BY created_at, intent_id
+            """,
+            params,
+        ).fetchall()
+
+    @staticmethod
+    def _cancellation_blocker_rows(
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+        *,
+        exclude_intent_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [account_id, environment]
+        exclusion = ""
+        if exclude_intent_id is not None:
+            exclusion = " AND intent_id != ?"
+            params.append(exclude_intent_id)
+        return conn.execute(
+            f"""
+            SELECT * FROM order_cancellations
+            WHERE account_id = ? AND environment = ?
+              AND state != 'TERMINAL'{exclusion}
             ORDER BY created_at, intent_id
             """,
             params,
@@ -6528,7 +7743,8 @@ class OrderIntentLedger:
             manifest["evidence_kind"] != "CAPACITY"
             or manifest["completeness"] != "COMPLETE"
             or manifest["target_broker_order_id"] is not None
-            or result.get("schema") != "etrade-capacity.v2"
+            or result.get("schema")
+            not in {"etrade-capacity.v2", "etrade-capacity.v3"}
             or result.get("state_sha256")
             != receipt.portfolio_snapshot_digest
             or observed_at != _to_us(receipt.observed_at)
@@ -6538,7 +7754,7 @@ class OrderIntentLedger:
             > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
         ):
             raise OrderIntentReconciliationRequired(
-                "post capacity decision lacks fresh complete schema-v2 evidence"
+                "post capacity decision lacks fresh complete position-lot evidence"
             )
         return manifest, result
 
@@ -6785,7 +8001,8 @@ class OrderIntentLedger:
                 or post_manifest["completeness"] != "COMPLETE"
                 or post_manifest["account_id"] != row["account_id"]
                 or post_manifest["environment"] != row["environment"]
-                or post_result.get("schema") != "etrade-capacity.v2"
+                or post_result.get("schema")
+                not in {"etrade-capacity.v2", "etrade-capacity.v3"}
                 or int(post_manifest["observed_at"])
                 <= int(terminal_manifest["observed_at"])
                 or int(post_manifest["observed_at"])
@@ -6849,6 +8066,390 @@ class OrderIntentLedger:
             ),
             observed_at=_from_us(row["observed_at"]),
             recorded_at=_from_us(row["recorded_at"]),
+        )
+
+    def _verified_cancellation_order_read(
+        self,
+        conn: sqlite3.Connection,
+        intent: sqlite3.Row,
+        evidence: BrokerReadEvidenceRef,
+        *,
+        now: int,
+        require_open: bool,
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        manifest, result = self._verified_broker_read_manifest(
+            conn, evidence.evidence_sha256
+        )
+        _validate_order_query_manifest_result(result)
+        if (
+            manifest["evidence_kind"] != "ORDER_QUERY"
+            or manifest["completeness"] != "COMPLETE"
+            or manifest["account_id"] != intent["account_id"]
+            or manifest["environment"] != intent["environment"]
+            or manifest["target_broker_order_id"]
+            != intent["broker_order_id"]
+            or result.get("schema") != "etrade-order-query.v2"
+            or result.get("broker_order_id")
+            != intent["broker_order_id"]
+        ):
+            raise OrderIntentIntegrityError(
+                "cancellation order read is not bound to the durable intent"
+            )
+        observed_at = int(manifest["observed_at"])
+        if (
+            observed_at > now + 5_000_000
+            or now - observed_at
+            > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentValidationError(
+                "cancellation order read is stale or from the future"
+            )
+        self._require_latest_complete_manifest_head(
+            conn, manifest, recorded_at_boundary=now
+        )
+        cancellation = conn.execute(
+            """
+            SELECT * FROM order_cancellations
+            WHERE intent_id = ?
+            """,
+            (intent["intent_id"],),
+        ).fetchone()
+        if cancellation is not None:
+            authorization = self._require_cancel_authorization(
+                conn, cancellation["authorization_sha256"]
+            )
+            if (
+                manifest["account_id_key"]
+                != authorization["account_id_key"]
+                or manifest["institution_type"]
+                != authorization["institution_type"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancellation account binding changed"
+                )
+        if result["not_found"]:
+            if require_open:
+                raise OrderIntentReconciliationRequired(
+                    "known order disappeared before cancellation authorization"
+                )
+            return manifest, result
+        expected_payload_hash = self._expected_order_payload_hash_conn(
+            conn, intent
+        )
+        if expected_payload_hash not in result["order_payload_hashes"]:
+            raise OrderIntentBrokerTermsMismatch(
+                "cancel target terms do not match the durable intent"
+            )
+        if require_open and (
+            result["outcome"] != "OPEN"
+            or result["raw_status"] != "OPEN"
+            or result["replacement_links"]
+            != {
+                "replaces_order_id": None,
+                "replaced_by_order_id": None,
+            }
+            or result["fill_summary"]["classification"] != "OPEN"
+        ):
+            raise OrderIntentReconciliationRequired(
+                "cancel authorization requires an exact zero-fill OPEN order"
+            )
+        return manifest, result
+
+    def _require_cancel_authorization(
+        self,
+        conn: sqlite3.Connection,
+        authorization_sha256: str,
+    ) -> sqlite3.Row:
+        _validate_sha256(
+            "cancel authorization digest", authorization_sha256
+        )
+        row = conn.execute(
+            """
+            SELECT * FROM cancel_authorizations
+            WHERE authorization_sha256 = ?
+            """,
+            (authorization_sha256,),
+        ).fetchone()
+        if row is None:
+            raise OrderIntentIntegrityError(
+                "unknown cancel authorization"
+            )
+        material = {
+            "intent_id": row["intent_id"],
+            "account_id": row["account_id"],
+            "account_id_key": row["account_id_key"],
+            "institution_type": row["institution_type"],
+            "environment": row["environment"],
+            "owner": row["owner"],
+            "idempotency_key": row["idempotency_key"],
+            "fencing_token": int(row["fencing_token"]),
+            "broker_order_id": row["broker_order_id"],
+            "order_evidence_sha256": row["order_evidence_sha256"],
+            "order_payload_hash": row["order_payload_hash"],
+            "authorized_at": int(row["authorized_at"]),
+            "expires_at": int(row["expires_at"]),
+        }
+        expected = _domain_json_hash(
+            _CANCEL_AUTHORIZATION_HASH_DOMAIN, material
+        )
+        if not hmac.compare_digest(expected, authorization_sha256):
+            raise OrderIntentIntegrityError(
+                "cancel authorization digest does not verify"
+            )
+        return row
+
+    def _verify_cancellation_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> None:
+        intent = self._require_intent(conn, row["intent_id"])
+        authorization = self._require_cancel_authorization(
+            conn, row["authorization_sha256"]
+        )
+        if (
+            intent["account_id"] != row["account_id"]
+            or intent["environment"] != row["environment"]
+            or intent["broker_order_id"] != row["broker_order_id"]
+            or intent["intent_kind"] != "OPENING"
+            or authorization["intent_id"] != row["intent_id"]
+            or authorization["account_id"] != row["account_id"]
+            or authorization["environment"] != row["environment"]
+            or authorization["owner"] != row["owner"]
+            or authorization["idempotency_key"]
+            != row["idempotency_key"]
+            or int(authorization["fencing_token"])
+            != int(row["fencing_token"])
+            or authorization["broker_order_id"]
+            != row["broker_order_id"]
+            or authorization["order_evidence_sha256"]
+            != row["order_evidence_sha256"]
+            or authorization["order_payload_hash"]
+            != row["order_payload_hash"]
+            or int(authorization["expires_at"])
+            != int(row["expires_at"])
+        ):
+            raise OrderIntentIntegrityError(
+                "durable cancellation identity is inconsistent"
+            )
+        attempt = conn.execute(
+            """
+            SELECT * FROM cancel_send_attempts
+            WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        response = conn.execute(
+            """
+            SELECT * FROM cancel_response_receipts
+            WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        resolution = conn.execute(
+            """
+            SELECT * FROM cancel_resolutions
+            WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        if attempt is None:
+            if (
+                row["state"] not in {"LEASED", "TERMINAL"}
+                or response is not None
+                or (
+                    row["state"] == "LEASED"
+                    and resolution is not None
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "unsent cancellation has impossible durable state"
+                )
+        else:
+            if row["state"] == "LEASED":
+                raise OrderIntentIntegrityError(
+                    "sent cancellation remained in a sendable state"
+                )
+            expected_request = CancellationRequestEvidence(
+                account_id=attempt["account_id"],
+                account_id_key=attempt["account_id_key"],
+                institution_type=attempt["institution_type"],
+                environment=attempt["environment"],
+                intent_id=attempt["intent_id"],
+                owner=attempt["owner"],
+                idempotency_key=attempt["idempotency_key"],
+                fencing_token=int(attempt["fencing_token"]),
+                broker_order_id=attempt["broker_order_id"],
+                authorization_sha256=attempt[
+                    "authorization_sha256"
+                ],
+                http_method=attempt["http_method"],
+                route=attempt["route"],
+                final_xml_bytes=attempt["final_xml_bytes"],
+                final_xml_sha256=attempt["final_xml_sha256"],
+            )
+            _validate_cancellation_request(expected_request)
+            if (
+                attempt["authorization_sha256"]
+                != row["authorization_sha256"]
+                or attempt["broker_order_id"]
+                != row["broker_order_id"]
+                or attempt["idempotency_key"]
+                != row["idempotency_key"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel send attempt is disconnected from its authorization"
+                )
+        if response is None:
+            if row["state"] == "REQUEST_ACCEPTED":
+                raise OrderIntentIntegrityError(
+                    "accepted cancellation lacks a response receipt"
+                )
+        else:
+            try:
+                messages = json.loads(response["messages_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise OrderIntentIntegrityError(
+                    "cancel response messages are invalid"
+                ) from exc
+            if (
+                type(messages) is not list
+                or any(
+                    type(message) is not dict
+                    or set(message)
+                    != {"code", "type", "description_sha256"}
+                    for message in messages
+                )
+                or _canonical_read_json(messages)
+                != response["messages_json"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel response messages are not canonical"
+                )
+            persisted_response = CancellationResponseEvidence(
+                disposition=response["disposition"],
+                http_status=response["http_status"],
+                message_codes=tuple(
+                    message["code"] for message in messages
+                ),
+                message_types=tuple(
+                    message["type"] for message in messages
+                ),
+                message_description_digests=tuple(
+                    message["description_sha256"]
+                    for message in messages
+                ),
+                raw_response_digest=response[
+                    "raw_response_digest"
+                ],
+                observed_at=_from_us(response["observed_at"]),
+                unknown_reason=response["unknown_reason"],
+            )
+            try:
+                _validate_cancellation_response(persisted_response)
+            except OrderIntentValidationError as exc:
+                raise OrderIntentIntegrityError(
+                    "cancel response receipt no longer verifies"
+                ) from exc
+            if (
+                int(response["observed_at"])
+                < int(attempt["claimed_at"])
+                or int(response["recorded_at"])
+                < int(response["observed_at"])
+                or (
+                    response["disposition"] == "REQUEST_ACCEPTED"
+                    and row["state"]
+                    not in {"REQUEST_ACCEPTED", "TERMINAL"}
+                )
+                or (
+                    response["disposition"] == "UNKNOWN"
+                    and row["state"]
+                    not in {"SEND_UNKNOWN", "TERMINAL"}
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel response conflicts with cancellation state"
+                )
+        if row["state"] == "TERMINAL":
+            if (
+                resolution is None
+                or row["terminal_evidence_sha256"]
+                != resolution["order_evidence_sha256"]
+                or intent["state"] != resolution["terminal_outcome"]
+                or intent["broker_order_id"]
+                != resolution["broker_order_id"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "terminal cancellation lacks exact broker resolution"
+                )
+            resolution_material = {
+                "intent_id": resolution["intent_id"],
+                "broker_order_id": resolution["broker_order_id"],
+                "terminal_outcome": resolution["terminal_outcome"],
+                "order_evidence_sha256":
+                    resolution["order_evidence_sha256"],
+                "observed_at": int(resolution["observed_at"]),
+                "recorded_at": int(resolution["recorded_at"]),
+            }
+            expected_resolution = _domain_json_hash(
+                _CANCEL_RESOLUTION_HASH_DOMAIN,
+                resolution_material,
+            )
+            if not hmac.compare_digest(
+                expected_resolution,
+                resolution["resolution_sha256"],
+            ):
+                raise OrderIntentIntegrityError(
+                    "cancel resolution digest does not verify"
+                )
+        elif resolution is not None:
+            raise OrderIntentIntegrityError(
+                "nonterminal cancellation has a terminal resolution"
+            )
+
+    @staticmethod
+    def _cancellation_authorization_from_row(
+        row: sqlite3.Row,
+    ) -> CancellationAuthorization:
+        return CancellationAuthorization(
+            intent_id=row["intent_id"],
+            account_id=row["account_id"],
+            account_id_key=row["account_id_key"],
+            institution_type=row["institution_type"],
+            environment=row["environment"],
+            owner=row["owner"],
+            idempotency_key=row["idempotency_key"],
+            fencing_token=int(row["fencing_token"]),
+            broker_order_id=row["broker_order_id"],
+            order_evidence_sha256=row["order_evidence_sha256"],
+            order_payload_hash=row["order_payload_hash"],
+            authorization_sha256=row["authorization_sha256"],
+            authorized_at=_from_us(row["authorized_at"]),
+            expires_at=_from_us(row["expires_at"]),
+        )
+
+    @staticmethod
+    def _cancellation_from_row(
+        row: sqlite3.Row,
+    ) -> CancellationRecord:
+        return CancellationRecord(
+            intent_id=row["intent_id"],
+            account_id=row["account_id"],
+            environment=row["environment"],
+            broker_order_id=row["broker_order_id"],
+            idempotency_key=row["idempotency_key"],
+            state=row["state"],
+            owner=row["owner"],
+            fencing_token=int(row["fencing_token"]),
+            authorization_sha256=row["authorization_sha256"],
+            order_evidence_sha256=row["order_evidence_sha256"],
+            order_payload_hash=row["order_payload_hash"],
+            expires_at=_from_us(row["expires_at"]),
+            terminal_evidence_sha256=row[
+                "terminal_evidence_sha256"
+            ],
+            created_at=_from_us(row["created_at"]),
+            updated_at=_from_us(row["updated_at"]),
         )
 
     def _require_intent(self, conn: sqlite3.Connection, intent_id: str) -> sqlite3.Row:
@@ -7001,6 +8602,246 @@ def _validate_envelope(envelope: OrderIntent) -> None:
         raise OrderIntentIntegrityError("wire payload is invalid JSON") from exc
     if wire_order_payload(wire_payload) != envelope.wire_payload or canonical_order_payload(wire_payload) != envelope.canonical_payload or _derive_intent_kind(wire_payload) != envelope.intent_kind:
         raise OrderIntentIntegrityError("wire payload does not satisfy strict canonical identity")
+
+
+def _validate_cancellation_authorization(
+    authorization: CancellationAuthorization,
+) -> None:
+    if type(authorization) is not CancellationAuthorization:
+        raise OrderIntentValidationError(
+            "cancel authorization must use its exact immutable type"
+        )
+    for name in (
+        "intent_id",
+        "account_id",
+        "account_id_key",
+        "institution_type",
+        "owner",
+        "idempotency_key",
+    ):
+        _validate_identity(name, getattr(authorization, name))
+    _validate_environment(authorization.environment)
+    _validate_fencing_token(authorization.fencing_token)
+    _canonical_unsigned_integer_text(
+        authorization.broker_order_id,
+        "cancel broker order id",
+        positive=True,
+    )
+    for name in (
+        "order_evidence_sha256",
+        "order_payload_hash",
+        "authorization_sha256",
+    ):
+        _validate_sha256(name, getattr(authorization, name))
+    _validate_timestamp(authorization.authorized_at)
+    _validate_timestamp(authorization.expires_at)
+    duration = (
+        authorization.expires_at - authorization.authorized_at
+    ).total_seconds()
+    if not 0 < duration <= 300:
+        raise OrderIntentValidationError(
+            "cancel authorization lifetime is invalid"
+        )
+
+
+def _validate_cancellation_request(
+    request: CancellationRequestEvidence,
+) -> None:
+    if type(request) is not CancellationRequestEvidence:
+        raise OrderIntentValidationError(
+            "cancel request must use its exact immutable type"
+        )
+    for name in (
+        "account_id",
+        "account_id_key",
+        "institution_type",
+        "intent_id",
+        "owner",
+        "idempotency_key",
+    ):
+        _validate_identity(name, getattr(request, name))
+    _validate_environment(request.environment)
+    _validate_fencing_token(request.fencing_token)
+    _canonical_unsigned_integer_text(
+        request.broker_order_id,
+        "cancel broker order id",
+        positive=True,
+    )
+    _validate_sha256(
+        "cancel authorization digest", request.authorization_sha256
+    )
+    _validate_sha256("cancel XML digest", request.final_xml_sha256)
+    if (
+        request.http_method != "PUT"
+        or type(request.route) is not str
+        or type(request.final_xml_bytes) is not bytes
+        or not request.final_xml_bytes
+        or len(request.final_xml_bytes) > _MAX_TRANSPORT_REQUEST_BYTES
+        or not hmac.compare_digest(
+            hashlib.sha256(request.final_xml_bytes).hexdigest(),
+            request.final_xml_sha256,
+        )
+    ):
+        raise OrderIntentValidationError(
+            "cancel request method or body is invalid"
+        )
+    expected_route = _cancel_order_route(request.account_id_key)
+    if (
+        request.route != expected_route
+        or request.final_xml_bytes
+        != _cancel_order_xml(request.broker_order_id)
+    ):
+        raise OrderIntentIntegrityError(
+            "cancel request route or body is not exact"
+        )
+
+
+def _validate_cancellation_response(
+    response: CancellationResponseEvidence,
+) -> None:
+    if type(response) is not CancellationResponseEvidence:
+        raise OrderIntentValidationError(
+            "cancel response must use its exact immutable type"
+        )
+    if (
+        response.disposition
+        not in {"REQUEST_ACCEPTED", "UNKNOWN"}
+        or (
+            response.http_status is not None
+            and (
+                type(response.http_status) is not int
+                or not 100 <= response.http_status <= 599
+            )
+        )
+    ):
+        raise OrderIntentValidationError(
+            "cancel response disposition or status is invalid"
+        )
+    tuples = (
+        response.message_codes,
+        response.message_types,
+        response.message_description_digests,
+    )
+    if (
+        any(type(value) is not tuple for value in tuples)
+        or len({len(value) for value in tuples}) != 1
+        or len(response.message_codes) > 64
+        or any(
+            type(code) is not int or not 0 <= code <= 2_147_483_647
+            for code in response.message_codes
+        )
+        or any(
+            type(message_type) is not str
+            or message_type
+            not in {"WARNING", "INFO", "INFO_HOLD", "ERROR"}
+            for message_type in response.message_types
+        )
+    ):
+        raise OrderIntentValidationError(
+            "cancel response messages are invalid"
+        )
+    for digest in response.message_description_digests:
+        _validate_sha256("cancel message digest", digest)
+    if response.raw_response_digest is not None:
+        _validate_sha256(
+            "cancel raw response digest",
+            response.raw_response_digest,
+        )
+    _validate_timestamp(response.observed_at)
+    if (response.disposition == "UNKNOWN") != (
+        response.unknown_reason is not None
+    ):
+        raise OrderIntentValidationError(
+            "cancel unknown reason is inconsistent"
+        )
+    if response.unknown_reason is not None:
+        _validate_identity(
+            "cancel unknown reason", response.unknown_reason
+        )
+    if response.disposition == "REQUEST_ACCEPTED" and (
+        response.http_status != 200
+        or response.raw_response_digest is None
+        or not response.message_codes
+        or any(code != 5011 for code in response.message_codes)
+        or any(
+            message_type != "WARNING"
+            for message_type in response.message_types
+        )
+    ):
+        raise OrderIntentValidationError(
+            "cancel acceptance is not the exact processing acknowledgement"
+        )
+
+
+def _cancel_attempt_matches_request(
+    row: sqlite3.Row,
+    request: CancellationRequestEvidence,
+) -> bool:
+    return (
+        row["intent_id"],
+        row["authorization_sha256"],
+        row["account_id"],
+        row["account_id_key"],
+        row["institution_type"],
+        row["environment"],
+        row["owner"],
+        row["idempotency_key"],
+        int(row["fencing_token"]),
+        row["broker_order_id"],
+        row["http_method"],
+        row["route"],
+        row["final_xml_bytes"],
+        row["final_xml_sha256"],
+    ) == (
+        request.intent_id,
+        request.authorization_sha256,
+        request.account_id,
+        request.account_id_key,
+        request.institution_type,
+        request.environment,
+        request.owner,
+        request.idempotency_key,
+        request.fencing_token,
+        request.broker_order_id,
+        request.http_method,
+        request.route,
+        request.final_xml_bytes,
+        request.final_xml_sha256,
+    )
+
+
+def _is_zero_fill_cancel_pending(result: dict[str, Any]) -> bool:
+    summary = result.get("fill_summary")
+    if (
+        result.get("not_found") is not False
+        or result.get("raw_status") != "CANCEL_REQUESTED"
+        or result.get("outcome") != "UNRESOLVED"
+        or result.get("replacement_links")
+        != {
+            "replaces_order_id": None,
+            "replaced_by_order_id": None,
+        }
+        or type(summary) is not dict
+        or summary.get("classification") != "UNRESOLVED"
+        or summary.get("placed_time_epoch_ms") is None
+        or summary.get("executed_time_epoch_ms") is not None
+        or type(summary.get("legs")) is not list
+        or len(summary["legs"]) != 2
+    ):
+        return False
+    return all(
+        _canonical_signed_decimal_text(
+            leg["filled_quantity"],
+            "cancel pending filled quantity",
+        )
+        == 0
+        and _canonical_signed_decimal_text(
+            leg["cancel_quantity"],
+            "cancel pending cancelled quantity",
+        )
+        == 0
+        for leg in summary["legs"]
+    )
 
 
 def _validate_transport_request_evidence(
@@ -7722,11 +9563,18 @@ def _validate_capacity_receipt_lineage(
     receipt_rows: tuple[sqlite3.Row, ...],
 ) -> None:
     schema = result.get("schema")
-    if schema not in {"etrade-capacity.v1", "etrade-capacity.v2"}:
+    if schema not in {
+        "etrade-capacity.v1",
+        "etrade-capacity.v2",
+        "etrade-capacity.v3",
+    }:
         raise OrderIntentIntegrityError(
             "capacity manifest uses an unsupported result schema"
         )
-    lots_required = schema == "etrade-capacity.v2"
+    lots_required = schema in {
+        "etrade-capacity.v2",
+        "etrade-capacity.v3",
+    }
     if member_roles[0] != "binding.start" or member_roles[-1] != "binding.end":
         raise OrderIntentIntegrityError(
             "capacity manifest lacks account-binding brackets"
@@ -7893,9 +9741,13 @@ def _validate_capacity_receipt_lineage(
     rebuilt = dict(scans[1])
     rebuilt["state_sha256"] = _domain_json_hash(
         (
-            b"etrade-capacity-state.v2\0"
-            if lots_required
-            else b"etrade-capacity-state.v1\0"
+            b"etrade-capacity-state.v3\0"
+            if schema == "etrade-capacity.v3"
+            else (
+                b"etrade-capacity-state.v2\0"
+                if schema == "etrade-capacity.v2"
+                else b"etrade-capacity-state.v1\0"
+            )
         ),
         economic_scans[1],
     )
@@ -8468,28 +10320,43 @@ def _validate_fill_summary_shape(summary: Any) -> None:
         )
 
 
-def _validate_capacity_v2_positions(
+def _validate_capacity_positions(
     positions: list[Any],
+    *,
+    schema: str,
 ) -> None:
+    if schema not in {"etrade-capacity.v2", "etrade-capacity.v3"}:
+        raise OrderIntentIntegrityError(
+            "capacity position validator received an unsupported schema"
+        )
+    contract_identity_required = schema == "etrade-capacity.v3"
     position_ids: list[str] = []
     lot_ids: set[str] = set()
     for position in positions:
+        expected_position_keys = {
+            "position_id",
+            "account_id",
+            "product",
+            "quantity",
+            "position_type",
+            "position_indicator",
+            "osi_key",
+            "lots",
+        }
+        if contract_identity_required:
+            expected_position_keys.update(
+                {
+                    "option_multiplier",
+                    "options_adjusted_flag",
+                    "deliverables",
+                }
+            )
         if (
             type(position) is not dict
-            or set(position)
-            != {
-                "position_id",
-                "account_id",
-                "product",
-                "quantity",
-                "position_type",
-                "position_indicator",
-                "osi_key",
-                "lots",
-            }
+            or set(position) != expected_position_keys
         ):
             raise OrderIntentIntegrityError(
-                "schema-v2 position shape is invalid"
+                f"{schema} position shape is invalid"
             )
         _canonical_unsigned_integer_text(
             position["position_id"],
@@ -8507,6 +10374,43 @@ def _validate_capacity_v2_positions(
         _validate_normalized_product(
             position["product"], "position"
         )
+        if contract_identity_required:
+            if position["product"]["security_type"] == "OPTN":
+                multiplier = _canonical_signed_decimal_text(
+                    position["option_multiplier"],
+                    "position option multiplier",
+                )
+                deliverables = position["deliverables"]
+                if (
+                    multiplier <= 0
+                    or type(position["options_adjusted_flag"]) is not bool
+                    or (
+                        deliverables is not None
+                        and (
+                            type(deliverables) is not str
+                            or not deliverables
+                            or len(deliverables) > 512
+                            or any(
+                                ord(char) < 32 or ord(char) > 126
+                                for char in deliverables
+                            )
+                        )
+                    )
+                ):
+                    raise OrderIntentIntegrityError(
+                        "option contract evidence is invalid"
+                    )
+            elif any(
+                position[name] is not None
+                for name in (
+                    "option_multiplier",
+                    "options_adjusted_flag",
+                    "deliverables",
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "equity position contains option contract evidence"
+                )
         for name in (
             "position_type",
             "position_indicator",
@@ -8744,9 +10648,12 @@ def _terminal_position_lot_proof(
     fill_summary: dict[str, Any],
 ) -> list[dict[str, Any]]:
     _validate_capacity_manifest_result(capacity_result)
-    if capacity_result["schema"] != "etrade-capacity.v2":
+    if capacity_result["schema"] not in {
+        "etrade-capacity.v2",
+        "etrade-capacity.v3",
+    }:
         raise OrderIntentReconciliationRequired(
-            "full-fill absorption requires schema-v2 position lots"
+            "full-fill absorption requires complete position-lot evidence"
         )
     if any(
         type(order) is dict
@@ -8928,7 +10835,11 @@ def _validate_capacity_manifest_result(
         )
     schema = result["schema"]
     if (
-        schema not in {"etrade-capacity.v1", "etrade-capacity.v2"}
+        schema not in {
+            "etrade-capacity.v1",
+            "etrade-capacity.v2",
+            "etrade-capacity.v3",
+        }
         or result["account_status"] != "ACTIVE"
         or result["account_mode"] != "MARGIN"
         or type(result["account_type"]) is not str
@@ -8951,8 +10862,11 @@ def _validate_capacity_manifest_result(
             "capacity manifest buying power is not canonical"
         )
     _validate_sha256("capacity state digest", result["state_sha256"])
-    if schema == "etrade-capacity.v2":
-        _validate_capacity_v2_positions(result["positions"])
+    if schema in {"etrade-capacity.v2", "etrade-capacity.v3"}:
+        _validate_capacity_positions(
+            result["positions"],
+            schema=schema,
+        )
         if expected_account_id is not None and any(
             position["account_id"] != expected_account_id
             for position in result["positions"]
@@ -8967,9 +10881,13 @@ def _validate_capacity_manifest_result(
     }
     expected_digest = _domain_json_hash(
         (
-            b"etrade-capacity-state.v2\0"
-            if schema == "etrade-capacity.v2"
-            else b"etrade-capacity-state.v1\0"
+            b"etrade-capacity-state.v3\0"
+            if schema == "etrade-capacity.v3"
+            else (
+                b"etrade-capacity-state.v2\0"
+                if schema == "etrade-capacity.v2"
+                else b"etrade-capacity-state.v1\0"
+            )
         ),
         state,
     )

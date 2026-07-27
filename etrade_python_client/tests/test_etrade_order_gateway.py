@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import dataclass, field, replace
@@ -31,6 +32,7 @@ from live_trading.etrade_broker_transport import (
     _ExchangeResult,
 )
 from live_trading.etrade_order_gateway import (
+    CancelOpeningCommand,
     EtradeOrderGateway,
     GatewayReconciliationRequired,
     GatewayValidationError,
@@ -206,12 +208,45 @@ def place_result(*, order_id="94", status="OPEN", messages=None):
     )
 
 
+def cancel_result(*, order_id="94"):
+    body = {
+        "CancelOrderResponse": {
+            "accountId": ACCOUNT_ID,
+            "orderId": order_id,
+            "cancelTime": 1785171600000,
+            "messages": {
+                "Message": {
+                    "code": 5011,
+                    "description": (
+                        "200|Your request to cancel your order is "
+                        "being processed."
+                    ),
+                    "type": "WARNING",
+                }
+            },
+        }
+    }
+    return _ExchangeResult(
+        "RESPONSE",
+        http_status=200,
+        raw_response=json.dumps(
+            body, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8"),
+    )
+
+
 class ExchangeHarness:
     def __init__(self):
         self.outcomes = []
         self.calls = []
 
-    def exchange(self, prepared, *, timeout_seconds):
+    def exchange(
+        self,
+        prepared,
+        *,
+        timeout_seconds,
+        max_response_bytes=64 * 1024,
+    ):
         self.calls.append((prepared, timeout_seconds))
         if not self.outcomes:
             raise AssertionError("unexpected broker mutation")
@@ -402,7 +437,7 @@ class FakeReader:
                 )
             )
         economic_state = {
-            "schema": "etrade-capacity.v2",
+            "schema": "etrade-capacity.v3",
             "account_status": "ACTIVE",
             "account_mode": "MARGIN",
             "account_type": "INDIVIDUAL",
@@ -413,7 +448,7 @@ class FakeReader:
         result = dict(economic_state)
         result["broker_buying_power_as_of"] = as_of
         result["state_sha256"] = _domain_json_sha256(
-            b"etrade-capacity-state.v2\0", economic_state
+            b"etrade-capacity-state.v3\0", economic_state
         )
         return self.ledger.record_broker_read_manifest(
             BrokerReadManifestEvidence(
@@ -462,6 +497,9 @@ class FakeReader:
                         "position_type": position_type,
                         "position_indicator": "TYPE1",
                         "osi_key": None,
+                        "option_multiplier": "100",
+                        "options_adjusted_flag": False,
+                        "deliverables": "100 shares of SPY",
                         "lots": [
                             {
                                 "position_id": position_id,
@@ -669,6 +707,11 @@ class FakeReader:
             "quantity": position["quantity"],
             "positionType": position["position_type"],
             "positionIndicator": position["position_indicator"],
+            "osiKey": position["osi_key"],
+            "optionMultiplier": position["option_multiplier"],
+            "optionsAdjustedFlag":
+                position["options_adjusted_flag"],
+            "deliverablesStr": position["deliverables"],
             "PositionLot": [
                 {
                     "positionId": lot["position_id"],
@@ -1037,6 +1080,205 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         reservation = self.ledger.get_margin_reservation(first.intent_id)
         self.assertIsNotNone(reservation.capacity_decision_sha256)
         self.assertEqual(len(reservation.capacity_decision_sha256), 64)
+
+    def test_cancel_ack_stays_pending_and_restart_never_resends(
+        self,
+    ):
+        submitted = self.submit_named_order(
+            key="cancel-order",
+            decision="cancel-decision",
+            broker_order_id="94",
+        )
+        self.reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "OPEN",
+            self.clock.now,
+            200,
+            "1" * 64,
+            order_payload_hash(),
+            True,
+        )
+        self.harness.add(cancel_result())
+        command = CancelOpeningCommand(
+            intent_id=submitted.intent_id,
+            idempotency_key="cancel-order-94",
+            owner=OWNER,
+        )
+
+        result = self.gateway.cancel_opening(command)
+        replay = self.gateway.cancel_opening(command)
+
+        self.assertEqual(result.state, "REQUEST_ACCEPTED")
+        self.assertEqual(replay.state, "REQUEST_ACCEPTED")
+        self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+        self.assertEqual(
+            self.ledger.get_margin_reservation(
+                submitted.intent_id
+            ).state,
+            "ACTIVE",
+        )
+
+        pending_reader = FakeReader(self.clock, self.account)
+        pending_reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "OPEN",
+            self.clock.now,
+            200,
+            "2" * 64,
+            order_payload_hash(),
+            True,
+        )
+        restarted, _, _ = self.restart(reader=pending_reader)
+        with self.assertRaises(GatewayReconciliationRequired):
+            restarted.start()
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+
+        self.clock.advance(1)
+        terminal_reader = FakeReader(self.clock, self.account)
+        terminal_reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "CANCELLED",
+            self.clock.now,
+            200,
+            "3" * 64,
+            order_payload_hash(),
+            True,
+        )
+        resolved, resolved_ledger, _ = self.restart(
+            reader=terminal_reader
+        )
+        resolved.start()
+        self.assertEqual(
+            resolved_ledger.get_cancellation(
+                submitted.intent_id
+            ).state,
+            "TERMINAL",
+        )
+        self.assertEqual(
+            resolved_ledger.get_margin_reservation(
+                submitted.intent_id
+            ).state,
+            "RELEASED",
+        )
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+
+    def test_ambiguous_cancel_send_is_durable_and_not_retried(self):
+        submitted = self.submit_named_order(
+            key="cancel-timeout",
+            decision="cancel-timeout-decision",
+            broker_order_id="95",
+        )
+        self.reader.query_behaviors["95"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "95",
+            "OPEN",
+            self.clock.now,
+            200,
+            "4" * 64,
+            order_payload_hash(),
+            True,
+        )
+        self.harness.add(_ExchangeResult("TIMEOUT"))
+        command = CancelOpeningCommand(
+            intent_id=submitted.intent_id,
+            idempotency_key="cancel-timeout-95",
+            owner=OWNER,
+        )
+
+        result = self.gateway.cancel_opening(command)
+        replay = self.gateway.cancel_opening(command)
+
+        self.assertEqual(result.state, "SEND_UNKNOWN")
+        self.assertEqual(result.reason_code, "TIMEOUT")
+        self.assertEqual(replay.state, "SEND_UNKNOWN")
+        self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM cancel_send_attempts
+                    WHERE intent_id = ?
+                    """,
+                    (submitted.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_unsent_cancel_lease_can_resume_once_after_restart(self):
+        submitted = self.submit_named_order(
+            key="cancel-pre-send",
+            decision="cancel-pre-send-decision",
+            broker_order_id="96",
+        )
+        self.reader.query_behaviors["96"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "96",
+            "OPEN",
+            self.clock.now,
+            200,
+            "5" * 64,
+            order_payload_hash(),
+            True,
+        )
+        read = self.reader.query_order(self.account, "96")
+        self.ledger.authorize_cancellation(
+            submitted.intent_id,
+            "cancel-pre-send-96",
+            OWNER,
+            30,
+            read,
+        )
+        restarted, restarted_ledger, restarted_reader = self.restart()
+        restarted_reader.query_behaviors["96"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "96",
+            "OPEN",
+            self.clock.now,
+            200,
+            "6" * 64,
+            order_payload_hash(),
+            True,
+        )
+        self.harness.add(cancel_result(order_id="96"))
+
+        result = restarted.cancel_opening(
+            CancelOpeningCommand(
+                intent_id=submitted.intent_id,
+                idempotency_key="cancel-pre-send-96",
+                owner=OWNER,
+            )
+        )
+
+        self.assertEqual(result.state, "REQUEST_ACCEPTED")
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM cancel_send_attempts
+                    WHERE intent_id = ?
+                    """,
+                    (submitted.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+        self.assertEqual(
+            restarted_ledger.get_cancellation(
+                submitted.intent_id
+            ).state,
+            "REQUEST_ACCEPTED",
+        )
 
     def test_fake_reader_requires_explicit_test_patch_and_dependencies_are_immutable(
         self,

@@ -202,6 +202,9 @@ def position(
         "positionType": "LONG",
         "positionIndicator": "TYPE1",
         "osiKey": f"SPY---260821P00{strike}",
+        "optionMultiplier": "100",
+        "optionsAdjustedFlag": False,
+        "deliverablesStr": "100 shares of SPY",
         "Product": {
             "symbol": "SPY",
             "securityType": "OPTN",
@@ -654,13 +657,28 @@ class ETradeBrokerReaderTests(unittest.TestCase):
         result = self.manifest_result(
             case, evidence.evidence_sha256
         )
-        self.assertEqual(result["schema"], "etrade-capacity.v2")
+        self.assertEqual(result["schema"], "etrade-capacity.v3")
         self.assertEqual(result["broker_buying_power"], "1000")
         self.assertEqual(
             [item["position_id"] for item in result["positions"]],
             ["11", "12"],
         )
         self.assertEqual(result["open_orders"], [])
+        self.assertEqual(
+            {
+                "option_multiplier":
+                    result["positions"][0]["option_multiplier"],
+                "options_adjusted_flag":
+                    result["positions"][0]["options_adjusted_flag"],
+                "deliverables":
+                    result["positions"][0]["deliverables"],
+            },
+            {
+                "option_multiplier": "100",
+                "options_adjusted_flag": False,
+                "deliverables": "100 shares of SPY",
+            },
+        )
         self.assertEqual(
             result["positions"][0]["lots"][0],
             {
@@ -940,6 +958,47 @@ class ETradeBrokerReaderTests(unittest.TestCase):
                 self.assertEqual(
                     parsed["positions"][0]["lots"], []
                 )
+
+    def test_option_contract_evidence_is_required_and_preserved(
+        self,
+    ) -> None:
+        case = self.case([])
+        adjusted = position("12", "620")
+        adjusted["optionMultiplier"] = "50"
+        adjusted["optionsAdjustedFlag"] = True
+        adjusted["deliverablesStr"] = "50 shares plus CASH"
+
+        parsed, completeness = case.reader._parse_portfolio_page(
+            200,
+            portfolio_page(1, 1, [adjusted]).raw,
+            1,
+            lots_required=True,
+        )
+
+        self.assertEqual(completeness, "COMPLETE")
+        normalized = parsed["positions"][0]
+        self.assertEqual(normalized["option_multiplier"], "50")
+        self.assertIs(normalized["options_adjusted_flag"], True)
+        self.assertEqual(
+            normalized["deliverables"], "50 shares plus CASH"
+        )
+
+        for missing_field, message in (
+            ("optionMultiplier", "omitted optionMultiplier"),
+            ("optionsAdjustedFlag", "omitted optionsAdjustedFlag"),
+        ):
+            with self.subTest(missing_field=missing_field):
+                incomplete = position("12", "620")
+                incomplete.pop(missing_field)
+                with self.assertRaisesRegex(
+                    ETradeBrokerReaderIntegrityError, message
+                ):
+                    case.reader._parse_portfolio_page(
+                        200,
+                        portfolio_page(1, 1, [incomplete]).raw,
+                        1,
+                        lots_required=True,
+                    )
 
     def test_unrelated_lot_order_and_leg_sentinels_are_preserved(
         self,

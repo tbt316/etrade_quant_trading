@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from live_trading.etrade_broker_transport import (
     BrokerReply,
+    CancelBrokerReply,
     ETradeBrokerTransport,
     ETradeBrokerTransportError,
     SelectedBrokerAccount,
@@ -29,6 +30,8 @@ from live_trading.etrade_broker_reader import (
 from live_trading.order_intent_ledger import (
     BrokerReadEvidenceRef,
     BrokerEvidence,
+    CancellationObservation,
+    CancellationRecord,
     CapacityDecisionReceipt,
     IntentRecord,
     MarginReservation,
@@ -89,6 +92,14 @@ class RepriceOpeningCommand:
 
 
 @dataclass(frozen=True)
+class CancelOpeningCommand:
+    intent_id: str
+    idempotency_key: str
+    owner: str
+    lease_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class GatewayMutationResult:
     intent_id: str
     client_order_id: str = field(repr=False)
@@ -98,6 +109,16 @@ class GatewayMutationResult:
     created: bool
     broker_order_id: str | None = field(repr=False)
     preview_id: str | None = field(repr=False)
+    reason_code: str | None
+
+
+@dataclass(frozen=True)
+class GatewayCancellationResult:
+    intent_id: str
+    state: Literal[
+        "LEASED", "SEND_UNKNOWN", "REQUEST_ACCEPTED", "TERMINAL"
+    ]
+    broker_order_id: str = field(repr=False)
     reason_code: str | None
 
 
@@ -209,6 +230,20 @@ class EtradeOrderGateway:
         self._started = False
         account = self._checked_account()
         self._account = account
+        cancellations = self.ledger.cancellation_blockers(
+            account.account_id, self.runtime_safety.environment
+        )
+        for cancellation in cancellations:
+            self._reconcile_cancellation_once(cancellation, account)
+        remaining_cancellations = self.ledger.cancellation_blockers(
+            account.account_id, self.runtime_safety.environment
+        )
+        if remaining_cancellations:
+            raise GatewayReconciliationRequired(
+                "gateway remains read-only: "
+                f"{len(remaining_cancellations)} cancellation(s) "
+                "lack terminal broker proof"
+            )
         blockers = self.ledger.reconciliation_blockers(
             account.account_id, self.runtime_safety.environment
         )
@@ -520,6 +555,118 @@ class EtradeOrderGateway:
             placed.unknown_reason,
         )
 
+    def cancel_opening(
+        self, command: CancelOpeningCommand
+    ) -> GatewayCancellationResult:
+        """Request one cancel; only a later direct read may prove terminal."""
+
+        command = _validate_cancel_command(command)
+        existing = self.ledger.get_cancellation(command.intent_id)
+        if (
+            existing is not None
+            and existing.idempotency_key != command.idempotency_key
+        ):
+            raise GatewayValidationError(
+                "cancellation idempotency key cannot be rebound"
+            )
+        if existing is not None and existing.state != "LEASED":
+            return self._cancellation_result(
+                existing, "IDEMPOTENT_REPLAY"
+            )
+        if existing is None:
+            self._require_started()
+        record = self._require_intent(command.intent_id)
+        if (
+            record.envelope.intent_kind != "OPENING"
+            or record.state != "SUBMITTED"
+            or record.pending_operation is not None
+            or record.broker_order_id is None
+        ):
+            raise GatewayValidationError(
+                "only a known submitted opening intent may be cancelled"
+            )
+        account = self._checked_account()
+        if (
+            record.envelope.account_id != account.account_id
+            or record.envelope.environment
+            != self.runtime_safety.environment
+        ):
+            raise RuntimeSafetyError(
+                "durable cancel intent does not match the armed account"
+            )
+        if existing is None:
+            self._require_no_blockers(account)
+        order_read = self._query_known_order(
+            account, record.broker_order_id
+        )
+        if existing is not None:
+            observation = self.ledger.classify_cancellation_read(
+                record.intent_id, order_read
+            )
+            if observation.outcome in {
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+            }:
+                self._apply_cancellation_terminal(
+                    record, observation, order_read
+                )
+                resolved = self.ledger.complete_cancellation(
+                    record.intent_id, order_read
+                )
+                return self._cancellation_result(
+                    resolved, "BROKER_TERMINAL"
+                )
+        authorization = self.ledger.authorize_cancellation(
+            record.intent_id,
+            command.idempotency_key,
+            command.owner,
+            command.lease_seconds,
+            order_read,
+        )
+        self._checked_account()
+        reply: CancelBrokerReply
+        try:
+            reply = self._transport.cancel(authorization)
+        except ETradeBrokerTransportError:
+            current = self.ledger.get_cancellation(record.intent_id)
+            if current is not None and current.state in {
+                "SEND_UNKNOWN",
+                "REQUEST_ACCEPTED",
+            }:
+                return self._cancellation_result(
+                    current,
+                    "TRANSPORT_RESPONSE_PERSISTENCE_ERROR",
+                )
+            raise
+        finally:
+            # After entering the transport path, the gateway must reconcile a
+            # direct broker read before enabling any further mutation.
+            self._started = False
+        current = self.ledger.get_cancellation(record.intent_id)
+        if current is None:
+            raise GatewayReconciliationRequired(
+                "cancel response lacks durable cancellation state"
+            )
+        expected_state = (
+            "REQUEST_ACCEPTED"
+            if reply.disposition == "REQUEST_ACCEPTED"
+            else "SEND_UNKNOWN"
+        )
+        if current.state != expected_state:
+            raise GatewayReconciliationRequired(
+                "cancel response and durable state disagree"
+            )
+        return self._cancellation_result(
+            current,
+            (
+                None
+                if reply.disposition == "REQUEST_ACCEPTED"
+                else reply.unknown_reason
+            ),
+        )
+
     def _checked_account(self) -> SelectedBrokerAccount:
         if (
             type(self._runtime_safety) is not RuntimeSafetyBoundary
@@ -551,6 +698,143 @@ class EtradeOrderGateway:
         if self._account is not None:
             _require_same_account(self._account, transport_account)
         return transport_account
+
+    def _query_known_order(
+        self,
+        account: SelectedBrokerAccount,
+        broker_order_id: str,
+    ) -> BrokerReadEvidenceRef:
+        checked = self._checked_account()
+        _require_same_account(account, checked)
+        _exact_broker_id(broker_order_id)
+        try:
+            evidence = self.reader.query_order(
+                checked, broker_order_id
+            )
+        except ETradeBrokerReaderUnavailable as exc:
+            raise GatewayReconciliationRequired(
+                "known broker order could not be read completely"
+            ) from exc
+        except ETradeBrokerReaderIntegrityError as exc:
+            raise GatewayValidationError(
+                "known broker order violated the durable read contract"
+            ) from exc
+        except ETradeBrokerReaderError as exc:
+            raise GatewayReconciliationRequired(
+                "known broker order could not be read safely"
+            ) from exc
+        if (
+            type(evidence) is not BrokerReadEvidenceRef
+            or evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise GatewayValidationError(
+                "order reader returned invalid durable evidence"
+            )
+        self._checked_account()
+        return evidence
+
+    def _reconcile_cancellation_once(
+        self,
+        cancellation: CancellationRecord,
+        account: SelectedBrokerAccount,
+    ) -> None:
+        if (
+            type(cancellation) is not CancellationRecord
+            or cancellation.account_id != account.account_id
+            or cancellation.environment
+            != self.runtime_safety.environment
+            or cancellation.state == "TERMINAL"
+        ):
+            raise GatewayValidationError(
+                "cancellation blocker has invalid durable identity"
+            )
+        order_read = self._query_known_order(
+            account, cancellation.broker_order_id
+        )
+        try:
+            observation = self.ledger.classify_cancellation_read(
+                cancellation.intent_id, order_read
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "cancellation read failed durable validation"
+            ) from exc
+        if observation.outcome not in {
+            "FILLED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+        }:
+            return
+        record = self._require_intent(cancellation.intent_id)
+        self._apply_cancellation_terminal(
+            record, observation, order_read
+        )
+        try:
+            completed = self.ledger.complete_cancellation(
+                cancellation.intent_id, order_read
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal cancellation could not be completed durably"
+            ) from exc
+        if completed.state != "TERMINAL":
+            raise GatewayValidationError(
+                "terminal cancellation completion was not durable"
+            )
+
+    def _apply_cancellation_terminal(
+        self,
+        record: IntentRecord,
+        observation: CancellationObservation,
+        order_read: BrokerReadEvidenceRef,
+    ) -> None:
+        if (
+            type(observation) is not CancellationObservation
+            or observation.intent_id != record.intent_id
+            or observation.broker_order_id != record.broker_order_id
+            or observation.evidence_sha256
+            != order_read.evidence_sha256
+            or observation.outcome
+            not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        ):
+            raise GatewayValidationError(
+                "terminal cancellation observation is not intent-bound"
+            )
+        try:
+            broker_evidence = self.ledger.broker_evidence_from_read(
+                record.intent_id,
+                order_read,
+                operation="ORDER_QUERY",
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal cancellation evidence failed validation"
+            ) from exc
+        if (
+            type(broker_evidence) is not BrokerEvidence
+            or broker_evidence.outcome != observation.outcome
+        ):
+            raise GatewayReconciliationRequired(
+                "terminal cancellation lacks exact broker evidence"
+            )
+        current = self._require_intent(record.intent_id)
+        if current.state == observation.outcome:
+            return
+        if current.state != "SUBMITTED":
+            raise GatewayReconciliationRequired(
+                "terminal cancellation conflicts with durable intent state"
+            )
+        try:
+            self.ledger.reconcile_terminal(
+                record.intent_id,
+                observation.outcome,
+                broker_evidence,
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal cancellation could not reconcile the intent"
+            ) from exc
 
     def _read_capacity(
         self,
@@ -892,6 +1176,14 @@ class EtradeOrderGateway:
             raise GatewayReconciliationRequired(
                 f"{len(blockers)} durable broker operation(s) block mutation"
             )
+        cancellations = self.ledger.cancellation_blockers(
+            account.account_id, self.runtime_safety.environment
+        )
+        if cancellations:
+            raise GatewayReconciliationRequired(
+                f"{len(cancellations)} unresolved cancellation(s) "
+                "block mutation"
+            )
         if self.ledger.unabsorbed_filled_reservation_count(
             account.account_id, self.runtime_safety.environment
         ):
@@ -1010,6 +1302,22 @@ class EtradeOrderGateway:
             reason_code=reason_code,
         )
 
+    @staticmethod
+    def _cancellation_result(
+        record: CancellationRecord,
+        reason_code: str | None,
+    ) -> GatewayCancellationResult:
+        if type(record) is not CancellationRecord:
+            raise GatewayValidationError(
+                "cancellation result requires exact durable state"
+            )
+        return GatewayCancellationResult(
+            intent_id=record.intent_id,
+            state=record.state,
+            broker_order_id=record.broker_order_id,
+            reason_code=reason_code,
+        )
+
 
 def _validate_submit_command(
     command: SubmitOpeningCommand,
@@ -1046,6 +1354,20 @@ def _validate_reprice_command(
     _exact_text(command.idempotency_key, "idempotency_key")
     _exact_text(command.owner, "owner")
     _exact_payload_bytes(command.payload_bytes)
+    _lease_seconds(command.lease_seconds)
+    return command
+
+
+def _validate_cancel_command(
+    command: CancelOpeningCommand,
+) -> CancelOpeningCommand:
+    if type(command) is not CancelOpeningCommand:
+        raise GatewayValidationError(
+            "cancel command must use its exact immutable type"
+        )
+    _exact_text(command.intent_id, "intent_id")
+    _exact_text(command.idempotency_key, "idempotency_key")
+    _exact_text(command.owner, "owner")
     _lease_seconds(command.lease_seconds)
     return command
 

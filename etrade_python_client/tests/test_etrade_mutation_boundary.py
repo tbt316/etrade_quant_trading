@@ -10,6 +10,7 @@ from scripts.check_etrade_mutation_boundary import (
     REQUIRED_TOMBSTONES,
     TombstoneSpec,
     TRANSPORT_INTERNAL_CAPABILITIES,
+    TRANSPORT_MUTATION_METHODS,
     VENDOR_MUTATION_CAPABILITIES,
     VENDOR_MUTATION_METHODS,
     scan_paths,
@@ -121,6 +122,13 @@ EXPECTED_TRANSPORT_INTERNAL_CAPABILITIES = {
     "_run_isolated_exchange",
     "_serialized_prepared_request",
 }
+EXPECTED_TRANSPORT_MUTATION_METHODS = {
+    "preview",
+    "place",
+    "preview_change",
+    "place_change",
+    "cancel",
+}
 
 
 def _write_sources(root: Path, sources: dict[str, str]) -> None:
@@ -149,6 +157,9 @@ def test_mutation_capability_policy_cannot_silently_drift() -> None:
     assert set(VENDOR_MUTATION_METHODS) == EXPECTED_VENDOR_MUTATION_METHODS
     assert set(TRANSPORT_INTERNAL_CAPABILITIES) == (
         EXPECTED_TRANSPORT_INTERNAL_CAPABILITIES
+    )
+    assert set(TRANSPORT_MUTATION_METHODS) == (
+        EXPECTED_TRANSPORT_MUTATION_METHODS
     )
 
 
@@ -567,6 +578,8 @@ def test_only_exact_gateway_transport_invocations_are_allowed(
                 "    def reprice_opening(self):\n"
                 "        self._transport.preview_change(order_id, auth)\n"
                 "        self._transport.place_change(order_id, auth, preview)\n"
+                "    def cancel_opening(self):\n"
+                "        self._transport.cancel(auth)\n"
             )
         },
     )

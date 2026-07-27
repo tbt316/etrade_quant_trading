@@ -1,9 +1,9 @@
 """Private, no-retry E*TRADE order-mutation transport.
 
-The durable order ledger authorizes exact JSON bytes.  This module is the
-single adapter that may transform those bytes into E*TRADE XML and issue an
-HTTP mutation.  It deliberately contains no retry, reconciliation, strategy,
-or risk-policy logic.
+The durable order ledger authorizes exact order bytes or one exact known-order
+cancellation.  This module is the single adapter that may derive E*TRADE XML
+and issue an HTTP mutation.  It deliberately contains no retry,
+reconciliation, strategy, or risk-policy logic.
 """
 
 from __future__ import annotations
@@ -33,11 +33,18 @@ from requests.exceptions import Timeout
 from urllib3.util.retry import Retry
 
 from live_trading.order_intent_ledger import (
+    CancellationAuthorization,
+    CancellationRequestEvidence,
+    CancellationResponseEvidence,
     OrderIntentLedger,
     OutboundAuthorization,
     TransportRequestEvidence,
     TransportResponseEvidence,
     wire_order_payload,
+)
+from live_trading.etrade_order_protocol import (
+    cancel_order_route as _cancel_order_route,
+    cancel_order_xml as _cancel_order_xml,
 )
 from live_trading.runtime_safety import RuntimeSafetyBoundary
 
@@ -203,6 +210,83 @@ class BoundBrokerRequest:
         _validate_bound_request_shape(self)
 
 
+@dataclass(frozen=True, repr=False)
+class BoundCancelRequest:
+    """Exact, sealed cancellation request for one durable authorization."""
+
+    account_id: str = field(repr=False)
+    account_id_key: str = field(repr=False)
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    intent_id: str
+    owner: str = field(repr=False)
+    idempotency_key: str = field(repr=False)
+    fencing_token: int
+    broker_order_id: str = field(repr=False)
+    authorization_sha256: str
+    http_method: Literal["PUT"]
+    route: str = field(repr=False)
+    final_xml_bytes: bytes = field(repr=False)
+    final_xml_sha256: str
+    transport_seal: bytes = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self) is not BoundCancelRequest:
+            raise ETradeBrokerTransportError(
+                "bound cancellation request must use its exact immutable type"
+            )
+        _broker_numeric_text(self.account_id, "account id")
+        _identifier(self.account_id_key, "account key")
+        _identifier(self.institution_type, "institution type")
+        _identifier(self.intent_id, "intent id")
+        _identifier(self.owner, "owner")
+        _identifier(self.idempotency_key, "cancellation idempotency key")
+        if (
+            type(self.environment) is not str
+            or self.environment not in {"sandbox", "production"}
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation environment is invalid"
+            )
+        if type(self.fencing_token) is not int or self.fencing_token <= 0:
+            raise ETradeBrokerTransportError(
+                "bound cancellation fencing token is invalid"
+            )
+        _broker_numeric_text(self.broker_order_id, "broker order id")
+        _sha256(self.authorization_sha256, "cancellation authorization digest")
+        if self.http_method != "PUT":
+            raise ETradeBrokerTransportError(
+                "bound cancellation HTTP method is invalid"
+            )
+        if type(self.route) is not str:
+            raise ETradeBrokerTransportError(
+                "bound cancellation route is invalid"
+            )
+        if (
+            type(self.final_xml_bytes) is not bytes
+            or not self.final_xml_bytes
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation XML must be non-empty exact bytes"
+            )
+        _sha256(self.final_xml_sha256, "bound cancellation XML digest")
+        if not hmac.compare_digest(
+            hashlib.sha256(self.final_xml_bytes).hexdigest(),
+            self.final_xml_sha256,
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation XML digest does not verify"
+            )
+        if (
+            type(self.transport_seal) is not bytes
+            or len(self.transport_seal) != 32
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation request seal is invalid"
+            )
+        _validate_bound_cancel_request_shape(self)
+
+
 @dataclass(frozen=True)
 class BrokerMessage:
     code: int
@@ -282,6 +366,88 @@ class BrokerReply:
                 raise ETradeBrokerTransportError("preview acknowledgement lacks preview id")
             if self.request.transport_operation.endswith("PLACE") and self.broker_order_id is None:
                 raise ETradeBrokerTransportError("place acknowledgement lacks broker order id")
+
+
+@dataclass(frozen=True)
+class CancelBrokerReply:
+    """Redacted receipt for one cancellation request.
+
+    ``REQUEST_ACCEPTED`` means only that E*TRADE accepted the request for
+    processing.  It is deliberately not a terminal order-state assertion.
+    """
+
+    request: BoundCancelRequest = field(repr=False)
+    disposition: Literal["REQUEST_ACCEPTED", "UNKNOWN"]
+    http_status: int | None
+    broker_messages: tuple[BrokerMessage, ...]
+    raw_response_digest: str | None
+    observed_at: datetime
+    unknown_reason: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not CancelBrokerReply
+            or type(self.request) is not BoundCancelRequest
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation reply must use exact bound types"
+            )
+        if (
+            type(self.disposition) is not str
+            or self.disposition not in {"REQUEST_ACCEPTED", "UNKNOWN"}
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation reply disposition is invalid"
+            )
+        if self.http_status is not None and (
+            type(self.http_status) is not int
+            or not 100 <= self.http_status <= 599
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation reply HTTP status is invalid"
+            )
+        if (
+            type(self.broker_messages) is not tuple
+            or any(
+                type(message) is not BrokerMessage
+                for message in self.broker_messages
+            )
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation reply messages are invalid"
+            )
+        if self.raw_response_digest is not None:
+            _sha256(
+                self.raw_response_digest,
+                "cancellation raw response digest",
+            )
+        if (
+            type(self.observed_at) is not datetime
+            or self.observed_at.tzinfo is not timezone.utc
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation reply time must use the exact UTC timezone"
+            )
+        if (self.disposition == "UNKNOWN") != (
+            self.unknown_reason is not None
+        ):
+            raise ETradeBrokerTransportError(
+                "unknown cancellation reason is inconsistent"
+            )
+        if self.unknown_reason is not None:
+            _identifier(
+                self.unknown_reason,
+                "unknown cancellation reason",
+            )
+        if self.disposition == "REQUEST_ACCEPTED":
+            if (
+                self.http_status != 200
+                or self.raw_response_digest is None
+                or not _messages_accept_cancellation(self.broker_messages)
+            ):
+                raise ETradeBrokerTransportError(
+                    "cancellation acceptance evidence is incomplete"
+                )
 
 
 class ETradeBrokerTransport:
@@ -448,6 +614,182 @@ class ETradeBrokerTransport:
             preview_id=preview_id,
         )
         return self._execute(request, authorization)
+
+    def cancel(
+        self, authorization: CancellationAuthorization
+    ) -> CancelBrokerReply:
+        """Send one durable per-intent cancellation request.
+
+        A successful response acknowledges only that cancellation processing
+        was requested.  A direct broker read must later prove terminal state.
+        """
+
+        now = self._now()
+        _validate_cancellation_authorization(authorization, now=now)
+        if (
+            authorization.account_id != self._account_id
+            or authorization.account_id_key != self._account_id_key
+            or authorization.institution_type != self._institution_type
+            or authorization.environment != self._environment
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation authorization does not match the bound account"
+            )
+        request = self._build_cancel_request(authorization)
+        return self._execute_cancel(request, authorization)
+
+    def _build_cancel_request(
+        self, authorization: CancellationAuthorization
+    ) -> BoundCancelRequest:
+        route = _cancel_order_route(self._account_id_key)
+        xml_bytes = _cancel_order_xml(authorization.broker_order_id)
+        fields = {
+            "account_id": self._account_id,
+            "account_id_key": self._account_id_key,
+            "institution_type": self._institution_type,
+            "environment": self._environment,
+            "intent_id": authorization.intent_id,
+            "owner": authorization.owner,
+            "idempotency_key": authorization.idempotency_key,
+            "fencing_token": authorization.fencing_token,
+            "broker_order_id": authorization.broker_order_id,
+            "authorization_sha256": authorization.authorization_sha256,
+            "http_method": "PUT",
+            "route": route,
+            "final_xml_bytes": xml_bytes,
+            "final_xml_sha256": hashlib.sha256(xml_bytes).hexdigest(),
+        }
+        transport_seal = hmac.new(
+            self._binding_secret,
+            _bound_cancel_request_material(fields),
+            hashlib.sha256,
+        ).digest()
+        return BoundCancelRequest(
+            **fields,
+            transport_seal=transport_seal,
+        )
+
+    def _execute_cancel(
+        self,
+        request: BoundCancelRequest,
+        authorization: CancellationAuthorization,
+    ) -> CancelBrokerReply:
+        with self._send_lock:
+            self._verify_bound_cancel_request(request)
+            trusted_request = _copy_bound_cancel_request(request)
+            self._verify_bound_cancel_request(trusted_request)
+            origin = _ETRADE_ORIGINS[trusted_request.environment]
+            url = origin + trusted_request.route
+            prepared = _prepare_oauth_request(
+                self._oauth,
+                trusted_request,
+                url,
+            )
+            _validate_prepared_request(
+                prepared,
+                trusted_request,
+                url,
+            )
+
+            runtime_safety = self._runtime_safety
+            selected_account = self._selected_account
+            now = self._now()
+            runtime_safety.assert_current(now)
+            runtime_safety.verify_account(
+                selected_account.runtime_mapping(),
+                now=now,
+            )
+            _validate_cancellation_authorization(
+                authorization,
+                now=now,
+            )
+            _verify_cancellation_authorization_binding(
+                trusted_request,
+                authorization,
+            )
+            evidence = _cancellation_request_evidence(trusted_request)
+
+            # This is the final state-changing step before the single socket
+            # exchange.  A crash, timeout, malformed response, or persistence
+            # failure after this point may be reconciled, but never resent.
+            self._ledger.claim_cancellation_send(
+                evidence,
+                authorization,
+            )
+            now = self._now()
+            runtime_safety.assert_current(now)
+            runtime_safety.verify_account(
+                selected_account.runtime_mapping(),
+                now=now,
+            )
+            _validate_cancellation_authorization(
+                authorization,
+                now=now,
+            )
+            _verify_cancellation_authorization_binding(
+                trusted_request,
+                authorization,
+            )
+            _validate_prepared_request(
+                prepared,
+                trusted_request,
+                url,
+            )
+            try:
+                exchange = _isolated_mutation_exchange(
+                    prepared,
+                    timeout_seconds=_TOTAL_EXCHANGE_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                reply = _unknown_cancel_reply(
+                    trusted_request,
+                    "TRANSPORT_ERROR",
+                    observed_at=self._now(),
+                )
+            else:
+                observed_at = self._now()
+                if exchange.kind == "TIMEOUT":
+                    reply = _unknown_cancel_reply(
+                        trusted_request,
+                        "TIMEOUT",
+                        observed_at=observed_at,
+                    )
+                elif exchange.kind == "TRANSPORT_ERROR":
+                    reply = _unknown_cancel_reply(
+                        trusted_request,
+                        "TRANSPORT_ERROR",
+                        observed_at=observed_at,
+                    )
+                elif exchange.kind == "MALFORMED_RESPONSE":
+                    reply = _unknown_cancel_reply(
+                        trusted_request,
+                        "MALFORMED_RESPONSE",
+                        observed_at=observed_at,
+                    )
+                else:
+                    try:
+                        reply = _parse_cancel_reply_bytes(
+                            trusted_request,
+                            exchange.http_status,
+                            exchange.raw_response,
+                            observed_at=observed_at,
+                        )
+                    except Exception:
+                        reply = _unknown_cancel_reply(
+                            trusted_request,
+                            "MALFORMED_RESPONSE",
+                            observed_at=observed_at,
+                        )
+            try:
+                self._ledger.record_cancellation_response(
+                    evidence,
+                    _cancellation_response_evidence(reply),
+                )
+            except Exception as exc:
+                raise ETradeBrokerTransportError(
+                    "cancellation response could not be persisted durably"
+                ) from exc
+            return reply
 
     def _preview_id(
         self,
@@ -656,6 +998,34 @@ class ETradeBrokerTransport:
             raise ETradeBrokerTransportError("bound XML digest does not verify")
         _validate_bound_request_shape(request)
 
+    def _verify_bound_cancel_request(
+        self, request: BoundCancelRequest
+    ) -> None:
+        if type(request) is not BoundCancelRequest:
+            raise ETradeBrokerTransportError(
+                "transport can send only an exact bound cancellation request"
+            )
+        expected_seal = hmac.new(
+            self._binding_secret,
+            _bound_cancel_request_material(request),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(
+            request.transport_seal,
+            expected_seal,
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation request was not issued by this transport"
+            )
+        if not hmac.compare_digest(
+            hashlib.sha256(request.final_xml_bytes).hexdigest(),
+            request.final_xml_sha256,
+        ):
+            raise ETradeBrokerTransportError(
+                "bound cancellation XML digest does not verify"
+            )
+        _validate_bound_cancel_request_shape(request)
+
 
 def _transport_evidence(request: BoundBrokerRequest) -> TransportRequestEvidence:
     return TransportRequestEvidence(
@@ -704,6 +1074,51 @@ def _transport_response_evidence(
     )
 
 
+def _cancellation_request_evidence(
+    request: BoundCancelRequest,
+) -> CancellationRequestEvidence:
+    return CancellationRequestEvidence(
+        account_id=request.account_id,
+        account_id_key=request.account_id_key,
+        institution_type=request.institution_type,
+        environment=request.environment,
+        intent_id=request.intent_id,
+        owner=request.owner,
+        idempotency_key=request.idempotency_key,
+        fencing_token=request.fencing_token,
+        broker_order_id=request.broker_order_id,
+        authorization_sha256=request.authorization_sha256,
+        http_method=request.http_method,
+        route=request.route,
+        final_xml_bytes=request.final_xml_bytes,
+        final_xml_sha256=request.final_xml_sha256,
+    )
+
+
+def _cancellation_response_evidence(
+    reply: CancelBrokerReply,
+) -> CancellationResponseEvidence:
+    return CancellationResponseEvidence(
+        disposition=reply.disposition,
+        http_status=reply.http_status,
+        message_codes=tuple(
+            message.code for message in reply.broker_messages
+        ),
+        message_types=tuple(
+            message.message_type for message in reply.broker_messages
+        ),
+        message_description_digests=tuple(
+            hashlib.sha256(
+                message.description.encode("utf-8")
+            ).hexdigest()
+            for message in reply.broker_messages
+        ),
+        raw_response_digest=reply.raw_response_digest,
+        observed_at=reply.observed_at,
+        unknown_reason=reply.unknown_reason,
+    )
+
+
 def _copy_bound_request(request: BoundBrokerRequest) -> BoundBrokerRequest:
     return BoundBrokerRequest(
         account_id=request.account_id,
@@ -721,6 +1136,28 @@ def _copy_bound_request(request: BoundBrokerRequest) -> BoundBrokerRequest:
         target_broker_order_id=request.target_broker_order_id,
         preview_id=request.preview_id,
         authorization_payload_digest=request.authorization_payload_digest,
+        final_xml_bytes=request.final_xml_bytes,
+        final_xml_sha256=request.final_xml_sha256,
+        transport_seal=request.transport_seal,
+    )
+
+
+def _copy_bound_cancel_request(
+    request: BoundCancelRequest,
+) -> BoundCancelRequest:
+    return BoundCancelRequest(
+        account_id=request.account_id,
+        account_id_key=request.account_id_key,
+        institution_type=request.institution_type,
+        environment=request.environment,
+        intent_id=request.intent_id,
+        owner=request.owner,
+        idempotency_key=request.idempotency_key,
+        fencing_token=request.fencing_token,
+        broker_order_id=request.broker_order_id,
+        authorization_sha256=request.authorization_sha256,
+        http_method=request.http_method,
+        route=request.route,
         final_xml_bytes=request.final_xml_bytes,
         final_xml_sha256=request.final_xml_sha256,
         transport_seal=request.transport_seal,
@@ -1117,7 +1554,7 @@ def _isolated_get_exchange(
 
 def _prepare_oauth_request(
     oauth: OAuth1Session,
-    request: BoundBrokerRequest,
+    request: BoundBrokerRequest | BoundCancelRequest,
     url: str,
 ):
     if (
@@ -1165,7 +1602,7 @@ def _prepare_oauth_request(
 
 def _validate_prepared_request(
     prepared: Any,
-    request: BoundBrokerRequest,
+    request: BoundBrokerRequest | BoundCancelRequest,
     expected_url: str,
 ) -> None:
     parsed = urlsplit(prepared.url)
@@ -1226,6 +1663,41 @@ def _bound_request_material(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _bound_cancel_request_material(value: Any) -> bytes:
+    names = (
+        "account_id",
+        "account_id_key",
+        "institution_type",
+        "environment",
+        "intent_id",
+        "owner",
+        "idempotency_key",
+        "fencing_token",
+        "broker_order_id",
+        "authorization_sha256",
+        "http_method",
+        "route",
+        "final_xml_sha256",
+    )
+    if type(value) is dict:
+        document = {name: value[name] for name in names}
+    elif type(value) is BoundCancelRequest:
+        document = {
+            name: getattr(value, name)
+            for name in names
+        }
+    else:
+        raise ETradeBrokerTransportError(
+            "bound cancellation request material is invalid"
+        )
+    return json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
 def _validate_bound_request_shape(request: BoundBrokerRequest) -> None:
     operation = request.transport_operation
     expected_authorization = "SUBMIT" if operation.startswith("SUBMIT") else "AMEND"
@@ -1274,6 +1746,136 @@ def _validate_bound_request_shape(request: BoundBrokerRequest) -> None:
     bound_preview = root.findtext("./PreviewIds/previewId")
     if bound_preview != request.preview_id:
         raise ETradeBrokerTransportError("bound XML preview is inconsistent")
+
+
+def _validate_bound_cancel_request_shape(
+    request: BoundCancelRequest,
+) -> None:
+    expected_route = _cancel_order_route(request.account_id_key)
+    if request.http_method != "PUT" or request.route != expected_route:
+        raise ETradeBrokerTransportError(
+            "bound cancellation route is inconsistent"
+        )
+    expected_xml = _cancel_order_xml(request.broker_order_id)
+    if not hmac.compare_digest(
+        request.final_xml_bytes,
+        expected_xml,
+    ):
+        raise ETradeBrokerTransportError(
+            "bound cancellation XML identity is inconsistent"
+        )
+
+
+def _validate_cancellation_authorization(
+    authorization: CancellationAuthorization,
+    *,
+    now: datetime,
+) -> None:
+    if type(authorization) is not CancellationAuthorization:
+        raise ETradeBrokerTransportError(
+            "cancellation authorization must use its exact immutable type"
+        )
+    if (
+        type(now) is not datetime
+        or now.tzinfo is not timezone.utc
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation validation time must use the exact UTC timezone"
+        )
+    primitive_fields = (
+        (authorization.account_id, str),
+        (authorization.account_id_key, str),
+        (authorization.institution_type, str),
+        (authorization.environment, str),
+        (authorization.intent_id, str),
+        (authorization.owner, str),
+        (authorization.idempotency_key, str),
+        (authorization.fencing_token, int),
+        (authorization.broker_order_id, str),
+        (authorization.order_evidence_sha256, str),
+        (authorization.order_payload_hash, str),
+        (authorization.authorization_sha256, str),
+        (authorization.authorized_at, datetime),
+        (authorization.expires_at, datetime),
+    )
+    if any(
+        type(value) is not expected
+        for value, expected in primitive_fields
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation authorization fields must be exact primitives"
+        )
+    _broker_numeric_text(authorization.account_id, "account id")
+    _identifier(authorization.account_id_key, "account key")
+    _identifier(
+        authorization.institution_type,
+        "institution type",
+    )
+    if authorization.environment not in {
+        "sandbox",
+        "production",
+    }:
+        raise ETradeBrokerTransportError(
+            "cancellation authorization environment is invalid"
+        )
+    _identifier(authorization.intent_id, "intent id")
+    _identifier(authorization.owner, "owner")
+    _identifier(
+        authorization.idempotency_key,
+        "cancellation idempotency key",
+    )
+    if authorization.fencing_token <= 0:
+        raise ETradeBrokerTransportError(
+            "cancellation authorization fencing token is invalid"
+        )
+    _broker_numeric_text(
+        authorization.broker_order_id,
+        "broker order id",
+    )
+    _sha256(
+        authorization.order_evidence_sha256,
+        "cancellation order evidence digest",
+    )
+    _sha256(
+        authorization.order_payload_hash,
+        "cancellation order payload hash",
+    )
+    _sha256(
+        authorization.authorization_sha256,
+        "cancellation authorization digest",
+    )
+    if (
+        authorization.authorized_at.tzinfo is not timezone.utc
+        or authorization.expires_at.tzinfo is not timezone.utc
+        or authorization.expires_at <= authorization.authorized_at
+        or now < authorization.authorized_at
+        or now >= authorization.expires_at
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation authorization is not currently valid"
+        )
+
+
+def _verify_cancellation_authorization_binding(
+    request: BoundCancelRequest,
+    authorization: CancellationAuthorization,
+) -> None:
+    if (
+        request.account_id != authorization.account_id
+        or request.account_id_key != authorization.account_id_key
+        or request.institution_type != authorization.institution_type
+        or request.environment != authorization.environment
+        or request.intent_id != authorization.intent_id
+        or request.owner != authorization.owner
+        or request.idempotency_key != authorization.idempotency_key
+        or request.fencing_token != authorization.fencing_token
+        or request.broker_order_id != authorization.broker_order_id
+        or request.authorization_sha256
+        != authorization.authorization_sha256
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation request does not match its authorization"
+        )
 
 
 def _authorized_vertical(
@@ -1668,6 +2270,349 @@ def _parse_reply_bytes(
         observed_at=observed_at,
         unknown_reason=None,
     )
+
+
+def _parse_cancel_reply_bytes(
+    request: BoundCancelRequest,
+    status: int | None,
+    raw: bytes,
+    *,
+    observed_at: datetime | None = None,
+) -> CancelBrokerReply:
+    observed_at = observed_at or datetime.now(timezone.utc)
+    if (
+        type(request) is not BoundCancelRequest
+        or type(observed_at) is not datetime
+        or observed_at.tzinfo is not timezone.utc
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation response binding is invalid"
+        )
+    if (
+        type(status) is not int
+        or not 100 <= status <= 599
+        or type(raw) is not bytes
+    ):
+        return _unknown_cancel_reply(
+            request,
+            "MALFORMED_RESPONSE",
+            observed_at=observed_at,
+        )
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    if len(raw) > _MAX_MUTATION_RESPONSE_BYTES:
+        return _unknown_cancel_reply(
+            request,
+            "RESPONSE_TOO_LARGE",
+            http_status=status,
+            raw_response_digest=raw_digest,
+            observed_at=observed_at,
+        )
+    if status != 200:
+        return _unknown_cancel_reply(
+            request,
+            "HTTP_STATUS",
+            http_status=status,
+            raw_response_digest=raw_digest,
+            observed_at=observed_at,
+        )
+    try:
+        parsed = _parse_cancel_response(raw)
+    except Exception:
+        return _unknown_cancel_reply(
+            request,
+            "MALFORMED_RESPONSE",
+            http_status=status,
+            raw_response_digest=raw_digest,
+            observed_at=observed_at,
+        )
+    messages = parsed["broker_messages"]
+    if (
+        parsed["account_id"] != request.account_id
+        or parsed["broker_order_id"] != request.broker_order_id
+    ):
+        return _unknown_cancel_reply(
+            request,
+            "IDENTITY_MISMATCH",
+            http_status=status,
+            broker_messages=messages,
+            raw_response_digest=raw_digest,
+            observed_at=observed_at,
+        )
+    if not _messages_accept_cancellation(messages):
+        return _unknown_cancel_reply(
+            request,
+            "REVIEW_REQUIRED",
+            http_status=status,
+            broker_messages=messages,
+            raw_response_digest=raw_digest,
+            observed_at=observed_at,
+        )
+    return CancelBrokerReply(
+        request=request,
+        disposition="REQUEST_ACCEPTED",
+        http_status=status,
+        broker_messages=messages,
+        raw_response_digest=raw_digest,
+        observed_at=observed_at,
+        unknown_reason=None,
+    )
+
+
+def _parse_cancel_response(raw: bytes) -> dict[str, Any]:
+    if type(raw) is not bytes:
+        raise ETradeBrokerTransportError(
+            "cancellation response bytes are invalid"
+        )
+    stripped = raw.lstrip()
+    if not stripped:
+        raise ETradeBrokerTransportError(
+            "cancellation response is empty"
+        )
+    if stripped.startswith(b"<"):
+        if (
+            b"<!doctype" in stripped.lower()
+            or b"<!entity" in stripped.lower()
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML declarations are forbidden"
+            )
+        root = ET.fromstring(raw)
+        if root.tag != "CancelOrderResponse":
+            raise ETradeBrokerTransportError(
+                "cancellation XML response root is invalid"
+            )
+        nodes = list(root.iter())
+        if (
+            len(nodes) > _MAX_RESPONSE_NODES
+            or any(
+                type(element.tag) is not str
+                or "{" in element.tag
+                or "}" in element.tag
+                or element.attrib
+                or element.tag.lower() == "error"
+                for element in nodes
+            )
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML response is unsafe"
+            )
+        _validate_cancel_xml_content(root)
+        children = list(root)
+        child_tags = [child.tag for child in children]
+        if (
+            len(children) != 4
+            or set(child_tags)
+            != {"accountId", "orderId", "cancelTime", "Messages"}
+            or any(child_tags.count(tag) != 1 for tag in set(child_tags))
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML response shape is invalid"
+            )
+        account_id = _broker_numeric_id(
+            _one_xml_text(root, "accountId"),
+            "cancellation response account id",
+        )
+        broker_order_id = _broker_numeric_id(
+            _one_xml_text(root, "orderId"),
+            "cancellation response order id",
+        )
+        _broker_numeric_id(
+            _one_xml_text(root, "cancelTime"),
+            "cancellation response time",
+        )
+        messages = _cancel_xml_messages(
+            _one_xml_child(root, "Messages")
+        )
+        return {
+            "account_id": account_id,
+            "broker_order_id": broker_order_id,
+            "broker_messages": messages,
+        }
+
+    document = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if (
+        type(document) is not dict
+        or set(document) != {"CancelOrderResponse"}
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation JSON response root is invalid"
+        )
+    root = document["CancelOrderResponse"]
+    if type(root) is not dict:
+        raise ETradeBrokerTransportError(
+            "cancellation JSON response must be an object"
+        )
+    _validate_json_tree(root)
+    message_keys = set(root) & {"messages", "Messages"}
+    if (
+        len(message_keys) != 1
+        or set(root) - message_keys
+        != {"accountId", "orderId", "cancelTime"}
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation JSON response shape is invalid"
+        )
+    message_key = next(iter(message_keys))
+    account_id = _broker_numeric_id(
+        root["accountId"],
+        "cancellation response account id",
+    )
+    broker_order_id = _broker_numeric_id(
+        root["orderId"],
+        "cancellation response order id",
+    )
+    _broker_numeric_id(
+        root["cancelTime"],
+        "cancellation response time",
+    )
+    messages = _cancel_json_messages(root[message_key])
+    return {
+        "account_id": account_id,
+        "broker_order_id": broker_order_id,
+        "broker_messages": messages,
+    }
+
+
+def _validate_cancel_xml_content(root: ET.Element) -> None:
+    """Reject hidden mixed content while allowing formatting whitespace."""
+
+    for element in root.iter():
+        children = list(element)
+        if children:
+            if (
+                element.text is not None
+                and element.text.strip()
+            ):
+                raise ETradeBrokerTransportError(
+                    "cancellation XML contains mixed content"
+                )
+        elif (
+            type(element.text) is not str
+            or not element.text
+            or element.text != element.text.strip()
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML scalar text is not exact"
+            )
+        if (
+            element.tail is not None
+            and element.tail.strip()
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML contains mixed content"
+            )
+
+
+def _cancel_xml_messages(
+    container: ET.Element,
+) -> tuple[BrokerMessage, ...]:
+    if (
+        type(container) is not ET.Element
+        or container.tag != "Messages"
+        or container.attrib
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation XML messages are invalid"
+        )
+    entries = list(container)
+    if not entries or any(
+        entry.tag != "Message" or entry.attrib
+        for entry in entries
+    ):
+        raise ETradeBrokerTransportError(
+            "cancellation XML messages are malformed"
+        )
+    messages: list[BrokerMessage] = []
+    for entry in entries:
+        child_tags = [child.tag for child in list(entry)]
+        if (
+            len(child_tags) != 3
+            or set(child_tags) != {"description", "code", "type"}
+            or any(
+                child_tags.count(tag) != 1
+                for tag in set(child_tags)
+            )
+        ):
+            raise ETradeBrokerTransportError(
+                "cancellation XML message is malformed"
+            )
+        messages.append(
+            _cancel_broker_message(
+                code=_message_code(_one_xml_text(entry, "code")),
+                message_type=_one_xml_text(entry, "type"),
+                description=_one_xml_text(entry, "description"),
+            )
+        )
+    return tuple(messages)
+
+
+def _cancel_json_messages(
+    container: Any,
+) -> tuple[BrokerMessage, ...]:
+    if type(container) is not dict or len(container) != 1:
+        raise ETradeBrokerTransportError(
+            "cancellation JSON messages are invalid"
+        )
+    entry_key = next(iter(container))
+    if entry_key not in {"Message", "message"}:
+        raise ETradeBrokerTransportError(
+            "cancellation JSON message key is invalid"
+        )
+    value = container[entry_key]
+    if type(value) is dict:
+        entries = [value]
+    elif type(value) is list:
+        entries = value
+    else:
+        raise ETradeBrokerTransportError(
+            "cancellation JSON messages are malformed"
+        )
+    if not entries:
+        raise ETradeBrokerTransportError(
+            "cancellation JSON messages are empty"
+        )
+    messages: list[BrokerMessage] = []
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != {
+            "description",
+            "code",
+            "type",
+        }:
+            raise ETradeBrokerTransportError(
+                "cancellation JSON message is malformed"
+            )
+        messages.append(
+            _cancel_broker_message(
+                code=_message_code(entry["code"]),
+                message_type=entry["type"],
+                description=entry["description"],
+            )
+        )
+    return tuple(messages)
+
+
+def _cancel_broker_message(
+    *,
+    code: int,
+    message_type: str,
+    description: str,
+) -> BrokerMessage:
+    message = BrokerMessage(
+        code=code,
+        message_type=message_type,
+        description=description,
+    )
+    try:
+        description.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ETradeBrokerTransportError(
+            "cancellation message is not valid UTF-8 text"
+        ) from exc
+    return message
 
 
 def _read_bounded_response(
@@ -2115,6 +3060,21 @@ def _messages_allow_ack(
     )
 
 
+def _messages_accept_cancellation(
+    messages: tuple[BrokerMessage, ...],
+) -> bool:
+    return (
+        type(messages) is tuple
+        and len(messages) == 1
+        and all(
+            type(message) is BrokerMessage
+            and message.message_type == "WARNING"
+            and message.code == 5011
+            for message in messages
+        )
+    )
+
+
 def _one_xml_child(parent: ET.Element, tag: str) -> ET.Element:
     matches = [child for child in list(parent) if child.tag == tag]
     if len(matches) != 1:
@@ -2196,6 +3156,26 @@ def _unknown_reply(
         echoed_client_order_id=None,
         broker_order_id=broker_order_id,
         preview_id=request.preview_id if preview_id is None else preview_id,
+        broker_messages=broker_messages,
+        raw_response_digest=raw_response_digest,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        unknown_reason=reason,
+    )
+
+
+def _unknown_cancel_reply(
+    request: BoundCancelRequest,
+    reason: str,
+    *,
+    http_status: int | None = None,
+    broker_messages: tuple[BrokerMessage, ...] = (),
+    raw_response_digest: str | None = None,
+    observed_at: datetime | None = None,
+) -> CancelBrokerReply:
+    return CancelBrokerReply(
+        request=request,
+        disposition="UNKNOWN",
+        http_status=http_status,
         broker_messages=broker_messages,
         raw_response_digest=raw_response_digest,
         observed_at=observed_at or datetime.now(timezone.utc),

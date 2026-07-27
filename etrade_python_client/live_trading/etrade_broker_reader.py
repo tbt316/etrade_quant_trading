@@ -61,12 +61,13 @@ _ACTIVE_ORDER_STATUSES = (
     "CANCEL_REQUESTED",
     "INDIVIDUAL_FILLS",
 )
-_PARSER_SCHEMA = "etrade-broker-reader.v2"
+_PARSER_SCHEMA = "etrade-broker-reader.v3"
 _PARSER_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _PARSER_CONFIG_SHA256 = hashlib.sha256(
     json.dumps(
         {
             "active_statuses": _ACTIVE_ORDER_STATUSES,
+            "capacity_position_identity": "option-contract-v1",
             "max_json_depth": _MAX_JSON_DEPTH,
             "max_json_nodes": _MAX_JSON_NODES,
             "max_order_pages": _MAX_ORDER_PAGES,
@@ -450,7 +451,7 @@ class ETradeBrokerReader:
         )
         orders, order_members, orders_completed = self._read_active_orders()
         result = {
-            "schema": "etrade-capacity.v2",
+            "schema": "etrade-capacity.v3",
             "account_status": binding.account_status,
             "account_mode": binding.account_mode,
             "account_type": binding.account_type,
@@ -464,7 +465,7 @@ class ETradeBrokerReader:
         economic_state = dict(result)
         economic_state.pop("broker_buying_power_as_of")
         state_sha256 = _domain_json_hash(
-            b"etrade-capacity-state.v2\0", economic_state
+            b"etrade-capacity-state.v3\0", economic_state
         )
         members = (
             BrokerReadManifestMember(
@@ -813,6 +814,40 @@ class ETradeBrokerReader:
         }
         if not lots_required:
             return normalized
+        if product["security_type"] == "OPTN":
+            if "optionMultiplier" not in position:
+                raise ETradeBrokerReaderIntegrityError(
+                    "option position omitted optionMultiplier"
+                )
+            if "optionsAdjustedFlag" not in position:
+                raise ETradeBrokerReaderIntegrityError(
+                    "option position omitted optionsAdjustedFlag"
+                )
+            option_multiplier = _decimal_text(
+                position["optionMultiplier"],
+                "position option multiplier",
+                nonnegative=True,
+            )
+            options_adjusted_flag = _bool(
+                position["optionsAdjustedFlag"],
+                "position options adjusted flag",
+            )
+            deliverables = _optional_empty_ascii_text(
+                position.get("deliverablesStr"),
+                "position option deliverables",
+                maximum=512,
+            )
+        else:
+            option_multiplier = None
+            options_adjusted_flag = None
+            deliverables = None
+        normalized.update(
+            {
+                "option_multiplier": option_multiplier,
+                "options_adjusted_flag": options_adjusted_flag,
+                "deliverables": deliverables,
+            }
+        )
         lot_fields = [
             field
             for field in ("PositionLot", "positionLot")
@@ -1994,6 +2029,25 @@ def _optional_ascii_text(value: Any, label: str) -> str | None:
     if value is None:
         return None
     return _ascii_text(value, label)
+
+
+def _optional_empty_ascii_text(
+    value: Any,
+    label: str,
+    *,
+    maximum: int = 256,
+) -> str | None:
+    if value is None or value == "":
+        return None
+    if (
+        type(value) is not str
+        or len(value) > maximum
+        or any(ord(char) < 32 or ord(char) > 126 for char in value)
+    ):
+        raise ETradeBrokerReaderIntegrityError(
+            f"{label} must be bounded printable ASCII"
+        )
+    return value
 
 
 def _integer_text(

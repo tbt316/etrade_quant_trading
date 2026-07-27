@@ -22,6 +22,7 @@ APPLICATION_ROOT = Path(__file__).resolve().parents[1]
 TRANSPORT_PATH = "live_trading/etrade_broker_transport.py"
 GATEWAY_PATH = "live_trading/etrade_order_gateway.py"
 READER_PATH = "live_trading/etrade_broker_reader.py"
+ORDER_PROTOCOL_PATH = "live_trading/etrade_order_protocol.py"
 RUNTIME_SAFETY_PATH = "live_trading/runtime_safety.py"
 CHECKER_PATH = "scripts/check_etrade_mutation_boundary.py"
 RUNTIME_SAFETY_MODULE = "live_trading.runtime_safety"
@@ -29,7 +30,7 @@ TRANSPORT_MODULE = "live_trading.etrade_broker_transport"
 CENTRAL_REJECTOR = "live_trading.runtime_safety.reject_legacy_execution"
 
 TRANSPORT_MUTATION_METHODS = frozenset(
-    {"preview", "place", "preview_change", "place_change"}
+    {"preview", "place", "preview_change", "place_change", "cancel"}
 )
 TRANSPORT_INTERNAL_CAPABILITIES = frozenset(
     {
@@ -53,6 +54,9 @@ GATEWAY_MUTATION_CALLERS = {
     ),
     "place_change": (
         "live_trading.etrade_order_gateway.EtradeOrderGateway.reprice_opening"
+    ),
+    "cancel": (
+        "live_trading.etrade_order_gateway.EtradeOrderGateway.cancel_opening"
     ),
 }
 HTTP_MUTATION_METHODS = frozenset(
@@ -148,6 +152,7 @@ ALLOWED_TRANSPORT_IMPORTS = {
     GATEWAY_PATH: frozenset(
         {
             "BrokerReply",
+            "CancelBrokerReply",
             "ETradeBrokerTransport",
             "ETradeBrokerTransportError",
             "SelectedBrokerAccount",
@@ -1117,7 +1122,10 @@ class _SourceVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
-        if self.relative_path == TRANSPORT_PATH:
+        if self.relative_path in {
+            TRANSPORT_PATH,
+            ORDER_PROTOCOL_PATH,
+        }:
             return
         value = node.value
         if isinstance(value, bytes):
