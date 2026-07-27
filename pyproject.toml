@@ -12,3 +12,9 @@ requires-python = ">=3.10"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["polygonio*", "strategies*", "yfinance*", "accounts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["etrade_python_client/tests"]
+markers = [
+    "integration: tests that require live external services",
+]
