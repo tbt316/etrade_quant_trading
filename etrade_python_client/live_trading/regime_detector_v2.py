@@ -16,6 +16,10 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 
+from live_trading.regime_evidence_store import (
+    RegimeEvidenceStore,
+    SnapshotEvidenceReport,
+)
 from live_trading.regime_market_data import (
     CALENDAR_POLICY_VERSION,
     RegimeMarketDataSnapshot,
@@ -679,15 +683,28 @@ def detect_regimes(
     return result
 
 
-def detect_regimes_from_snapshot(
+def _detect_regimes_from_snapshot(
     snapshot: RegimeMarketDataSnapshot,
-    config: RegimeDetectorConfig | None = None,
+    config: RegimeDetectorConfig | None,
+    evidence_report: SnapshotEvidenceReport | None,
 ) -> pd.DataFrame:
-    """Run the shadow detector from an immutable evidence-backed snapshot."""
-
     if not isinstance(snapshot, RegimeMarketDataSnapshot):
         raise TypeError("snapshot must be a RegimeMarketDataSnapshot")
+    if evidence_report is not None:
+        if not evidence_report.verified:
+            raise ValueError("Snapshot evidence report is not verified")
+        if evidence_report.snapshot_sha256 != snapshot.snapshot_sha256:
+            raise ValueError("Snapshot evidence report does not match the snapshot")
+        if (
+            evidence_report.evidence_sha256 is None
+            or evidence_report.verification_kind is None
+            or evidence_report.verified_at is None
+            or evidence_report.failures
+        ):
+            raise ValueError("Snapshot evidence report is incomplete")
+
     inputs = snapshot.detector_inputs()
+    inputs["source_provenance_verified"] = evidence_report is not None
     result = _detect_regimes_from_arrays(
         inputs.pop("prices"),
         config,
@@ -712,14 +729,36 @@ def detect_regimes_from_snapshot(
     result["Calendar_Schedule_SHA256"] = snapshot.schedule_sha256
     result["Source_Policy_Version"] = snapshot.source_policy_version
     result["Source_Policy_SHA256"] = snapshot.source_policy_sha256
-    result["Input_Provenance_Status"] = (
-        "verified" if snapshot.provenance_verified else "unverified"
-    )
-    result["Input_Provenance_Evidence"] = (
-        "complete_but_not_durably_verified"
-        if snapshot.provenance_evidence_complete
-        else "incomplete"
-    )
+    if evidence_report is None:
+        result["Input_Provenance_Status"] = "unverified"
+        result["Input_Provenance_Evidence"] = (
+            "complete_but_not_durably_verified"
+            if snapshot.provenance_evidence_complete
+            else "incomplete"
+        )
+        result["Evidence_Manifest_SHA256"] = None
+        result["Evidence_Verification_Kind"] = None
+        result["Evidence_Verified_At"] = None
+        result["Evidence_Decision_Time_Eligible"] = False
+    else:
+        result["Input_Provenance_Status"] = "verified"
+        result["Input_Provenance_Evidence"] = (
+            "durable_raw_payload_and_parser_receipts_verified"
+        )
+        result["Evidence_Manifest_SHA256"] = evidence_report.evidence_sha256
+        result["Evidence_Verification_Kind"] = (
+            evidence_report.verification_kind
+        )
+        result["Evidence_Verified_At"] = evidence_report.verified_at
+        decision_time_evidence = (
+            evidence_report.verification_kind == "decision_time"
+        )
+        result["Evidence_Decision_Time_Eligible"] = decision_time_evidence
+        if not decision_time_evidence:
+            result["Data_Quality"] = (
+                result["Data_Quality"]
+                + "|evidence_verified_replay_not_decision_time"
+            )
     result["Detector_Stage"] = "shadow"
     result["Execution_Eligible"] = False
 
@@ -734,5 +773,66 @@ def detect_regimes_from_snapshot(
     result.attrs["input_provenance_evidence_complete"] = (
         snapshot.provenance_evidence_complete
     )
-    result.attrs["input_provenance_failure_codes"] = provenance_failure_codes
+    result.attrs["input_provenance_failure_codes"] = (
+        [] if evidence_report is not None else provenance_failure_codes
+    )
+    result.attrs["evidence_manifest_sha256"] = (
+        evidence_report.evidence_sha256
+        if evidence_report is not None
+        else None
+    )
+    result.attrs["evidence_verification_kind"] = (
+        evidence_report.verification_kind
+        if evidence_report is not None
+        else None
+    )
+    result.attrs["evidence_verified_at"] = (
+        evidence_report.verified_at
+        if evidence_report is not None
+        else None
+    )
+    result.attrs["evidence_decision_time_eligible"] = bool(
+        evidence_report is not None
+        and evidence_report.verification_kind == "decision_time"
+    )
+    if evidence_report is not None:
+        result.attrs["freshness_assessed"] = bool(
+            evidence_report.verification_kind == "decision_time"
+        )
     return result
+
+
+def detect_regimes_from_snapshot(
+    snapshot: RegimeMarketDataSnapshot,
+    config: RegimeDetectorConfig | None = None,
+) -> pd.DataFrame:
+    """Run the shadow detector without claiming durable provenance.
+
+    Snapshot self-descriptions cannot prove that retained provider bytes still
+    exist or deterministically reproduce every observation.  Call
+    :func:`detect_regimes_from_verified_snapshot` when a durable evidence store
+    is available.
+    """
+
+    return _detect_regimes_from_snapshot(snapshot, config, None)
+
+
+def detect_regimes_from_verified_snapshot(
+    snapshot: RegimeMarketDataSnapshot,
+    evidence_store: RegimeEvidenceStore,
+    config: RegimeDetectorConfig | None = None,
+) -> pd.DataFrame:
+    """Verify retained evidence in the store, then run the shadow detector."""
+
+    if not isinstance(evidence_store, RegimeEvidenceStore):
+        raise TypeError("evidence_store must be a RegimeEvidenceStore")
+    report = evidence_store.verify_snapshot(snapshot)
+    if not report.verified:
+        failure_codes = sorted(
+            {failure.split(":", 1)[0] for failure in report.failures}
+        )
+        raise ValueError(
+            "Snapshot does not have complete durable provider evidence; "
+            f"failure_codes={failure_codes}"
+        )
+    return _detect_regimes_from_snapshot(snapshot, config, report)

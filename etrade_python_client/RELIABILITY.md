@@ -42,6 +42,14 @@ For every reliability incident:
   one independent final SPY close and one independent final VIX close. A
   partial leg, holiday-only row, or conflicting correction must not overwrite
   the last confirmed snapshot.
+- A continuously scheduled or order-adjacent market-data collector must have a
+  current entitlement covering non-display strategy use, raw-response
+  retention, the exact dataset, and the deployed subscriber. Missing, expired,
+  or scope-mismatched rights fail before the first network request; an API key
+  or publicly accessible CSV is not entitlement evidence.
+- Retained provider responses are evidence, not dashboard content. Raw bytes
+  must never be committed, logged, embedded in generated HTML, or returned by a
+  dashboard endpoint.
 
 ### Calculations
 
