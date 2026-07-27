@@ -7,10 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from live_trading.positions_artifact import (
+    PositionsArtifactReader,
+    PositionsArtifactSigningKey,
+)
 from live_trading.runtime_composition import (
     DashboardAuth,
     MAX_SESSION_SECONDS,
     ReadOnlyRuntimeContext,
+    RuntimeCompositionError,
     load_read_only_runtime,
 )
 from live_trading.runtime_config import DashboardSecrets, RuntimeConfigError
@@ -70,6 +75,9 @@ def _environment(mode: str = "paper") -> dict[str, str]:
         "ETRADE_DASHBOARD_PIN": "A9~strong",
         "ETRADE_DASHBOARD_SESSION_SECRET": (
             "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
+        ),
+        "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+            "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
         ),
     }
     if mode == "sandbox":
@@ -144,12 +152,16 @@ def test_load_read_only_runtime_binds_exact_paths_and_redacts(
     assert context.broker_environment == "production"
     assert context.broker_reads_enabled is True
     assert context.broker_mutations_enabled is False
-    assert context.paths.positions_artifact_file == (
+    assert context.positions_artifact_reader.path == (
         private / "runtime" / "artifacts" / "positions.html"
     )
+    assert context.positions_artifact_reader.max_age_seconds == 300
     assert context.regime_shadow_reader.path == (
         private / "runtime" / "model" / "regime-v2-shadow.json"
     )
+    assert not hasattr(context, "paths")
+    assert not hasattr(context.settings, "paths")
+    assert not hasattr(context.positions_artifact_reader, "publish")
     assert not hasattr(context.regime_shadow_reader, "publish")
     assert not hasattr(context, "config")
     assert not hasattr(context, "selected_account")
@@ -242,6 +254,34 @@ def test_directory_validation_precedes_any_secret_resolution(
         )
 
 
+def test_read_only_runtime_requires_only_its_exposed_directories(
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    config_path = _write_runtime(
+        private,
+        mode="paper",
+        create_directories=False,
+    )
+    root = private / "runtime"
+    root.mkdir(mode=0o700)
+    (root / "artifacts").mkdir(mode=0o700)
+    (root / "model").mkdir(mode=0o700)
+
+    context = load_read_only_runtime(
+        config_path,
+        environ=_environment("paper"),
+    )
+
+    assert context.mode == "paper"
+    assert not (root / "state").exists()
+    assert not (root / "cache").exists()
+    assert not (root / "logs").exists()
+    assert not (root / "execution").exists()
+    assert not (root / "data").exists()
+
+
 def test_live_context_is_unarmed_and_read_only(
     tmp_path: Path,
 ) -> None:
@@ -292,6 +332,9 @@ def test_read_only_runtime_never_reads_or_retains_broker_secrets(
                 "ETRADE_DASHBOARD_SESSION_SECRET": (
                     "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
                 ),
+                "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+                    "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+                ),
             }
         ),
     )
@@ -301,6 +344,7 @@ def test_read_only_runtime_never_reads_or_retains_broker_secrets(
         "ETRADE_DASHBOARD_USER",
         "ETRADE_DASHBOARD_PASSWORD",
         "ETRADE_DASHBOARD_SESSION_SECRET",
+        "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY",
     ]
     assert not hasattr(context, "secrets")
 
@@ -330,3 +374,57 @@ def test_runtime_instance_audience_is_path_bound(
         first_context.session_cookie_name
         != second_context.session_cookie_name
     )
+
+
+def test_context_rejects_reader_not_bound_to_runtime_settings(
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    context = load_read_only_runtime(
+        _write_runtime(private, mode="shadow"),
+        environ=_environment("shadow"),
+    )
+    mismatched_reader = PositionsArtifactReader(
+        context.positions_artifact_reader.path,
+        max_age_seconds=context.max_snapshot_age_seconds + 1,
+        signing_key=PositionsArtifactSigningKey.from_text(
+            _environment("shadow")[
+                "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY"
+            ]
+        ),
+        expected_broker_environment=context.broker_environment,
+        expected_runtime_binding=(
+            context.settings.positions_runtime_binding
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeCompositionError,
+        match="reader is not bound",
+    ):
+        ReadOnlyRuntimeContext(
+            settings=context.settings,
+            dashboard_auth=context.dashboard_auth,
+            positions_artifact_reader=mismatched_reader,
+            regime_shadow_reader=context.regime_shadow_reader,
+        )
+
+
+def test_runtime_rejects_reused_artifact_and_session_secret(
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    environment = _environment("shadow")
+    reused_token = (
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+    )
+    environment["ETRADE_DASHBOARD_SESSION_SECRET"] = reused_token
+    environment["ETRADE_POSITIONS_ARTIFACT_HMAC_KEY"] = reused_token
+
+    with pytest.raises(RuntimeConfigError, match="must not reuse"):
+        load_read_only_runtime(
+            _write_runtime(private, mode="shadow"),
+            environ=environment,
+        )

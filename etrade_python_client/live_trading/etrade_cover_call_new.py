@@ -25,7 +25,7 @@ from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import timedelta
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 import logging
 import pandas as pd
@@ -59,6 +59,20 @@ from pandas_market_calendars import get_calendar
 from live_trading.regime_shadow_store import (
     RegimeShadowStore,
     unavailable_dashboard_payload,
+)
+from live_trading.positions_artifact import (
+    PositionsArtifactSigningKey,
+    build_positions_snapshot,
+    positions_identity_fingerprint,
+)
+from live_trading.positions_artifact_publisher import (
+    PositionsArtifactPublisher,
+)
+from live_trading.runtime_config import (
+    RuntimeConfigError,
+    load_runtime_config,
+    resolve_positions_artifact_hmac_key,
+    validate_runtime_directories,
 )
 from live_trading.runtime_safety import (
     LegacyExecutionDisabled,
@@ -373,6 +387,64 @@ NEUTRALIZE_TRIGGER_DTE = 21
 NEUTRALIZE_TARGET_DTE = 42
 AUTO_REFRESH_INTERVAL_SECONDS = 300
 DASHBOARD_ON_DEMAND_REFRESH_ONLY = True
+READ_ONLY_POSITIONS_PUBLISHER = None
+READ_ONLY_POSITIONS_BROKER_ENVIRONMENT = None
+
+
+def _publish_confirmed_positions(positions, *, observed_at=None):
+    """Publish one complete raw portfolio snapshot for the isolated dashboard."""
+
+    publisher = READ_ONLY_POSITIONS_PUBLISHER
+    environment = READ_ONLY_POSITIONS_BROKER_ENVIRONMENT
+    if (
+        type(publisher) is not PositionsArtifactPublisher
+        or environment not in {"sandbox", "production"}
+    ):
+        raise RuntimeError(
+            "read-only positions publisher is not configured"
+        )
+    source_as_of = (
+        datetime.now(timezone.utc)
+        if observed_at is None
+        else observed_at
+    )
+    snapshot = build_positions_snapshot(
+        positions,
+        broker_environment=environment,
+        source_as_of=source_as_of,
+    )
+    receipt = publisher.publish(snapshot)
+    print(
+        "✅ [Read-only Publisher] "
+        f"{receipt.state}: {receipt.source_generation[:12]} "
+        f"({receipt.size_bytes} bytes)"
+    )
+    return receipt
+
+
+def _load_stable_positions(accounts):
+    """Require two page-complete scans with identical identity and quantity."""
+
+    first = accounts.portfolio(
+        print_enable=False,
+        minimal=True,
+        require_success=True,
+    )
+    source_as_of = datetime.now(timezone.utc)
+    second = accounts.portfolio(
+        print_enable=False,
+        require_success=True,
+    )
+    if (
+        positions_identity_fingerprint(first)
+        != positions_identity_fingerprint(second)
+    ):
+        raise RuntimeError(
+            "E*TRADE portfolio changed between confirmation reads; "
+            "the prior positions artifact was preserved"
+        )
+    return second, source_as_of
+
 
 def _status_now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3791,6 +3863,12 @@ if __name__ == "__main__":
     parser.add_argument('--expected-account-id-key')
     parser.add_argument('--expected-institution-type')
     parser.add_argument('--production-arm-file', type=Path)
+    parser.add_argument(
+        '--runtime-config',
+        required=True,
+        type=Path,
+        help='strict runtime configuration for state and artifact paths',
+    )
 
     parser.add_argument('--username', help='username for login', type=str, required=False)
     parser.add_argument('--password', help='password for login', type=str, required=False)
@@ -3812,6 +3890,56 @@ if __name__ == "__main__":
         )
     except RuntimeSafetyError as exc:
         parser.error(str(exc))
+
+    try:
+        runtime_config = load_runtime_config(args.runtime_config)
+        validate_runtime_directories(runtime_config.paths)
+        configured_account = runtime_config.selected_account
+        configured_identity = (
+            None
+            if configured_account is None
+            else (
+                configured_account.account_id,
+                configured_account.account_id_key,
+                configured_account.institution_type,
+            )
+        )
+        safety_identity = (
+            runtime_safety.expected_account_id,
+            runtime_safety.expected_account_id_key,
+            runtime_safety.expected_institution_type,
+        )
+        if (
+            runtime_config.broker_environment
+            != runtime_safety.environment
+            or configured_identity is None
+            or configured_identity != safety_identity
+        ):
+            raise RuntimeConfigError(
+                "runtime configuration does not match the exact "
+                "broker environment and account safety boundary"
+            )
+        READ_ONLY_POSITIONS_PUBLISHER = (
+            PositionsArtifactPublisher.from_runtime_config(
+                runtime_config,
+                signing_key=PositionsArtifactSigningKey.from_text(
+                    resolve_positions_artifact_hmac_key()
+                ),
+            )
+        )
+        READ_ONLY_POSITIONS_BROKER_ENVIRONMENT = (
+            runtime_config.broker_environment
+        )
+        AUTO_REFRESH_INTERVAL_SECONDS = min(
+            AUTO_REFRESH_INTERVAL_SECONDS,
+            max(
+                1,
+                runtime_config.data.max_snapshot_age_seconds // 2,
+            ),
+        )
+        DASHBOARD_ON_DEMAND_REFRESH_ONLY = False
+    except (OSError, RuntimeConfigError, RuntimeError, ValueError) as exc:
+        parser.error(f"runtime configuration rejected: {exc}")
 
     # --- SINGLETON LOCK ---
     try:
@@ -4044,6 +4172,18 @@ if __name__ == "__main__":
             is_open, market_status, market_open_time, market_close_time = is_market_open()
             print(f"\n📊 Market status: {market_status}  (checked at {now.strftime('%Y-%m-%d %H:%M:%S')})")
 
+            # Publish the authoritative raw-position view before slower model,
+            # analytics, or candidate scans. A failed/incomplete broker read
+            # leaves the prior atomic artifact untouched.
+            _select_runtime_account(accounts)
+            cycle_positions, positions_source_as_of = (
+                _load_stable_positions(accounts)
+            )
+            _publish_confirmed_positions(
+                cycle_positions,
+                observed_at=positions_source_as_of,
+            )
+
             # Capture close prices even in on-demand mode or when the process starts after close.
             if _market_close_refresh_due(market_status=market_status, market_close_time=market_close_time):
                 if record_market_close_prices(etrade_instance.market):
@@ -4078,7 +4218,7 @@ if __name__ == "__main__":
                 print(f"🔄 [Manual Refresh] Regenerating portfolio HTML ({market_status})...")
                 try:
                     _select_runtime_account(accounts)
-                    refresh_positions = accounts.portfolio(print_enable=False, require_success=True)
+                    refresh_positions = cycle_positions
                     from copy import deepcopy
                     refresh_screened = accounts.screen_option(deepcopy(refresh_positions))
 
@@ -4155,7 +4295,7 @@ if __name__ == "__main__":
             # etrade_instance.order.option_gain_new('2026-01-01')
             accounts.balance()
     
-            all_positions = accounts.portfolio(print_enable=True)  
+            all_positions = cycle_positions
 
             # --- EXTRINSIC VALUE ALERTS FOR ITM SHORT OPTIONS ---
             # Skip this check outside regular market hours because option quotes can be stale.

@@ -15,14 +15,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from live_trading.positions_artifact import (
+    PositionsArtifactReader,
+    PositionsArtifactSigningKey,
+)
 from live_trading.regime_shadow_store import RegimeShadowReader
 from live_trading.runtime_config import (
     DashboardSecrets,
     RuntimeConfig,
-    RuntimePaths,
     load_runtime_config,
+    positions_artifact_runtime_binding,
     resolve_dashboard_secrets,
-    validate_runtime_directories,
+    resolve_positions_artifact_hmac_key,
+    validate_positions_artifact_key_separation,
+    validate_read_only_runtime_directories,
 )
 
 
@@ -167,11 +173,12 @@ class ReadOnlyRuntimeSettings:
 
     schema_version: int
     mode: str
-    paths: RuntimePaths
     source_sha256: str
     instance_id: str
     broker_environment: str | None
     max_snapshot_age_seconds: int
+    positions_artifact_path_sha256: str
+    positions_runtime_binding: str
 
     @classmethod
     def from_runtime_config(
@@ -197,12 +204,20 @@ class ReadOnlyRuntimeSettings:
         return cls(
             schema_version=config.schema_version,
             mode=config.mode,
-            paths=config.paths,
             source_sha256=config.source_sha256,
             instance_id=instance_id,
             broker_environment=config.broker_environment,
             max_snapshot_age_seconds=(
                 config.data.max_snapshot_age_seconds
+            ),
+            positions_artifact_path_sha256=hashlib.sha256(
+                (
+                    "positions-artifact-path.v1\0"
+                    f"{config.paths.positions_artifact_file}"
+                ).encode("utf-8")
+            ).hexdigest(),
+            positions_runtime_binding=(
+                positions_artifact_runtime_binding(config)
             ),
         )
 
@@ -221,6 +236,7 @@ class ReadOnlyRuntimeContext:
 
     settings: ReadOnlyRuntimeSettings
     dashboard_auth: DashboardAuth
+    positions_artifact_reader: PositionsArtifactReader
     regime_shadow_reader: RegimeShadowReader
 
     def __post_init__(self) -> None:
@@ -230,16 +246,36 @@ class ReadOnlyRuntimeContext:
             )
         if type(self.dashboard_auth) is not DashboardAuth:
             raise TypeError("dashboard_auth must be an exact DashboardAuth instance")
+        if type(self.positions_artifact_reader) is not PositionsArtifactReader:
+            raise TypeError(
+                "positions_artifact_reader must be an exact "
+                "PositionsArtifactReader instance"
+            )
         if type(self.regime_shadow_reader) is not RegimeShadowReader:
             raise TypeError(
                 "regime_shadow_reader must be an exact RegimeShadowReader instance"
             )
+        reader = self.positions_artifact_reader
+        path_sha256 = hashlib.sha256(
+            (
+                "positions-artifact-path.v1\0"
+                f"{reader.path}"
+            ).encode("utf-8")
+        ).hexdigest()
         if (
-            self.regime_shadow_reader.path
-            != self.settings.paths.regime_shadow_file
+            reader.max_age_seconds
+            != self.settings.max_snapshot_age_seconds
+            or reader.expected_broker_environment
+            != self.settings.broker_environment
+            or reader.expected_runtime_binding
+            != self.settings.positions_runtime_binding
+            or path_sha256
+            != self.settings.positions_artifact_path_sha256
+            or reader.enabled
+            != (self.settings.broker_environment is not None)
         ):
             raise RuntimeCompositionError(
-                "regime shadow reader is not bound to the configured runtime path"
+                "positions artifact reader is not bound to runtime settings"
             )
 
     def __repr__(self) -> str:
@@ -250,10 +286,6 @@ class ReadOnlyRuntimeContext:
             f"source_sha256={self.settings.source_sha256!r}, "
             "secrets=[REDACTED])"
         )
-
-    @property
-    def paths(self) -> RuntimePaths:
-        return self.settings.paths
 
     @property
     def mode(self) -> str:
@@ -292,10 +324,21 @@ def load_read_only_runtime(
     """Load all read-only startup inputs before any external collaborator."""
 
     config = load_runtime_config(config_path)
-    validate_runtime_directories(config.paths)
+    validate_read_only_runtime_directories(config.paths)
     settings = ReadOnlyRuntimeSettings.from_runtime_config(config)
+    runtime_environment = os.environ if environ is None else environ
     dashboard_secrets = resolve_dashboard_secrets(
-        environ=os.environ if environ is None else environ,
+        environ=runtime_environment,
+    )
+    artifact_key_text = resolve_positions_artifact_hmac_key(
+        environ=runtime_environment,
+    )
+    validate_positions_artifact_key_separation(
+        artifact_key_text,
+        dashboard_secrets,
+    )
+    artifact_signing_key = PositionsArtifactSigningKey.from_text(
+        artifact_key_text
     )
     auth = DashboardAuth.from_dashboard_secrets(
         dashboard_secrets,
@@ -304,8 +347,17 @@ def load_read_only_runtime(
     return ReadOnlyRuntimeContext(
         settings=settings,
         dashboard_auth=auth,
+        positions_artifact_reader=PositionsArtifactReader(
+            config.paths.positions_artifact_file,
+            max_age_seconds=config.data.max_snapshot_age_seconds,
+            signing_key=artifact_signing_key,
+            expected_broker_environment=config.broker_environment,
+            expected_runtime_binding=(
+                settings.positions_runtime_binding
+            ),
+        ),
         regime_shadow_reader=RegimeShadowReader(
-            settings.paths.regime_shadow_file
+            config.paths.regime_shadow_file
         ),
     )
 

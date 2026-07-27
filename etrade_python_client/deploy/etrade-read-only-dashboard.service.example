@@ -1,0 +1,62 @@
+# Inactive reviewed example. Deployment and service installation remain
+# suspended. Copying this file is insufficient: the approval condition is
+# deliberately absent by default, and this example has no [Install] section.
+
+[Unit]
+Description=Broker-isolated E*TRADE read-only dashboard
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+ConditionPathExists=/etc/etrade/read-only-dashboard.approved
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=etrade
+Group=etrade
+UMask=0077
+EnvironmentFile=/etc/etrade/read-only-dashboard.env
+ExecStart=/opt/etrade/venv/bin/etrade-read-only-dashboard serve --config /var/lib/etrade/runtime-config.json --host 127.0.0.1 --port 8765 --secure-cookie
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/etrade/runtime-config.json
+ReadOnlyPaths=/var/lib/etrade/runtime/artifacts
+ReadOnlyPaths=/var/lib/etrade/runtime/model
+InaccessiblePaths=/var/lib/etrade/runtime/state
+InaccessiblePaths=/var/lib/etrade/runtime/cache
+InaccessiblePaths=/var/lib/etrade/runtime/logs
+InaccessiblePaths=/var/lib/etrade/runtime/execution
+InaccessiblePaths=/var/lib/etrade/runtime/data
+InaccessiblePaths=/home /root
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SocketBindDeny=any
+SocketBindAllow=ipv4:tcp:8765
+
+StandardOutput=journal
+StandardError=journal

@@ -180,6 +180,7 @@ OS environment is authoritative. The supported E*TRADE names are:
 - `ETRADE_DASHBOARD_PASSWORD`
 - `ETRADE_DASHBOARD_PIN`
 - `ETRADE_DASHBOARD_SESSION_SECRET`
+- `ETRADE_POSITIONS_ARTIFACT_HMAC_KEY`
 
 A local development fallback, when permitted by mode, must be a
 current-user-owned regular file with no group or world permissions under the
@@ -213,6 +214,31 @@ so every existing stateless session is invalidated.
 `ETRADE_PRODUCTION_ARMING_SECRET` remains environment-only. It is never valid
 in the runtime configuration or local fallback, and it must not be supplied on
 the command line.
+
+`ETRADE_POSITIONS_ARTIFACT_HMAC_KEY` is also environment-only and is not a
+valid key in `secrets.json`. Generate a unique value for each runtime and
+broker environment with `secrets.token_urlsafe(32)`. It must not reuse the
+dashboard-session or production-arming secret. The validator requires at
+exactly the canonical 43-character unpadded URL-safe encoding of 32 bytes,
+rejects low-diversity and repeating patterns, and cannot prove randomness;
+generation from a cryptographic random source remains an operator invariant.
+
+The positions publisher and reader derive a non-reversible runtime binding
+from the exact mode, broker environment, allowlisted account identity,
+canonical runtime root, schema version, and raw configuration SHA-256. Any
+configuration-byte change, including whitespace, changes that SHA-256 and
+invalidates the prior artifact until it is republished. Moving the runtime
+root or changing mode, environment, or account has the same fail-closed
+effect.
+
+`data.max_snapshot_age_seconds` governs both publisher admission and reader
+freshness for the positions display. The integrated producer requires a
+window of at least 60 seconds and polls at no more than half the configured
+window. The reader independently checks both the signed full-scan start
+time and the artifact file modification time, with at most five seconds of
+future clock skew. The HMAC key is currently required at dashboard startup in
+all modes, including `paper`; `paper` still returns
+`broker_positions_disabled`.
 
 Do not auto-load `.env`, accept passwords through command-line arguments, or
 copy local secret/state files through the code-deployment path.
@@ -255,8 +281,8 @@ python -m live_trading.runtime_config validate \
 ```
 
 That path reads only `ETRADE_DASHBOARD_USER`,
-`ETRADE_DASHBOARD_PASSWORD`, and
-`ETRADE_DASHBOARD_SESSION_SECRET`. It never reads the combined fallback,
+`ETRADE_DASHBOARD_PASSWORD`, `ETRADE_DASHBOARD_SESSION_SECRET`, and
+`ETRADE_POSITIONS_ARTIFACT_HMAC_KEY`. It never reads the combined fallback,
 broker credential variables, or `ETRADE_DASHBOARD_PIN`.
 
 The release gate verifies that the credential-free example is present in both
@@ -273,6 +299,11 @@ it constructs no OAuth, broker, market-data, model, or order collaborator.
 Dashboard credentials remain immutable and are not stored in or editable
 through legacy live settings. The operator process never reads or retains
 E*TRADE credentials or the unused action PIN.
+
+The positions HMAC key is the only secret shared with the transitional
+publisher. The dashboard receives only an authenticated, runtime-bound static
+artifact reader capability, not the full runtime path set or a publication
+capability.
 
 See [`read_only_dashboard.md`](read_only_dashboard.md) for provisioning,
 startup, endpoint, and artifact-integrity details. This read-only service does

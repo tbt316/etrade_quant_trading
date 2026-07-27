@@ -63,6 +63,18 @@ mutation quarantine:
   URLs. The older interactive order client and spread executable are
   quarantined.
 
+R8a–R8e-B add repository hygiene, one canonical reproducible package, offline
+artifact-first CI, strict typed runtime configuration, and a separate
+broker-isolated loopback operator process. The supported positions read model
+now requires two consecutive complete E*TRADE scans with identical canonical
+position identity and quantity. It renders bounded primitive DTOs, signs the
+exact deterministic HTML with HMAC-SHA256, binds it to environment, account,
+configuration, and runtime root, and publishes with an owner-only lock plus
+durable atomic replacement. The dashboard authenticates exact bytes and both
+source/file freshness, has no writer or broker capability, and pins its iframe
+to the SHA-256 reported by status so an intervening replacement returns a
+fail-closed conflict rather than mixed data.
+
 These changes do **not** satisfy Phase 0 or make the repository production
 ready. R7a–R7e preserve the arm/account check and add isolated durable intent identity,
 capacity reservations, mutation fencing, direct known-order reconciliation,
@@ -79,10 +91,23 @@ credentials are provisioned. GitHub reports the repository as public on
 compromised: external revoke/rotate is required, followed by a coordinated
 history purge and downstream cleanup. No live service restart, deployment,
 E*TRADE mutation, deployed restart, or exact deployed-dashboard verification
-has been performed. The real local handler and generated positions artifact
-were inspected at desktop and mobile widths for R7f, including the fixed
-same-origin iframe policy and fixed eight-digit PIN input; that is source
-verification only.
+has been performed. The exact broker-isolated local handler and signed
+positions artifact were inspected at desktop and mobile widths for R8e-B,
+including responsive layout, signed negative-value formatting, unavailable
+regime labeling, sandboxed same-origin framing, and digest-pinned delivery;
+that is source verification only.
+
+R8e-B does not close the live release gate. The artifact is a display read
+model, not a transactional broker, risk, or execution snapshot.
+`source_as_of` is local time captured before the complete second scan. The
+publisher remains coupled to the legacy monitor, publisher and reader share a
+symmetric key, and the same-UID dashboard requires an OS-enforced read-only
+mount namespace.
+Adjusted or non-100-multiplier options are rejected from the display artifact;
+accepted options bind and show their exact standard-contract OSI identity.
+Standalone collection, hardened service activation, atomic release/rollback
+drills, cancellation, closing, full risk policy, and live gateway composition
+remain open.
 
 ## What is worth preserving
 

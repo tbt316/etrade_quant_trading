@@ -10,6 +10,28 @@ historical `--trade` flag is not an instruction or override for live trading.
 The dashboard is authenticated and loopback-only. Service installation and
 remote restart remain suspended.
 
+## First-in-cycle positions publication
+
+R8e-B publishes the broker-isolated dashboard's static positions read model
+before model loading, candidate scans, and other slower analytics. Publication
+requires two consecutive page-complete E*TRADE portfolio reads. The first is a
+minimal identity/quantity scan; the second is the complete display scan. Their
+canonical symbol, security type, option contract, and quantity fingerprints
+must match.
+
+An HTTP, pagination, account-identity, schema, stability, projection,
+signature, filesystem, or freshness failure prevents replacement and preserves
+the last confirmed artifact. That older artifact eventually becomes visibly
+stale; it is never silently refreshed by file modification time alone.
+Publication cadence is no slower than half
+`data.max_snapshot_age_seconds`.
+
+The publisher remains composed inside the transitional legacy monitor rather
+than a standalone read collector. The historical `--trade` CLI spelling is
+therefore still required to start that monitor even though all compatibility
+mutation paths are unconditional tombstones. The static artifact is strictly
+for operator display and cannot be used as a risk or execution snapshot.
+
 ## Retained analytical logic
 
 The runtime may still calculate and display:
@@ -55,10 +77,11 @@ pytest -q tests
 ```
 
 The static checker protects the reviewed mutation boundary and exact
-tombstones across tracked sources. R7f dashboard behavior was visually checked
-through an isolated real handler and generated position artifact at desktop
-and mobile sizes. The deployed service was not restarted or inspected, and no
-E*TRADE order path was exercised.
+tombstones across tracked sources. R8e-B dashboard behavior was visually
+checked through the exact broker-isolated local handler and signed generated
+position artifact at desktop and mobile sizes, including digest-pinned iframe
+delivery. The deployed service was not restarted or inspected, and no E*TRADE
+order path was exercised.
 
 ## Promotion path
 

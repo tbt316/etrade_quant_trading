@@ -1027,7 +1027,42 @@ def actions_option_trade_html(stock_positions, folder_path='./daily_log', overwr
 
 class StockPosition:
     """Class to represent a stock position in the portfolio."""
-    def __init__(self, symbol, quantity, last_price=None, price_paid=None, total_gain=None, market_value=None, position_id=None, position_type=None, security_type=None, date_acquired=None, strike_price=None, call_put=None, expiration_date=None, days_to_expiration=None, distance_to_strike=None, volatility=None, implied_volatility=None, theta=None, rho=None, vega=None, delta=None, gamma=None, net_ticker_delta=None, ticker_hedging_cost=None, target_option_roll=None, target_hedge_option_roll=None, underlying_last_price=None, option_intrinsic=None, iv_skew=None):
+    def __init__(
+        self,
+        symbol,
+        quantity,
+        last_price=None,
+        price_paid=None,
+        total_gain=None,
+        market_value=None,
+        position_id=None,
+        position_type=None,
+        security_type=None,
+        date_acquired=None,
+        strike_price=None,
+        call_put=None,
+        expiration_date=None,
+        days_to_expiration=None,
+        distance_to_strike=None,
+        volatility=None,
+        implied_volatility=None,
+        theta=None,
+        rho=None,
+        vega=None,
+        delta=None,
+        gamma=None,
+        net_ticker_delta=None,
+        ticker_hedging_cost=None,
+        target_option_roll=None,
+        target_hedge_option_roll=None,
+        underlying_last_price=None,
+        option_intrinsic=None,
+        iv_skew=None,
+        osi_key=None,
+        option_multiplier=None,
+        options_adjusted_flag=None,
+        option_deliverables=None,
+    ):
         self.symbol = symbol
         self.quantity = quantity
         self.last_price = last_price
@@ -1063,6 +1098,10 @@ class StockPosition:
         self.option_intrinsic = None
         self.iv_skew = None
         self.lots_url = None  # URL for lots information, if applicable
+        self.osi_key = osi_key
+        self.option_multiplier = option_multiplier
+        self.options_adjusted_flag = options_adjusted_flag
+        self.option_deliverables = option_deliverables
 
 
     def __str__(self):
@@ -1907,8 +1946,9 @@ class Accounts:
             print_enable (bool): Whether to print position details. Defaults to False.
             minimal (bool): If True, skips time-consuming calculations and returns only basic position data
                         needed for position matching. Defaults to False.
-            require_success (bool): Raise when E*TRADE does not return a successful portfolio response.
-                        Dashboard writers use this to preserve the last confirmed artifact on upstream failure.
+            require_success (bool): Retained for caller compatibility. Incomplete
+                        or unsuccessful portfolio responses always raise so no
+                        caller can mistake partial data for a complete snapshot.
         
         Returns:
             list: List of StockPosition objects representing positions in the portfolio.
@@ -1920,47 +1960,218 @@ class Accounts:
         all_positions = []
         offset = 1
         count = 50
+        max_pages = 100
+        expected_total_pages = None
+        expected_total_field = None
+        seen_position_ids = set()
+
+        def reject_incomplete_snapshot(message, *, cause=None):
+            logger.error("E*TRADE portfolio response rejected: %s", message)
+            error = RuntimeError(
+                f"E*TRADE portfolio snapshot is incomplete: {message}"
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
         
         # Fetch all positions with pagination
         while True:
-            params = {"view": "COMPLETE", "count": count, "pageNumber": offset}
+            if offset > max_pages:
+                reject_incomplete_snapshot(
+                    "pagination exceeded the fixed 100-page bound"
+                )
+                break
+            params = {
+                "view": "COMPLETE",
+                "count": count,
+                "pageNumber": offset,
+                "sortBy": "SYMBOL",
+                "sortOrder": "ASC",
+                "marketSession": "REGULAR",
+                "totalsRequired": "false",
+                "lotsRequired": "false",
+            }
             response = self.session.get(url, params=params, header_auth=True)
             if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("portfolio fetch"):
                 url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/portfolio.json"
                 response = self.session.get(url, params=params, header_auth=True)
             logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
             
+            if response.status_code == 204:
+                response_body = getattr(response, "content", None)
+                if response_body is None:
+                    response_body = (
+                        getattr(response, "text", "") or ""
+                    ).encode("utf-8")
+                if offset != 1 or response_body:
+                    reject_incomplete_snapshot(
+                        "only an empty first-page HTTP 204 can confirm "
+                        "a portfolio with no positions"
+                    )
+                break
+
             # Check if API call was successful
             if response.status_code != 200:
                 logger.error("API request failed with status code: %s", response.status_code)
-                if require_success:
-                    raise RuntimeError(
-                        f"E*TRADE portfolio request failed on page {offset} "
-                        f"with status code {response.status_code}"
-                    )
-                break
+                raise RuntimeError(
+                    f"E*TRADE portfolio request failed on page {offset} "
+                    f"with status code {response.status_code}"
+                )
             
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception as exc:
+                reject_incomplete_snapshot(
+                    f"page {offset} is not valid JSON",
+                    cause=exc,
+                )
+                break
             logger.debug("Response Body: %s", json.dumps(data, indent=4, sort_keys=True))
             
-            # Verify expected response structure
-            if "PortfolioResponse" not in data or "AccountPortfolio" not in data["PortfolioResponse"]:
+            if not isinstance(data, dict):
+                reject_incomplete_snapshot(
+                    f"page {offset} root is not an object"
+                )
                 break
-            
-            # Extract positions from all AccountPortfolio entries in this response
-            positions_in_response = []
-            for acctPortfolio in data["PortfolioResponse"]["AccountPortfolio"]:
-                if "Position" in acctPortfolio:
-                    positions_in_response.extend(acctPortfolio["Position"])
+            portfolio_response = data.get("PortfolioResponse")
+            if not isinstance(portfolio_response, dict):
+                reject_incomplete_snapshot(
+                    f"page {offset} omitted PortfolioResponse"
+                )
+                break
+            account_portfolios = portfolio_response.get("AccountPortfolio")
+            if not isinstance(account_portfolios, list):
+                reject_incomplete_snapshot(
+                    f"page {offset} AccountPortfolio is not an array"
+                )
+                break
+            if not account_portfolios:
+                reject_incomplete_snapshot(
+                    "HTTP 200 omitted the account-level portfolio proof"
+                )
+                break
+            if len(account_portfolios) != 1:
+                reject_incomplete_snapshot(
+                    f"page {offset} did not contain exactly one account"
+                )
+                break
+
+            acctPortfolio = account_portfolios[0]
+            if not isinstance(acctPortfolio, dict):
+                reject_incomplete_snapshot(
+                    f"page {offset} account portfolio is not an object"
+                )
+                break
+            response_account_id = acctPortfolio.get("accountId")
+            expected_account_id = self.account.get("accountId")
+            if (
+                expected_account_id is not None
+                and str(response_account_id) != str(expected_account_id)
+            ):
+                reject_incomplete_snapshot(
+                    f"page {offset} account identity does not match"
+                )
+                break
+            positions_in_response = acctPortfolio.get("Position")
+            if not isinstance(positions_in_response, list):
+                reject_incomplete_snapshot(
+                    f"page {offset} Position is not an array"
+                )
+                break
+            if len(positions_in_response) > count:
+                reject_incomplete_snapshot(
+                    f"page {offset} exceeded the requested row count"
+                )
+                break
+            total_fields = [
+                name
+                for name in ("totalNoOfPages", "totalPages")
+                if name in acctPortfolio
+            ]
+            if len(total_fields) != 1:
+                reject_incomplete_snapshot(
+                    f"page {offset} lacks unambiguous total-page metadata"
+                )
+                break
+            raw_total_pages = acctPortfolio[total_fields[0]]
+            if (
+                type(raw_total_pages) not in {int, str}
+                or isinstance(raw_total_pages, bool)
+                or not str(raw_total_pages).isdigit()
+            ):
+                reject_incomplete_snapshot(
+                    f"page {offset} total-page metadata is invalid"
+                )
+                break
+            total_pages = int(raw_total_pages)
+            if (
+                not 1 <= total_pages <= max_pages
+                or offset > total_pages
+                or (
+                    expected_total_pages is not None
+                    and total_pages != expected_total_pages
+                )
+                or (
+                    expected_total_field is not None
+                    and total_fields[0] != expected_total_field
+                )
+            ):
+                reject_incomplete_snapshot(
+                    f"page {offset} total-page metadata changed or is out of bounds"
+                )
+                break
+            if expected_total_pages is None:
+                expected_total_pages = total_pages
+                expected_total_field = total_fields[0]
+            for position in positions_in_response:
+                if not isinstance(position, dict):
+                    reject_incomplete_snapshot(
+                        f"page {offset} contains a non-object position"
+                    )
+                    break
+                position_id = position.get("positionId")
+                position_id_text = (
+                    str(position_id)
+                    if type(position_id) in {int, str}
+                    and not isinstance(position_id, bool)
+                    else ""
+                )
+                if (
+                    not position_id_text.isascii()
+                    or not position_id_text.isdigit()
+                    or not 1 <= len(position_id_text) <= 19
+                    or str(int(position_id_text)) != position_id_text
+                    or not 1
+                    <= int(position_id_text)
+                    <= 9_223_372_036_854_775_807
+                    or position_id_text in seen_position_ids
+                ):
+                    reject_incomplete_snapshot(
+                        f"page {offset} contains an invalid or duplicate position id"
+                    )
+                    break
+                seen_position_ids.add(position_id_text)
             
             # Add to total positions
             all_positions.extend(positions_in_response)
 
-            # If fewer positions than count are returned, this is the last page
-            if len(positions_in_response) < count:
+            if offset == total_pages:
+                if acctPortfolio.get("nextPageNo") not in {None, ""}:
+                    reject_incomplete_snapshot(
+                        "terminal portfolio page advertised another page"
+                    )
                 break
-            
-            # Move to next batch
+            raw_next_page = acctPortfolio.get("nextPageNo")
+            if (
+                type(raw_next_page) not in {int, str}
+                or isinstance(raw_next_page, bool)
+                or not str(raw_next_page).isdigit()
+                or int(raw_next_page) != offset + 1
+            ):
+                reject_incomplete_snapshot(
+                    f"page {offset} next-page metadata is invalid"
+                )
+                break
             offset += 1
         
         stock_positions = []
@@ -2031,6 +2242,7 @@ class Accounts:
         for position in all_positions:
             product = position.get("Product", {})
             complete = position.get("Complete", {})
+            security_type_code = product.get("securityType", "N/A")
             
             # Calculate detailed metrics if not in minimal mode
             if not minimal:
@@ -2104,6 +2316,7 @@ class Accounts:
             # Map security type
             security_type_map = {"EQ": "Stock", "OPTN": "Option"}
             security_type = security_type_map.get(security_type_code, "Unknown")
+            is_option = security_type == "Option"
 
 
             # Create StockPosition object
@@ -2117,7 +2330,23 @@ class Accounts:
                 position_id=position_id,
                 position_type=position_type,
                 security_type=security_type,
-                date_acquired=date_acquired
+                date_acquired=date_acquired,
+                osi_key=position.get("osiKey") if is_option else None,
+                option_multiplier=(
+                    complete.get("optionMultiplier")
+                    if is_option
+                    else None
+                ),
+                options_adjusted_flag=(
+                    complete.get("optionsAdjustedFlag")
+                    if is_option
+                    else None
+                ),
+                option_deliverables=(
+                    complete.get("deliverablesStr")
+                    if is_option
+                    else None
+                ),
             )
             stock_position.lots_url = position.get("lotsDetails")
             # Add option-specific attributes

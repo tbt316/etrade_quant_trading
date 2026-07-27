@@ -26,6 +26,7 @@ PACKAGE_ROOTS = (
     "strategies",
 )
 READ_ONLY_MODULES = (
+    "live_trading.positions_artifact",
     "live_trading.read_only_dashboard",
     "live_trading.runtime_composition",
     "live_trading.runtime_config",
@@ -37,6 +38,7 @@ SUPPORTED_MODULES = (
     "data_and_research.vol_plot",
     "live_trading.etrade_cover_call_new",
     "live_trading.etrade_put_credit_spread",
+    "live_trading.positions_artifact_publisher",
     "live_trading.regime_detector_v2",
     "live_trading.runtime_safety",
     "market.market_bo",
@@ -53,6 +55,7 @@ FORBIDDEN_READ_ONLY_IMPORT_PREFIXES = (
     "live_trading.etrade_cover_call_new",
     "live_trading.etrade_order_gateway",
     "live_trading.order_intent_ledger",
+    "live_trading.positions_artifact_publisher",
     "order.order_bo",
     "polygonio.poly_client",
     "pyetrade",
@@ -139,11 +142,17 @@ def main() -> int:
                 "ETRADE_DASHBOARD_SESSION_SECRET": (
                     "runtime-smoke-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R7Ts1Qa"
                 ),
+                "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+                    "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+                ),
             },
         )
         if (
             application.runtime.broker_mutations_enabled
             or hasattr(application.runtime, "config")
+            or hasattr(application.runtime, "paths")
+            or hasattr(application.runtime.settings, "paths")
+            or hasattr(application.runtime.positions_artifact_reader, "publish")
             or hasattr(application.runtime.regime_shadow_reader, "publish")
         ):
             raise RuntimeSmokeError(
@@ -169,6 +178,24 @@ def main() -> int:
     if distribution.version != "0.1.0":
         raise RuntimeSmokeError(
             f"unexpected installed version: {distribution.version}"
+        )
+    console_scripts = sorted(
+        (entry.name, entry.value)
+        for entry in distribution.entry_points
+        if entry.group == "console_scripts"
+    )
+    if console_scripts != [
+        (
+            "etrade-read-only-dashboard",
+            "live_trading.read_only_dashboard:main",
+        ),
+        (
+            "etrade-runtime-config",
+            "live_trading.runtime_config:main",
+        ),
+    ]:
+        raise RuntimeSmokeError(
+            f"unexpected console entry points: {console_scripts}"
         )
     for name in FORBIDDEN_RUNTIME_DISTRIBUTIONS:
         try:

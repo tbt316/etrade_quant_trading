@@ -90,10 +90,20 @@
       iframe { min-height: 720px; }
     }
     @media (max-width: 540px) {
-      header { align-items: flex-start; }
+      header {
+        display: grid; grid-template-columns: minmax(0, 1fr);
+        align-items: flex-start; gap: 10px;
+      }
+      .header-actions {
+        display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        width: 100%;
+      }
+      .header-actions button { width: 100%; }
       .grid { grid-template-columns: 1fr; }
       .card { min-height: 94px; }
       .readonly { align-items: flex-start; }
+      .positions-head { align-items: flex-start; flex-direction: column; }
+      #updated { text-align: left; }
       iframe { min-height: 820px; }
     }
   </style>
@@ -146,17 +156,91 @@
         <h2>Current portfolio artifact</h2>
         <div id="updated">Waiting for status…</div>
       </div>
-      <iframe id="positions-frame" src="/api/positions" sandbox
+      <iframe id="positions-frame" src="about:blank" sandbox
               title="Read-only portfolio positions"></iframe>
     </section>
     <div class="error" id="error" role="alert"></div>
   </main>
   <script>
     let positionsVersion = null;
+    let positionsLoadGeneration = 0;
+    let positionsExpiresAt = null;
+    let positionsExpiryTimer = null;
     const text = (id, value, state) => {
       const node = document.getElementById(id);
       node.textContent = value;
       if (state) node.className = `value ${state}`;
+    };
+    const clearPositionsExpiry = () => {
+      positionsExpiresAt = null;
+      if (positionsExpiryTimer !== null) {
+        clearTimeout(positionsExpiryTimer);
+        positionsExpiryTimer = null;
+      }
+    };
+    const hidePositions = detail => {
+      positionsLoadGeneration += 1;
+      positionsVersion = null;
+      clearPositionsExpiry();
+      text('positions', 'Unavailable', 'bad');
+      document.getElementById('positions-detail').textContent = detail;
+      document.getElementById('updated').textContent =
+        'No verified current artifact';
+      const frame = document.getElementById('positions-frame');
+      frame.hidden = true;
+      frame.removeAttribute('srcdoc');
+      frame.src = 'about:blank';
+    };
+    const loadPositions = async (positions, nextVersion) => {
+      const generation = ++positionsLoadGeneration;
+      const frame = document.getElementById('positions-frame');
+      frame.hidden = true;
+      frame.removeAttribute('srcdoc');
+      frame.src = 'about:blank';
+      const requestedVersion = positions.available
+        ? positions.sha256
+        : 'unavailable';
+      const response = await fetch(
+        `/api/positions?sha256=${requestedVersion}`,
+        {cache: 'no-store'},
+      );
+      if (response.status === 401) {
+        location.href = '/login';
+        return false;
+      }
+      const body = await response.text();
+      if (generation !== positionsLoadGeneration) return false;
+      const expectedStatus = positions.available ? 200 : 503;
+      if (response.status !== expectedStatus) {
+        throw new Error('Verified positions artifact is unavailable');
+      }
+      frame.srcdoc = body;
+      frame.hidden = false;
+      positionsVersion = nextVersion;
+      return true;
+    };
+    const enforcePositionsExpiry = () => {
+      if (
+        positionsExpiresAt !== null &&
+        Date.now() >= positionsExpiresAt
+      ) {
+        hidePositions('Verified freshness window expired');
+      }
+    };
+    const armPositionsExpiry = expiresAt => {
+      if (positionsExpiryTimer !== null) clearTimeout(positionsExpiryTimer);
+      positionsExpiresAt = Date.parse(expiresAt);
+      if (!Number.isFinite(positionsExpiresAt)) {
+        hidePositions('Artifact expiry metadata is invalid');
+        return false;
+      }
+      const delay = Math.max(0, positionsExpiresAt - Date.now());
+      if (delay === 0) {
+        hidePositions('Verified freshness window expired');
+        return false;
+      }
+      positionsExpiryTimer = setTimeout(enforcePositionsExpiry, delay);
+      return true;
     };
     const refresh = async () => {
       try {
@@ -179,13 +263,23 @@
         const nextPositionsVersion = p.available
           ? `available:${p.sha256}`
           : `unavailable:${p.reason || 'unknown'}`;
-        if (nextPositionsVersion !== positionsVersion) {
-          positionsVersion = nextPositionsVersion;
-          document.getElementById('positions-frame').src =
-            `/api/positions?v=${encodeURIComponent(nextPositionsVersion)}`;
+        let freshUntilExpiry = true;
+        if (p.available) {
+          freshUntilExpiry = armPositionsExpiry(p.expires_at);
+        } else {
+          clearPositionsExpiry();
+        }
+        if (
+          freshUntilExpiry &&
+          nextPositionsVersion !== positionsVersion
+        ) {
+          if (!await loadPositions(p, nextPositionsVersion)) return;
         }
         const r = data.regime || {};
-        text('regime', r.composite_label || 'Unavailable',
+        const regimeLabel = r.available
+          ? r.composite_label || 'Advisory'
+          : r.stale ? 'Stale' : 'Unavailable';
+        text('regime', regimeLabel,
           r.available && !r.stale ? 'good' : r.stale ? 'warn' : 'bad');
         document.getElementById('regime-detail').textContent =
           r.available
@@ -193,6 +287,7 @@
             : `Status: ${r.status || 'unavailable'} · cannot authorize execution`;
         document.getElementById('error').style.display = 'none';
       } catch (error) {
+        hidePositions('Status poll failed; previous artifact hidden');
         const box = document.getElementById('error');
         box.textContent = error.message || 'Dashboard status is unavailable.';
         box.style.display = 'block';
@@ -203,6 +298,12 @@
       location.href = '/login';
     });
     document.getElementById('refresh-now').addEventListener('click', refresh);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        enforcePositionsExpiry();
+        refresh();
+      }
+    });
     refresh();
     setInterval(refresh, 60000);
   </script>

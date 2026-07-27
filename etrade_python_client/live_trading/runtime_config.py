@@ -7,7 +7,10 @@ an E*TRADE account: schema version 1 rejects mutation enablement in every mode.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -54,6 +57,7 @@ _EXECUTION_FIELDS = frozenset(
 _ACCOUNT_FIELDS = frozenset(
     {"account_id", "account_id_key", "institution_type"}
 )
+_URLSAFE_32_BYTE_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _RISK_FIELDS = frozenset(
     {
         "max_order_contracts",
@@ -856,10 +860,10 @@ def load_runtime_config(path: str | Path) -> RuntimeConfig:
     )
 
 
-def validate_runtime_directories(paths: RuntimePaths) -> None:
-    """Require pre-created, owner-only directories without changing them."""
-
-    for directory in paths.directories:
+def _validate_runtime_directory_set(
+    directories: tuple[Path, ...],
+) -> None:
+    for directory in directories:
         try:
             metadata = os.lstat(directory)
         except OSError as exc:
@@ -875,6 +879,24 @@ def validate_runtime_directories(paths: RuntimePaths) -> None:
             raise RuntimeConfigError(
                 f"runtime directory must be owner-only and non-symbolic: {directory}"
             )
+
+
+def validate_runtime_directories(paths: RuntimePaths) -> None:
+    """Require every pre-created owner-only runtime directory."""
+
+    _validate_runtime_directory_set(paths.directories)
+
+
+def validate_read_only_runtime_directories(paths: RuntimePaths) -> None:
+    """Validate only directories exposed to the broker-isolated dashboard."""
+
+    _validate_runtime_directory_set(
+        (
+            paths.root,
+            paths.artifacts_dir,
+            paths.model_dir,
+        )
+    )
 
 
 def _environment_secret_values(
@@ -1059,6 +1081,112 @@ def resolve_dashboard_secrets(
     )
 
 
+def resolve_positions_artifact_hmac_key(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the environment-only key shared by publisher and reader."""
+
+    environment = os.environ if environ is None else environ
+    value = environment.get("ETRADE_POSITIONS_ARTIFACT_HMAC_KEY")
+    values = {"positions_artifact_hmac_key": value}
+    required = ("positions_artifact_hmac_key",)
+    if not value:
+        raise RuntimeConfigError(
+            "required positions artifact signing secret is missing"
+        )
+    _validate_secret_strings(values, required)
+    try:
+        decoded = base64.b64decode(
+            value + "=",
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+        raise RuntimeConfigError(
+            "positions artifact signing secret must be a canonical "
+            "32-byte URL-safe token"
+        ) from exc
+    periodic = any(
+        all(
+            character == value[index % width]
+            for index, character in enumerate(value)
+        )
+        for width in range(1, len(value) // 2 + 1)
+    )
+    if (
+        _URLSAFE_32_BYTE_TOKEN.fullmatch(value) is None
+        or len(decoded) != 32
+        or base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+        != value
+        or len(set(value)) < 12
+        or periodic
+    ):
+        raise RuntimeConfigError(
+            "positions artifact signing secret must be a canonical, "
+            "non-repeating 32-byte URL-safe token"
+        )
+    return value
+
+
+def validate_positions_artifact_key_separation(
+    artifact_key: str,
+    dashboard_secrets: DashboardSecrets,
+) -> None:
+    """Reject reuse of browser-facing authentication secrets."""
+
+    if type(artifact_key) is not str or not artifact_key:
+        raise TypeError("artifact_key must be a non-empty exact string")
+    if type(dashboard_secrets) is not DashboardSecrets:
+        raise TypeError(
+            "dashboard_secrets must be exact DashboardSecrets"
+        )
+    for name, value in (
+        ("dashboard password", dashboard_secrets.password),
+        ("dashboard session secret", dashboard_secrets.session_secret),
+    ):
+        if hmac.compare_digest(
+            artifact_key.encode("utf-8"),
+            value.encode("utf-8"),
+        ):
+            raise RuntimeConfigError(
+                "positions artifact signing secret must not reuse "
+                f"the {name}"
+            )
+
+
+def positions_artifact_runtime_binding(config: RuntimeConfig) -> str:
+    """Hash runtime, environment, and account identity without exposing it."""
+
+    if type(config) is not RuntimeConfig:
+        raise TypeError("config must be an exact RuntimeConfig")
+    account = config.selected_account
+    canonical = {
+        "account": (
+            None
+            if account is None
+            else {
+                "account_id": account.account_id,
+                "account_id_key": account.account_id_key,
+                "institution_type": account.institution_type,
+            }
+        ),
+        "broker_environment": config.broker_environment,
+        "mode": config.mode,
+        "runtime_root": str(config.paths.root),
+        "schema_version": config.schema_version,
+        "source_sha256": config.source_sha256,
+    }
+    return hashlib.sha256(
+        b"etrade-positions-runtime-binding.v1\0"
+        + json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def resolve_runtime_secrets(
     config: RuntimeConfig,
     *,
@@ -1129,7 +1257,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.check_secrets:
             resolve_runtime_secrets(config)
         if args.check_dashboard_secrets:
-            resolve_dashboard_secrets()
+            dashboard_secrets = resolve_dashboard_secrets()
+            artifact_key = resolve_positions_artifact_hmac_key()
+            validate_positions_artifact_key_separation(
+                artifact_key,
+                dashboard_secrets,
+            )
     except RuntimeConfigError as exc:
         print(f"runtime configuration invalid: {exc}", file=sys.stderr)
         return 2
@@ -1169,7 +1302,11 @@ __all__ = [
     "StrategyConfig",
     "load_runtime_config",
     "main",
+    "positions_artifact_runtime_binding",
     "resolve_dashboard_secrets",
+    "resolve_positions_artifact_hmac_key",
     "resolve_runtime_secrets",
+    "validate_positions_artifact_key_separation",
+    "validate_read_only_runtime_directories",
     "validate_runtime_directories",
 ]

@@ -7,22 +7,33 @@ from dataclasses import replace
 from email.message import Message
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Mapping
 
 import pytest
 
 from live_trading.read_only_dashboard import (
-    MAX_ARTIFACT_FUTURE_SKEW_SECONDS,
     LOGIN_FAILURE_WINDOW_SECONDS,
     MAX_LOGIN_FAILURES,
-    POSITIONS_READ_ONLY_MARKER,
     ReadOnlyDashboardApplication,
     ReadOnlyDashboardError,
     create_server,
     make_handler,
 )
+from live_trading.positions_artifact import (
+    MAX_ARTIFACT_FUTURE_SKEW_SECONDS,
+    POSITIONS_READ_ONLY_MARKER,
+    PositionsArtifactSigningKey,
+    build_positions_snapshot,
+    render_positions_html,
+)
 
-FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+ARTIFACT_KEY_TEXT = (
+    "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+)
+ARTIFACT_KEY = PositionsArtifactSigningKey.from_text(
+    ARTIFACT_KEY_TEXT
+)
 
 
 def _write_application(tmp_path: Path) -> ReadOnlyDashboardApplication:
@@ -44,7 +55,7 @@ def _write_application(tmp_path: Path) -> ReadOnlyDashboardApplication:
         os.chmod(directory, 0o700)
     config = {
         "schema_version": 1,
-        "mode": "paper",
+        "mode": "shadow",
         "runtime_root": "runtime",
         "strategy": {
             "enabled": False,
@@ -61,8 +72,12 @@ def _write_application(tmp_path: Path) -> ReadOnlyDashboardApplication:
             "max_signal_age_seconds": 86_400,
         },
         "execution": {
-            "selected_account_id_key": None,
-            "account_allowlist": [],
+            "selected_account_id_key": "account-key-private",
+            "account_allowlist": [{
+                "account_id": "12345678",
+                "account_id_key": "account-key-private",
+                "institution_type": "BROKERAGE",
+            }],
             "broker_mutations_enabled": False,
         },
         "risk": {
@@ -85,8 +100,66 @@ def _write_application(tmp_path: Path) -> ReadOnlyDashboardApplication:
             "ETRADE_DASHBOARD_SESSION_SECRET": (
                 "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
             ),
+            "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+                ARTIFACT_KEY_TEXT
+            ),
         },
     )
+
+
+def _artifact_path(
+    application: ReadOnlyDashboardApplication,
+) -> Path:
+    return application.runtime.positions_artifact_reader.path
+
+
+def _write_positions_artifact(
+    application: ReadOnlyDashboardApplication,
+    *,
+    source_as_of: datetime | None = None,
+    symbol: str = "SPY",
+) -> Path:
+    observed = source_as_of or datetime.now(timezone.utc)
+    snapshot = build_positions_snapshot(
+        [
+            SimpleNamespace(
+                symbol=symbol,
+                security_type="Option",
+                quantity=-2,
+                last_price=1.25,
+                price_paid=2.50,
+                market_value=-250.00,
+                total_gain=250.00,
+                call_put="CALL",
+                expiration_date="2026-08-21",
+                strike_price=650,
+                underlying_last_price=640.25,
+                osi_key=(
+                    f"{symbol.replace('.', '').ljust(6, '-')}"
+                    "260821C00650000"
+                ),
+                option_multiplier=100,
+                options_adjusted_flag=False,
+                option_deliverables="100 shares",
+            )
+        ],
+        broker_environment="production",
+        source_as_of=observed,
+    )
+    artifact = _artifact_path(application)
+    artifact.write_bytes(
+        render_positions_html(
+            snapshot,
+            signing_key=ARTIFACT_KEY,
+            runtime_binding=(
+                application.runtime
+                .positions_artifact_reader
+                .expected_runtime_binding
+            ),
+        )
+    )
+    os.chmod(artifact, 0o600)
+    return artifact
 
 
 def _request(
@@ -166,12 +239,8 @@ def test_login_status_positions_and_regime_are_broker_isolated(
     tmp_path: Path,
 ) -> None:
     application = _write_application(tmp_path)
-    artifact = application.runtime.paths.positions_artifact_file
-    artifact.write_bytes(
-        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
-    )
-    os.chmod(artifact, 0o600)
-    assert "SPY Aug 21 650 Call" not in repr(
+    _write_positions_artifact(application)
+    assert "SPY" not in repr(
         application.positions_snapshot()
     )
 
@@ -216,9 +285,19 @@ def test_login_status_positions_and_regime_are_broker_isolated(
     assert b"V2 shadow advisory" in template
     assert b"cannot authorize execution" in template
     assert b'id="refresh-now"' in template
-    assert b'id="positions-frame" src="/api/positions" sandbox' in template
+    assert b'id="positions-frame" src="about:blank" sandbox' in template
     assert b"nextPositionsVersion !== positionsVersion" in template
-    assert b"/api/positions?v=" in template
+    assert b"/api/positions?sha256=" in template
+    assert b"frame.srcdoc = body" in template
+    assert (
+        template.index(b"frame.srcdoc = body")
+        < template.index(b"positionsVersion = nextVersion")
+    )
+    assert b"positionsLoadGeneration += 1" in template
+    assert b"generation !== positionsLoadGeneration" in template
+    assert b"Verified freshness window expired" in template
+    assert b"Status poll failed; previous artifact hidden" in template
+    assert b"visibilitychange" in template
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
     assert headers["permissions-policy"] == (
         "camera=(), geolocation=(), microphone=(), payment=()"
@@ -235,13 +314,17 @@ def test_login_status_positions_and_regime_are_broker_isolated(
     assert payload["read_only"] is True
     assert payload["execution_enabled"] is False
     assert payload["positions"]["available"] is True
+    assert payload["positions"]["expires_at"] is not None
     assert payload["regime"]["may_authorize_execution"] is False
     assert set(payload["positions"]) == {
         "available",
+        "expires_at",
         "modified_at",
         "reason",
         "sha256",
         "size_bytes",
+        "source_as_of",
+        "source_generation",
         "stale",
     }
     assert "account" not in json.dumps(payload).lower()
@@ -249,17 +332,19 @@ def test_login_status_positions_and_regime_are_broker_isolated(
     status, headers, body = _request(
         application,
         "GET",
-        "/api/positions",
+        f"/api/positions?sha256={payload['positions']['sha256']}",
         headers={"Cookie": cookie},
     )
     assert status == 200
-    assert b"SPY Aug 21 650 Call" in body
+    assert b"SPY" in body
+    assert b"CALL Short" in body
+    assert b"$650.00" in body
     assert headers["x-frame-options"] == "SAMEORIGIN"
     assert "connect-src 'none'" in headers["content-security-policy"]
     raw = _raw_request(
         application,
         "GET",
-        "/api/positions",
+        f"/api/positions?sha256={payload['positions']['sha256']}",
         headers={"Cookie": cookie},
     )
     raw_headers = raw.split(b"\r\n\r\n", 1)[0].lower()
@@ -276,6 +361,67 @@ def test_login_status_positions_and_regime_are_broker_isolated(
     regime = json.loads(body)
     assert regime["available"] is False
     assert regime["may_authorize_execution"] is False
+
+
+def test_positions_route_never_serves_a_generation_newer_than_requested(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    now = datetime.now(timezone.utc)
+    _write_positions_artifact(
+        application,
+        source_as_of=now,
+        symbol="SPY",
+    )
+    cookie = _login(application)
+    status, _, body = _request(
+        application,
+        "GET",
+        "/api/status",
+        headers={"Cookie": cookie},
+    )
+    assert status == 200
+    first_sha256 = json.loads(body)["positions"]["sha256"]
+
+    _write_positions_artifact(
+        application,
+        source_as_of=now + timedelta(seconds=1),
+        symbol="QQQ",
+    )
+    status, _, body = _request(
+        application,
+        "GET",
+        f"/api/positions?sha256={first_sha256}",
+        headers={"Cookie": cookie},
+    )
+    assert status == 409
+    assert b"QQQ" not in body
+    assert b"Current position data is unavailable" in body
+
+    status, _, _ = _request(
+        application,
+        "GET",
+        "/api/positions",
+        headers={"Cookie": cookie},
+    )
+    assert status == 400
+
+    status, _, body = _request(
+        application,
+        "GET",
+        "/api/status",
+        headers={"Cookie": cookie},
+    )
+    second_sha256 = json.loads(body)["positions"]["sha256"]
+    assert second_sha256 != first_sha256
+    status, _, body = _request(
+        application,
+        "GET",
+        f"/api/positions?sha256={second_sha256}",
+        headers={"Cookie": cookie},
+    )
+    assert status == 200
+    assert b"QQQ" in body
 
 
 def test_disabled_route_rejects_before_reading_declared_body(
@@ -507,7 +653,7 @@ def test_positions_artifact_rejects_legacy_actions_and_symlinks(
     tmp_path: Path,
 ) -> None:
     application = _write_application(tmp_path)
-    artifact = application.runtime.paths.positions_artifact_file
+    artifact = _artifact_path(application)
     artifact.write_text(
         f"{POSITIONS_READ_ONLY_MARKER}"
         '<button data-close-position="legacy">Close</button>',
@@ -516,7 +662,7 @@ def test_positions_artifact_rejects_legacy_actions_and_symlinks(
     os.chmod(artifact, 0o600)
     snapshot = application.positions_snapshot()
     assert snapshot.available is False
-    assert snapshot.reason == "legacy_or_executable"
+    assert snapshot.reason == "untrusted_artifact"
 
     artifact.unlink()
     target = tmp_path / "outside.html"
@@ -539,11 +685,7 @@ def test_positions_artifact_open_is_nonblocking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     application = _write_application(tmp_path)
-    artifact = application.runtime.paths.positions_artifact_file
-    artifact.write_bytes(
-        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
-    )
-    os.chmod(artifact, 0o600)
+    artifact = _write_positions_artifact(application)
     original_open = os.open
     observed_flags: list[int] = []
 
@@ -553,7 +695,7 @@ def test_positions_artifact_open_is_nonblocking(
         return original_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(
-        "live_trading.read_only_dashboard.os.open",
+        "live_trading.positions_artifact.os.open",
         inspecting_open,
     )
     assert application.positions_snapshot().available is True
@@ -568,12 +710,8 @@ def test_positions_artifact_rejects_stale_and_future_timestamps(
     tmp_path: Path,
 ) -> None:
     application = _write_application(tmp_path)
-    artifact = application.runtime.paths.positions_artifact_file
-    artifact.write_bytes(
-        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
-    )
-    os.chmod(artifact, 0o600)
     now = datetime.now(timezone.utc)
+    artifact = _write_positions_artifact(application, source_as_of=now)
 
     old = now - timedelta(
         seconds=(
@@ -587,6 +725,19 @@ def test_positions_artifact_rejects_stale_and_future_timestamps(
     assert stale.reason == "stale"
     assert stale.sha256 is not None
     assert stale.modified_at == old.isoformat()
+
+    source_old = now - timedelta(
+        seconds=application.runtime.max_snapshot_age_seconds + 1
+    )
+    artifact = _write_positions_artifact(
+        application,
+        source_as_of=source_old,
+    )
+    os.utime(artifact, (now.timestamp(), now.timestamp()))
+    source_stale = application.positions_snapshot(now=now)
+    assert source_stale.available is False
+    assert source_stale.stale is True
+    assert source_stale.source_as_of == source_old.isoformat()
 
     future = now + timedelta(
         seconds=MAX_ARTIFACT_FUTURE_SKEW_SECONDS + 1

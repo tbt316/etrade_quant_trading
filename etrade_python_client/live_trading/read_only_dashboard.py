@@ -8,12 +8,9 @@ mutations.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.resources
 import json
-import os
 import re
-import stat
 import sys
 import threading
 import time
@@ -26,6 +23,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from live_trading.positions_artifact import (
+    ArtifactSnapshot,
+    POSITIONS_READ_ONLY_MARKER,
+)
 from live_trading.regime_shadow_store import unavailable_dashboard_payload
 from live_trading.runtime_composition import (
     MAX_SESSION_SECONDS,
@@ -39,12 +40,7 @@ from live_trading.runtime_config import RuntimeConfigError
 MAX_LOGIN_BODY_BYTES = 8 * 1024
 MAX_LOGIN_FAILURES = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 60
-MAX_POSITIONS_ARTIFACT_BYTES = 8 * 1024 * 1024
-MAX_ARTIFACT_FUTURE_SKEW_SECONDS = 5
 REQUEST_SOCKET_TIMEOUT_SECONDS = 10
-POSITIONS_READ_ONLY_MARKER = (
-    "Read only — all E*TRADE order actions are disabled"
-)
 DISABLED_EXECUTION_PATHS = frozenset(
     {
         "/api/execute_manual_order",
@@ -55,13 +51,6 @@ DISABLED_EXECUTION_PATHS = frozenset(
         "/api/settings",
         "/api/verify_pin",
         "/refresh",
-    }
-)
-FORBIDDEN_POSITIONS_MARKERS = frozenset(
-    {
-        *DISABLED_EXECUTION_PATHS,
-        "data-close-position",
-        "action-cell",
     }
 )
 POSITIONS_FRAME_CSP = (
@@ -113,17 +102,6 @@ class LoginAttemptLimiter:
     def reset(self) -> None:
         with self._lock:
             self._failures.clear()
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactSnapshot:
-    available: bool
-    stale: bool
-    content: bytes | None = field(repr=False)
-    sha256: str | None
-    modified_at: str | None
-    size_bytes: int | None
-    reason: str | None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -191,11 +169,7 @@ class ReadOnlyDashboardApplication:
         *,
         now: datetime | None = None,
     ) -> ArtifactSnapshot:
-        return _read_positions_artifact(
-            self.runtime.paths.positions_artifact_file,
-            max_age_seconds=self.runtime.max_snapshot_age_seconds,
-            now=now,
-        )
+        return self.runtime.positions_artifact_reader.read(now=now)
 
     def regime_payload(self) -> dict[str, Any]:
         try:
@@ -226,6 +200,9 @@ class ReadOnlyDashboardApplication:
                 "modified_at": positions.modified_at,
                 "size_bytes": positions.size_bytes,
                 "reason": positions.reason,
+                "source_as_of": positions.source_as_of,
+                "source_generation": positions.source_generation,
+                "expires_at": positions.expires_at,
             },
             "regime": {
                 "available": bool(regime.get("available")),
@@ -241,197 +218,6 @@ class ReadOnlyDashboardApplication:
             },
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
-
-
-def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
-    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
-
-
-def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        _same_file(left, right)
-        and left.st_size == right.st_size
-        and left.st_mtime_ns == right.st_mtime_ns
-        and left.st_ctime_ns == right.st_ctime_ns
-    )
-
-
-def _private_regular_file(metadata: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
-        and not stat.S_IMODE(metadata.st_mode) & 0o077
-        and metadata.st_nlink == 1
-    )
-
-
-def _safe_open_flags(base: int) -> int:
-    return base | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-
-def _unavailable_snapshot(
-    reason: str,
-    *,
-    stale: bool = False,
-    sha256: str | None = None,
-    modified_at: str | None = None,
-    size_bytes: int | None = None,
-) -> ArtifactSnapshot:
-    return ArtifactSnapshot(
-        available=False,
-        stale=stale,
-        content=None,
-        sha256=sha256,
-        modified_at=modified_at,
-        size_bytes=size_bytes,
-        reason=reason,
-    )
-
-
-def _read_positions_artifact(
-    path: Path,
-    *,
-    max_age_seconds: int,
-    now: datetime | None = None,
-) -> ArtifactSnapshot:
-    """Read one owner-only artifact through a descriptor-verified parent."""
-
-    if (
-        not isinstance(path, Path)
-        or not path.name
-        or type(max_age_seconds) is not int
-        or max_age_seconds <= 0
-    ):
-        return _unavailable_snapshot("invalid_path")
-    current_time = datetime.now(timezone.utc) if now is None else now
-    if type(current_time) is not datetime or current_time.tzinfo is None:
-        raise TypeError("now must be an exact timezone-aware datetime")
-    current_time = current_time.astimezone(timezone.utc)
-    try:
-        parent_before = os.lstat(path.parent)
-        if (
-            stat.S_ISLNK(parent_before.st_mode)
-            or not stat.S_ISDIR(parent_before.st_mode)
-            or parent_before.st_uid != os.geteuid()
-            or stat.S_IMODE(parent_before.st_mode) != 0o700
-        ):
-            return _unavailable_snapshot("unsafe_parent")
-        parent_descriptor = os.open(
-            path.parent,
-            _safe_open_flags(
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            ),
-        )
-    except FileNotFoundError:
-        return _unavailable_snapshot("missing")
-    except OSError:
-        return _unavailable_snapshot("unsafe_parent")
-    try:
-        parent_after = os.fstat(parent_descriptor)
-        if not _same_file(parent_before, parent_after):
-            return _unavailable_snapshot("unsafe_parent")
-        try:
-            before = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return _unavailable_snapshot("missing")
-        except OSError:
-            return _unavailable_snapshot("unsafe_file")
-        if not _private_regular_file(before):
-            return _unavailable_snapshot("unsafe_file")
-        if before.st_size > MAX_POSITIONS_ARTIFACT_BYTES:
-            return _unavailable_snapshot("oversized")
-        try:
-            descriptor = os.open(
-                path.name,
-                _safe_open_flags(
-                    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-                ),
-                dir_fd=parent_descriptor,
-            )
-        except OSError:
-            return _unavailable_snapshot("unsafe_file")
-        try:
-            after = os.fstat(descriptor)
-            if not _same_file(before, after):
-                return _unavailable_snapshot("changed")
-            chunks: list[bytes] = []
-            remaining = MAX_POSITIONS_ARTIFACT_BYTES + 1
-            while remaining:
-                chunk = os.read(descriptor, min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            content = b"".join(chunks)
-            final = os.fstat(descriptor)
-            try:
-                path_after = os.stat(
-                    path.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                return _unavailable_snapshot("changed")
-            if (
-                not _private_regular_file(final)
-                or not _private_regular_file(path_after)
-                or not _same_snapshot(before, after)
-                or not _same_snapshot(after, final)
-                or not _same_snapshot(final, path_after)
-                or len(content) != final.st_size
-            ):
-                return _unavailable_snapshot("changed")
-        finally:
-            os.close(descriptor)
-    finally:
-        os.close(parent_descriptor)
-    if len(content) > MAX_POSITIONS_ARTIFACT_BYTES:
-        return _unavailable_snapshot("oversized")
-    try:
-        text = content.decode("utf-8")
-    except UnicodeError:
-        return _unavailable_snapshot("invalid_encoding")
-    lowered = text.lower()
-    if (
-        POSITIONS_READ_ONLY_MARKER not in text
-        or any(marker.lower() in lowered for marker in FORBIDDEN_POSITIONS_MARKERS)
-    ):
-        return _unavailable_snapshot("legacy_or_executable")
-    digest = hashlib.sha256(content).hexdigest()
-    modified_at = datetime.fromtimestamp(
-        final.st_mtime,
-        tz=timezone.utc,
-    )
-    age_seconds = (current_time - modified_at).total_seconds()
-    if age_seconds < -MAX_ARTIFACT_FUTURE_SKEW_SECONDS:
-        return _unavailable_snapshot(
-            "future_timestamp",
-            sha256=digest,
-            modified_at=modified_at.isoformat(),
-            size_bytes=len(content),
-        )
-    if age_seconds > max_age_seconds:
-        return _unavailable_snapshot(
-            "stale",
-            stale=True,
-            sha256=digest,
-            modified_at=modified_at.isoformat(),
-            size_bytes=len(content),
-        )
-    return ArtifactSnapshot(
-        available=True,
-        stale=False,
-        content=content,
-        sha256=digest,
-        modified_at=modified_at.isoformat(),
-        size_bytes=len(content),
-        reason=None,
-    )
-
 
 def _decode_json_object(payload: bytes) -> dict[str, Any]:
     def reject_duplicates(
@@ -588,6 +374,17 @@ def make_handler(
             ):
                 return None
             return parsed.path
+
+        def _positions_request_version(self) -> str | None:
+            try:
+                parsed = urlsplit(self.path)
+            except (UnicodeError, ValueError):
+                return None
+            match = re.fullmatch(
+                r"sha256=(unavailable|[0-9a-f]{64})",
+                parsed.query,
+            )
+            return None if match is None else match.group(1)
 
         def _session_value(self) -> str | None:
             try:
@@ -793,16 +590,45 @@ def make_handler(
                         "modified_at": snapshot.modified_at,
                         "size_bytes": snapshot.size_bytes,
                         "reason": snapshot.reason,
+                        "source_as_of": snapshot.source_as_of,
+                        "source_generation": snapshot.source_generation,
+                        "expires_at": snapshot.expires_at,
                     },
                 )
                 return
             if path == "/api/positions":
+                expected_sha256 = self._positions_request_version()
+                if expected_sha256 is None:
+                    self._send_bytes(
+                        400,
+                        _positions_fallback(),
+                        content_type="text/html; charset=utf-8",
+                        csp=POSITIONS_FRAME_CSP,
+                        x_frame_options="SAMEORIGIN",
+                    )
+                    return
                 snapshot = self.app.positions_snapshot()
+                exact_version = (
+                    snapshot.available
+                    and expected_sha256 != "unavailable"
+                    and snapshot.sha256 == expected_sha256
+                    and snapshot.content is not None
+                )
+                if exact_version:
+                    status = 200
+                    body = snapshot.content
+                elif (
+                    snapshot.available
+                    and expected_sha256 != "unavailable"
+                ):
+                    status = 409
+                    body = _positions_fallback()
+                else:
+                    status = 503
+                    body = _positions_fallback()
                 self._send_bytes(
-                    200 if snapshot.available else 503,
-                    snapshot.content
-                    if snapshot.available and snapshot.content is not None
-                    else _positions_fallback(),
+                    status,
+                    body,
                     content_type="text/html; charset=utf-8",
                     csp=POSITIONS_FRAME_CSP,
                     x_frame_options="SAMEORIGIN",

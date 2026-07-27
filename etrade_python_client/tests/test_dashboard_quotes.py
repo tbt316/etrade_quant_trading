@@ -15,6 +15,7 @@ class _Response:
         self._payload = payload
         self.status_code = status_code
         self.text = text
+        self.content = text.encode("utf-8")
         self.request = SimpleNamespace(headers={})
 
     def json(self):
@@ -127,11 +128,9 @@ class DashboardQuoteTests(unittest.TestCase):
         expired_session = _Session(responses=[
             _Response({}, status_code=401, text="oauth_problem=token_expired"),
         ])
-        refreshed_session = _Session({
-            "PortfolioResponse": {
-                "AccountPortfolio": [],
-            }
-        })
+        refreshed_session = _Session(responses=[
+            _Response(None, status_code=204),
+        ])
         accounts = Accounts(expired_session, "https://api.etrade.test", consumer_key="")
         accounts.account = {"accountIdKey": "account-key"}
         accounts.auth_refresh_callback = lambda reason: (
@@ -154,6 +153,405 @@ class DashboardQuoteTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "status code 401"):
             accounts.portfolio(require_success=True)
+
+    def test_required_portfolio_rejects_malformed_success_payload(self):
+        session = _Session({
+            "PortfolioResponse": {},
+        })
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "snapshot is incomplete",
+        ):
+            accounts.portfolio(require_success=True)
+
+    def test_portfolio_accepts_only_empty_first_page_204_as_no_positions(self):
+        session = _Session(responses=[
+            _Response(None, status_code=204),
+        ])
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        self.assertEqual(accounts.portfolio(), [])
+
+        ambiguous = _Session({
+            "PortfolioResponse": {
+                "AccountPortfolio": [],
+            },
+        })
+        accounts.session = ambiguous
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "account-level portfolio proof",
+        ):
+            accounts.portfolio()
+
+        accounts.session = _Session(responses=[
+            _Response(
+                None,
+                status_code=204,
+                text="unexpected body",
+            ),
+        ])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "empty first-page HTTP 204",
+        ):
+            accounts.portfolio()
+
+        accounts.session = _Session(responses=[
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalNoOfPages": 2,
+                        "nextPageNo": "2",
+                        "Position": [{
+                            "positionId": 11,
+                            "Product": {
+                                "symbol": "SPY",
+                                "securityType": "EQ",
+                            },
+                            "quantity": 1,
+                        }],
+                    }],
+                },
+            }),
+            _Response(None, status_code=204),
+        ])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "empty first-page HTTP 204",
+        ):
+            accounts.portfolio()
+
+    def test_required_portfolio_uses_explicit_pagination_metadata(self):
+        position = {
+            "positionId": "11",
+            "Product": {
+                "symbol": "SPY",
+                "securityType": "EQ",
+            },
+            "quantity": 1,
+            "Complete": {
+                "price": 700.0,
+                "adjPrice": 700.0,
+            },
+            "marketValue": 700.0,
+            "positionType": "LONG",
+        }
+        session = _Session(responses=[
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalNoOfPages": 2,
+                        "nextPageNo": "2",
+                        "Position": [position],
+                    }],
+                },
+            }),
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalNoOfPages": 2,
+                        "Position": [{
+                            **position,
+                            "positionId": "12",
+                        }],
+                    }],
+                },
+            }),
+        ])
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        positions = accounts.portfolio(
+            minimal=True,
+            require_success=True,
+        )
+
+        self.assertEqual(
+            [item.position_id for item in positions],
+            ["11", "12"],
+        )
+        self.assertEqual(len(session.calls), 2)
+        expected_common = {
+            "view": "COMPLETE",
+            "count": 50,
+            "sortBy": "SYMBOL",
+            "sortOrder": "ASC",
+            "marketSession": "REGULAR",
+            "totalsRequired": "false",
+            "lotsRequired": "false",
+        }
+        self.assertEqual(
+            session.calls[0][1]["params"],
+            {**expected_common, "pageNumber": 1},
+        )
+        self.assertEqual(
+            session.calls[1][1]["params"],
+            {**expected_common, "pageNumber": 2},
+        )
+
+    def test_portfolio_preserves_standard_option_contract_identity(self):
+        session = _Session({
+            "PortfolioResponse": {
+                "AccountPortfolio": [{
+                    "accountId": "123",
+                    "totalNoOfPages": 1,
+                    "Position": [{
+                        "positionId": "11",
+                        "osiKey": "SPY---260821C00650000",
+                        "Product": {
+                            "symbol": "SPY",
+                            "securityType": "OPTN",
+                            "callPut": "CALL",
+                            "expiryYear": 2026,
+                            "expiryMonth": 8,
+                            "expiryDay": 21,
+                            "strikePrice": 650,
+                        },
+                        "quantity": -1,
+                        "Complete": {
+                            "adjPrice": 1.25,
+                            "optionsAdjustedFlag": False,
+                            "optionMultiplier": 100,
+                            "deliverablesStr": "100 shares",
+                        },
+                    }],
+                }],
+            },
+        })
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        positions = accounts.portfolio(minimal=True)
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(
+            positions[0].osi_key,
+            "SPY---260821C00650000",
+        )
+        self.assertEqual(positions[0].option_multiplier, 100)
+        self.assertIs(positions[0].options_adjusted_flag, False)
+        self.assertEqual(
+            positions[0].option_deliverables,
+            "100 shares",
+        )
+
+    def test_required_portfolio_rejects_duplicate_position_across_pages(self):
+        position = {
+            "positionId": 11,
+            "Product": {
+                "symbol": "SPY",
+                "securityType": "EQ",
+            },
+            "quantity": 1,
+        }
+        session = _Session(responses=[
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalPages": 2,
+                        "nextPageNo": 2,
+                        "Position": [position],
+                    }],
+                },
+            }),
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalPages": 2,
+                        "Position": [position],
+                    }],
+                },
+            }),
+        ])
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "duplicate position id",
+        ):
+            accounts.portfolio(
+                minimal=True,
+                require_success=True,
+            )
+
+        session = _Session(responses=[
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalPages": 2,
+                        "nextPageNo": "2",
+                        "Position": [position],
+                    }],
+                },
+            }),
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalPages": 2,
+                        "Position": [{
+                            **position,
+                            "positionId": "011",
+                        }],
+                    }],
+                },
+            }),
+        ])
+        accounts.session = session
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "invalid or duplicate position id",
+        ):
+            accounts.portfolio(
+                minimal=True,
+                require_success=True,
+            )
+
+    def test_required_portfolio_rejects_changed_pagination_field(self):
+        position = {
+            "positionId": 11,
+            "Product": {
+                "symbol": "SPY",
+                "securityType": "EQ",
+            },
+            "quantity": 1,
+        }
+        session = _Session(responses=[
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalNoOfPages": 2,
+                        "nextPageNo": 2,
+                        "Position": [position],
+                    }],
+                },
+            }),
+            _Response({
+                "PortfolioResponse": {
+                    "AccountPortfolio": [{
+                        "accountId": "123",
+                        "totalPages": 2,
+                        "Position": [{
+                            **position,
+                            "positionId": 12,
+                        }],
+                    }],
+                },
+            }),
+        ])
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.account = {
+            "accountId": "123",
+            "accountIdKey": "account-key",
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "metadata changed",
+        ):
+            accounts.portfolio(
+                minimal=True,
+                require_success=True,
+            )
+
+    def test_portfolio_never_returns_a_partial_page_set(self):
+        first_page = {
+            "PortfolioResponse": {
+                "AccountPortfolio": [{
+                    "accountId": "123",
+                    "totalNoOfPages": 2,
+                    "nextPageNo": 2,
+                    "Position": [{
+                        "positionId": 11,
+                        "Product": {
+                            "symbol": "SPY",
+                            "securityType": "EQ",
+                        },
+                        "quantity": 1,
+                    }],
+                }],
+            },
+        }
+        for require_success in (False, True):
+            with self.subTest(require_success=require_success):
+                session = _Session(responses=[
+                    _Response(first_page),
+                    _Response(
+                        {},
+                        status_code=500,
+                        text="temporarily unavailable",
+                    ),
+                ])
+                accounts = Accounts(
+                    session,
+                    "https://api.etrade.test",
+                    consumer_key="",
+                )
+                accounts.account = {
+                    "accountId": "123",
+                    "accountIdKey": "account-key",
+                }
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "failed on page 2",
+                ):
+                    accounts.portfolio(
+                        minimal=True,
+                        require_success=require_success,
+                    )
 
     def test_consumer_key_is_required_only_for_calls_that_use_its_header(self):
         session = _Session({})

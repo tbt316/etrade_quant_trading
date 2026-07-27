@@ -22,6 +22,12 @@ Installation and restart instructions will return only after the durable
 gateway is the sole mutation owner and the production-readiness gates have
 passed.
 
+The repository includes an inert hardened read-only-dashboard unit example for
+future review. It has an unmet approval condition, no `[Install]` section, and
+must not be activated while deployment is suspended. Provisioning, monitoring,
+rotation, failure recovery, and rollback requirements are documented in
+[`../docs/read_only_dashboard_runbook.md`](../docs/read_only_dashboard_runbook.md).
+
 ## Code-Only Sync
 
 From the Mac, copy an immutable archive of the current `HEAD` commit to the

@@ -21,8 +21,11 @@ from live_trading.runtime_config import (
     RuntimeConfigError,
     load_runtime_config,
     main as runtime_config_main,
+    positions_artifact_runtime_binding,
     resolve_dashboard_secrets,
+    resolve_positions_artifact_hmac_key,
     resolve_runtime_secrets,
+    validate_positions_artifact_key_separation,
     validate_runtime_directories,
 )
 
@@ -185,6 +188,9 @@ def _environment_secrets(
         "ETRADE_DASHBOARD_PIN": "B7!runtime",
         "ETRADE_DASHBOARD_SESSION_SECRET": (
             "environment-session-secret-with-at-least-32-characters"
+        ),
+        "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+            "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
         ),
     }
     if broker_prefix is not None:
@@ -1028,6 +1034,77 @@ class RuntimeSecretTests(unittest.TestCase):
             with self.subTest(environment=environment):
                 with self.assertRaises(RuntimeConfigError):
                     resolve_dashboard_secrets(environ=environment)
+
+    def test_positions_artifact_key_is_environment_only_and_strong(self):
+        environment = _environment_secrets()
+        value = resolve_positions_artifact_hmac_key(
+            environ=environment,
+        )
+        self.assertEqual(
+            value,
+            environment["ETRADE_POSITIONS_ARTIFACT_HMAC_KEY"],
+        )
+        for invalid in (
+            {},
+            {"ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": "short"},
+            {"ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": "x" * 64},
+            {
+                "ETRADE_POSITIONS_ARTIFACT_HMAC_KEY": (
+                    "abcdefghijkl" * 4
+                )[:43]
+            },
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(RuntimeConfigError):
+                    resolve_positions_artifact_hmac_key(
+                        environ=invalid,
+                    )
+
+    def test_positions_artifact_key_cannot_reuse_dashboard_secrets(self):
+        environment = _environment_secrets()
+        dashboard_secrets = resolve_dashboard_secrets(
+            environ=environment,
+        )
+
+        for reused in (
+            dashboard_secrets.password,
+            dashboard_secrets.session_secret,
+        ):
+            with self.subTest(reused=reused):
+                with self.assertRaises(RuntimeConfigError):
+                    validate_positions_artifact_key_separation(
+                        reused,
+                        dashboard_secrets,
+                    )
+
+    def test_positions_runtime_binding_changes_with_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            first = load_runtime_config(
+                _write_config(
+                    base,
+                    _document(mode="shadow"),
+                    name="first.json",
+                )
+            )
+            changed_document = _document(mode="shadow")
+            changed_document["execution"]["account_allowlist"][0][
+                "account_id"
+            ] = "different-account"
+            second = load_runtime_config(
+                _write_config(
+                    base,
+                    changed_document,
+                    name="second.json",
+                )
+            )
+
+            first_binding = positions_artifact_runtime_binding(first)
+            second_binding = positions_artifact_runtime_binding(second)
+
+            self.assertRegex(first_binding, r"^[0-9a-f]{64}$")
+            self.assertNotEqual(first_binding, second_binding)
+            self.assertNotIn("display-id", first_binding)
 
     def test_complete_environment_is_authoritative_and_repr_is_redacted(self):
         with tempfile.TemporaryDirectory() as temporary:
