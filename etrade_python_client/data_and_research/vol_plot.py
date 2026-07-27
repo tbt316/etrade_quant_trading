@@ -21,7 +21,7 @@ from backtesting.polygonio_dailytrade import (
     pull_option_chain_data,
     calculate_implied_volatility,
 )
-import polygonio_config  # your API key
+from . import polygonio_config
 
 
 # ---------- Realized 30D vol ----------

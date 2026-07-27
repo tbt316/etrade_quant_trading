@@ -65,4 +65,3 @@ def to_vendor_ticker(ticker: str, vendor: Literal["yfinance", "etrade", "polygon
 
     # Fallback: no change
     return t
-

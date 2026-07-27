@@ -1,8 +1,5 @@
 from __future__ import annotations
-try:
-    from etrade_quant_trading.strategies.strategies import sides_for_trade_type, get_strategy
-except Exception:
-    from strategies.strategies import sides_for_trade_type, get_strategy
+from strategies.strategies import get_strategy, sides_for_trade_type
 
 """
 Backtest orchestration primitives (no strategy changes).
@@ -21,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import get_settings
-from .market_calendar import TradingCalendar
 from .chains import pull_option_chain_data
 from .pricing import interpolate_option_price, calculate_delta
 from .earnings import get_earnings_dates
@@ -60,8 +56,6 @@ class BacktestConfig:
 # ----------------------------
 # Calendar helpers
 # ----------------------------
-
-from .market_calendar import trading_dates_df
 
 def list_expiries(weekday: str, start_date: str, end_date: str, expiring_wk: int, trading_df) -> List:
     """Wrapper that delegates to the calendar module's logic.
@@ -199,7 +193,7 @@ def run_monthly_backtest_cpu_bound(
     in tests. Return value and semantics are identical to your original
     `monthly_cpu_bound.run_monthly_backtest_cpu_bound`.
     """
-    from monthly_cpu_bound import run_monthly_backtest_cpu_bound as _run
+    from backtesting.monthly_cpu_bound import run_monthly_backtest_cpu_bound as _run
 
     kwargs = kwargs or {}
     return _run(ticker, global_start_date, global_end_date, **kwargs)

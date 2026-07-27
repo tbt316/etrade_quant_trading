@@ -1,0 +1,7 @@
+prune tests
+prune etrade_python_client/tests
+prune etrade_python_client/scratch
+prune etrade_python_client/live_trading/scratch
+
+global-exclude *.py[cod]
+global-exclude __pycache__

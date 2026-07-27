@@ -519,11 +519,7 @@ def _probe_put_credit_spread(
         )
 
 
-# Allow both package-root and in-package execution
-try:
-    from etrade_quant_trading.strategies.strategies import sides_for_trade_type, get_strategy
-except Exception:
-    from strategies.strategies import sides_for_trade_type, get_strategy
+from strategies.strategies import get_strategy, sides_for_trade_type
 
 
 # -------------------------------

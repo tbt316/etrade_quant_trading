@@ -278,4 +278,3 @@ def sides_for_trade_type(trade_type: str) -> List[Side]:
     """
 
     return get_strategy(trade_type).sides_needed()
-

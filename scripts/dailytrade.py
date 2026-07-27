@@ -5,8 +5,8 @@ import argparse
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
-from etrade_quant_trading.polygonio.recursive_backtest import RecursionConfig, backtest_options_sync_or_async
-from etrade_quant_trading.polygonio.daily_report import print_opened_and_closed_for_date
+from polygonio.recursive_backtest import RecursionConfig, backtest_options_sync_or_async
+from polygonio.daily_report import print_opened_and_closed_for_date
 
 def parse_args():
     p = argparse.ArgumentParser(description="Daily trade reporter (opened/closed positions).")

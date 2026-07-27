@@ -561,6 +561,21 @@ finding.
     is ignored, is not a regular Git file, or violates the explicit
     environment, private-key, secret, state, cache, database, log, backup, or
     generated-output policy.
+- Root `pyproject.toml`, `requirements/*.lock`, and package layout
+  - Use `etrade_python_client/` as the sole source root and explicitly package
+    only ten reviewed compatibility packages, the dashboard template, and
+    three strategy YAML files.
+  - Remove conflicting package definitions, empty root package shadows,
+    misspelled initializers, and runtime dependency installation.
+  - Pin CPython 3.10.20, every direct dependency, the build toolchain, and the
+    complete runtime/test graphs with distribution hashes.
+  - Permit source builds only for hash-pinned `pyetrade` and `rauth`, under the
+    preinstalled hash-locked build toolchain with build isolation disabled.
+  - Keep Polygon module import free of credential and network requirements;
+    explicit client construction without a key fails deterministically.
+- `deploy/pi_bootstrap.sh`
+  - Reject runtime bootstrap before any package, operating-system, filesystem,
+    or privileged mutation while deployment remains suspended.
 - `live_trading/etrade_check_option.py` and
   `live_trading/etrade_option_chains.py`
   - Remove hardcoded OAuth credentials from the current source and require
@@ -592,6 +607,11 @@ rendered through an isolated real local handler and generated positions
 artifact at desktop and mobile widths. That inspection found and fixed a
 same-origin iframe header conflict and a four-digit client-side PIN truncation;
 it does not verify the exact deployed dashboard.
+
+R8b establishes a reproducible package and dependency input but does not by
+itself certify a release artifact. R8c must still build from an exact committed
+archive, inspect the sdist/wheel contents, and execute the maintained suite
+against the installed wheel with source imports unavailable.
 
 ### Verification record
 
@@ -631,6 +651,14 @@ it does not verify the exact deployed dashboard.
   including ignored and semantic secret variants, unsafe Git modes and index
   overrides, immutable-snapshot completeness, Git-attribute omissions,
   committed symlinks, path/target injection, and pre-remote failure ordering.
+- The R8b test lock installs successfully under hash enforcement on CPython
+  3.10. The built wheel contains 110 entries rooted only in the ten allowlisted
+  packages plus distribution metadata, includes the dashboard template and
+  three strategy YAML files, and excludes local `yfinance`, tests, scratch,
+  credentials, state, caches, and reports. A fresh external install passed
+  package/data import smoke checks, resolved `yfinance` from site-packages,
+  failed Polygon construction cleanly without a key, accepted an explicit
+  offline key without I/O, and passed `pip check`.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration script to:
+Legacy integration script to:
 1. Fetch current portfolio tickers from E*Trade.
 2. Download analyst research reports for each ticker using browser_use_hybrid.
 """

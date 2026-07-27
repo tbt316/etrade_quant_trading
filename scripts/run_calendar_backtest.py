@@ -20,13 +20,13 @@ try:
 except ImportError:
     _HAS_MATPLOTLIB = False
 
-from etrade_quant_trading.polygonio.calendar_backtest import (
+from polygonio.calendar_backtest import (
     CalendarBacktestConfig,
     run_calendar_backtest,
 )
-from etrade_quant_trading.polygonio.cache_io import save_stored_option_data
-from etrade_quant_trading.polygonio.config import get_settings
-from etrade_quant_trading.polygonio.prices import get_historical_prices
+from polygonio.cache_io import save_stored_option_data
+from polygonio.config import get_settings
+from polygonio.prices import get_historical_prices
 
 
 def _print_daily(results: dict) -> None:

@@ -6,7 +6,7 @@ the forward implied volatility plus the normalized forward factor metric.
 
 Example:
 
-    python -m etrade_quant_trading.scripts.compute_forward_factor \
+    python scripts/compute_forward_factor.py \
         --ticker SPY --start 2024-03-01 --end 2025-03-01 --csv spy_ff.csv
 """
 
@@ -22,22 +22,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from datetime import datetime
 import pandas as pd
 
-from etrade_quant_trading.polygonio.cache_io import (
+from polygonio.cache_io import (
     load_stored_option_data,
     save_stored_option_data,
     stored_option_chain,
 )
-from etrade_quant_trading.polygonio.config import get_settings, resolve_premium_field
-from etrade_quant_trading.polygonio.option_math import calculate_implied_volatility
-from etrade_quant_trading.polygonio.poly_client import PolygonAPIClient
-from etrade_quant_trading.polygonio.prices import get_historical_prices
-from etrade_quant_trading.polygonio.earnings import get_earnings_dates
-from etrade_quant_trading.polygonio.calendar_utils import (
+from polygonio.config import get_settings, resolve_premium_field
+from polygonio.option_math import calculate_implied_volatility
+from polygonio.poly_client import PolygonAPIClient
+from polygonio.prices import get_historical_prices
+from polygonio.earnings import get_earnings_dates
+from polygonio.calendar_utils import (
     calc_implied_vol,
     forward_factor,
     gather_calendar_pair,
 )
-from etrade_quant_trading.polygonio.recursive_backtest import (
+from polygonio.recursive_backtest import (
     RecursionConfig,
     _price_from_data,
     _calendar_dte_targets,

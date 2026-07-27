@@ -199,11 +199,16 @@ def get_historical_prices(
                 url = (
                     f"https://api.polygon.io/v2/aggs/ticker/{ticker}"
                     f"/range/1/day/{s_str}/{e_str}"
-                    f"?adjusted=false&sort=asc&limit={max_bars}&apiKey={api_key}"
                 )
+                params = {
+                    "adjusted": "false",
+                    "sort": "asc",
+                    "limit": max_bars,
+                    "apiKey": api_key,
+                }
 
                 try:
-                    resp = requests.get(url, timeout=20)
+                    resp = requests.get(url, params=params, timeout=20)
                     resp.raise_for_status()
                     data = resp.json()
                     if "results" in data and data["results"]:

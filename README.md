@@ -1,107 +1,100 @@
-# E*TRADE API Python Sample Application
+# E*TRADE Quant Trading
 
-This sample Python application provides examples on using the ETRADE API endpoints.
+Causal options research, deterministic backtesting, and fail-closed E*TRADE
+trading infrastructure.
 
-> **Safety status:** live order execution, service installation, and remote
-> restart are intentionally disabled while the durable execution migration is
-> incomplete. The repository is not yet approved for unattended trading.
+> **Safety status:** live order execution, service installation, runtime
+> bootstrap, and remote restart are intentionally disabled while the durable
+> execution migration is incomplete. This repository is not approved for
+> unattended trading.
 
-## Repository and Credential Hygiene
+## Reproducible setup
 
-- Create virtual environments locally; `venv/`, `.venv/`, package metadata,
-  caches, logs, generated reports, and runtime state are not source files and
-  must remain untracked.
-- Keep OAuth values, broker configuration, dashboard settings, session files,
-  and arming material only in ignored owner-readable local files. Commit only
-  placeholder examples such as `.env.example`.
-- Run `python etrade_python_client/scripts/check_repo_hygiene.py` before a
-  commit. CI applies the same deterministic check to Git's index.
-- Ignore rules and removal from the current index do not erase old Git history.
-  Previously exposed broker keys still require external revocation/rotation
-  and coordinated history cleanup.
+Use the exact CPython release in `.python-version`:
 
-## Table of Contents
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
 
-* [Requirements](#requirements)
-* [Setup](#setup)
-* [Running Code](#running-code)
+python -m pip install \
+  --require-hashes \
+  --only-binary=:all: \
+  -r requirements/build.lock
 
-## Requirements
+python -m pip install \
+  --require-hashes \
+  --no-build-isolation \
+  --only-binary=:all: \
+  --no-binary=pyetrade,rauth \
+  -r requirements/test.lock
 
-In order to run this sample application you need the following three items:
-
-1. Python 3 - this sample application is written in Python and requires Python 3. If you do not
-already have Python 3 installed, download it from
-
-   [`https://www.python.org/downloads/`](https://www.python.org/downloads/).
-
-2. An [E*TRADE](https://us.etrade.com) account
-
-3. E*TRADE consumer key and consumer secret.
-
-
-## Setup
-
-1. Unzip python zip file
-
-2. Create a local, ignored `etrade_python_client/config.ini` and add the
-consumer key and consumer secret from the E*TRADE application keys page. Never
-commit that file.
-
-3. Create the virtual environment by running the Python's venv command; see the command syntax below
-
-```
-$ python3 -m venv venv
+python -m pip install --no-deps --no-build-isolation .
 ```
 
-4. Activate the Python virtual environment
+`pyproject.toml` is the only direct dependency and package definition.
+`requirements/*.lock` contains the complete hash-pinned environments. See
+[`requirements/README.md`](requirements/README.md) for the lock policy and
+regeneration commands.
 
-On Windows, run:
+## Offline verification
 
-```
-$ venv\Scripts\activate.bat
-```
+The default suite is deterministic and must not call brokers or market-data
+providers:
 
-On Unix or Mac OS, run:
-
-```
-$ source venv/bin/activate
-```
-
-5. Use pip to install dependencies for the sample application
-
-```
-$ pip install -r requirements.txt
+```bash
+python etrade_python_client/scripts/check_repo_hygiene.py
+python etrade_python_client/scripts/check_etrade_mutation_boundary.py
+python -m pytest -q etrade_python_client/tests
+python -m build --sdist --wheel --no-isolation
 ```
 
-6. Run the sample application
+CI runs the same checks on CPython 3.10.20. Network, broker, and provider tests
+must be explicitly marked as integration tests and are never part of the
+default gate.
 
-```
-$ cd etrade_python_client
-$ python3 etrade_python_client.py
-```
+## Source layout
 
-## Running Code
+The installable packages live under `etrade_python_client/`:
 
-Complete these steps to run the code for the sample application:
+- `backtesting/`: historical simulator, cache, strategy loader, and experiment
+  tooling.
+- `live_trading/`: broker safety boundary, durable intent components,
+  read-only dashboard, and causal regime pipeline.
+- `accounts/`, `market/`, `order/`, `core_api/`: legacy E*TRADE adapters kept
+  behind mutation tombstones during migration.
+- `polygonio/` and `strategies/`: reusable historical-data and strategy
+  modules.
+- `tests/`: deterministic reliability and contract tests; not distributed in
+  the runtime wheel.
+- `scratch/`: research-only scripts and outputs; not distributed.
 
-1. Activate the Python virtual environment
+The wheel includes only the ten explicitly allowlisted packages, the dashboard
+template, and three strategy YAML files. It excludes credentials, runtime
+state, caches, reports, tests, and scratch material.
 
-On Windows, run:
+## Credentials and local state
 
-```
-$ venv\Scripts\activate.bat
-```
+Never commit OAuth values, market-data keys, sessions, arming documents, broker
+responses, or runtime databases. Use ignored owner-readable local files or
+environment variables. The repository hygiene check enforces the tracked-index
+boundary.
 
-On Unix or Mac OS, run:
+Removing a credential from the current tree does not remove it from Git
+history. Previously exposed E*TRADE keys must still be revoked and rotated, and
+history cleanup must be coordinated separately.
 
-```
-$ source venv/bin/activate
-```
+## Architecture and operating rules
 
-2. Run the application
+- [`docs/project_overview.md`](etrade_python_client/docs/project_overview.md)
+  maps the current backtest, live, dashboard, and regime flows.
+- [`docs/production_readiness_upgrade_plan.md`](etrade_python_client/docs/production_readiness_upgrade_plan.md)
+  records the phased production-readiness gates.
+- [`RELIABILITY.md`](etrade_python_client/RELIABILITY.md) is the incident and
+  invariant ledger.
+- [`docs/market_regime_detect_specs.md`](etrade_python_client/docs/market_regime_detect_specs.md)
+  is mandatory for every regime-aware backtest or live-model change.
 
-```
-$ cd etrade_python_client
-$ python3 etrade_python_client.py
-```
+Backtests that cannot prove their calibration cutoff, out-of-sample range,
+causal inference method, one-session regime lag, and resolved-only probability
+buckets are `UNVERIFIED` or `INVALID`; they must not be presented as valid
+performance evidence.

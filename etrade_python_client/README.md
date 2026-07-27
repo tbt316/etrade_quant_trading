@@ -4,6 +4,10 @@ Welcome, Agent. This repository contains an institutional-grade, non-anticipativ
 
 This document serves as your **high-fidelity context bootstrap**. Every time you begin a new session, review this manual to instantly master the system architecture, mathematical pipelines, execution steps, and strict non-anticipativity mandates.
 
+> **Current safety boundary:** live execution and deployment remain suspended.
+> Install only from the root `pyproject.toml` and hash-locked files under
+> `requirements/`; do not use legacy per-directory requirement files.
+
 ---
 
 ## 1. System Architecture & Directory Topology
