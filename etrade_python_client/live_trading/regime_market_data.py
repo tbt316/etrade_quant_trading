@@ -403,6 +403,18 @@ def _schedule_sha256(schedule: pd.DataFrame) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def regime_source_policy_sha256() -> str:
+    """Return the active source-identity policy digest."""
+
+    return _current_source_policy_sha256()
+
+
+def regime_schedule_sha256(start: Any, end: Any) -> str:
+    """Return the active exchange-clock digest for an inclusive date range."""
+
+    return _schedule_sha256(regime_market_schedule(start, end))
+
+
 @dataclass(frozen=True)
 class MarketObservation:
     """One immutable finalized close and its source/clock lineage."""

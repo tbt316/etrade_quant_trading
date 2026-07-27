@@ -21,6 +21,8 @@ dashboard_requests.log
 *.json
 *.csv
 !etrade_cover_call_flow.md
+!docs/regime_v2_calibration_plan.json
+!research_reports/regime_v2_calibration_artifact.json
 
 # Plots and HTML outputs
 *.html

@@ -9,13 +9,17 @@ result is therefore usable no earlier than the next trading session.
 """
 
 import hashlib
+import inspect
 import json
+import math
+import sys
 from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 
+import live_trading.regime_market_data as regime_market_data_module
 from live_trading.regime_evidence_store import (
     RegimeEvidenceStore,
     SnapshotEvidenceReport,
@@ -28,7 +32,7 @@ from live_trading.regime_market_data import (
 
 
 SIGNAL_TIMESTAMP = "after_spy_vix_finalization_T_for_next_session"
-DETECTOR_VERSION = "regime_v2_shadow_0.2.0"
+DETECTOR_VERSION = "regime_v2_shadow_0.3.0"
 BACKGROUND_UNAVAILABLE = "unavailable"
 BACKGROUND_CALM = "calm"
 BACKGROUND_ELEVATED = "elevated"
@@ -56,6 +60,9 @@ class RegimeDetectorConfig:
     realized_vol_window: int = 10
     drawdown_window: int = 21
     score_halflife: float = 2.0
+    vix_slow_weight: float = 0.45
+    realized_vol_weight: float = 0.35
+    drawdown_weight: float = 0.20
 
     stress_entry_score: float = 0.75
     stress_exit_score: float = 0.65
@@ -86,19 +93,74 @@ class RegimeDetectorConfig:
             "calm_entry_days": self.calm_entry_days,
             "calm_exit_days": self.calm_exit_days,
         }
-        invalid = [name for name, value in positive_ints.items() if value < 1]
+        invalid = [
+            name
+            for name, value in positive_ints.items()
+            if isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+        ]
         if invalid:
-            raise ValueError(f"Configuration values must be positive: {invalid}")
+            raise ValueError(
+                "Configuration values must be positive integers: "
+                f"{invalid}"
+            )
+        if (
+            isinstance(self.aftershock_days, bool)
+            or not isinstance(self.aftershock_days, int)
+            or self.aftershock_days < 0
+        ):
+            raise ValueError(
+                "aftershock_days must be a nonnegative integer"
+            )
+        finite_values = {
+            "score_halflife": self.score_halflife,
+            "vix_slow_weight": self.vix_slow_weight,
+            "realized_vol_weight": self.realized_vol_weight,
+            "drawdown_weight": self.drawdown_weight,
+            "stress_entry_score": self.stress_entry_score,
+            "stress_exit_score": self.stress_exit_score,
+            "calm_entry_score": self.calm_entry_score,
+            "calm_exit_score": self.calm_exit_score,
+            "stress_vix_floor": self.stress_vix_floor,
+            "stress_realized_vol_floor": self.stress_realized_vol_floor,
+            "stress_drawdown_floor": self.stress_drawdown_floor,
+            "vix_shock_return": self.vix_shock_return,
+            "spy_shock_log_return": self.spy_shock_log_return,
+        }
+        invalid_finite = [
+            name
+            for name, value in finite_values.items()
+            if isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ]
+        if invalid_finite:
+            raise ValueError(
+                "Configuration values must be finite numbers: "
+                f"{invalid_finite}"
+            )
         if self.min_calibration_history > self.calibration_window:
             raise ValueError("min_calibration_history cannot exceed calibration_window")
         if not 0.0 <= self.calm_entry_score < self.calm_exit_score:
             raise ValueError("calm score thresholds are inconsistent")
         if not self.calm_exit_score < self.stress_exit_score < self.stress_entry_score <= 1.0:
             raise ValueError("stress score thresholds are inconsistent")
-        if self.aftershock_days < 0:
-            raise ValueError("aftershock_days cannot be negative")
         if self.score_halflife <= 0:
             raise ValueError("score_halflife must be positive")
+        score_weights = (
+            self.vix_slow_weight,
+            self.realized_vol_weight,
+            self.drawdown_weight,
+        )
+        if (
+            not all(math.isfinite(value) and value >= 0 for value in score_weights)
+            or not math.isclose(sum(score_weights), 1.0, abs_tol=1e-12)
+        ):
+            raise ValueError(
+                "background score weights must be finite, nonnegative, "
+                "and sum to one"
+            )
         if min(
             self.stress_vix_floor,
             self.stress_realized_vol_floor,
@@ -108,6 +170,71 @@ class RegimeDetectorConfig:
             raise ValueError("stress floors and VIX shock threshold cannot be negative")
         if self.spy_shock_log_return >= 0:
             raise ValueError("spy_shock_log_return must be negative")
+
+
+def regime_detector_config_sha256(config: RegimeDetectorConfig) -> str:
+    """Return the canonical identity of one immutable detector configuration."""
+
+    if not isinstance(config, RegimeDetectorConfig):
+        raise TypeError("config must be a RegimeDetectorConfig")
+    payload = json.dumps(
+        asdict(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def regime_detector_code_sha256() -> str:
+    """Return the portable identity of the detector and market-clock source.
+
+    The algorithm identity must be stable across machines running the same
+    committed source. Runtime package versions are recorded separately so a
+    Python patch release cannot silently invalidate a frozen research plan.
+    """
+
+    components = {
+        "detector_source_sha256": hashlib.sha256(
+            inspect.getsource(sys.modules[__name__]).encode("utf-8")
+        ).hexdigest(),
+        "market_data_source_sha256": hashlib.sha256(
+            inspect.getsource(regime_market_data_module).encode("utf-8")
+        ).hexdigest(),
+    }
+    payload = json.dumps(
+        components,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def regime_detector_runtime_fingerprint() -> str:
+    """Return the exact runtime identity for diagnostics and promotion gates."""
+
+    components = {
+        "numpy_version": np.__version__,
+        "pandas_market_calendars_version": getattr(
+            mcal,
+            "__version__",
+            "unknown",
+        ),
+        "pandas_version": pd.__version__,
+        "python_version": (
+            f"{sys.version_info.major}."
+            f"{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        ),
+    }
+    payload = json.dumps(
+        components,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _validate_prices(prices: pd.DataFrame) -> pd.DataFrame:
@@ -509,12 +636,7 @@ def _detect_regimes_from_arrays(
     """
 
     config = config or RegimeDetectorConfig()
-    config_payload = json.dumps(
-        asdict(config),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    config_hash = hashlib.sha256(config_payload.encode("utf-8")).hexdigest()
+    config_hash = regime_detector_config_sha256(config)
     if not isinstance(source_provenance_verified, (bool, np.bool_)):
         raise TypeError("source_provenance_verified must be a boolean")
     frame = _validate_prices(prices)
@@ -566,9 +688,9 @@ def _detect_regimes_from_arrays(
         )
 
     result["Background_Score_Raw"] = (
-        0.45 * result["VIX_Slow_Percentile"]
-        + 0.35 * result["Realized_Vol_Percentile"]
-        + 0.20 * result["Drawdown_Percentile"]
+        config.vix_slow_weight * result["VIX_Slow_Percentile"]
+        + config.realized_vol_weight * result["Realized_Vol_Percentile"]
+        + config.drawdown_weight * result["Drawdown_Percentile"]
     )
     result["Background_Score"] = result["Background_Score_Raw"].ewm(
         halflife=config.score_halflife,
@@ -628,6 +750,10 @@ def _detect_regimes_from_arrays(
     result.attrs["regime_signal_timestamp"] = SIGNAL_TIMESTAMP
     result.attrs["detector_version"] = DETECTOR_VERSION
     result.attrs["config_hash"] = config_hash
+    result.attrs["detector_code_sha256"] = regime_detector_code_sha256()
+    result.attrs["runtime_fingerprint_sha256"] = (
+        regime_detector_runtime_fingerprint()
+    )
     result.attrs["threshold_status"] = "research_baseline_unverified"
     result.attrs["inference_mode"] = "causal_transparent_shadow"
     result.attrs["freshness_assessed"] = bool(source_provenance_verified)

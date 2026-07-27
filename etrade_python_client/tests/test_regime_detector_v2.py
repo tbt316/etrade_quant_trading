@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 
+import live_trading.regime_detector_v2 as detector_module
 from live_trading.regime_detector_v2 import (
     BACKGROUND_CALM,
     BACKGROUND_STRESS,
@@ -16,6 +18,8 @@ from live_trading.regime_detector_v2 import (
     SHOCK_UNAVAILABLE,
     SIGNAL_TIMESTAMP,
     detect_regimes,
+    regime_detector_code_sha256,
+    regime_detector_runtime_fingerprint,
 )
 
 NYSE = mcal.get_calendar("NYSE")
@@ -73,6 +77,21 @@ def _detect(prices, config=None):
 
 
 class RegimeDetectorV2Tests(unittest.TestCase):
+    def test_algorithm_hash_is_portable_and_runtime_fingerprint_is_not(self):
+        code_hash = regime_detector_code_sha256()
+        runtime_hash = regime_detector_runtime_fingerprint()
+
+        with (
+            patch.object(detector_module.np, "__version__", "999.1"),
+            patch.object(detector_module.pd, "__version__", "999.2"),
+            patch.object(detector_module.mcal, "__version__", "999.3"),
+        ):
+            self.assertEqual(regime_detector_code_sha256(), code_hash)
+            self.assertNotEqual(
+                regime_detector_runtime_fingerprint(),
+                runtime_hash,
+            )
+
     def test_isolated_vix_jump_is_shock_not_persistent_stress(self):
         prices = _calm_prices()
         shock_date = prices.index[-5]
@@ -185,6 +204,14 @@ class RegimeDetectorV2Tests(unittest.TestCase):
         self.assertEqual(result.attrs["regime_signal_timestamp"], SIGNAL_TIMESTAMP)
         self.assertEqual(result.attrs["detector_version"], DETECTOR_VERSION)
         self.assertEqual(len(result.attrs["config_hash"]), 64)
+        self.assertEqual(
+            result.attrs["detector_code_sha256"],
+            regime_detector_code_sha256(),
+        )
+        self.assertEqual(
+            result.attrs["runtime_fingerprint_sha256"],
+            regime_detector_runtime_fingerprint(),
+        )
         self.assertFalse(result.attrs["freshness_assessed"])
         self.assertFalse(result.attrs["execution_eligible"])
         self.assertEqual(
