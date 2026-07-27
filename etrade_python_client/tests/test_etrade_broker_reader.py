@@ -467,7 +467,7 @@ class ETradeBrokerReaderTests(unittest.TestCase):
         )
         adapter = ExchangeHarness(outcomes)
         patcher = patch(
-            "live_trading.etrade_broker_reader._isolated_exchange",
+            "live_trading.etrade_broker_reader._isolated_get_exchange",
             side_effect=adapter.exchange,
         )
         patcher.start()

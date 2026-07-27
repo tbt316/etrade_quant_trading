@@ -1,7 +1,6 @@
 import json
 import logging
 import configparser
-from order.order import Order
 from live_trading.runtime_safety import configure_owner_only_logger, redact_http_headers
 
 # loading configuration file
@@ -230,7 +229,7 @@ class Accounts:
 
     def account_menu(self):
         """
-        Provides the different options for the sample application: balance, portfolio, view orders
+        Provides the read-only account options for balance and portfolio.
 
         :param self: Pass in authenticated session and information on selected account
         """
@@ -238,8 +237,7 @@ class Accounts:
         if self.account["institutionType"] == "BROKERAGE":
             menu_items = {"1": "Balance",
                           "2": "Portfolio",
-                          "3": "Orders",
-                          "4": "Go Back"}
+                          "3": "Go Back"}
 
             while True:
                 print("")
@@ -253,9 +251,6 @@ class Accounts:
                 elif selection == "2":
                     self.portfolio()
                 elif selection == "3":
-                    order = Order(self.session, self.account, self.base_url)
-                    order.view_orders()
-                elif selection == "4":
                     break
                 else:
                     print("Unknown Option Selected!")

@@ -40,19 +40,22 @@ backtest validity gates exit, regime-aware reports should be labeled
 ## Delivery status as of 2026-07-26
 
 R5 / PR #28 established a clean dependency/import baseline and passed 134 tests
-in clean CI. R6 now implements the first live-startup containment slice in the
-current source:
+in clean CI. R6 implements the first live-startup containment slice, and
+R7a–R7f add an isolated durable execution core plus a repository-wide legacy
+mutation quarantine:
 
 - `sandbox` or `production` must be selected explicitly; missing or conflicting
   mode input fails before OAuth construction.
 - Production requires an exact account ID, account key, and institution type
   plus an owner-only, HMAC-signed, versioned arm document bound to that identity.
   Its maximum lifetime is 15 minutes.
-- The selected identity and unexpired arm are checked at startup, on account
-  refresh, and immediately before every compatibility-client order API call.
-- The order-capable dashboard binds to loopback, does not launch ngrok
-  automatically, and does not grant wildcard CORS. Startup rejects weak
-  dashboard credentials, and touched settings/log files use owner-only handling.
+- The selected identity and unexpired arm are checked at startup and on account
+  refresh. Compatibility-client broker mutations are no longer operative.
+- The dashboard binds to loopback, does not launch ngrok automatically, and
+  does not grant wildcard CORS. It is permanently read-only: auto-open is
+  forced off, execution controls and mutation queue call sites are removed, and
+  retained historical execution routes reject before body parsing or side
+  effects.
 - Hardcoded OAuth credentials were removed from the current versions of two
   legacy utilities in favor of local configuration or environment variables.
 - Shared client logs use owner-only files and retain only redacted headers plus
@@ -61,18 +64,25 @@ current source:
   quarantined.
 
 These changes do **not** satisfy Phase 0 or make the repository production
-ready. The existing order paths are guarded but not yet centralized. R7a–R7e
-preserve the arm/account check and add isolated durable intent identity,
+ready. R7a–R7e preserve the arm/account check and add isolated durable intent identity,
 capacity reservations, mutation fencing, direct known-order reconciliation,
 raw read provenance, and exact zero/full terminal-risk absorption, but no live
-caller is composed through that stack.
+caller is composed through that stack. R7f makes 30 legacy mutation surfaces
+exact unconditional tombstones, removes the gateway's public transport
+property, and adds a deterministic AST gate across every tracked application
+Python source. Raw broker mutation remains permitted only in the hardened
+transport and exact transport calls only in the gateway. Service installation
+and remote restart are suspended.
 The current local dashboard settings are intentionally rejected until stronger
 credentials are provisioned. GitHub reports the repository as public on
 2026-07-26, and OAuth keys retained in its public history must be treated as
 compromised: external revoke/rotate is required, followed by a coordinated
 history purge and downstream cleanup. No live service restart, deployment,
-E*TRADE mutation, or exact served-dashboard verification has been performed
-for R6.
+E*TRADE mutation, deployed restart, or exact deployed-dashboard verification
+has been performed. The real local handler and generated positions artifact
+were inspected at desktop and mobile widths for R7f, including the fixed
+same-origin iframe policy and fixed eight-digit PIN input; that is source
+verification only.
 
 ## What is worth preserving
 
@@ -113,25 +123,26 @@ valuable:
 ```mermaid
 flowchart LR
     UI["Dashboard browser"] --> HTTP["RefreshHandler API"]
-    HTTP --> GLOBAL["Global mutable queues / JSON files"]
-    LOOP["Scheduler and trading loop"] --> GLOBAL
-    GLOBAL --> SCREEN["Portfolio / option screening / EV / GEX"]
-    SCREEN --> WORKERS["Eight order workers"]
-    WORKERS --> ORDER["Order preview / place / replace"]
-    ORDER --> BROKER["E*TRADE"]
-    BROKER --> TRACKER["Order and portfolio reconciliation"]
-    TRACKER --> FILES["JSON / CSV / generated HTML"]
+    HTTP --> FILES["JSON / CSV / generated HTML"]
+    LOOP["Legacy scheduler and analysis loop"] --> READS["Authenticated broker reads"]
+    READS --> SCREEN["Portfolio / option screening / EV / GEX"]
+    SCREEN --> FILES
     FILES --> HTTP
+    HTTP --> BLOCK["Execution routes reject before body parsing"]
+    LEGACY["Legacy order / close / nudge methods"] --> BLOCK
+    STATIC["Tracked-source mutation gate"] --> LEGACY
+    CORE["R7 durable gateway stack"] -.->|"isolated; not composed"| BROKER["E*TRADE"]
 ```
 
-Most of this flow resides in the 5,787-line
-`live_trading/etrade_cover_call_new.py`. The same process owns OAuth, the public
+Historically, most of this flow resided in the 5,787-line
+`live_trading/etrade_cover_call_new.py`. The same process owns OAuth, the local
 dashboard, scheduling, market reads, generated HTML, global state, model
-diagnostics, order placement, and order repricing. `accounts/accounts_bo.py`
+diagnostics, and retained historical order code. `accounts/accounts_bo.py`
 (7,821 lines) combines broker access, option screening, payload construction,
-and dashboard rendering. `order/order_bo.py` owns preview/place/change/status
-calls. This makes a dashboard, model, cache, or scheduler defect capable of
-crossing directly into execution.
+and dashboard rendering. R7f removes the operative dashboard/scheduler broker
+mutation call sites and tombstones the legacy order methods, so this path is
+now read-only. The monolith remains a maintainability and data-integrity risk,
+but it cannot be treated as an execution service.
 
 ### Backtest and regime path
 
@@ -480,16 +491,25 @@ Exit gate:
 - Secret scans of history, working tree, build output, and logs are clean.
 - Existing 11 focused reliability tests remain green.
 
-R6 status: the explicit mode, exact identity, short-lived signed arm,
-refresh-time and order-call revalidation, loopback dashboard, restrictive CORS,
-strong local credential checks, and owner-only/redacted client logging are
-implemented in source. Phase 0 remains open because placement is not centralized or durably
-idempotent, the remaining pre-trade and failure gates are incomplete, exposed
-keys still require external revoke/rotate and coordinated history cleanup, the
-current local settings fail the new policy, and no deployed service has been
-restarted or verified.
+R6/R7f status: explicit mode, exact identity, short-lived signed arm,
+refresh-time revalidation, loopback dashboard, restrictive CORS, strong local
+credential checks, owner-only/redacted client logging, unconditional legacy
+mutation tombstones, read-only UI/routes, a tracked-source mutation gate, and
+deployment install/restart suspension are implemented in source. Phase 0
+remains open because no durable gateway is composed into a production process,
+the full pure pre-trade and failure policy is incomplete, closing/cancellation
+protocols are absent, exposed keys still require external revoke/rotate and
+coordinated history cleanup, the current local settings fail the new policy,
+and no deployed service has been restarted or verified.
 
 ### Phase 1 — reproducible repository baseline (week 1)
+
+Implementation is split into four reviewable stacked changes: R8a removes
+tracked generated/runtime state without deleting local copies and adds an index
+hygiene gate; R8b establishes the single package definition and frozen lock;
+R8c validates a built artifact in deterministic offline CI; R8d introduces
+typed configuration and explicit runtime-state paths. This avoids mixing more
+than 1,500 mechanical index removals with packaging/runtime behavior.
 
 Deliver:
 
@@ -545,13 +565,14 @@ Exit gate:
 
 ### Phase 3 — durable live control plane (weeks 3–5)
 
-Status: partially delivered. R7a–R7e provide the schema-12 ledger, stable
+Status: partially delivered. R7a–R7f provide the schema-12 ledger, stable
 opening intent identity, outbox-style send claims, reconciliation, capacity
 reservations, a single isolated reprice owner, and exact zero/full terminal-risk
-absorption with retained filled-margin accounting. Partial/complex terminal
-states, closing/cancellation, the broader pure risk policy, process
-decomposition, dashboard command routing, and hardened live deployment remain
-open.
+absorption with retained filled-margin accounting. R7f also removes all current
+legacy mutation call sites and makes future bypasses fail CI. Partial/complex
+terminal states, closing/cancellation, the broader pure risk policy, process
+decomposition, a single reviewed composition root, dashboard command creation,
+and hardened live deployment remain open.
 
 Deliver:
 
@@ -674,7 +695,7 @@ boundaries are extracted. Remove old paths only after golden tests and
 shadow-parity prove equivalent intended behavior.
 
 The current stacked delivery names the source-level startup containment slice
-R6. R7a–R7e now implement an isolated schema-12 execution core: strict
+R6. R7a–R7e implement an isolated schema-12 execution core: strict
 vertical-spread validation, stable intent/client identity, durable capacity
 reservations, monotonic submission/amendment fences, exact immutable outbound
 authorization, a no-retry mutation transport, an opening/reprice coordinator,
@@ -682,13 +703,18 @@ an origin-bound durable E*TRADE reader, and order/lot-bound zero/full terminal
 absorption. The reader records bounded raw responses, the ledger independently
 replays their strict parser, and capacity or reconciliation can use only a
 semantically complete content-addressed manifest. Full fills retain their
-reserved margin in utilization after absorption. No live caller instantiates
-this stack.
+reserved margin in utilization after absorption. R7f quarantines the old
+execution system: 30 fixed mutation surfaces are reject-only tombstones, raw
+mutation I/O is statically confined to the transport, the gateway no longer
+exposes its transport, dashboard mutation routes and controls are inert, and
+install/restart tooling fails closed. No live caller instantiates the durable
+stack.
 
 The next R7 safety boundaries are closing-position capacity and one-shot
 per-intent cancellation. Only after those protocols pass restart/crash tests
-may the live composition root own the gateway and static enforcement prohibit
-every direct legacy mutation call. See `docs/order_intent_ledger.md`.
+may a reviewed live composition root own the gateway. The direct-legacy
+mutation prohibition is already enforced and must remain green. See
+`docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
 
@@ -735,7 +761,7 @@ and source template for both a sealed synthetic advisory and the missing-signal
 failure state. That proves the code/HTML path, not deployment or live provider
 operation. Its PR #28 clean CI job passed 134 tests.
 
-R6 has not restarted or inspected the deployed dashboard, called E*TRADE, or
+R6/R7f have not restarted or inspected the deployed dashboard, called E*TRADE, or
 exercised a live/sandbox mutation. Current-source credential removal also does
 not establish secret hygiene while the repository remains public and the old
 keys remain in Git history. External revoke/rotate, coordinated history purge,
@@ -744,7 +770,10 @@ partial/closing/cancellation protocols, durable-gateway composition, and
 deployment verification remain required. The isolated R7a–R7e stack has
 focused deterministic coverage and independent causal/security review,
 including exact zero/full terminal absorption, but it has no production call
-site and is not live-execution evidence. The remaining actions belong to the
+site and is not live-execution evidence. R7f was rendered through an isolated
+real local handler and generated positions artifact at desktop and mobile
+widths, and its disabled endpoint returned the fixed `503` schema; this does
+not verify the user's deployed artifact. The remaining actions belong to the
 staged acceptance gates above.
 
 The working tree was already heavily modified and contains important untracked

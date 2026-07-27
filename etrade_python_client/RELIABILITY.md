@@ -487,11 +487,11 @@ finding.
     dashboard request records.
 - `order/order_bo.py`, `order/order.py`, and
   `core_api/stock_trade_class.py`
-  - Pass the immutable runtime boundary into the reusable order client.
-  - Revalidate the current arm, environment, and exact account immediately
-    before every order API POST/PUT.
-  - Reject order API access without that boundary and quarantine the older
-    interactive order client.
+  - Retain read-only compatibility helpers but replace all known preview,
+    place, change, cancel, repricing, menu, and facade mutation methods with
+    unconditional `LegacyExecutionDisabled` tombstones.
+  - Provide no environment, configuration, arm, or operator override for a
+    legacy mutation.
 - Shared E*TRADE client logging
   - Uses owner-only files, does not propagate to unfiltered root handlers,
     redacts authorization-bearing headers, and records only SHA-256/size
@@ -525,6 +525,27 @@ finding.
   - Remain intentionally disconnected from the live agent until the remaining
     position, closing, cancellation, composition, and operational migration
     gates below are complete.
+- `live_trading/etrade_cover_call_new.py`,
+  `live_trading/dashboard_template.html`, and `accounts/accounts_bo.py`
+  - Remove the live monolith's order-worker call sites, automatic close,
+    margin-release, and stale-order mutation paths.
+  - Force persisted auto-open off and return a fixed authenticated
+    `503 LEGACY_EXECUTION_DISABLED` response from every retained historical
+    execution route before reading a request body or touching a collaborator.
+  - Remove execute, close, and neutralize controls/fetches from the dashboard
+    and generated position rows. Both views permanently identify themselves as
+    read-only.
+  - Reject missing, oversized, or pre-containment generated position artifacts
+    with a fixed read-only `503` fallback. The served iframe response disables
+    scripts, network connections, and form actions through a restrictive CSP.
+- `scripts/check_etrade_mutation_boundary.py` and CI
+  - Parse every tracked application Python file, including tracked scratch.
+  - Reject raw mutation I/O/imports/reflection, E*TRADE mutation literals,
+    transport access outside the reviewed allowlist, public gateway transport
+    exposure, legacy calls, and any change to the fixed tombstone policy.
+- `deploy/install_pi_service.sh` and `deploy/sync_to_pi.sh`
+  - Reject service installation and remote restart before privileged, SSH,
+    rsync, or service-manager actions.
 - `live_trading/etrade_check_option.py` and
   `live_trading/etrade_option_chains.py`
   - Remove hardcoded OAuth credentials from the current source and require
@@ -532,15 +553,17 @@ finding.
 
 ### Remaining risk
 
-This is containment in the current source, not production readiness. The
-compatibility order client still owns current live calls. The isolated R7a–R7e
-stack now provides a schema-12 intent ledger, hardened mutation transport,
-origin-bound durable reader, opening/reprice coordinator, and exact zero/full
-terminal-risk absorption, but no live code instantiates it.
+This is containment in the current source, not production readiness. Legacy
+mutation methods no longer own an operative call path; they fail closed, and CI
+rejects their reintroduction. The isolated R7a–R7e stack provides a schema-12
+intent ledger, hardened mutation transport, origin-bound durable reader,
+opening/reprice coordinator, and exact zero/full terminal-risk absorption, but
+no live code instantiates it.
 
 Partial/replacement/assignment recovery, closing capacity, durable per-intent
-cancellation, a single production composition root, and a static ban on every
-direct legacy mutation path remain required.
+cancellation, the pure full risk policy, and a single production composition
+root remain required. The static ban on direct legacy mutation is delivered
+and must remain green.
 
 The exposed OAuth keys still require external revocation and rotation. A later
 coordinated history purge must remove them from all refs and arrange cleanup of
@@ -549,8 +572,11 @@ private now would not undo prior exposure. The repository remains public.
 
 The current local dashboard settings intentionally fail the new credential
 policy and must be reprovisioned before startup. No live service has been
-restarted, no E*TRADE session or order path has been exercised, and the exact
-deployed dashboard has not been reloaded or visually inspected with R6.
+restarted and no E*TRADE session or order path has been exercised. R7f was
+rendered through an isolated real local handler and generated positions
+artifact at desktop and mobile widths. That inspection found and fixed a
+same-origin iframe header conflict and a four-digit client-side PIN truncation;
+it does not verify the exact deployed dashboard.
 
 ### Verification record
 
@@ -575,11 +601,16 @@ deployed dashboard has not been reloaded or visually inspected with R6.
   unresolved. The review explicitly retains a no-go on live wiring until the
   remaining partial/complex terminal, closing, cancellation, and composition
   protocols are delivered.
-- The maintained `tests/` suite passes 318 tests in the clean Python 3.10
+- The maintained `tests/` suite passes 361 tests in the clean Python 3.10
   environment. An unscoped repository-root pytest invocation still
   mis-collects two legacy `scratch/test_delta_*` research scripts and triggers
   import-time market-data behavior; the reproducible-build/CI gate must
   constrain collection and remove those import side effects.
+- R7f's checker passes across all 169 tracked application Python sources,
+  including tracked scratch. Focused tests cover exact reject-only tombstones,
+  fixed route schemas and side-effect ordering, read-only HTML, same-origin
+  positions framing, gateway privacy, mutation bypass attacks, and
+  install/restart containment.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.

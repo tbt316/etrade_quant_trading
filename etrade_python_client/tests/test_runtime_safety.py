@@ -17,6 +17,7 @@ from unittest import mock
 from accounts.accounts_bo import Accounts
 from live_trading.runtime_safety import (
     ARM_SCHEMA_VERSION,
+    LegacyExecutionDisabled,
     MAX_PRODUCTION_ARM_LIFETIME,
     OwnerOnlyRotatingFileHandler,
     RuntimeSafetyBoundary,
@@ -379,7 +380,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             use_sandbox=False,
             consumer_key="key",
         )
-        with self.assertRaisesRegex(RuntimeSafetyError, "RuntimeSafetyBoundary"):
+        with self.assertRaisesRegex(LegacyExecutionDisabled, "quarantined"):
             order_client.preview_order(
                 {
                     "securityType": "EQ",
@@ -394,7 +395,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
         session.post.assert_not_called()
 
-    def test_order_api_rechecks_arm_immediately_before_broker_io(self):
+    def test_legacy_order_api_cannot_be_enabled_by_a_valid_runtime_boundary(self):
         from order.order_bo import Order
 
         boundary = mock.Mock(spec=RuntimeSafetyBoundary)
@@ -409,8 +410,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             runtime_safety=boundary,
         )
         boundary.verify_account.reset_mock()
-        boundary.verify_account.side_effect = RuntimeSafetyError("production arm proof is expired")
-        with self.assertRaisesRegex(RuntimeSafetyError, "expired"):
+        with self.assertRaisesRegex(LegacyExecutionDisabled, "quarantined"):
             order_client.preview_order(
                 {
                     "securityType": "EQ",
@@ -423,13 +423,13 @@ class RuntimeSafetyTests(unittest.TestCase):
                     "quantity": 1,
                 }
             )
-        boundary.verify_account.assert_called_once_with(_account())
+        boundary.verify_account.assert_not_called()
         session.post.assert_not_called()
 
     def test_legacy_interactive_order_client_is_quarantined(self):
         from order.order import Order
 
-        with self.assertRaisesRegex(RuntimeSafetyError, "quarantined"):
+        with self.assertRaisesRegex(LegacyExecutionDisabled, "quarantined"):
             Order(object(), _account(), "https://example.invalid")
 
     def test_live_agent_refresh_resolves_configless_environment_credentials(self):
@@ -471,6 +471,14 @@ class RuntimeSafetyTests(unittest.TestCase):
                 "pin": "84927163",
             }
         )
+        with self.assertRaisesRegex(RuntimeSafetyError, "weak"):
+            validate_dashboard_credentials(
+                {
+                    "dashboard_user": "operator",
+                    "dashboard_pass": "long-random-dashboard-password",
+                    "pin": "9" * 65,
+                }
+            )
 
     def test_dashboard_settings_and_logs_do_not_leave_plaintext_credentials(self):
         from live_trading import etrade_cover_call_new as dashboard

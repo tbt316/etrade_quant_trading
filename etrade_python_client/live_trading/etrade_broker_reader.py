@@ -24,7 +24,7 @@ from requests import Request
 from live_trading.etrade_broker_transport import (
     SelectedBrokerAccount,
     _ExchangeResult,
-    _isolated_exchange,
+    _isolated_get_exchange,
 )
 from live_trading.order_intent_ledger import (
     BrokerReadEvidenceRef,
@@ -1486,7 +1486,7 @@ class ETradeBrokerReader:
         started_at = self._now()
         self._assert_runtime()
         try:
-            exchange = _isolated_exchange(
+            exchange = _isolated_get_exchange(
                 prepared,
                 timeout_seconds=_TOTAL_EXCHANGE_TIMEOUT_SECONDS,
                 max_response_bytes=_MAX_RAW_RESPONSE_BYTES,

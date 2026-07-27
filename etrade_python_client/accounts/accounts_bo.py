@@ -2714,7 +2714,6 @@ class Accounts:
                 if action_lot is None:
                     continue
 
-                raw_symbol = str(getattr(action_lot, "symbol", "") or "")
                 call_put = str(getattr(action_lot, "call_put", "") or "").upper()
                 expiration = str(getattr(action_lot, "expiration_date", "") or "")
                 signed_quantity = int(getattr(action_lot, "quantity", 0) or 0)
@@ -2760,11 +2759,9 @@ class Accounts:
                     distance_text = "—"
                     distance_class = ""
 
-                attr = lambda value: html.escape(str(value), quote=True)
-                long_strike_attr = "" if long_strike is None else str(long_strike)
                 threshold_html = f"<small>{threshold_label}</small>" if threshold_label else ""
                 group_rows.append(f'''
-                  <tr class="position-row {gain_class}" data-close-position-container>
+                  <tr class="position-row {gain_class}">
                     <td class="expiry-cell"><strong>{_dte(action_lot)} DTE</strong><span>{html.escape(expiration)}</span></td>
                     <td class="position-cell"><span class="option-type">{html.escape(call_put)}</span>{strikes}</td>
                     <td class="quantity-cell">{quantity}</td>
@@ -2772,17 +2769,7 @@ class Accounts:
                     <td class="mark-cell desktop-detail">{html.escape(_fmt_money(current_value))}</td>
                     <td class="distance-cell desktop-detail {distance_class}">{html.escape(distance_text)}</td>
                     <td class="gain-cell"><span>{gain_loss:.1f}%</span>{threshold_html}</td>
-                    <td class="action-cell">
-                      <input type="number" value="{quantity}" max="{quantity}" min="1" inputmode="numeric"
-                             aria-label="Contracts to close for {attr(ticker)} {attr(expiration)} {attr(call_put)} {attr(short_strike)}">
-                      <button type="button" data-close-position="1" data-symbol="{attr(raw_symbol)}"
-                              data-expiry="{attr(expiration)}" data-cp="{attr(call_put)}"
-                              data-short-strike="{attr(short_strike)}" data-long-strike="{attr(long_strike_attr)}"
-                              data-position-qty="{signed_quantity}"
-                              aria-label="Review close order for {attr(ticker)} {attr(expiration)} {attr(call_put)} {attr(short_strike)}">
-                        Close
-                      </button>
-                    </td>
+                    <td class="read-only-cell">Read only</td>
                   </tr>
                 ''')
 
@@ -2806,7 +2793,7 @@ class Accounts:
                         <th class="desktop-detail">Pair mark</th>
                         <th class="desktop-detail">Distance</th>
                         <th>Pair P/L</th>
-                        <th>Action</th>
+                        <th>Mode</th>
                       </tr>
                     </thead>
                     <tbody>{''.join(group_rows)}</tbody>
@@ -3119,6 +3106,7 @@ class Accounts:
         <style>
           body { font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 15px; background: #fff; color: #0f172a; margin: 0; }
           h1 { margin: 0 0 15px 0; font-size: 22px; color: #0f172a; font-weight: 600; }
+          .read-only-banner { margin: 0 0 16px; padding: 12px 16px; border: 2px solid #b91c1c; border-radius: 10px; background: #fef2f2; color: #991b1b; font-size: 14px; font-weight: 800; letter-spacing: 0.04em; text-align: center; text-transform: uppercase; }
           td.pos { color: #10b981 !important; font-weight: 600; }
           td.neg { color: #ef4444 !important; font-weight: 600; }
           .position-groups { display: grid; gap: 18px; margin: 0 0 20px; }
@@ -3155,10 +3143,7 @@ class Accounts:
           .position-row.close-watch .gain-cell span { background: #bbf7d0; color: #166534; }
           .position-row.close-now .gain-cell span { background: #16a34a; color: #fff; }
           .position-row.loss .gain-cell span { background: #fef2f2; color: #dc2626; }
-          .action-cell { white-space: nowrap; }
-          .action-cell input { box-sizing: border-box; width: 40px; min-height: 34px; margin-right: 5px; padding: 4px; border: 1px solid #cbd5e1; border-radius: 7px; background: #fff; color: #0f172a; font: inherit; font-size: 14px; text-align: center; }
-          .action-cell button { min-height: 34px; padding: 5px 10px; border: 0; border-radius: 7px; background: #dc2626; color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
-          .action-cell button:disabled { background: #94a3b8; cursor: wait; }
+          .read-only-cell { color: #991b1b !important; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }
           .portfolio-summary { width: 100%; overflow-x: auto; margin-bottom: 20px; border: 1px solid #e2e8f0; border-radius: 10px; }
           .summary-table { width: 100%; border-collapse: collapse; font-size: 12px; }
           .summary-table td { padding: 10px 12px; background: #f8fafc; border-top: 1px solid #e2e8f0; white-space: normal; }
@@ -3196,8 +3181,7 @@ class Accounts:
             .strike-values { font-size: 12px; white-space: nowrap; }
             .strike-labels { margin-left: 0; font-size: 8px; }
             .gain-cell span { min-width: 0; width: 100%; padding: 5px 2px; font-size: 12px; }
-            .action-cell input { width: 30px; min-height: 34px; margin-right: 2px; padding: 2px; font-size: 13px; }
-            .action-cell button { min-height: 34px; padding: 4px 6px; font-size: 10px; }
+            .read-only-cell { font-size: 8px; white-space: normal; }
             .portfolio-summary { display: none; }
           }
         </style>
@@ -4381,175 +4365,6 @@ class Accounts:
             </script>
         '''
 
-        close_button_script_html = '''
-            <script>
-              function resetCloseButton(btn) {
-                btn.disabled = false;
-                btn.textContent = btn.dataset.defaultLabel || 'Review Close';
-              }
-
-              function getDashboardPin() {
-                try {
-                  if (window.parent && window.parent !== window && window.parent.location.origin === window.location.origin) {
-                    return window.parent.currentDashboardPin || '';
-                  }
-                } catch (error) {
-                  console.warn('Unable to read the dashboard PIN from the parent page.', error);
-                }
-                return sessionStorage.getItem('dashboard_pin') || '';
-              }
-
-              function invalidateDashboardPin() {
-                sessionStorage.removeItem('dashboard_pin');
-                try {
-                  if (window.parent && window.parent !== window && window.parent.location.origin === window.location.origin && typeof window.parent.clearPin === 'function') {
-                    window.parent.clearPin();
-                  }
-                } catch (error) {
-                  console.warn('Unable to reset the dashboard PIN in the parent page.', error);
-                }
-              }
-
-              async function pollCloseStatus(requestId, btn) {
-                const endpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/status' : '/api/status';
-                for (let i = 0; i < 90; i++) {
-                  await new Promise(resolve => setTimeout(resolve, 2000));
-                  try {
-                    const response = await fetch(endpoint);
-                    if (!response.ok) continue;
-                    const status = await response.json();
-                    const requests = (status.manual_orders && status.manual_orders.requests) || [];
-                    const manual = requests.find(r => r.request_id === requestId) || {};
-                    if (!manual.request_id) continue;
-                    const label = manual.status || 'queued';
-                    btn.innerHTML = label;
-                    if (manual.status === 'failed') {
-                      resetCloseButton(btn);
-                      alert('❌ Close failed: ' + (manual.message || 'Unknown error'));
-                      return;
-                    }
-                    if (manual.status === 'placed' || manual.status === 'filled') {
-                      alert('✅ ' + (manual.message || 'Close order submitted'));
-                      window.location.reload();
-                      return;
-                    }
-                  } catch (err) {
-                    console.error('Close status poll failed', err);
-                  }
-                }
-                btn.innerHTML = 'Pending';
-              }
-
-              async function closePosition(symbol, expiry, cp, short_strike, long_strike, btn, position_qty = null) {
-                const actionContainer = btn.closest('[data-close-position-container], tr');
-                const qtyInput = actionContainer.querySelector('input[type="number"]');
-                const quantity = qtyInput.value;
-
-                btn.dataset.defaultLabel = btn.dataset.defaultLabel || btn.textContent.trim() || 'Review Close';
-                let pin = getDashboardPin();
-                if (!pin && window.parent === window) {
-                  pin = window.prompt('Enter the dashboard PIN to review this close order:');
-                }
-                if (!pin) {
-                  resetCloseButton(btn);
-                  return;
-                }
-
-                const requestPayload = {
-                  pin,
-                  symbol,
-                  expiry,
-                  cp,
-                  sell_strike: short_strike,
-                  long_strike,
-                  quantity,
-                  position_qty
-                };
-
-                btn.disabled = true;
-                btn.textContent = 'Checking…';
-
-                try {
-                  const reviewEndpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/review_close_position' : '/api/review_close_position';
-                  const reviewResponse = await fetch(reviewEndpoint, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(requestPayload)
-                  });
-                  const reviewResult = await reviewResponse.json();
-                  if (!reviewResponse.ok) {
-                    resetCloseButton(btn);
-                    if (reviewResponse.status === 403) invalidateDashboardPin();
-                    alert('❌ Error: ' + (reviewResult.error || 'Unable to review close order'));
-                    return;
-                  }
-                } catch (err) {
-                  resetCloseButton(btn);
-                  alert('❌ Connection Error: ' + err.message);
-                  return;
-                }
-
-                resetCloseButton(btn);
-                let msg = `Are you sure you want to CLOSE ${quantity} contracts of ${symbol} ${expiry} ${cp} ${short_strike}`;
-                if (long_strike) {
-                  msg += ` / ${long_strike} SPREAD`;
-                }
-                msg += ` using MID PRICE?`;
-
-                if (!confirm(msg)) {
-                  return;
-                }
-
-                btn.disabled = true;
-                btn.textContent = '...';
-
-                try {
-                    const endpoint = window.location.protocol === 'file:' ? 'http://localhost:8765/api/close_position' : '/api/close_position';
-                    const response = await fetch(endpoint, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(requestPayload)
-                    });
-                    
-                    const result = await response.json();
-                    if (response.ok) {
-                        btn.innerHTML = 'Queued';
-                        if (result.request_id) {
-                            pollCloseStatus(result.request_id, btn);
-                        } else {
-                            alert('✅ Success: ' + result.message);
-                            window.location.reload();
-                        }
-                    } else {
-                        resetCloseButton(btn);
-                        if (response.status === 403) invalidateDashboardPin();
-                        alert('❌ Error: ' + result.error);
-                    }
-                } catch (err) {
-                    resetCloseButton(btn);
-                    alert('❌ Connection Error: ' + err.message);
-                }
-              }
-
-              window.pollCloseStatus = pollCloseStatus;
-              window.closePosition = closePosition;
-              document.documentElement.dataset.closePositionReady = '1';
-              document.addEventListener('click', (event) => {
-                const btn = event.target.closest('button[data-close-position="1"]');
-                if (!btn) return;
-                closePosition(
-                  btn.dataset.symbol,
-                  btn.dataset.expiry,
-                  btn.dataset.cp,
-                  btn.dataset.shortStrike,
-                  btn.dataset.longStrike || null,
-                  btn,
-                  btn.dataset.positionQty === undefined ? null : Number(btn.dataset.positionQty)
-                );
-              });
-            </script>
-        '''
-
         market_close_auto_reload_html = '''
             <script>
               (function scheduleMarketCloseReload() {
@@ -4600,9 +4415,9 @@ class Accounts:
             {style}
           </head>
           <body>
+            <div class="read-only-banner" role="status">Read only — all E*TRADE order actions are disabled</div>
             <h1>{html.escape(title)}</h1>
             {refresh_button_html if show_refresh else ""}
-            {close_button_script_html}
             {market_close_auto_reload_html}
             <div class="position-groups" aria-label="Option positions grouped by ticker">
               {position_groups_html}
@@ -4865,7 +4680,7 @@ class Accounts:
 
     def account_menu(self):
         """
-        Provides the different options for the sample application: balance, portfolio, view orders
+        Provides read-only balance and portfolio options for the sample application.
 
         :param self: Pass in authenticated session and information on selected account
         """
@@ -4873,8 +4688,7 @@ class Accounts:
         if self.account["institutionType"] == "BROKERAGE":
             menu_items = {"1": "Balance",
                           "2": "Portfolio",
-                          "3": "Orders",
-                          "4": "Go Back"}
+                          "3": "Go Back"}
 
             while True:
                 print("")
@@ -4888,9 +4702,6 @@ class Accounts:
                 elif selection == "2":
                     self.portfolio()
                 elif selection == "3":
-                    order = Order(self.session, self.account, self.base_url)
-                    order.view_orders()
-                elif selection == "4":
                     break
                 else:
                     print("Unknown Option Selected!")

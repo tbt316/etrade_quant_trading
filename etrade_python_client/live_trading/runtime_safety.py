@@ -15,11 +15,28 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 class RuntimeSafetyError(RuntimeError):
     """Raised before broker construction when a runtime safety invariant fails."""
+
+
+class LegacyExecutionDisabled(RuntimeSafetyError):
+    """Raised when obsolete code attempts to reach a broker mutation surface."""
+
+
+def reject_legacy_execution(surface: str) -> NoReturn:
+    """Unconditionally reject a legacy execution surface.
+
+    Legacy paths have no operator, configuration, or environment override.
+    Broker mutations must be routed through the durable E*TRADE order gateway.
+    """
+
+    raise LegacyExecutionDisabled(
+        f"legacy execution surface is quarantined and disabled: {surface}; "
+        "route broker mutations through ETradeOrderGateway"
+    )
 
 
 ARM_SCHEMA_VERSION = 1
@@ -590,7 +607,12 @@ def validate_dashboard_credentials(settings: dict[str, Any]) -> None:
         raise RuntimeSafetyError("dashboard username is a reserved default")
     if len(password) < 16 or password.lower() in {"password", "changeme", "default"}:
         raise RuntimeSafetyError("dashboard password is weak")
-    if len(pin) < 8 or not pin.isdigit() or pin in {"00000000", "12345678", "1234"}:
+    if (
+        len(pin) < 8
+        or len(pin) > 64
+        or not pin.isdigit()
+        or pin in {"00000000", "12345678", "1234"}
+    ):
         raise RuntimeSafetyError("dashboard action PIN is weak")
 
 

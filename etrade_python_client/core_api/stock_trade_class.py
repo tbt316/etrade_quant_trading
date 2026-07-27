@@ -30,7 +30,7 @@ from itertools import product
 from accounts.accounts_bo import Accounts
 from market.market_bo import Market
 from order.order_bo import Order
-from live_trading.runtime_safety import RuntimeSafetyBoundary
+from live_trading.runtime_safety import RuntimeSafetyBoundary, reject_legacy_execution
 from datetime import time
 import pickle
 
@@ -1607,47 +1607,18 @@ class LiveTradeAgent:
             writer.writerows(rows)
 
     def check_short_availability(self,ticker_list):
-        fail_ticker_list = []
-        for ticker in ticker_list:
-            order = {
-                'symbol': ticker,
-                'quantity': 10,
-                'orderAction': 'SELL_SHORT',
-                'orderType': 'MARKET',
-                'priceType': 'MARKET',
-                'orderTerm': 'GOOD_FOR_DAY',
-                'limitPrice': '',
-                'client_order_id': random.randint(1000000000, 9999999999)
-            }
-            error = self.order.preview_order(order)
-            if error == "Hard_to_Borrow":
-                print(f"{ticker} is hard to borrow")
-                fail_ticker_list.append(ticker)
+        """Reject the obsolete broker-preview borrow check."""
 
-        print(f"Following ticker cannot be shorted: {fail_ticker_list}")
-        return fail_ticker_list
+        reject_legacy_execution(
+            "core_api.stock_trade_class.LiveTradeAgent.check_short_availability"
+        )
 
     def place_order(self,
                     etrade_orders,
                     ):
-        for order in etrade_orders:
-            try:
-                # Preview the order
-                preview_response = self.order.preview_order(order)
-                print(f'preview_response: {preview_response}')
-                if 'PreviewIds' in preview_response and preview_response['PreviewIds']:
-                    preview_id = preview_response['PreviewIds'][0]['previewId']
-                    order['previewId'] = preview_id
-                    
-                    # Place the order
-                    place_response = self.order.place_order(order)
-                    print(f'place_response: {place_response}')
-                    return place_response
-                else:
-                    raise Exception("Failed to preview order")
-            except Exception as e:
-                print("Error placing equity order:", e)
-                return None
+        """Reject the obsolete preview-and-place loop."""
+
+        reject_legacy_execution("core_api.stock_trade_class.LiveTradeAgent.place_order")
 
     def check_order_execution(self,
                             order_id,

@@ -452,6 +452,34 @@
 
         .hidden { display: none !important; }
 
+        .read-only-banner {
+            margin-bottom: 18px;
+            padding: 14px 18px;
+            border: 2px solid var(--danger);
+            border-radius: 14px;
+            background: rgba(239, 68, 68, 0.12);
+            color: var(--danger);
+            font-size: 0.9rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-align: center;
+            text-transform: uppercase;
+        }
+
+        .read-only-label {
+            display: block;
+            margin-top: 8px;
+            padding: 8px 10px;
+            border: 1px solid rgba(239, 68, 68, 0.25);
+            border-radius: 8px;
+            background: rgba(239, 68, 68, 0.08);
+            color: var(--danger);
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-align: center;
+            text-transform: uppercase;
+        }
+
         .toast {
             position: fixed;
             bottom: 30px;
@@ -489,24 +517,14 @@
 <body>
     <form id="auth-overlay" onsubmit="event.preventDefault(); verifyPin();">
         <h2 style="color: var(--text);">Enter Dashboard PIN</h2>
-        <input type="password" id="pin-field" name="dashboard-pin" aria-label="4-digit dashboard PIN" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" autocapitalize="off" spellcheck="false" style="width: 200px; text-align: center; font-size: 2rem; letter-spacing: 0.5em;" maxlength="4">
-        <div style="color: var(--text-muted); font-size: 0.85rem;">Use the 4-digit dashboard PIN, not your iPhone passcode.</div>
+        <input type="password" id="pin-field" name="dashboard-pin" aria-label="Dashboard PIN" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" autocapitalize="off" spellcheck="false" style="width: 240px; text-align: center; font-size: 2rem; letter-spacing: 0.35em;" minlength="8" maxlength="64">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Use the dashboard PIN (at least 8 digits), not your device passcode.</div>
         <div id="pin-error" role="alert" style="min-height: 20px; color: var(--danger); font-weight: 600;"></div>
         <button id="pin-submit" class="btn" type="submit" style="width: 200px;">Unlock</button>
     </form>
 
-    <div id="confirm-overlay" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 3500;">
-        <div class="confirm-dialog">
-            <h2 style="color: var(--warning);">⚠️ Confirm Execution</h2>
-            <div id="confirm-details" class="preview-card" style="margin-bottom: 20px; border-style: solid;"></div>
-            <div style="display: flex; gap: 10px;">
-                <button class="btn btn-secondary" onclick="closeConfirm()">Cancel</button>
-                <button class="btn btn-danger" onclick="executeNow()">Execute Trade</button>
-            </div>
-        </div>
-    </div>
-
     <div class="container">
+        <div class="read-only-banner" role="status">Read only — all E*TRADE order actions are disabled</div>
         <div id="server-status-warning" class="hidden" style="background: var(--danger); color: white; padding: 10px; border-radius: 12px; margin-bottom: 15px; text-align: center; font-weight: 600;"></div>
         <div id="manual-order-status" class="manual-order-status hidden">
             <strong>Manual Order Status</strong>
@@ -542,7 +560,7 @@
 
         <nav class="mobile-nav" aria-label="Dashboard sections">
             <a href="#portfolio">Portfolio</a>
-            <a href="#actions">Actions</a>
+            <a href="#risk-watch">Risk Watch</a>
             <a href="#analytics">Analytics</a>
             <a href="#settings">Settings</a>
         </nav>
@@ -564,14 +582,6 @@
                         <input type="number" id="spx_hedge_spread" step="1" onchange="debouncedPreview()">
                     </div>
                     <div class="form-group">
-                        <label>SPY Pair Quantity</label>
-                        <input type="number" id="spy_pair_quantity" step="1">
-                    </div>
-                    <div class="form-group">
-                        <label>SPX Pair Quantity</label>
-                        <input type="number" id="spx_pair_quantity" step="1">
-                    </div>
-                    <div class="form-group">
                         <label>Trading Side</label>
                         <select id="trade_side" onchange="debouncedPreview()">
                             <option value="PUT">Put Credit Spread</option>
@@ -590,23 +600,6 @@
                     <div class="form-group">
                         <label>SPX Target Expiration</label>
                         <select id="spx_target_expiration" onchange="debouncedPreview()"></select>
-                    </div>
-
-                    <div class="form-group" style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.03); padding: 12px; border-radius: 12px;">
-                        <label style="margin: 0;">Automatic Open Position</label>
-                        <label class="switch">
-                            <input type="checkbox" id="auto_open_enabled">
-                            <span class="slider"></span>
-                        </label>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Auto-Close Threshold (Cost $)</label>
-                        <input type="number" id="auto_close_midpoint_threshold" step="0.05">
-                    </div>
-                    <div class="form-group">
-                        <label>Auto-Close Threshold (Gain %)</label>
-                        <input type="number" id="auto_close_gain_threshold" step="5">
                     </div>
 
                     <div class="form-group" style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 20px;">
@@ -630,7 +623,7 @@
                             <div class="preview-label">Delta:</div><div class="preview-value" id="spy-pre-delta">--</div>
                             <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spy-pre-otm">--</div>
                         </div>
-                        <button id="spy-exec-btn" class="btn btn-secondary" style="margin-top: 5px; font-size: 0.85rem; padding: 8px 12px; background: var(--accent); color: white;" onclick="openConfirmForTicker('SPY')">🚀 Execute SPY Spread</button>
+                        <span class="read-only-label">Preview only — order submission disabled</span>
                     </div>
 
                     <div class="preview-card" style="margin-top: 15px;">
@@ -645,7 +638,7 @@
                             <div class="preview-label">Delta:</div><div class="preview-value" id="spx-pre-delta">--</div>
                             <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spx-pre-otm">--</div>
                         </div>
-                        <button id="spx-exec-btn" class="btn btn-secondary" style="margin-top: 5px; font-size: 0.85rem; padding: 8px 12px; background: var(--accent); color: white;" onclick="openConfirmForTicker('SPX')">🚀 Execute SPX Spread</button>
+                        <span class="read-only-label">Preview only — order submission disabled</span>
                     </div>
 
                     <button class="btn btn-secondary" style="margin-top: 15px;" onclick="saveSettings()">Save Configuration</button>
@@ -654,10 +647,10 @@
             </div>
 
             <div class="right-column" style="display: flex; flex-direction: column; gap: 20px;">
-                <div id="actions" class="mobile-section-heading">Actions</div>
+                <div id="risk-watch" class="mobile-section-heading">Risk Watch</div>
                 <div id="high-gain-card" class="card hidden">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                        <h2 style="color: var(--success); margin: 0;">🎯 High Gain Spreads to Close</h2>
+                        <h2 style="color: var(--success); margin: 0;">🎯 High Gain Spread Watchlist</h2>
                         <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshHighGain()">Force Update</button>
                     </div>
                     <div id="high-gain-list" style="overflow-x: auto;">
@@ -669,9 +662,7 @@
                                     <th style="padding: 10px;">Strikes</th>
                                     <th style="padding: 10px;">Gain</th>
                                     <th style="padding: 10px;">Cost (Mid)</th>
-                                    <th style="padding: 10px;">QTY</th>
                                     <th style="padding: 10px;">Status</th>
-                                    <th style="padding: 10px;">Action</th>
                                 </tr>
                             </thead>
                             <tbody id="high-gain-body"></tbody>
@@ -681,7 +672,7 @@
 
                 <div id="neutralize-card" class="card hidden">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                        <h2 style="color: var(--warning); margin: 0;">Neutralize Assignment Risk</h2>
+                        <h2 style="color: var(--warning); margin: 0;">Assignment Risk Analysis</h2>
                         <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshNeutralize()">Force Update</button>
                     </div>
                     <div id="neutralize-list" style="overflow-x: auto;">
@@ -698,7 +689,6 @@
                                     <th style="padding: 10px;">Net</th>
                                     <th style="padding: 10px;">QTY</th>
                                     <th style="padding: 10px;">Status</th>
-                                    <th style="padding: 10px;">Action</th>
                                 </tr>
                             </thead>
                             <tbody id="neutralize-body"></tbody>
@@ -817,9 +807,7 @@
     <script>
         let currentPin = '';
         let previewTimer = null;
-        let lastPreviewData = null;
         let currentNeutralizeData = [];
-        let pendingNeutralizeData = null;
         let settingsInitialized = false;
         let portfolioFrameResizeObserver = null;
         let portfolioFrameResizeTimer = null;
@@ -841,29 +829,74 @@
             if (!frame) return;
 
             disconnectPortfolioFrameObserver();
-            if (!portfolioMobileQuery.matches) {
-                frame.style.removeProperty('height');
-                return;
-            }
 
             try {
                 const frameDocument = frame.contentDocument || frame.contentWindow.document;
+                if (!frameDocument || !frameDocument.documentElement || !frameDocument.body) return;
+                const compactFallback = (
+                    frameDocument.body.dataset.positionsArtifactState
+                    === 'unavailable'
+                );
+                if (!portfolioMobileQuery.matches && !compactFallback) {
+                    frame.style.removeProperty('min-height');
+                    frame.style.removeProperty('height');
+                    return;
+                }
+                if (compactFallback) {
+                    frame.style.minHeight = '120px';
+                } else {
+                    frame.style.removeProperty('min-height');
+                }
                 const measure = () => {
-                    if (!portfolioMobileQuery.matches || !frameDocument.body) return;
+                    if (
+                        !frameDocument.body
+                        || (!portfolioMobileQuery.matches && !compactFallback)
+                    ) return;
+                    const viewportHeight = frame.clientHeight;
+                    const bodyRect = frameDocument.body.getBoundingClientRect();
+                    const childBottom = Array.from(
+                        frameDocument.body.children
+                    ).reduce(
+                        (bottom, child) => Math.max(
+                            bottom,
+                            child.getBoundingClientRect().bottom
+                        ),
+                        bodyRect.top
+                    );
+                    const paddingBottom = parseFloat(
+                        frame.contentWindow.getComputedStyle(
+                            frameDocument.body
+                        ).paddingBottom
+                    ) || 0;
+                    const naturalHeight = (
+                        childBottom - bodyRect.top + paddingBottom
+                    );
+                    const overflowingHeight = Math.max(
+                        frameDocument.body.scrollHeight > viewportHeight + 1
+                            ? frameDocument.body.scrollHeight
+                            : 0,
+                        frameDocument.documentElement.scrollHeight
+                            > viewportHeight + 1
+                            ? frameDocument.documentElement.scrollHeight
+                            : 0
+                    );
                     const height = Math.max(
-                        320,
-                        frameDocument.body.scrollHeight,
-                        frameDocument.body.offsetHeight,
-                        frameDocument.documentElement.scrollHeight,
-                        frameDocument.documentElement.offsetHeight
+                        compactFallback ? 120 : 320,
+                        naturalHeight,
+                        overflowingHeight
                     );
                     frame.style.height = `${Math.ceil(height)}px`;
                 };
 
                 measure();
-                portfolioFrameResizeObserver = new ResizeObserver(() => window.requestAnimationFrame(measure));
-                portfolioFrameResizeObserver.observe(frameDocument.documentElement);
-                if (frameDocument.body) portfolioFrameResizeObserver.observe(frameDocument.body);
+                const FrameResizeObserver = frame.contentWindow && frame.contentWindow.ResizeObserver;
+                if (typeof FrameResizeObserver === 'function') {
+                    portfolioFrameResizeObserver = new FrameResizeObserver(
+                        () => window.requestAnimationFrame(measure)
+                    );
+                    portfolioFrameResizeObserver.observe(frameDocument.documentElement);
+                    if (frameDocument.body) portfolioFrameResizeObserver.observe(frameDocument.body);
+                }
                 portfolioFrameResizeTimer = setTimeout(measure, 500);
             } catch (error) {
                 console.warn('Portfolio auto-height requires same-origin /api/positions content.', error);
@@ -900,8 +933,8 @@
                 pinField.focus();
                 return false;
             }
-            if (pin.length !== 4) {
-                pinError.textContent = 'Enter all 4 digits of the dashboard PIN.';
+            if (pin.length < 8) {
+                pinError.textContent = 'Enter at least 8 digits for the dashboard PIN.';
                 pinField.focus();
                 return false;
             }
@@ -966,19 +999,13 @@
                     if (data.length > 0) {
                         card.classList.remove('hidden');
                         body.innerHTML = '';
-                        data.forEach((p, i) => {
+                        data.forEach((p) => {
                             const row = document.createElement('tr');
                             row.style.borderBottom = '1px solid var(--border)';
 
-                            let actionCell = '';
                             const statusCell = p.has_open_order
                                 ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
-                                : `<span style="color: var(--success); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(16, 185, 129, 0.1); border-radius: 6px;">Ready</span>`;
-                            if (p.has_open_order) {
-                                actionCell = `<span style="color: var(--warning); font-weight: 600; font-size: 0.85rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order Pending</span>`;
-                            } else {
-                                actionCell = `<button class="btn" style="width: auto; padding: 6px 16px; margin: 0; background: var(--success);" onclick="confirmClose(${i}, ${JSON.stringify(p).replace(/"/g, '&quot;')})">Close</button>`;
-                            }
+                                : `<span class="read-only-label" style="margin: 0;">Read only</span>`;
 
                             row.innerHTML = `
                                 <td style="padding: 10px; font-weight: 600;">${p.ticker}</td>
@@ -986,13 +1013,7 @@
                                 <td style="padding: 10px;">${p.short_strike}/${p.long_strike} (${p.call_put})</td>
                                 <td style="padding: 10px; color: var(--success); font-weight: 600;">${p.gain_pct.toFixed(1)}%</td>
                                 <td style="padding: 10px;">$${Math.abs(p.midpoint).toFixed(2)}</td>
-                                <td style="padding: 10px;">
-                                    <input type="number" id="qty-${i}" value="${p.pair_quantity}" style="width: 60px; padding: 4px 8px; border-radius: 6px;" min="1" max="${p.pair_quantity}" ${p.has_open_order ? 'disabled' : ''}>
-                                </td>
                                 <td style="padding: 10px;">${statusCell}</td>
-                                <td style="padding: 10px;">
-                                    ${actionCell}
-                                </td>
                             `;
                             body.appendChild(row);
                         });
@@ -1010,19 +1031,13 @@
 
             if (currentNeutralizeData.length > 0) {
                 card.classList.remove('hidden');
-                currentNeutralizeData.forEach((p, i) => {
+                currentNeutralizeData.forEach((p) => {
                     const row = document.createElement('tr');
                     row.style.borderBottom = '1px solid var(--border)';
 
-                    let actionCell = '';
                     const statusCell = p.has_open_order
                         ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
-                        : `<span style="color: var(--success); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(16, 185, 129, 0.1); border-radius: 6px;">Ready</span>`;
-                    if (p.has_open_order) {
-                        actionCell = `<span style="color: var(--warning); font-weight: 600; font-size: 0.85rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order Pending</span>`;
-                    } else {
-                        actionCell = `<button class="btn" style="width: auto; padding: 6px 16px; margin: 0; background: var(--warning); color: #111827;" onclick="confirmNeutralize(${i}, ${JSON.stringify(p).replace(/"/g, '&quot;')})">Neutralize</button>`;
-                    }
+                        : `<span class="read-only-label" style="margin: 0;">Read only</span>`;
 
                     let triggerHtml = '';
                     if (p.trigger) {
@@ -1060,7 +1075,6 @@
                         <td style="padding: 10px; color: ${Number(p.estimated_net_credit) >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 600;">$${Number(p.estimated_net_credit).toFixed(2)}</td>
                         <td style="padding: 10px;">${p.qty}</td>
                         <td style="padding: 10px;">${statusCell}</td>
-                        <td style="padding: 10px;">${actionCell}</td>
                     `;
                     body.appendChild(row);
                 });
@@ -1099,65 +1113,6 @@
             }
         }
 
-        function confirmNeutralize(index, data) {
-            pendingNeutralizeData = { ...data, idx: index };
-            const offsetText = data.offset
-                ? `${data.offset.call_put} ${data.offset.short_strike}/${data.offset.long_strike} | Exp ${data.offset.expiration}`
-                : 'No call leg';
-
-            const details = `
-                    <div class="preview-grid">
-                        <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
-                        <div class="preview-label">Original:</div><div class="preview-value">${data.original.call_put} ${data.original.short_strike}/${data.original.long_strike}</div>
-                        <div class="preview-label">Trigger:</div><div class="preview-value">${data.trigger || 'Delta risk'} | Δ ${Number(data.original.delta).toFixed(3)} | ${data.original.dte} DTE</div>
-                        <div class="preview-label">Close:</div><div class="preview-value">$${Math.abs(Number(data.original.midpoint_debit)).toFixed(2)} debit</div>
-                        <div class="preview-label">Roll To:</div><div class="preview-value">${data.replacement.call_put} ${data.replacement.short_strike}/${data.replacement.long_strike} | Exp ${data.replacement.expiration}</div>
-                        <div class="preview-label">Offset:</div><div class="preview-value">${offsetText}</div>
-                        <div class="preview-label">Estimated Net:</div><div class="preview-value">${Number(data.estimated_net_credit) >= 0 ? '+' : ''}$${Number(data.estimated_net_credit).toFixed(2)}</div>
-                        <div class="preview-label">Quantity:</div><div class="preview-value">${data.qty}</div>
-                    </div>
-            `;
-            document.getElementById('confirm-details').innerHTML = details;
-
-            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
-            execBtn.innerText = "Execute Neutralize";
-            execBtn.onclick = executeNeutralize;
-
-            document.getElementById('confirm-overlay').classList.remove('hidden');
-        }
-
-        async function executeNeutralize() {
-            if (!pendingNeutralizeData) return;
-            closeConfirm();
-            showToast("Sending Neutralize Order...");
-
-            try {
-                const res = await fetch('/api/execute_neutralize_order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        pin: currentPin,
-                        proposal_id: pendingNeutralizeData.proposal_id,
-                        ticker: pendingNeutralizeData.ticker,
-                        qty: pendingNeutralizeData.qty,
-                        original: pendingNeutralizeData.original,
-                        replacement: pendingNeutralizeData.replacement,
-                        offset: pendingNeutralizeData.offset
-                    })
-                });
-                if (res.status === 401) { window.location.href = '/login'; return; }
-                if (res.ok) {
-                    const data = await res.json();
-                    showToast("Neutralize Order Queued");
-                    if (data.request_id) pollManualOrderStatus(data.request_id);
-                    setTimeout(fetchNeutralizeRisk, 15000);
-                } else {
-                    if (res.status === 403) clearPin();
-                    alert("Failed to execute neutralize order.");
-                }
-            } catch (err) { alert("Error: " + err); }
-        }
-
         async function forceRefreshHighGain() {
             showToast("Force checking candidates... (Takes ~10s)");
             try {
@@ -1175,59 +1130,6 @@
             } catch (err) {
                 showToast("Error triggering update", true);
             }
-        }
-
-        let pendingCloseData = null;
-        function confirmClose(index, data) {
-            const qty = document.getElementById(`qty-${index}`).value;
-            pendingCloseData = { ...data, qty: parseInt(qty) };
-
-            const details = `
-                <div class="preview-grid">
-                    <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
-                    <div class="preview-label">Expiration:</div><div class="preview-value">${data.expiration}</div>
-                    <div class="preview-label">Strikes:</div><div class="preview-value">${data.short_strike} / ${data.long_strike}</div>
-                    <div class="preview-label">Current Gain:</div><div class="preview-value" style="color: var(--success);">${data.gain_pct.toFixed(1)}%</div>
-                    <div class="preview-label">Qty to Close:</div><div class="preview-value">${qty} Pairs</div>
-                    <div class="preview-label">Est. Debit:</div><div class="preview-value">$${(Math.abs(data.midpoint) * qty).toFixed(2)}</div>
-                </div>
-            `;
-            document.getElementById('confirm-details').innerHTML = details;
-
-            // Change button text/action for this specific confirm
-            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
-            execBtn.innerText = "Execute Close";
-            execBtn.onclick = executeClose;
-
-            document.getElementById('confirm-overlay').classList.remove('hidden');
-        }
-
-        async function executeClose() {
-            if (!pendingCloseData) return;
-            closeConfirm();
-            showToast("Sending Close Order...");
-
-            try {
-                const res = await fetch('/api/execute_close_order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        pin: currentPin,
-                        ...pendingCloseData,
-                        midpoint: pendingCloseData.midpoint // Ensure it's explicitly included
-                    })
-                });
-                if (res.status === 401) { window.location.href = '/login'; return; }
-                if (res.ok) {
-                    const data = await res.json();
-                    showToast("Close Order Queued");
-                    if (data.request_id) pollManualOrderStatus(data.request_id);
-                    setTimeout(fetchHighGainSpreads, 15000);
-                } else {
-                    if (res.status === 403) clearPin();
-                    alert("Failed to execute close order.");
-                }
-            } catch (err) { alert("Error: " + err); }
         }
 
         function updateRangeLabel(id, labelId) {
@@ -1311,7 +1213,6 @@
                     document.getElementById('spy-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
 
                     document.getElementById('spy-preview-title').innerText = `SPY LIVE PREVIEW (${side} SPREAD)`;
-                    document.getElementById('spy-exec-btn').disabled = false;
 
                     if (data.is_mock) {
                         document.getElementById('spy-mock-badge').classList.remove('hidden');
@@ -1326,7 +1227,6 @@
                     document.getElementById('spy-pre-credit').innerText = "--";
                     document.getElementById('spy-pre-delta').innerText = "--";
                     document.getElementById('spy-pre-otm').innerText = "--";
-                    document.getElementById('spy-exec-btn').disabled = true;
                     document.getElementById('spy-mock-badge').classList.add('hidden');
                 }
             } catch (err) {
@@ -1347,7 +1247,6 @@
                     document.getElementById('spx-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
 
                     document.getElementById('spx-preview-title').innerText = `SPX LIVE PREVIEW (${side} SPREAD)`;
-                    document.getElementById('spx-exec-btn').disabled = false;
 
                     if (data.is_mock) {
                         document.getElementById('spx-mock-badge').classList.remove('hidden');
@@ -1362,7 +1261,6 @@
                     document.getElementById('spx-pre-credit').innerText = "--";
                     document.getElementById('spx-pre-delta').innerText = "--";
                     document.getElementById('spx-pre-otm').innerText = "--";
-                    document.getElementById('spx-exec-btn').disabled = true;
                     document.getElementById('spx-mock-badge').classList.add('hidden');
                 }
             } catch (err) {
@@ -1503,7 +1401,7 @@
         }
 
         async function saveSettings() {
-            const keys = ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'auto_close_midpoint_threshold', 'auto_close_gain_threshold', 'spy_pair_quantity', 'spx_pair_quantity', 'target_weeks', 'spy_target_expiration', 'spx_target_expiration', 'auto_open_enabled', 'trade_side', 'dashboard_user', 'dashboard_pass'];
+            const keys = ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'target_weeks', 'spy_target_expiration', 'spx_target_expiration', 'trade_side', 'dashboard_user', 'dashboard_pass'];
             const data = { pin: currentPin };
             keys.forEach(key => {
                 const el = document.getElementById(key);
@@ -1534,88 +1432,6 @@
                     alert("Error: " + (err.error || "Unknown error"));
                 }
             } catch (err) { alert("Failed to save: " + err); }
-        }
-
-        function openConfirmForTicker(ticker) {
-            const data = ticker === 'SPX' ? spxPreviewData : spyPreviewData;
-            if (!data) {
-                alert(`No spread found for ${ticker} to execute. Adjust settings.`);
-                return;
-            }
-            lastPreviewData = data;
-            const qtyInput = ticker === 'SPX' ? document.getElementById('spx_pair_quantity').value : document.getElementById('spy_pair_quantity').value;
-            const qty = qtyInput || 1;
-            const premiumDisp = data.premium != null ? `$${data.premium.toFixed(2)}` : "N/A";
-            const details = `
-                <div class="preview-grid">
-                    <div class="preview-label">Ticker:</div><div class="preview-value">${data.ticker}</div>
-                    <div class="preview-label">Side:</div><div class="preview-value">${data.side} SPREAD</div>
-                    <div class="preview-label">Expiration:</div><div class="preview-value">${data.expiration}</div>
-                    <div class="preview-label">Strikes:</div><div class="preview-value">${data.sell_strike} / ${data.buy_strike}</div>
-                    <div class="preview-label">Quantity:</div><div class="preview-value">${qty} Pairs</div>
-                    <div class="preview-label">Limit Credit:</div><div class="preview-value">${premiumDisp}</div>
-                </div>
-            `;
-            document.getElementById('confirm-details').innerHTML = details;
-            document.getElementById('confirm-overlay').classList.remove('hidden');
-        }
-
-        function closeConfirm() {
-            document.getElementById('confirm-overlay').classList.add('hidden');
-            // Reset button to default
-            const execBtn = document.querySelector('#confirm-overlay .btn-danger');
-            execBtn.innerText = "Execute Trade";
-            execBtn.onclick = executeNow;
-        }
-
-        async function executeNow() {
-            closeConfirm();
-            showToast("Sending Order...");
-            try {
-                const qtyInput = lastPreviewData.ticker === 'SPX' ? document.getElementById('spx_pair_quantity').value : document.getElementById('spy_pair_quantity').value;
-                const qty = qtyInput || 1;
-                const selectedExpiry = document.getElementById(lastPreviewData.ticker === 'SPX' ? 'spx_target_expiration' : 'spy_target_expiration').value;
-                if (selectedExpiry && lastPreviewData.expiration !== selectedExpiry) {
-                    alert(`Preview expiration ${lastPreviewData.expiration} does not match selected expiration ${selectedExpiry}. Refresh preview before executing.`);
-                    return;
-                }
-                const res = await fetch('/api/execute_manual_order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        pin: currentPin,
-                        ticker: lastPreviewData.ticker,
-                        side: lastPreviewData.side,
-                        sell_strike: lastPreviewData.sell_strike,
-                        buy_strike: lastPreviewData.buy_strike,
-                        expiration: lastPreviewData.expiration,
-                        qty: parseInt(qty) || 1,
-                        premium: lastPreviewData.premium, // Send price for consistency
-                        delta: lastPreviewData.delta      // Send delta for reference
-                    })
-                });
-                if (res.status === 401) { window.location.href = '/login'; return; }
-                if (res.ok) {
-                    const data = await res.json();
-                    showToast("Order Queued Successfully");
-                    renderManualOrderStatus({
-                        manual_order: {
-                            request_id: data.request_id,
-                            request_type: 'open',
-                            status: 'queued',
-                            ticker: lastPreviewData.ticker,
-                            side: lastPreviewData.side,
-                            message: data.message || 'Order request queued.'
-                        }
-                    });
-                    if (data.request_id) pollManualOrderStatus(data.request_id);
-                }
-                else {
-                    if (res.status === 403) clearPin();
-                    const err = await res.json().catch(() => ({}));
-                    alert("Execution failed: " + (err.error || "Check PIN."));
-                }
-            } catch (err) { alert("Execution error: " + err); }
         }
 
         async function pollManualOrderStatus(requestId) {
@@ -2051,7 +1867,7 @@
         }
 
         document.getElementById('pin-field').addEventListener('input', (event) => {
-            event.target.value = event.target.value.replace(/\D/g, '').slice(0, 4);
+            event.target.value = event.target.value.replace(/\D/g, '').slice(0, 64);
             document.getElementById('pin-error').textContent = '';
         });
         setInterval(() => maybeAutoRefreshPortfolio(false), 30000);
