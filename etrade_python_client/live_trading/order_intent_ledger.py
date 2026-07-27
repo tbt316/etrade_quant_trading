@@ -17,20 +17,26 @@ import sqlite3
 import stat
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
+from urllib.parse import quote
 
 
-SCHEMA_VERSION = 9
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8})
+SCHEMA_VERSION = 10
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9})
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
 _PAYLOAD_HASH_DOMAIN = b"etrade-order-payload.v2\0"
 _CLIENT_ID_DOMAIN = b"etrade-client-order-id.v2\0"
+_MAX_TRANSPORT_REQUEST_BYTES = 64 * 1024
+_PREVIEW_RECEIPT_MAX_AGE_SECONDS = 180
+_TRANSPORT_OPERATIONS = frozenset(
+    {"SUBMIT_PREVIEW", "SUBMIT_PLACE", "AMEND_PREVIEW", "AMEND_PLACE"}
+)
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
 _TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"})
@@ -246,9 +252,65 @@ class OutboundAuthorization:
     operation: Literal["SUBMIT", "AMEND"]
     owner: str
     fencing_token: int
-    client_order_id: str
-    payload_bytes: bytes
+    client_order_id: str = field(repr=False)
+    payload_bytes: bytes = field(repr=False)
     payload_digest: str
+
+
+@dataclass(frozen=True)
+class TransportRequestEvidence:
+    """Exact broker request claimed durably before one network attempt."""
+
+    account_id: str = field(repr=False)
+    account_id_key: str = field(repr=False)
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    intent_id: str
+    owner: str
+    authorization_operation: Literal["SUBMIT", "AMEND"]
+    fencing_token: int
+    transport_operation: Literal[
+        "SUBMIT_PREVIEW", "SUBMIT_PLACE", "AMEND_PREVIEW", "AMEND_PLACE"
+    ]
+    http_method: Literal["POST", "PUT"]
+    route: str = field(repr=False)
+    client_order_id: str = field(repr=False)
+    target_broker_order_id: str | None = field(repr=False)
+    preview_id: str | None = field(repr=False)
+    authorization_payload_digest: str
+    final_xml_bytes: bytes = field(repr=False)
+    final_xml_sha256: str
+
+
+@dataclass(frozen=True)
+class TransportResponseEvidence:
+    """Parsed response bound to one exact transport send attempt."""
+
+    disposition: Literal["ACKNOWLEDGED", "UNKNOWN"]
+    http_status: int | None
+    broker_status: str | None
+    broker_order_id: str | None = field(repr=False)
+    preview_id: str | None = field(repr=False)
+    message_codes: tuple[int, ...]
+    message_types: tuple[str, ...]
+    message_description_digests: tuple[str, ...]
+    raw_response_digest: str | None
+    observed_at: datetime
+    unknown_reason: str | None
+
+
+@dataclass(frozen=True)
+class TransportResponseReceipt:
+    """Immutable typed response available to restart reconciliation."""
+
+    intent_id: str
+    authorization_operation: Literal["SUBMIT", "AMEND"]
+    fencing_token: int
+    transport_operation: Literal[
+        "SUBMIT_PREVIEW", "SUBMIT_PLACE", "AMEND_PREVIEW", "AMEND_PLACE"
+    ]
+    response: TransportResponseEvidence
+    recorded_at: datetime
 
 
 @dataclass(frozen=True)
@@ -561,6 +623,34 @@ class OrderIntentLedger:
             row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
         return self._intent_from_row(row) if row else None
 
+    def transport_response_receipts(
+        self, intent_id: str
+    ) -> tuple[TransportResponseReceipt, ...]:
+        """Return durable parsed mutation responses for reconciliation."""
+
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            self._require_intent(conn, intent_id)
+            rows = conn.execute(
+                """
+                SELECT * FROM transport_response_receipts
+                WHERE intent_id = ?
+                ORDER BY
+                    CASE authorization_operation
+                        WHEN 'SUBMIT' THEN 0 ELSE 1
+                    END,
+                    fencing_token,
+                    recorded_at,
+                    CASE
+                        WHEN transport_operation LIKE '%_PREVIEW' THEN 0
+                        ELSE 1
+                    END,
+                    transport_operation
+                """,
+                (intent_id,),
+            ).fetchall()
+        return tuple(_transport_response_receipt(row) for row in rows)
+
     def set_reservation_cap(self, evidence: AccountCapacityEvidence) -> Decimal:
         if type(evidence) is not AccountCapacityEvidence:
             raise OrderIntentValidationError("set_reservation_cap requires typed AccountCapacityEvidence")
@@ -779,6 +869,383 @@ class OrderIntentLedger:
             raise OrderIntentReconciliationRequired("expired claimed lease is in-doubt; do not POST")
         assert authorization is not None
         return authorization
+
+    def claim_transport_send(
+        self,
+        evidence: TransportRequestEvidence,
+        authorization: OutboundAuthorization,
+    ) -> None:
+        """Persist one exact broker send and transition place calls in-doubt.
+
+        The unique attempt row is the durable exactly-once fence. A process
+        crash after this method returns is reconciled and never retransmitted.
+        """
+
+        _validate_transport_request_evidence(evidence)
+        if type(authorization) is not OutboundAuthorization:
+            raise OrderIntentValidationError(
+                "transport send requires exact outbound authorization"
+            )
+        now = self._now_us()
+        expired = False
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, evidence.intent_id)
+            if (
+                intent["account_id"] != evidence.account_id
+                or intent["environment"] != evidence.environment
+                or (
+                    evidence.authorization_operation == "SUBMIT"
+                    and intent["client_order_id"] != evidence.client_order_id
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "transport account or client identity does not match intent"
+                )
+            if conn.execute(
+                """
+                SELECT 1 FROM transport_send_attempts
+                WHERE intent_id = ? AND authorization_operation = ?
+                  AND fencing_token = ? AND transport_operation = ?
+                """,
+                (
+                    evidence.intent_id,
+                    evidence.authorization_operation,
+                    evidence.fencing_token,
+                    evidence.transport_operation,
+                ),
+            ).fetchone() is not None:
+                raise OrderIntentReconciliationRequired(
+                    "exact transport stage already has a durable send attempt"
+                )
+
+            if evidence.authorization_operation == "SUBMIT":
+                if evidence.target_broker_order_id is not None:
+                    raise OrderIntentIntegrityError(
+                        "submission transport cannot target a broker order"
+                    )
+                if self._claim_expired(intent, now):
+                    self._mark_claim_in_doubt(conn, intent, now)
+                    expired = True
+                else:
+                    self._require_submission_fence(
+                        intent, evidence.owner, evidence.fencing_token
+                    )
+                    payload = json.loads(intent["wire_payload"])
+                    if type(payload) is not dict:
+                        raise OrderIntentIntegrityError(
+                            "stored submission payload is invalid"
+                        )
+                    payload["client_order_id"] = intent["client_order_id"]
+                    validated = self._require_outbound_authorization(
+                        authorization,
+                        intent_id=evidence.intent_id,
+                        operation="SUBMIT",
+                        owner=evidence.owner,
+                        fencing_token=evidence.fencing_token,
+                        client_order_id=evidence.client_order_id,
+                        payload=payload,
+                    )
+                    self._require_active_opening_reservation(conn, intent, now)
+                    if self._amendment_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                    ):
+                        raise OrderIntentReconciliationRequired(
+                            "account/environment has an unresolved amendment"
+                        )
+                    self._record_outbound_authorization(conn, validated, now)
+                    if evidence.transport_operation == "SUBMIT_PLACE":
+                        self._require_preview_receipt(conn, evidence, now)
+                        conn.execute(
+                            """
+                            UPDATE order_intents
+                            SET state = 'SUBMISSION_UNKNOWN',
+                                submission_lease_owner = NULL,
+                                submission_lease_expires_at = NULL,
+                                pending_operation = 'SUBMIT', pending_owner = ?,
+                                pending_fence = ?, last_reconciled_run = NULL,
+                                updated_at = ?
+                            WHERE intent_id = ?
+                            """,
+                            (
+                                evidence.owner,
+                                evidence.fencing_token,
+                                now,
+                                evidence.intent_id,
+                            ),
+                        )
+                        self._append_event(
+                            conn,
+                            evidence.intent_id,
+                            "POST_STARTED",
+                            "CLAIMED",
+                            "SUBMISSION_UNKNOWN",
+                            evidence.owner,
+                            "POST_STARTED",
+                            now,
+                        )
+            else:
+                amendment = conn.execute(
+                    "SELECT * FROM amendment_leases WHERE intent_id = ?",
+                    (evidence.intent_id,),
+                ).fetchone()
+                if (
+                    amendment is None
+                    or amendment["state"] != "LEASED"
+                    or amendment["owner"] != evidence.owner
+                    or int(amendment["fencing_token"]) != evidence.fencing_token
+                ):
+                    raise OrderIntentLeaseConflict(
+                        "amendment transport is not owned by this fence"
+                    )
+                if int(amendment["expires_at"]) <= now:
+                    self._mark_amendment_in_doubt(conn, intent, amendment, now)
+                    expired = True
+                elif (
+                    evidence.target_broker_order_id != amendment["broker_order_id"]
+                    or evidence.client_order_id != amendment["client_order_id"]
+                ):
+                    raise OrderIntentIntegrityError(
+                        "amendment transport target is not lease-bound"
+                    )
+                else:
+                    payload = json.loads(amendment["wire_payload"])
+                    if type(payload) is not dict:
+                        raise OrderIntentIntegrityError(
+                            "stored amendment payload is invalid"
+                        )
+                    payload["client_order_id"] = amendment["client_order_id"]
+                    validated = self._require_outbound_authorization(
+                        authorization,
+                        intent_id=evidence.intent_id,
+                        operation="AMEND",
+                        owner=evidence.owner,
+                        fencing_token=evidence.fencing_token,
+                        client_order_id=evidence.client_order_id,
+                        payload=payload,
+                    )
+                    if self._blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ) or self._amendment_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ):
+                        raise OrderIntentReconciliationRequired(
+                            "account/environment has unresolved broker work"
+                        )
+                    self._require_opening_amendment_reservation(
+                        conn, intent, amendment["wire_payload"], now
+                    )
+                    self._record_outbound_authorization(conn, validated, now)
+                    if evidence.transport_operation == "AMEND_PLACE":
+                        self._require_preview_receipt(conn, evidence, now)
+                        conn.execute(
+                            "UPDATE amendment_leases SET state = 'IN_DOUBT', updated_at = ? WHERE intent_id = ?",
+                            (now, evidence.intent_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE order_intents
+                            SET pending_operation = 'AMEND', pending_owner = ?,
+                                pending_fence = ?, last_reconciled_run = NULL,
+                                updated_at = ?
+                            WHERE intent_id = ?
+                            """,
+                            (
+                                evidence.owner,
+                                evidence.fencing_token,
+                                now,
+                                evidence.intent_id,
+                            ),
+                        )
+                        self._append_event(
+                            conn,
+                            evidence.intent_id,
+                            "AMENDMENT_STARTED",
+                            "SUBMITTED",
+                            "SUBMITTED",
+                            evidence.owner,
+                            "POST_STARTED",
+                            now,
+                            broker_order_id=intent["broker_order_id"],
+                        )
+
+            if not expired:
+                conn.execute(
+                    """
+                    INSERT INTO transport_send_attempts (
+                        intent_id, authorization_operation, fencing_token,
+                        transport_operation, owner, account_id, account_id_key,
+                        institution_type, environment, http_method, route,
+                        client_order_id, target_broker_order_id, preview_id,
+                        authorization_payload_digest, final_xml_bytes,
+                        final_xml_sha256, claimed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence.intent_id,
+                        evidence.authorization_operation,
+                        evidence.fencing_token,
+                        evidence.transport_operation,
+                        evidence.owner,
+                        evidence.account_id,
+                        evidence.account_id_key,
+                        evidence.institution_type,
+                        evidence.environment,
+                        evidence.http_method,
+                        evidence.route,
+                        evidence.client_order_id,
+                        evidence.target_broker_order_id,
+                        evidence.preview_id,
+                        evidence.authorization_payload_digest,
+                        evidence.final_xml_bytes,
+                        evidence.final_xml_sha256,
+                        now,
+                    ),
+                )
+        if expired:
+            raise OrderIntentReconciliationRequired(
+                "expired transport lease is in-doubt and cannot be sent"
+            )
+
+    def record_transport_response(
+        self,
+        request: TransportRequestEvidence,
+        response: TransportResponseEvidence,
+    ) -> IntentRecord:
+        """Persist the first parsed response and atomically apply an ACK."""
+
+        _validate_transport_request_evidence(request)
+        _validate_transport_response_evidence(response)
+        _validate_acknowledged_transport_response(request, response)
+        now = self._now_us()
+        observed = _to_us(response.observed_at)
+        messages_json = json.dumps(
+            [
+                {
+                    "code": code,
+                    "type": message_type,
+                    "description_sha256": description_digest,
+                }
+                for code, message_type, description_digest in zip(
+                    response.message_codes,
+                    response.message_types,
+                    response.message_description_digests,
+                    strict=True,
+                )
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._transaction() as conn:
+            attempt = conn.execute(
+                """
+                SELECT * FROM transport_send_attempts
+                WHERE intent_id = ? AND authorization_operation = ?
+                  AND fencing_token = ? AND transport_operation = ?
+                """,
+                (
+                    request.intent_id,
+                    request.authorization_operation,
+                    request.fencing_token,
+                    request.transport_operation,
+                ),
+            ).fetchone()
+            if attempt is None or any(
+                attempt[field] != expected
+                for field, expected in (
+                    ("owner", request.owner),
+                    ("account_id", request.account_id),
+                    ("account_id_key", request.account_id_key),
+                    ("institution_type", request.institution_type),
+                    ("environment", request.environment),
+                    ("http_method", request.http_method),
+                    ("route", request.route),
+                    ("client_order_id", request.client_order_id),
+                    ("target_broker_order_id", request.target_broker_order_id),
+                    ("preview_id", request.preview_id),
+                    (
+                        "authorization_payload_digest",
+                        request.authorization_payload_digest,
+                    ),
+                    ("final_xml_sha256", request.final_xml_sha256),
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "transport response does not match its durable send attempt"
+                )
+            if observed < int(attempt["claimed_at"]) or observed > now + 5_000_000:
+                raise OrderIntentIntegrityError(
+                    "transport response time is not causally bound to its send"
+                )
+            conn.execute(
+                """
+                INSERT INTO transport_response_receipts (
+                    intent_id, authorization_operation, fencing_token,
+                    transport_operation, disposition, http_status,
+                    broker_status, broker_order_id, preview_id, messages_json,
+                    raw_response_digest, observed_at, unknown_reason, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.intent_id,
+                    request.authorization_operation,
+                    request.fencing_token,
+                    request.transport_operation,
+                    response.disposition,
+                    response.http_status,
+                    response.broker_status,
+                    response.broker_order_id,
+                    response.preview_id,
+                    messages_json,
+                    response.raw_response_digest,
+                    observed,
+                    response.unknown_reason,
+                    now,
+                ),
+            )
+            if (
+                response.disposition == "ACKNOWLEDGED"
+                and request.transport_operation.endswith("PREVIEW")
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO broker_preview_receipts (
+                        intent_id, authorization_operation, fencing_token,
+                        account_id, environment, client_order_id,
+                        target_broker_order_id, authorization_payload_digest,
+                        preview_id, raw_response_digest, observed_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request.intent_id,
+                        request.authorization_operation,
+                        request.fencing_token,
+                        request.account_id,
+                        request.environment,
+                        request.client_order_id,
+                        request.target_broker_order_id,
+                        request.authorization_payload_digest,
+                        response.preview_id,
+                        response.raw_response_digest,
+                        observed,
+                        now,
+                    ),
+                )
+            if (
+                response.disposition == "ACKNOWLEDGED"
+                and request.transport_operation.endswith("PLACE")
+            ):
+                self._apply_transport_ack(conn, request, response, now)
+            return self._intent_from_row(
+                self._require_intent(conn, request.intent_id)
+            )
 
     def begin_submission(
         self, intent_id: str, owner: str, fencing_token: int, authorization: OutboundAuthorization
@@ -1446,6 +1913,69 @@ class OrderIntentLedger:
                     PRIMARY KEY (intent_id, operation, fencing_token),
                     CHECK (length(payload_bytes) > 0 AND length(payload_digest) = 64)
                 );
+                CREATE TABLE IF NOT EXISTS transport_send_attempts (
+                    intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
+                    authorization_operation TEXT NOT NULL CHECK (authorization_operation IN ('SUBMIT', 'AMEND')),
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                    transport_operation TEXT NOT NULL CHECK (transport_operation IN ('SUBMIT_PREVIEW', 'SUBMIT_PLACE', 'AMEND_PREVIEW', 'AMEND_PLACE')),
+                    owner TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    account_id_key TEXT NOT NULL,
+                    institution_type TEXT NOT NULL,
+                    environment TEXT NOT NULL CHECK (environment IN ('sandbox', 'production')),
+                    http_method TEXT NOT NULL CHECK (http_method IN ('POST', 'PUT')),
+                    route TEXT NOT NULL,
+                    client_order_id TEXT NOT NULL,
+                    target_broker_order_id TEXT,
+                    preview_id TEXT,
+                    authorization_payload_digest TEXT NOT NULL,
+                    final_xml_bytes BLOB NOT NULL,
+                    final_xml_sha256 TEXT NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    PRIMARY KEY (intent_id, authorization_operation, fencing_token, transport_operation),
+                    CHECK (length(authorization_payload_digest) = 64),
+                    CHECK (length(final_xml_bytes) > 0 AND length(final_xml_sha256) = 64),
+                    CHECK ((transport_operation LIKE 'AMEND_%') = (target_broker_order_id IS NOT NULL)),
+                    CHECK ((transport_operation LIKE '%_PLACE') = (preview_id IS NOT NULL))
+                );
+                CREATE TABLE IF NOT EXISTS broker_preview_receipts (
+                    intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
+                    authorization_operation TEXT NOT NULL CHECK (authorization_operation IN ('SUBMIT', 'AMEND')),
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL CHECK (environment IN ('sandbox', 'production')),
+                    client_order_id TEXT NOT NULL,
+                    target_broker_order_id TEXT,
+                    authorization_payload_digest TEXT NOT NULL,
+                    preview_id TEXT NOT NULL,
+                    raw_response_digest TEXT NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    PRIMARY KEY (intent_id, authorization_operation, fencing_token),
+                    UNIQUE (account_id, environment, preview_id),
+                    CHECK (length(authorization_payload_digest) = 64),
+                    CHECK (length(raw_response_digest) = 64)
+                );
+                CREATE TABLE IF NOT EXISTS transport_response_receipts (
+                    intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
+                    authorization_operation TEXT NOT NULL CHECK (authorization_operation IN ('SUBMIT', 'AMEND')),
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                    transport_operation TEXT NOT NULL CHECK (transport_operation IN ('SUBMIT_PREVIEW', 'SUBMIT_PLACE', 'AMEND_PREVIEW', 'AMEND_PLACE')),
+                    disposition TEXT NOT NULL CHECK (disposition IN ('ACKNOWLEDGED', 'UNKNOWN')),
+                    http_status INTEGER,
+                    broker_status TEXT,
+                    broker_order_id TEXT,
+                    preview_id TEXT,
+                    messages_json TEXT NOT NULL,
+                    raw_response_digest TEXT,
+                    observed_at INTEGER NOT NULL,
+                    unknown_reason TEXT,
+                    recorded_at INTEGER NOT NULL,
+                    PRIMARY KEY (intent_id, authorization_operation, fencing_token, transport_operation),
+                    CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+                    CHECK (raw_response_digest IS NULL OR length(raw_response_digest) = 64),
+                    CHECK ((disposition = 'UNKNOWN') = (unknown_reason IS NOT NULL))
+                );
                 CREATE TABLE IF NOT EXISTS order_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
@@ -1485,6 +2015,12 @@ class OrderIntentLedger:
                 CREATE TRIGGER IF NOT EXISTS prevent_amendment_history_delete BEFORE DELETE ON amendment_history BEGIN SELECT RAISE(ABORT, 'amendment history is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_outbound_authorization_update BEFORE UPDATE ON outbound_authorizations BEGIN SELECT RAISE(ABORT, 'outbound authorizations are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_outbound_authorization_delete BEFORE DELETE ON outbound_authorizations BEGIN SELECT RAISE(ABORT, 'outbound authorizations are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_transport_send_attempt_update BEFORE UPDATE ON transport_send_attempts BEGIN SELECT RAISE(ABORT, 'transport send attempts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_transport_send_attempt_delete BEFORE DELETE ON transport_send_attempts BEGIN SELECT RAISE(ABORT, 'transport send attempts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_preview_receipt_update BEFORE UPDATE ON broker_preview_receipts BEGIN SELECT RAISE(ABORT, 'broker preview receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_preview_receipt_delete BEFORE DELETE ON broker_preview_receipts BEGIN SELECT RAISE(ABORT, 'broker preview receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_update BEFORE UPDATE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_delete BEFORE DELETE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_update BEFORE UPDATE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_delete BEFORE DELETE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_intent_identity_mutation BEFORE UPDATE ON order_intents
@@ -1560,6 +2096,38 @@ class OrderIntentLedger:
     def _mark_claim_in_doubt(self, conn: sqlite3.Connection, intent: sqlite3.Row, now: int) -> None:
         if intent["state"] != "CLAIMED":
             return
+        place_attempt = conn.execute(
+            """
+            SELECT 1 FROM transport_send_attempts
+            WHERE intent_id = ? AND authorization_operation = 'SUBMIT'
+              AND fencing_token = ? AND transport_operation = 'SUBMIT_PLACE'
+            """,
+            (intent["intent_id"], intent["submission_fence"]),
+        ).fetchone()
+        if place_attempt is None:
+            conn.execute(
+                """
+                UPDATE order_intents SET state = 'INTENT',
+                    submission_lease_owner = NULL,
+                    submission_lease_expires_at = NULL,
+                    pending_operation = NULL, pending_owner = NULL,
+                    pending_fence = NULL, last_reconciled_run = NULL,
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (now, intent["intent_id"]),
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "PREVIEW_ONLY_EXPIRED",
+                "CLAIMED",
+                "INTENT",
+                "system",
+                "LEASE_EXPIRED_IN_DOUBT",
+                now,
+            )
+            return
         conn.execute(
             """
             UPDATE order_intents SET state = 'SUBMISSION_UNKNOWN', submission_lease_owner = NULL,
@@ -1572,6 +2140,31 @@ class OrderIntentLedger:
 
     def _mark_amendment_in_doubt(self, conn: sqlite3.Connection, intent: sqlite3.Row, amendment: sqlite3.Row, now: int) -> None:
         if amendment["state"] != "LEASED":
+            return
+        place_attempt = conn.execute(
+            """
+            SELECT 1 FROM transport_send_attempts
+            WHERE intent_id = ? AND authorization_operation = 'AMEND'
+              AND fencing_token = ? AND transport_operation = 'AMEND_PLACE'
+            """,
+            (intent["intent_id"], amendment["fencing_token"]),
+        ).fetchone()
+        if place_attempt is None:
+            conn.execute(
+                "DELETE FROM amendment_leases WHERE intent_id = ?",
+                (intent["intent_id"],),
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "AMENDMENT_PREVIEW_ONLY_EXPIRED",
+                "SUBMITTED",
+                "SUBMITTED",
+                "system",
+                "LEASE_EXPIRED_IN_DOUBT",
+                now,
+                broker_order_id=intent["broker_order_id"],
+            )
             return
         conn.execute("UPDATE amendment_leases SET state = 'IN_DOUBT', updated_at = ? WHERE intent_id = ?", (now, intent["intent_id"]))
         conn.execute("UPDATE order_intents SET pending_operation = 'AMEND', pending_owner = ?, pending_fence = ?, last_reconciled_run = NULL, updated_at = ? WHERE intent_id = ?", (amendment["owner"], amendment["fencing_token"], now, intent["intent_id"]))
@@ -1641,6 +2234,238 @@ class OrderIntentLedger:
             raise OrderIntentReservationError("active reservations exceed account/environment cap")
 
     @staticmethod
+    def _require_preview_receipt(
+        conn: sqlite3.Connection,
+        evidence: TransportRequestEvidence,
+        now: int,
+    ) -> None:
+        preview_operation = evidence.transport_operation.replace("PLACE", "PREVIEW")
+        receipt = conn.execute(
+            """
+            SELECT * FROM broker_preview_receipts
+            WHERE intent_id = ? AND authorization_operation = ?
+              AND fencing_token = ?
+            """,
+            (
+                evidence.intent_id,
+                evidence.authorization_operation,
+                evidence.fencing_token,
+            ),
+        ).fetchone()
+        if receipt is None or any(
+            receipt[field] != expected
+            for field, expected in (
+                ("account_id", evidence.account_id),
+                ("environment", evidence.environment),
+                ("client_order_id", evidence.client_order_id),
+                ("target_broker_order_id", evidence.target_broker_order_id),
+                (
+                    "authorization_payload_digest",
+                    evidence.authorization_payload_digest,
+                ),
+                ("preview_id", evidence.preview_id),
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "place request lacks its exact broker preview receipt"
+            )
+        preview_attempt = conn.execute(
+            """
+            SELECT * FROM transport_send_attempts
+            WHERE intent_id = ? AND authorization_operation = ?
+              AND fencing_token = ? AND transport_operation = ?
+            """,
+            (
+                evidence.intent_id,
+                evidence.authorization_operation,
+                evidence.fencing_token,
+                preview_operation,
+            ),
+        ).fetchone()
+        expected_preview_route = (
+            evidence.route.removesuffix("place") + "preview"
+        )
+        if preview_attempt is None or any(
+            preview_attempt[field] != expected
+            for field, expected in (
+                ("owner", evidence.owner),
+                ("account_id", evidence.account_id),
+                ("account_id_key", evidence.account_id_key),
+                ("institution_type", evidence.institution_type),
+                ("environment", evidence.environment),
+                ("http_method", evidence.http_method),
+                ("route", expected_preview_route),
+                ("client_order_id", evidence.client_order_id),
+                ("target_broker_order_id", evidence.target_broker_order_id),
+                ("preview_id", None),
+                (
+                    "authorization_payload_digest",
+                    evidence.authorization_payload_digest,
+                ),
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "place request lacks its exact durable preview send attempt"
+            )
+        observed_at = int(receipt["observed_at"])
+        if (
+            observed_at > now + 5_000_000
+            or now - observed_at > _PREVIEW_RECEIPT_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentReconciliationRequired(
+                "broker preview receipt is stale; do not place"
+            )
+
+    def _apply_transport_ack(
+        self,
+        conn: sqlite3.Connection,
+        request: TransportRequestEvidence,
+        response: TransportResponseEvidence,
+        now: int,
+    ) -> None:
+        if (
+            response.http_status != 200
+            or response.broker_order_id is None
+            or response.raw_response_digest is None
+            or response.broker_status not in {None, "OPEN"}
+            or response.unknown_reason is not None
+            or (
+                response.message_codes
+                and any(
+                    code != 1026 or message_type != "WARNING"
+                    for code, message_type in zip(
+                        response.message_codes,
+                        response.message_types,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise OrderIntentValidationError(
+                "transport acknowledgement is not definitive"
+            )
+        operation = (
+            "SUBMIT_ACK"
+            if request.authorization_operation == "SUBMIT"
+            else "AMEND_ACK"
+        )
+        broker_evidence = BrokerEvidence(
+            account_id=request.account_id,
+            environment=request.environment,
+            client_order_id=request.client_order_id,
+            broker_order_id=response.broker_order_id,
+            operation=operation,
+            outcome="OPEN",
+            observed_at=response.observed_at,
+            http_status=response.http_status,
+            raw_response_digest=response.raw_response_digest,
+        )
+        BrokerEvidence.validate(broker_evidence, _from_us(now))
+        intent = self._require_intent(conn, request.intent_id)
+        if request.authorization_operation == "SUBMIT":
+            self._validate_broker_evidence(
+                conn,
+                intent,
+                broker_evidence,
+                allowed_operations={"SUBMIT_ACK"},
+                allowed_outcomes={"OPEN"},
+            )
+            if (
+                intent["state"] != "SUBMISSION_UNKNOWN"
+                or intent["pending_operation"] != "SUBMIT"
+                or intent["pending_owner"] != request.owner
+                or int(intent["pending_fence"] or -1) != request.fencing_token
+            ):
+                raise OrderIntentTransitionError(
+                    "transport acknowledgement requires its pending submission"
+                )
+            self._bind_broker_order_history(
+                conn, response.broker_order_id, request.intent_id, now
+            )
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'SUBMITTED', broker_order_id = ?,
+                    pending_operation = NULL, pending_owner = NULL,
+                    pending_fence = NULL, last_reconciled_run = ?, updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    response.broker_order_id,
+                    self.run_id,
+                    now,
+                    request.intent_id,
+                ),
+            )
+            self._append_reconciliation_event(
+                conn,
+                request.intent_id,
+                "SUBMISSION_UNKNOWN",
+                "SUBMITTED",
+                "POST_ACKNOWLEDGED",
+                "POST_ACKNOWLEDGED",
+                broker_evidence,
+                now,
+            )
+            return
+        amendment = conn.execute(
+            "SELECT * FROM amendment_leases WHERE intent_id = ?",
+            (request.intent_id,),
+        ).fetchone()
+        self._validate_broker_evidence(
+            conn,
+            intent,
+            broker_evidence,
+            allowed_operations={"AMEND_ACK"},
+            allowed_outcomes={"OPEN"},
+        )
+        if (
+            amendment is None
+            or amendment["state"] != "IN_DOUBT"
+            or amendment["owner"] != request.owner
+            or int(amendment["fencing_token"]) != request.fencing_token
+            or intent["pending_operation"] != "AMEND"
+            or intent["pending_owner"] != request.owner
+            or int(intent["pending_fence"] or -1) != request.fencing_token
+        ):
+            raise OrderIntentLeaseConflict(
+                "transport acknowledgement is not fenced to its amendment"
+            )
+        self._bind_broker_order_history(
+            conn, response.broker_order_id, request.intent_id, now
+        )
+        conn.execute(
+            """
+            UPDATE order_intents
+            SET broker_order_id = ?, pending_operation = NULL,
+                pending_owner = NULL, pending_fence = NULL,
+                last_reconciled_run = ?, updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (
+                response.broker_order_id,
+                self.run_id,
+                now,
+                request.intent_id,
+            ),
+        )
+        self._archive_amendment(conn, amendment, "ACKNOWLEDGED", now)
+        conn.execute(
+            "DELETE FROM amendment_leases WHERE intent_id = ?",
+            (request.intent_id,),
+        )
+        self._append_reconciliation_event(
+            conn,
+            request.intent_id,
+            "SUBMITTED",
+            "SUBMITTED",
+            "AMENDMENT_ACKNOWLEDGED",
+            "POST_ACKNOWLEDGED",
+            broker_evidence,
+            now,
+        )
+
+    @staticmethod
     def _require_outbound_authorization(
         authorization: OutboundAuthorization,
         *,
@@ -1697,6 +2522,30 @@ class OrderIntentLedger:
     def _record_outbound_authorization(
         conn: sqlite3.Connection, authorization: OutboundAuthorization, now: int
     ) -> None:
+        existing = conn.execute(
+            """
+            SELECT * FROM outbound_authorizations
+            WHERE intent_id = ? AND operation = ? AND fencing_token = ?
+            """,
+            (
+                authorization.intent_id,
+                authorization.operation,
+                authorization.fencing_token,
+            ),
+        ).fetchone()
+        if existing is not None:
+            if any(
+                existing[field] != expected
+                for field, expected in (
+                    ("client_order_id", authorization.client_order_id),
+                    ("payload_bytes", authorization.payload_bytes),
+                    ("payload_digest", authorization.payload_digest),
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "durable outbound authorization conflicts with this fence"
+                )
+            return
         conn.execute(
             """
             INSERT INTO outbound_authorizations
@@ -1877,6 +2726,72 @@ class OrderIntentLedger:
         return IntentEvent(sequence=int(row["sequence"]), intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], client_order_id=row["client_order_id"], event_type=row["event_type"], from_state=row["from_state"], to_state=row["to_state"], actor=row["actor"], reason_code=row["reason_code"], broker_status=row["broker_status"], broker_order_id=row["broker_order_id"], observed_at=_from_us(row["observed_at"]) if row["observed_at"] is not None else None, evidence_operation=row["evidence_operation"], http_status=row["http_status"], raw_response_digest=row["raw_response_digest"], created_at=_from_us(row["created_at"]))
 
 
+def _transport_response_receipt(
+    row: sqlite3.Row,
+) -> TransportResponseReceipt:
+    try:
+        messages = json.loads(row["messages_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise OrderIntentIntegrityError(
+            "stored transport response messages are invalid"
+        ) from exc
+    if (
+        type(messages) is not list
+        or any(
+            type(message) is not dict
+            or set(message)
+            != {"code", "type", "description_sha256"}
+            for message in messages
+        )
+        or json.dumps(
+            messages, sort_keys=True, separators=(",", ":")
+        )
+        != row["messages_json"]
+    ):
+        raise OrderIntentIntegrityError(
+            "stored transport response messages are not canonical"
+        )
+    response = TransportResponseEvidence(
+        disposition=row["disposition"],
+        http_status=row["http_status"],
+        broker_status=row["broker_status"],
+        broker_order_id=row["broker_order_id"],
+        preview_id=row["preview_id"],
+        message_codes=tuple(message["code"] for message in messages),
+        message_types=tuple(message["type"] for message in messages),
+        message_description_digests=tuple(
+            message["description_sha256"] for message in messages
+        ),
+        raw_response_digest=row["raw_response_digest"],
+        observed_at=_from_us(row["observed_at"]),
+        unknown_reason=row["unknown_reason"],
+    )
+    _validate_transport_response_evidence(response)
+    intent_id = row["intent_id"]
+    authorization_operation = row["authorization_operation"]
+    fencing_token = int(row["fencing_token"])
+    transport_operation = row["transport_operation"]
+    _validate_identity("intent_id", intent_id)
+    _validate_fencing_token(fencing_token)
+    if (
+        authorization_operation not in {"SUBMIT", "AMEND"}
+        or transport_operation not in _TRANSPORT_OPERATIONS
+        or transport_operation.split("_", 1)[0]
+        != authorization_operation
+    ):
+        raise OrderIntentIntegrityError(
+            "stored transport response operation is invalid"
+        )
+    return TransportResponseReceipt(
+        intent_id=intent_id,
+        authorization_operation=authorization_operation,
+        fencing_token=fencing_token,
+        transport_operation=transport_operation,
+        response=response,
+        recorded_at=_from_us(row["recorded_at"]),
+    )
+
+
 def _validate_envelope(envelope: OrderIntent) -> None:
     if type(envelope) is not OrderIntent:
         raise OrderIntentValidationError("intent envelope must use the exact OrderIntent type")
@@ -1897,6 +2812,203 @@ def _validate_envelope(envelope: OrderIntent) -> None:
         raise OrderIntentIntegrityError("wire payload is invalid JSON") from exc
     if wire_order_payload(wire_payload) != envelope.wire_payload or canonical_order_payload(wire_payload) != envelope.canonical_payload or _derive_intent_kind(wire_payload) != envelope.intent_kind:
         raise OrderIntentIntegrityError("wire payload does not satisfy strict canonical identity")
+
+
+def _validate_transport_request_evidence(
+    evidence: TransportRequestEvidence,
+) -> None:
+    if type(evidence) is not TransportRequestEvidence:
+        raise OrderIntentValidationError(
+            "transport request evidence must use its exact immutable type"
+        )
+    for name in (
+        "account_id",
+        "account_id_key",
+        "institution_type",
+        "intent_id",
+        "owner",
+        "client_order_id",
+    ):
+        _validate_identity(name, getattr(evidence, name))
+    _validate_environment(evidence.environment)
+    _validate_fencing_token(evidence.fencing_token)
+    if (
+        type(evidence.authorization_operation) is not str
+        or evidence.authorization_operation not in {"SUBMIT", "AMEND"}
+        or type(evidence.transport_operation) is not str
+        or evidence.transport_operation not in _TRANSPORT_OPERATIONS
+        or type(evidence.http_method) is not str
+        or evidence.http_method not in {"POST", "PUT"}
+    ):
+        raise OrderIntentValidationError(
+            "transport operation metadata is invalid"
+        )
+    expected_authorization = (
+        "SUBMIT"
+        if evidence.transport_operation.startswith("SUBMIT")
+        else "AMEND"
+    )
+    expected_method = (
+        "POST"
+        if evidence.transport_operation.startswith("SUBMIT")
+        else "PUT"
+    )
+    if (
+        evidence.authorization_operation != expected_authorization
+        or evidence.http_method != expected_method
+    ):
+        raise OrderIntentIntegrityError(
+            "transport operation is inconsistent with authorization"
+        )
+    is_amend = expected_authorization == "AMEND"
+    is_place = evidence.transport_operation.endswith("PLACE")
+    if is_amend != (evidence.target_broker_order_id is not None):
+        raise OrderIntentIntegrityError("transport target binding is inconsistent")
+    if is_place != (evidence.preview_id is not None):
+        raise OrderIntentIntegrityError("transport preview binding is inconsistent")
+    if evidence.target_broker_order_id is not None:
+        _validate_identity(
+            "target_broker_order_id", evidence.target_broker_order_id
+        )
+    if evidence.preview_id is not None:
+        _validate_identity("preview_id", evidence.preview_id)
+    _validate_sha256(
+        "authorization_payload_digest",
+        evidence.authorization_payload_digest,
+    )
+    _validate_sha256("final_xml_sha256", evidence.final_xml_sha256)
+    if (
+        type(evidence.final_xml_bytes) is not bytes
+        or not evidence.final_xml_bytes
+        or len(evidence.final_xml_bytes) > _MAX_TRANSPORT_REQUEST_BYTES
+        or not hmac.compare_digest(
+            hashlib.sha256(evidence.final_xml_bytes).hexdigest(),
+            evidence.final_xml_sha256,
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "transport request body does not verify"
+        )
+    encoded_account = quote(evidence.account_id_key, safe="")
+    if is_amend:
+        encoded_target = quote(evidence.target_broker_order_id or "", safe="")
+        action = "place" if is_place else "preview"
+        expected_route = (
+            f"/v1/accounts/{encoded_account}/orders/"
+            f"{encoded_target}/change/{action}"
+        )
+    else:
+        action = "place" if is_place else "preview"
+        expected_route = f"/v1/accounts/{encoded_account}/orders/{action}"
+    if type(evidence.route) is not str or evidence.route != expected_route:
+        raise OrderIntentIntegrityError("transport route binding is invalid")
+
+
+def _validate_transport_response_evidence(
+    evidence: TransportResponseEvidence,
+) -> None:
+    if type(evidence) is not TransportResponseEvidence:
+        raise OrderIntentValidationError(
+            "transport response evidence must use its exact immutable type"
+        )
+    if (
+        type(evidence.disposition) is not str
+        or evidence.disposition not in {"ACKNOWLEDGED", "UNKNOWN"}
+        or (
+            evidence.http_status is not None
+            and (
+                type(evidence.http_status) is not int
+                or not 100 <= evidence.http_status <= 599
+            )
+        )
+    ):
+        raise OrderIntentValidationError(
+            "transport response disposition is invalid"
+        )
+    for name, value in (
+        ("broker_status", evidence.broker_status),
+        ("broker_order_id", evidence.broker_order_id),
+        ("preview_id", evidence.preview_id),
+        ("unknown_reason", evidence.unknown_reason),
+    ):
+        if value is not None:
+            _validate_identity(name, value)
+    tuples = (
+        evidence.message_codes,
+        evidence.message_types,
+        evidence.message_description_digests,
+    )
+    if (
+        any(type(value) is not tuple for value in tuples)
+        or len({len(value) for value in tuples}) != 1
+        or len(evidence.message_codes) > 64
+        or any(
+            type(code) is not int or not 0 <= code <= 2_147_483_647
+            for code in evidence.message_codes
+        )
+        or any(
+            type(message_type) is not str
+            or message_type not in {"WARNING", "INFO", "INFO_HOLD", "ERROR"}
+            for message_type in evidence.message_types
+        )
+    ):
+        raise OrderIntentValidationError(
+            "transport response messages are invalid"
+        )
+    for digest in evidence.message_description_digests:
+        _validate_sha256("message_description_digest", digest)
+    if evidence.raw_response_digest is not None:
+        _validate_sha256(
+            "raw_response_digest", evidence.raw_response_digest
+        )
+    _validate_timestamp(evidence.observed_at)
+    if (evidence.disposition == "UNKNOWN") != (
+        evidence.unknown_reason is not None
+    ):
+        raise OrderIntentValidationError(
+            "transport response unknown reason is inconsistent"
+        )
+
+
+def _validate_acknowledged_transport_response(
+    request: TransportRequestEvidence,
+    response: TransportResponseEvidence,
+) -> None:
+    if response.disposition != "ACKNOWLEDGED":
+        return
+    if (
+        response.http_status != 200
+        or response.raw_response_digest is None
+        or response.broker_status not in {None, "OPEN"}
+    ):
+        raise OrderIntentValidationError(
+            "transport acknowledgement lacks definitive broker evidence"
+        )
+    if request.transport_operation.endswith("PREVIEW"):
+        if (
+            response.preview_id is None
+            or response.broker_order_id is not None
+            or response.message_codes
+        ):
+            raise OrderIntentValidationError(
+                "preview acknowledgement is not safe for placement"
+            )
+        return
+    if (
+        response.broker_order_id is None
+        or response.preview_id != request.preview_id
+        or any(
+            code != 1026 or message_type != "WARNING"
+            for code, message_type in zip(
+                response.message_codes,
+                response.message_types,
+                strict=True,
+            )
+        )
+    ):
+        raise OrderIntentValidationError(
+            "place acknowledgement is not definitive"
+        )
 
 
 def _payload_hash(canonical_payload: str) -> str:
