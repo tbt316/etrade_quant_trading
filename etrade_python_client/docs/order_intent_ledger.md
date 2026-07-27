@@ -1,7 +1,7 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7 durable execution core plus schema-15 non-authorizing
-opening-risk persistence, crash-safe cancellation, exact closing-capacity
+**Delivery status:** R7 durable execution core plus schema-16 non-authorizing
+opening-risk evidence lineage, crash-safe cancellation, exact closing-capacity
 reservations, terminal absorption, and legacy mutation quarantine, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
@@ -101,6 +101,35 @@ remains blocked rather than guessed or retried.
   promoted to broker evidence. A future promotion must atomically revalidate
   fresh independent evidence and reserve capacity rather than upgrading this
   historical proof in place.
+- Schema 16 adds an append-only, evidence-only quote and aggregate lineage. It
+  retains the exact E*TRADE quote-response bytes, credential-free route/query,
+  request and response times, raw-response hash, and installed parser
+  schema/code/config hashes. The ledger reruns the strict parser before
+  accepting the receipt, requires exactly the two unadjusted standard
+  contracts in the opening vertical, and cross-binds the resulting
+  `QuoteSnapshotEvidence` to the schema-15 prerequisite.
+- The schema-16 lineage independently replays the complete capacity-v3
+  manifest and records the broker buying power, exact option positions,
+  requested-contract position conflicts, requested-contract active-order
+  conflicts, and the ledger's currently retained reservation/claim subset.
+  These are diagnostics, not placement authority. The row is append-only and
+  can only be `INDEPENDENT_EVIDENCE_PENDING`.
+- The following policy inputs still cannot be completely reconstructed from
+  the retained E*TRADE fields: risk of pre-existing broker positions, risk of
+  active broker opening orders, full portfolio and symbol delta, marked daily
+  P&L including fees/commissions, and exchange-session daily order/new-risk
+  counters across legacy paths. Schema 16 persists these exact typed blockers:
+  `BROKER_POSITION_OPEN_RISK_NOT_REPLAYABLE`,
+  `BROKER_OPEN_ORDER_OPEN_RISK_NOT_REPLAYABLE`,
+  `PORTFOLIO_DELTA_NOT_REPLAYABLE`, `SYMBOL_DELTA_NOT_REPLAYABLE`,
+  `DAILY_PNL_NOT_REPLAYABLE`, and
+  `DAILY_SESSION_BOUNDARY_NOT_DURABLE`. The offline-only slice also records
+  `QUOTE_ACQUISITION_CHANNEL_NOT_COMPOSED` and
+  `QUOTE_MARKET_DATA_ENTITLEMENT_NOT_DURABLE`: retained bytes and a credential-
+  free request hash are not proof that the future live collector used the
+  reviewed OAuth/runtime boundary or held the required market-data rights.
+  Stale prerequisite evidence adds
+  `PREREQUISITE_STALE_AT_LINEAGE_RECORD`.
 - Closing reservations are content-addressed and bind the intent payload to the
   complete capacity evidence, exact contracts/lots, active broker closes, and
   projected post-fill positions. A second process cannot reserve an overlapping
@@ -156,14 +185,16 @@ remains blocked rather than guessed or retried.
 
 ## Schema policy
 
-Schema 15 adds append-only `opening_risk_prerequisites` and exact intent,
+Schema 16 adds append-only `opening_quote_receipts` and
+`opening_risk_lineages`, while retaining schema 15
+`opening_risk_prerequisites` and exact intent,
 capacity-decision, and manifest cross-binding guards. These rows are
 persistence prerequisites, never placement authority or capacity claims.
 It retains schema 14 immutable closing reservations, pre-place void receipts,
 and terminal closing-absorption receipts; schema 13 cancellation records;
 schema 12 opening terminal-absorption receipts; schema 11 raw broker-read
 receipts and semantic manifests; and the existing durable capacity decisions.
-Additive schema 8→9→10→11→12→13→14→15 migration is one explicit SQLite
+Additive schema 8→9→10→11→12→13→14→15→16 migration is one explicit SQLite
 transaction and verifies required columns, foreign keys, append-only triggers,
 journal mode, foreign-key integrity, and `quick_check` before version
 promotion. Unknown or malformed schemas fail closed. A production operator
@@ -191,11 +222,11 @@ process is enabled:
    transport, and coordinator. R7f already rejects direct legacy mutation,
    transport bypass, reflection, and tombstone drift across all tracked
    application Python in CI; the future root must preserve that gate.
-4. Opening placement needs durable raw quote manifests and an independently
-   replayable derivation of every portfolio-risk aggregate consumed by the pure
-   policy. A later schema must keep the persisted prerequisite historical,
-   revalidate fresh evidence, and atomically create a separate authorization
-   plus capacity reservation before any send can become eligible.
+4. Opening placement still needs the missing schema-16 aggregate sources named
+   above. A later schema must keep both historical records immutable,
+   revalidate fresh complete evidence, and atomically create a separate
+   authorization plus capacity reservation before any send can become
+   eligible.
 5. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
    every nonterminal/terminal broker status, replacement chains, cancellation,
    closing, and process death at each durable/I/O boundary.

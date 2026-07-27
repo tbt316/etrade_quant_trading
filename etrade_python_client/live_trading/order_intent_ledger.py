@@ -44,13 +44,25 @@ from live_trading.pretrade_risk import (
     OpeningRiskAuthorization,
     PretradeRiskValidationError,
     RiskDecision,
+    quote_evidence_sha256,
     validate_opening_risk_authorization,
+)
+from live_trading.opening_risk_lineage import (
+    OPENING_QUOTE_PARSER_CODE_SHA256,
+    OPENING_QUOTE_PARSER_CONFIG_SHA256,
+    OPENING_QUOTE_PARSER_SCHEMA,
+    OpeningQuoteReceiptRef,
+    OpeningQuoteResponseEvidence,
+    OpeningRiskLineageError,
+    OpeningRiskLineageRef,
+    expected_quote_route,
+    parse_opening_quote_response,
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _MIGRATABLE_SCHEMA_VERSIONS = frozenset(
-    {8, 9, 10, 11, 12, 13, 14}
+    {8, 9, 10, 11, 12, 13, 14, 15}
 )
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
@@ -115,6 +127,12 @@ _CLOSING_POSITION_PROOF_HASH_DOMAIN = (
 )
 _OPENING_RISK_PREREQUISITE_HASH_DOMAIN = (
     b"etrade-opening-risk-prerequisite.v1\0"
+)
+_OPENING_QUOTE_RECEIPT_HASH_DOMAIN = (
+    b"etrade-opening-quote-receipt.v1\0"
+)
+_OPENING_RISK_LINEAGE_HASH_DOMAIN = (
+    b"etrade-opening-risk-lineage.v1\0"
 )
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
@@ -677,6 +695,58 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON opening_risk_prerequisites
         BEGIN
             SELECT RAISE(ABORT, 'opening risk prerequisites are append-only');
+        END
+    """,
+    "prevent_opening_quote_receipt_update": """
+        CREATE TRIGGER prevent_opening_quote_receipt_update
+        BEFORE UPDATE ON opening_quote_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'opening quote receipts are append-only');
+        END
+    """,
+    "prevent_opening_quote_receipt_delete": """
+        CREATE TRIGGER prevent_opening_quote_receipt_delete
+        BEFORE DELETE ON opening_quote_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'opening quote receipts are append-only');
+        END
+    """,
+    "prevent_opening_quote_receipt_replace": """
+        CREATE TRIGGER prevent_opening_quote_receipt_replace
+        BEFORE INSERT ON opening_quote_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM opening_quote_receipts
+            WHERE receipt_sha256 = NEW.receipt_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'opening quote receipts are append-only');
+        END
+    """,
+    "prevent_opening_risk_lineage_update": """
+        CREATE TRIGGER prevent_opening_risk_lineage_update
+        BEFORE UPDATE ON opening_risk_lineages
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk lineages are append-only');
+        END
+    """,
+    "prevent_opening_risk_lineage_delete": """
+        CREATE TRIGGER prevent_opening_risk_lineage_delete
+        BEFORE DELETE ON opening_risk_lineages
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk lineages are append-only');
+        END
+    """,
+    "prevent_opening_risk_lineage_replace": """
+        CREATE TRIGGER prevent_opening_risk_lineage_replace
+        BEFORE INSERT ON opening_risk_lineages
+        WHEN EXISTS (
+            SELECT 1 FROM opening_risk_lineages
+            WHERE lineage_sha256 = NEW.lineage_sha256
+               OR intent_id = NEW.intent_id
+               OR prerequisite_sha256 = NEW.prerequisite_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk lineages are append-only');
         END
     """,
     "validate_opening_risk_prerequisite_insert": """
@@ -2450,6 +2520,360 @@ class OrderIntentLedger:
             return self._opening_risk_prerequisite_from_row(
                 conn, row
             )
+
+    def record_opening_quote_response(
+        self, evidence: OpeningQuoteResponseEvidence
+    ) -> OpeningQuoteReceiptRef:
+        """Persist and independently replay exact retained quote bytes.
+
+        This method records evidence only.  It creates no intent, reservation,
+        authorization, lease, preview, or broker mutation capability.
+        """
+
+        if type(evidence) is not OpeningQuoteResponseEvidence:
+            raise OrderIntentValidationError(
+                "opening quote capture requires exact evidence"
+            )
+        now = self._now_us()
+        try:
+            quotes, canonical_quotes_json = parse_opening_quote_response(
+                evidence
+            )
+        except OpeningRiskLineageError as exc:
+            raise OrderIntentIntegrityError(
+                "opening quote response failed independent replay"
+            ) from exc
+        started_at = _to_us(evidence.request_started_at)
+        completed_at = _to_us(evidence.response_completed_at)
+        if (
+            completed_at > now
+            or completed_at - started_at
+            > _MAX_BROKER_READ_SPAN_SECONDS * 1_000_000
+        ):
+            raise OrderIntentIntegrityError(
+                "opening quote response timing is unavailable"
+            )
+        contracts = tuple(quote.contract for quote in quotes.quotes)
+        if evidence.route != expected_quote_route(contracts):
+            raise OrderIntentIntegrityError(
+                "opening quote route does not match parsed contracts"
+            )
+        raw_sha256 = hashlib.sha256(
+            evidence.raw_response_bytes
+        ).hexdigest()
+        canonical_sha256 = _domain_bytes_hash(
+            b"etrade-opening-quote-parsed.v1\0",
+            canonical_quotes_json.encode("utf-8"),
+        )
+        quote_observed_at = min(
+            _to_us(quote.observed_at) for quote in quotes.quotes
+        )
+        if any(
+            _to_us(quote.observed_at) > completed_at
+            for quote in quotes.quotes
+        ):
+            raise OrderIntentIntegrityError(
+                "opening quote observation postdates its response"
+            )
+        recorded_at = now
+        material = {
+            "account_id": evidence.account_id,
+            "account_id_key": evidence.account_id_key,
+            "institution_type": evidence.institution_type,
+            "environment": evidence.environment,
+            "origin": evidence.origin,
+            "route": evidence.route,
+            "query_json": evidence.query_json,
+            "authorization_sha256": evidence.authorization_sha256,
+            "request_started_at": started_at,
+            "response_completed_at": completed_at,
+            "http_status": evidence.http_status,
+            "raw_byte_length": len(evidence.raw_response_bytes),
+            "raw_response_sha256": raw_sha256,
+            "parser_schema": evidence.parser_schema,
+            "parser_code_sha256": evidence.parser_code_sha256,
+            "parser_config_sha256": evidence.parser_config_sha256,
+            "canonical_quotes_sha256": canonical_sha256,
+            "quote_snapshot_sha256": quotes.snapshot_sha256,
+            "quote_evidence_sha256": quote_evidence_sha256(quotes),
+            "quote_observed_at": quote_observed_at,
+            "recorded_at": recorded_at,
+        }
+        receipt_sha256 = _domain_json_hash(
+            _OPENING_QUOTE_RECEIPT_HASH_DOMAIN, material
+        )
+        values = (
+            receipt_sha256,
+            evidence.account_id,
+            evidence.account_id_key,
+            evidence.institution_type,
+            evidence.environment,
+            evidence.origin,
+            evidence.route,
+            evidence.query_json,
+            evidence.authorization_sha256,
+            started_at,
+            completed_at,
+            evidence.http_status,
+            evidence.raw_response_bytes,
+            len(evidence.raw_response_bytes),
+            raw_sha256,
+            evidence.parser_schema,
+            evidence.parser_code_sha256,
+            evidence.parser_config_sha256,
+            canonical_quotes_json,
+            canonical_sha256,
+            quotes.snapshot_sha256,
+            quote_evidence_sha256(quotes),
+            quote_observed_at,
+            recorded_at,
+        )
+        with self._transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM opening_quote_receipts
+                WHERE receipt_sha256 = ?
+                """,
+                (receipt_sha256,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO opening_quote_receipts (
+                        receipt_sha256, account_id, account_id_key,
+                        institution_type, environment, origin, route,
+                        query_json, authorization_sha256,
+                        request_started_at, response_completed_at,
+                        http_status, raw_response_bytes, raw_byte_length,
+                        raw_response_sha256, parser_schema,
+                        parser_code_sha256, parser_config_sha256,
+                        canonical_quotes_json, canonical_quotes_sha256,
+                        quote_snapshot_sha256, quote_evidence_sha256,
+                        quote_observed_at, recorded_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    values,
+                )
+            elif tuple(
+                existing[column]
+                for column in (
+                    "receipt_sha256",
+                    "account_id",
+                    "account_id_key",
+                    "institution_type",
+                    "environment",
+                    "origin",
+                    "route",
+                    "query_json",
+                    "authorization_sha256",
+                    "request_started_at",
+                    "response_completed_at",
+                    "http_status",
+                    "raw_response_bytes",
+                    "raw_byte_length",
+                    "raw_response_sha256",
+                    "parser_schema",
+                    "parser_code_sha256",
+                    "parser_config_sha256",
+                    "canonical_quotes_json",
+                    "canonical_quotes_sha256",
+                    "quote_snapshot_sha256",
+                    "quote_evidence_sha256",
+                    "quote_observed_at",
+                    "recorded_at",
+                )
+            ) != values:
+                raise OrderIntentIntegrityError(
+                    "opening quote receipt content-address collision"
+                )
+            _verify_opening_quote_receipt_row(existing or conn.execute(
+                """
+                SELECT * FROM opening_quote_receipts
+                WHERE receipt_sha256 = ?
+                """,
+                (receipt_sha256,),
+            ).fetchone())
+        return OpeningQuoteReceiptRef(receipt_sha256)
+
+    def record_opening_risk_lineage(
+        self,
+        intent_id: str,
+        quote_receipt: OpeningQuoteReceiptRef,
+    ) -> OpeningRiskLineageRef:
+        """Cross-bind independently replayable evidence without authorizing."""
+
+        _validate_identity("intent_id", intent_id)
+        if type(quote_receipt) is not OpeningQuoteReceiptRef:
+            raise OrderIntentValidationError(
+                "opening risk lineage requires exact quote receipt"
+            )
+        now = self._now_us()
+        with self._transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM opening_risk_lineages WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                result = _verify_opening_risk_lineage_row(conn, existing)
+                if (
+                    existing["quote_receipt_sha256"]
+                    != quote_receipt.receipt_sha256
+                ):
+                    raise OrderIntentIntegrityError(
+                        "opening risk lineage already binds another quote"
+                    )
+                return result
+            prerequisite_row = conn.execute(
+                """
+                SELECT * FROM opening_risk_prerequisites WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            prerequisite = self._opening_risk_prerequisite_from_row(
+                conn, prerequisite_row
+            )
+            quote_row = conn.execute(
+                """
+                SELECT * FROM opening_quote_receipts
+                WHERE receipt_sha256 = ?
+                """,
+                (quote_receipt.receipt_sha256,),
+            ).fetchone()
+            quotes = _verify_opening_quote_receipt_row(quote_row)
+            if (
+                quote_row["account_id"] != prerequisite_row["account_id"]
+                or quote_row["account_id_key"]
+                != prerequisite_row["account_id_key"]
+                or quote_row["institution_type"]
+                != prerequisite_row["institution_type"]
+                or quote_row["environment"]
+                != prerequisite_row["environment"]
+                or quote_row["quote_snapshot_sha256"]
+                != prerequisite.quote_snapshot_sha256
+                or quote_row["quote_evidence_sha256"]
+                != prerequisite.quote_evidence_sha256
+            ):
+                raise OrderIntentIntegrityError(
+                    "opening quote receipt does not bind the prerequisite"
+                )
+            capacity_row, capacity_result = (
+                self._verified_broker_read_manifest(
+                    conn,
+                    prerequisite.portfolio_broker_read_evidence_sha256,
+                )
+            )
+            if (
+                capacity_row["evidence_kind"] != "CAPACITY"
+                or capacity_row["completeness"] != "COMPLETE"
+                or capacity_result.get("schema") != "etrade-capacity.v3"
+                or capacity_result.get("state_sha256")
+                != prerequisite.portfolio_snapshot_sha256
+            ):
+                raise OrderIntentIntegrityError(
+                    "opening lineage requires exact capacity-v3 evidence"
+                )
+            intent = self._require_intent(conn, intent_id)
+            self._verify_durable_risk_state(
+                conn,
+                account_id=intent["account_id"],
+                environment=intent["environment"],
+            )
+            derivation, missing = _derive_opening_risk_lineage(
+                conn=conn,
+                intent=intent,
+                prerequisite=prerequisite_row,
+                capacity_result=capacity_result,
+                quotes=quotes,
+                recorded_at=now,
+            )
+            canonical_derivation_json = _canonical_read_json(derivation)
+            derivation_sha256 = _domain_bytes_hash(
+                b"etrade-opening-risk-derivation.v1\0",
+                canonical_derivation_json.encode("utf-8"),
+            )
+            missing_json = _canonical_read_json(list(missing))
+            durable_state_sha256 = derivation[
+                "durable_ledger_state_sha256"
+            ]
+            material = {
+                "intent_id": intent_id,
+                "prerequisite_sha256": prerequisite.binding_sha256,
+                "quote_receipt_sha256": quote_receipt.receipt_sha256,
+                "capacity_evidence_sha256":
+                    prerequisite.portfolio_broker_read_evidence_sha256,
+                "capacity_state_sha256":
+                    prerequisite.portfolio_snapshot_sha256,
+                "durable_state_sha256": durable_state_sha256,
+                "derivation_sha256": derivation_sha256,
+                "missing_evidence_reasons_json": missing_json,
+                "status": "INDEPENDENT_EVIDENCE_PENDING",
+                "quote_observed_at": int(
+                    quote_row["quote_observed_at"]
+                ),
+                "portfolio_observed_at": int(
+                    capacity_row["observed_at"]
+                ),
+                "recorded_at": now,
+            }
+            lineage_sha256 = _domain_json_hash(
+                _OPENING_RISK_LINEAGE_HASH_DOMAIN, material
+            )
+            conn.execute(
+                """
+                INSERT INTO opening_risk_lineages (
+                    lineage_sha256, intent_id, prerequisite_sha256,
+                    quote_receipt_sha256, capacity_evidence_sha256,
+                    capacity_state_sha256, durable_state_sha256,
+                    canonical_derivation_json, derivation_sha256,
+                    missing_evidence_reasons_json, status,
+                    quote_observed_at, portfolio_observed_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lineage_sha256,
+                    intent_id,
+                    prerequisite.binding_sha256,
+                    quote_receipt.receipt_sha256,
+                    prerequisite.portfolio_broker_read_evidence_sha256,
+                    prerequisite.portfolio_snapshot_sha256,
+                    durable_state_sha256,
+                    canonical_derivation_json,
+                    derivation_sha256,
+                    missing_json,
+                    "INDEPENDENT_EVIDENCE_PENDING",
+                    int(quote_row["quote_observed_at"]),
+                    int(capacity_row["observed_at"]),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM opening_risk_lineages
+                WHERE lineage_sha256 = ?
+                """,
+                (lineage_sha256,),
+            ).fetchone()
+            return _verify_opening_risk_lineage_row(conn, row)
+
+    def get_opening_risk_lineage(
+        self, intent_id: str
+    ) -> OpeningRiskLineageRef | None:
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM opening_risk_lineages WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return _verify_opening_risk_lineage_row(conn, row)
 
     def create_closing_intent_from_read(
         self,
@@ -6484,6 +6908,79 @@ class OrderIntentLedger:
                         AND CAST(collateral_amount AS REAL) > 0
                     )
                 );
+                CREATE TABLE IF NOT EXISTS opening_quote_receipts (
+                    receipt_sha256 TEXT PRIMARY KEY
+                        CHECK (length(receipt_sha256) = 64),
+                    account_id TEXT NOT NULL,
+                    account_id_key TEXT NOT NULL,
+                    institution_type TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    origin TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    query_json TEXT NOT NULL,
+                    authorization_sha256 TEXT NOT NULL
+                        CHECK (length(authorization_sha256) = 64),
+                    request_started_at INTEGER NOT NULL,
+                    response_completed_at INTEGER NOT NULL,
+                    http_status INTEGER NOT NULL CHECK (http_status = 200),
+                    raw_response_bytes BLOB NOT NULL,
+                    raw_byte_length INTEGER NOT NULL CHECK (
+                        raw_byte_length = length(raw_response_bytes)
+                        AND raw_byte_length <= 2097152
+                    ),
+                    raw_response_sha256 TEXT NOT NULL
+                        CHECK (length(raw_response_sha256) = 64),
+                    parser_schema TEXT NOT NULL,
+                    parser_code_sha256 TEXT NOT NULL
+                        CHECK (length(parser_code_sha256) = 64),
+                    parser_config_sha256 TEXT NOT NULL
+                        CHECK (length(parser_config_sha256) = 64),
+                    canonical_quotes_json TEXT NOT NULL,
+                    canonical_quotes_sha256 TEXT NOT NULL
+                        CHECK (length(canonical_quotes_sha256) = 64),
+                    quote_snapshot_sha256 TEXT NOT NULL
+                        CHECK (length(quote_snapshot_sha256) = 64),
+                    quote_evidence_sha256 TEXT NOT NULL
+                        CHECK (length(quote_evidence_sha256) = 64),
+                    quote_observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    CHECK (response_completed_at >= request_started_at),
+                    CHECK (recorded_at >= response_completed_at),
+                    CHECK (
+                        (environment = 'production'
+                         AND origin = 'https://api.etrade.com')
+                        OR
+                        (environment = 'sandbox'
+                         AND origin = 'https://apisb.etrade.com')
+                    )
+                );
+                CREATE TABLE IF NOT EXISTS opening_risk_lineages (
+                    lineage_sha256 TEXT PRIMARY KEY
+                        CHECK (length(lineage_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES order_intents(intent_id),
+                    prerequisite_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES opening_risk_prerequisites(binding_sha256),
+                    quote_receipt_sha256 TEXT NOT NULL
+                        REFERENCES opening_quote_receipts(receipt_sha256),
+                    capacity_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    capacity_state_sha256 TEXT NOT NULL
+                        CHECK (length(capacity_state_sha256) = 64),
+                    durable_state_sha256 TEXT NOT NULL
+                        CHECK (length(durable_state_sha256) = 64),
+                    canonical_derivation_json TEXT NOT NULL,
+                    derivation_sha256 TEXT NOT NULL
+                        CHECK (length(derivation_sha256) = 64),
+                    missing_evidence_reasons_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status = 'INDEPENDENT_EVIDENCE_PENDING'
+                    ),
+                    quote_observed_at INTEGER NOT NULL,
+                    portfolio_observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reservation_absorptions (
                     absorption_sha256 TEXT PRIMARY KEY
                         CHECK (length(absorption_sha256) = 64),
@@ -7384,6 +7881,48 @@ class OrderIntentLedger:
                 "authorization_state",
                 "created_at",
             },
+            "opening_quote_receipts": {
+                "receipt_sha256",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "origin",
+                "route",
+                "query_json",
+                "authorization_sha256",
+                "request_started_at",
+                "response_completed_at",
+                "http_status",
+                "raw_response_bytes",
+                "raw_byte_length",
+                "raw_response_sha256",
+                "parser_schema",
+                "parser_code_sha256",
+                "parser_config_sha256",
+                "canonical_quotes_json",
+                "canonical_quotes_sha256",
+                "quote_snapshot_sha256",
+                "quote_evidence_sha256",
+                "quote_observed_at",
+                "recorded_at",
+            },
+            "opening_risk_lineages": {
+                "lineage_sha256",
+                "intent_id",
+                "prerequisite_sha256",
+                "quote_receipt_sha256",
+                "capacity_evidence_sha256",
+                "capacity_state_sha256",
+                "durable_state_sha256",
+                "canonical_derivation_json",
+                "derivation_sha256",
+                "missing_evidence_reasons_json",
+                "status",
+                "quote_observed_at",
+                "portfolio_observed_at",
+                "recorded_at",
+            },
             "order_events": {"broker_read_evidence_sha256"},
             "reservation_absorptions": {
                 "absorption_sha256",
@@ -7589,6 +8128,10 @@ class OrderIntentLedger:
             ("opening_risk_prerequisites", "order_intents"),
             ("opening_risk_prerequisites", "capacity_decisions"),
             ("opening_risk_prerequisites", "broker_read_manifests"),
+            ("opening_risk_lineages", "order_intents"),
+            ("opening_risk_lineages", "opening_risk_prerequisites"),
+            ("opening_risk_lineages", "opening_quote_receipts"),
+            ("opening_risk_lineages", "broker_read_manifests"),
             ("order_events", "broker_read_manifests"),
             ("reservation_absorptions", "order_intents"),
             ("reservation_absorptions", "broker_read_manifests"),
@@ -11649,6 +12192,484 @@ class OrderIntentLedger:
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> IntentEvent:
         return IntentEvent(sequence=int(row["sequence"]), intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], client_order_id=row["client_order_id"], event_type=row["event_type"], from_state=row["from_state"], to_state=row["to_state"], actor=row["actor"], reason_code=row["reason_code"], broker_status=row["broker_status"], broker_order_id=row["broker_order_id"], observed_at=_from_us(row["observed_at"]) if row["observed_at"] is not None else None, evidence_operation=row["evidence_operation"], http_status=row["http_status"], raw_response_digest=row["raw_response_digest"], broker_read_evidence_sha256=row["broker_read_evidence_sha256"], created_at=_from_us(row["created_at"]))
+
+
+def _verify_opening_quote_receipt_row(
+    row: sqlite3.Row | None,
+):
+    if row is None:
+        raise OrderIntentIntegrityError("opening quote receipt is missing")
+    try:
+        evidence = OpeningQuoteResponseEvidence(
+            account_id=row["account_id"],
+            account_id_key=row["account_id_key"],
+            institution_type=row["institution_type"],
+            environment=row["environment"],
+            origin=row["origin"],
+            route=row["route"],
+            query_json=row["query_json"],
+            authorization_sha256=row["authorization_sha256"],
+            request_started_at=_from_us(row["request_started_at"]),
+            response_completed_at=_from_us(row["response_completed_at"]),
+            http_status=int(row["http_status"]),
+            raw_response_bytes=bytes(row["raw_response_bytes"]),
+            parser_schema=row["parser_schema"],
+            parser_code_sha256=row["parser_code_sha256"],
+            parser_config_sha256=row["parser_config_sha256"],
+        )
+        quotes, canonical = parse_opening_quote_response(evidence)
+    except (OpeningRiskLineageError, TypeError, ValueError) as exc:
+        raise OrderIntentIntegrityError(
+            "opening quote receipt does not replay"
+        ) from exc
+    raw_sha256 = hashlib.sha256(evidence.raw_response_bytes).hexdigest()
+    canonical_sha256 = _domain_bytes_hash(
+        b"etrade-opening-quote-parsed.v1\0",
+        canonical.encode("utf-8"),
+    )
+    quote_observed_at = min(
+        _to_us(quote.observed_at) for quote in quotes.quotes
+    )
+    material = {
+        "account_id": row["account_id"],
+        "account_id_key": row["account_id_key"],
+        "institution_type": row["institution_type"],
+        "environment": row["environment"],
+        "origin": row["origin"],
+        "route": row["route"],
+        "query_json": row["query_json"],
+        "authorization_sha256": row["authorization_sha256"],
+        "request_started_at": int(row["request_started_at"]),
+        "response_completed_at": int(row["response_completed_at"]),
+        "http_status": int(row["http_status"]),
+        "raw_byte_length": int(row["raw_byte_length"]),
+        "raw_response_sha256": row["raw_response_sha256"],
+        "parser_schema": row["parser_schema"],
+        "parser_code_sha256": row["parser_code_sha256"],
+        "parser_config_sha256": row["parser_config_sha256"],
+        "canonical_quotes_sha256": row["canonical_quotes_sha256"],
+        "quote_snapshot_sha256": row["quote_snapshot_sha256"],
+        "quote_evidence_sha256": row["quote_evidence_sha256"],
+        "quote_observed_at": int(row["quote_observed_at"]),
+        "recorded_at": int(row["recorded_at"]),
+    }
+    if (
+        row["parser_schema"] != OPENING_QUOTE_PARSER_SCHEMA
+        or row["parser_code_sha256"] != OPENING_QUOTE_PARSER_CODE_SHA256
+        or row["parser_config_sha256"]
+        != OPENING_QUOTE_PARSER_CONFIG_SHA256
+        or int(row["raw_byte_length"]) != len(evidence.raw_response_bytes)
+        or row["raw_response_sha256"] != raw_sha256
+        or row["canonical_quotes_json"] != canonical
+        or row["canonical_quotes_sha256"] != canonical_sha256
+        or row["quote_snapshot_sha256"] != quotes.snapshot_sha256
+        or row["quote_evidence_sha256"]
+        != quote_evidence_sha256(quotes)
+        or int(row["quote_observed_at"]) != quote_observed_at
+        or int(row["response_completed_at"])
+        < int(row["request_started_at"])
+        or int(row["recorded_at"])
+        < int(row["response_completed_at"])
+        or any(
+            _to_us(quote.observed_at)
+            > int(row["response_completed_at"])
+            for quote in quotes.quotes
+        )
+        or row["route"]
+        != expected_quote_route(
+            tuple(quote.contract for quote in quotes.quotes)
+        )
+        or not hmac.compare_digest(
+            row["receipt_sha256"],
+            _domain_json_hash(
+                _OPENING_QUOTE_RECEIPT_HASH_DOMAIN, material
+            ),
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "opening quote receipt integrity changed"
+        )
+    return quotes
+
+
+def _derive_opening_risk_lineage(
+    *,
+    conn: sqlite3.Connection,
+    intent: sqlite3.Row,
+    prerequisite: sqlite3.Row,
+    capacity_result: dict[str, Any],
+    quotes: Any,
+    recorded_at: int,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    target_contracts = tuple(
+        sorted(
+            (quote.contract for quote in quotes.quotes),
+            key=lambda item: item.canonical_material,
+        )
+    )
+    position_documents: list[dict[str, Any]] = []
+    position_conflicts: list[dict[str, Any]] = []
+    for position in capacity_result["positions"]:
+        if position["product"]["security_type"] != "OPTN":
+            continue
+        try:
+            contract = _closing_contract_from_position(position)
+        except OrderIntentReservationError as exc:
+            raise OrderIntentIntegrityError(
+                "capacity-v3 position identity cannot be replayed"
+            ) from exc
+        document = {
+            "position_id": position["position_id"],
+            "quantity": position["quantity"],
+            "contract": _closing_contract_document(contract),
+        }
+        position_documents.append(document)
+        if contract in target_contracts:
+            position_conflicts.append(document)
+    position_documents.sort(key=_canonical_read_json)
+    position_conflicts.sort(key=_canonical_read_json)
+
+    order_conflicts: list[dict[str, Any]] = []
+    for order in capacity_result["open_orders"]:
+        for detail_ordinal, detail in enumerate(order["details"]):
+            for instrument_ordinal, instrument in enumerate(
+                detail["instruments"]
+            ):
+                matches = [
+                    contract
+                    for contract in target_contracts
+                    if _normalized_product_matches_contract(
+                        instrument.get("product"), contract
+                    )
+                ]
+                if not matches:
+                    continue
+                if len(matches) != 1:
+                    raise OrderIntentIntegrityError(
+                        "target active-order contract is ambiguous"
+                    )
+                order_conflicts.append(
+                    {
+                        "order_id": order["order_id"],
+                        "detail_ordinal": detail_ordinal,
+                        "instrument_ordinal": instrument_ordinal,
+                        "status": detail["status"],
+                        "order_action": instrument["order_action"],
+                        "ordered_quantity":
+                            instrument["ordered_quantity"],
+                        "filled_quantity":
+                            instrument["filled_quantity"],
+                        "cancel_quantity":
+                            instrument["cancel_quantity"],
+                        "contract":
+                            _closing_contract_document(matches[0]),
+                        "replacement_linked": any(
+                            value is not None
+                            for value in (
+                                order["replaces_order_id"],
+                                order["replaced_by_order_id"],
+                                detail["replaces_order_id"],
+                                detail["replaced_by_order_id"],
+                            )
+                        ),
+                    }
+                )
+    order_conflicts.sort(key=_canonical_read_json)
+
+    reservation_rows = conn.execute(
+        """
+        SELECT reservation.intent_id, reservation.amount,
+               reservation.max_loss_amount, reservation.state,
+               reservation.released_reason_code, intent.wire_payload,
+               intent.created_at
+        FROM margin_reservations AS reservation
+        JOIN order_intents AS intent USING (intent_id)
+        WHERE reservation.account_id = ?
+          AND reservation.environment = ?
+          AND (
+                reservation.state IN (
+                    'ACTIVE','FILLED_PENDING_ABSORPTION'
+                )
+                OR (
+                    reservation.state = 'RELEASED'
+                    AND reservation.released_reason_code =
+                        'FULL_FILL_POSITION_ABSORBED'
+                )
+              )
+        ORDER BY reservation.intent_id
+        """,
+        (intent["account_id"], intent["environment"]),
+    ).fetchall()
+    reservation_documents = []
+    account_reserved_max_loss = Decimal("0")
+    symbol_reserved_max_loss = Decimal("0")
+    target_symbol = target_contracts[0].symbol
+    for row in reservation_rows:
+        max_loss = _canonical_signed_decimal_text(
+            row["max_loss_amount"], "durable reservation max loss"
+        )
+        amount = _canonical_signed_decimal_text(
+            row["amount"], "durable reservation collateral"
+        )
+        if max_loss < 0 or amount < 0:
+            raise OrderIntentIntegrityError(
+                "durable opening risk cannot be negative"
+            )
+        try:
+            payload = json.loads(row["wire_payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrderIntentIntegrityError(
+                "durable reservation payload is invalid"
+            ) from exc
+        symbol = payload.get("symbol") if type(payload) is dict else None
+        if type(symbol) is not str or not symbol:
+            raise OrderIntentIntegrityError(
+                "durable reservation symbol is unavailable"
+            )
+        account_reserved_max_loss += max_loss
+        if symbol == target_symbol:
+            symbol_reserved_max_loss += max_loss
+        reservation_documents.append(
+            {
+                "intent_id": row["intent_id"],
+                "symbol": symbol,
+                "collateral_amount": _signed_decimal_string(amount),
+                "max_loss_amount": _signed_decimal_string(max_loss),
+                "state": row["state"],
+                "released_reason_code": row["released_reason_code"],
+                "created_at": int(row["created_at"]),
+            }
+        )
+
+    session_date = prerequisite["trade_session"]
+    claim_rows = conn.execute(
+        """
+        SELECT event.intent_id, MIN(event.created_at) AS claimed_at,
+               reservation.max_loss_amount, intent.wire_payload
+        FROM order_events AS event
+        JOIN order_intents AS intent USING (intent_id)
+        LEFT JOIN margin_reservations AS reservation USING (intent_id)
+        WHERE event.account_id = ?
+          AND event.environment = ?
+          AND event.event_type = 'SUBMISSION_CLAIMED'
+        GROUP BY event.intent_id, reservation.max_loss_amount,
+                 intent.wire_payload
+        ORDER BY event.intent_id
+        """,
+        (intent["account_id"], intent["environment"]),
+    ).fetchall()
+    claims_utc_date = []
+    daily_new_risk_amount = Decimal("0")
+    for row in claim_rows:
+        claimed_at = int(row["claimed_at"])
+        if _from_us(claimed_at).date().isoformat() != session_date:
+            continue
+        max_loss = (
+            None
+            if row["max_loss_amount"] is None
+            else _canonical_signed_decimal_text(
+                row["max_loss_amount"], "claimed reservation max loss"
+            )
+        )
+        if max_loss is not None:
+            daily_new_risk_amount += max_loss
+        claims_utc_date.append(
+            {
+                "intent_id": row["intent_id"],
+                "claimed_at": claimed_at,
+                "max_loss_amount": (
+                    None
+                    if max_loss is None
+                    else _signed_decimal_string(max_loss)
+                ),
+            }
+        )
+
+    state_material = {
+        "reservations": reservation_documents,
+        "claims_utc_date": claims_utc_date,
+    }
+    durable_state_sha256 = _domain_json_hash(
+        b"etrade-opening-durable-risk-state.v1\0", state_material
+    )
+    buying_power_cents_decimal = (
+        _canonical_signed_decimal_text(
+            capacity_result["broker_buying_power"],
+            "opening lineage buying power",
+        )
+        * Decimal("100")
+    )
+    if (
+        buying_power_cents_decimal
+        != buying_power_cents_decimal.to_integral_value()
+        or buying_power_cents_decimal < 0
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity buying power is not exact cents"
+        )
+    missing = {
+        "BROKER_OPEN_ORDER_OPEN_RISK_NOT_REPLAYABLE",
+        "BROKER_POSITION_OPEN_RISK_NOT_REPLAYABLE",
+        "DAILY_PNL_NOT_REPLAYABLE",
+        "DAILY_SESSION_BOUNDARY_NOT_DURABLE",
+        "PORTFOLIO_DELTA_NOT_REPLAYABLE",
+        "QUOTE_ACQUISITION_CHANNEL_NOT_COMPOSED",
+        "QUOTE_MARKET_DATA_ENTITLEMENT_NOT_DURABLE",
+        "SYMBOL_DELTA_NOT_REPLAYABLE",
+    }
+    if int(prerequisite["valid_until"]) <= recorded_at:
+        missing.add("PREREQUISITE_STALE_AT_LINEAGE_RECORD")
+    derivation = {
+        "schema": "etrade-opening-risk-lineage.v1",
+        "account_id": intent["account_id"],
+        "environment": intent["environment"],
+        "symbol": target_symbol,
+        "trade_session": session_date,
+        "capacity_state_sha256": capacity_result["state_sha256"],
+        "buying_power_cents": int(buying_power_cents_decimal),
+        "position_contracts": position_documents,
+        "requested_position_conflicts": position_conflicts,
+        "requested_active_order_conflicts": order_conflicts,
+        "durable_account_reserved_max_loss_amount":
+            _signed_decimal_string(account_reserved_max_loss),
+        "durable_symbol_reserved_max_loss_amount":
+            _signed_decimal_string(symbol_reserved_max_loss),
+        "durable_claim_count_on_trade_session_utc":
+            len(claims_utc_date),
+        "durable_new_risk_on_trade_session_utc_amount":
+            _signed_decimal_string(daily_new_risk_amount),
+        "durable_ledger_state_sha256": durable_state_sha256,
+        "aggregate_completeness": {
+            "buying_power": "COMPLETE",
+            "position_contract_conflicts": "COMPLETE",
+            "active_order_contract_conflicts": "COMPLETE",
+            "account_open_risk": "PARTIAL_DURABLE_ONLY",
+            "symbol_open_risk": "PARTIAL_DURABLE_ONLY",
+            "portfolio_delta": "MISSING",
+            "symbol_delta": "MISSING",
+            "daily_pnl": "MISSING",
+            "daily_order_count": "PARTIAL_UTC_DIAGNOSTIC_ONLY",
+            "daily_new_risk": "PARTIAL_UTC_DIAGNOSTIC_ONLY",
+        },
+    }
+    return derivation, tuple(sorted(missing))
+
+
+def _verify_opening_risk_lineage_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | None,
+) -> OpeningRiskLineageRef:
+    if row is None:
+        raise OrderIntentIntegrityError("opening risk lineage is missing")
+    if row["status"] != "INDEPENDENT_EVIDENCE_PENDING":
+        raise OrderIntentIntegrityError(
+            "opening risk lineage was treated as authorization"
+        )
+    try:
+        derivation = _load_canonical_json_object(
+            row["canonical_derivation_json"],
+            "opening risk derivation",
+        )
+        missing = _load_canonical_json(
+            row["missing_evidence_reasons_json"],
+            "opening risk missing evidence",
+        )
+    except OrderIntentValidationError as exc:
+        raise OrderIntentIntegrityError(
+            "opening risk lineage JSON is invalid"
+        ) from exc
+    if (
+        type(missing) is not list
+        or not missing
+        or missing != sorted(set(missing))
+        or any(type(reason) is not str or not reason for reason in missing)
+        or derivation.get("schema") != "etrade-opening-risk-lineage.v1"
+        or derivation.get("durable_ledger_state_sha256")
+        != row["durable_state_sha256"]
+    ):
+        raise OrderIntentIntegrityError(
+            "opening risk lineage is not fail-closed"
+        )
+    prerequisite = conn.execute(
+        """
+        SELECT * FROM opening_risk_prerequisites
+        WHERE binding_sha256 = ?
+        """,
+        (row["prerequisite_sha256"],),
+    ).fetchone()
+    quote_row = conn.execute(
+        """
+        SELECT * FROM opening_quote_receipts WHERE receipt_sha256 = ?
+        """,
+        (row["quote_receipt_sha256"],),
+    ).fetchone()
+    manifest = conn.execute(
+        """
+        SELECT * FROM broker_read_manifests WHERE evidence_sha256 = ?
+        """,
+        (row["capacity_evidence_sha256"],),
+    ).fetchone()
+    if (
+        prerequisite is None
+        or quote_row is None
+        or manifest is None
+        or prerequisite["intent_id"] != row["intent_id"]
+        or prerequisite["binding_sha256"]
+        != row["prerequisite_sha256"]
+        or prerequisite["portfolio_broker_read_evidence_sha256"]
+        != row["capacity_evidence_sha256"]
+        or prerequisite["portfolio_snapshot_sha256"]
+        != row["capacity_state_sha256"]
+        or quote_row["quote_snapshot_sha256"]
+        != prerequisite["quote_snapshot_sha256"]
+        or quote_row["quote_evidence_sha256"]
+        != prerequisite["quote_evidence_sha256"]
+        or int(quote_row["quote_observed_at"])
+        != int(row["quote_observed_at"])
+        or int(manifest["observed_at"])
+        != int(row["portfolio_observed_at"])
+    ):
+        raise OrderIntentIntegrityError(
+            "opening risk lineage dependencies changed"
+        )
+    _verify_opening_quote_receipt_row(quote_row)
+    derivation_sha256 = _domain_bytes_hash(
+        b"etrade-opening-risk-derivation.v1\0",
+        row["canonical_derivation_json"].encode("utf-8"),
+    )
+    material = {
+        "intent_id": row["intent_id"],
+        "prerequisite_sha256": row["prerequisite_sha256"],
+        "quote_receipt_sha256": row["quote_receipt_sha256"],
+        "capacity_evidence_sha256": row["capacity_evidence_sha256"],
+        "capacity_state_sha256": row["capacity_state_sha256"],
+        "durable_state_sha256": row["durable_state_sha256"],
+        "derivation_sha256": row["derivation_sha256"],
+        "missing_evidence_reasons_json":
+            row["missing_evidence_reasons_json"],
+        "status": row["status"],
+        "quote_observed_at": int(row["quote_observed_at"]),
+        "portfolio_observed_at": int(row["portfolio_observed_at"]),
+        "recorded_at": int(row["recorded_at"]),
+    }
+    if (
+        derivation_sha256 != row["derivation_sha256"]
+        or not hmac.compare_digest(
+            row["lineage_sha256"],
+            _domain_json_hash(
+                _OPENING_RISK_LINEAGE_HASH_DOMAIN, material
+            ),
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "opening risk lineage digest does not verify"
+        )
+    return OpeningRiskLineageRef(
+        lineage_sha256=row["lineage_sha256"],
+        intent_id=row["intent_id"],
+        status=row["status"],
+        missing_evidence_reasons=tuple(missing),
+    )
 
 
 def _opening_risk_prerequisite_material(

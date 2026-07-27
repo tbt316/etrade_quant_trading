@@ -126,7 +126,7 @@ def _domain_json_sha256(domain, value):
 
 class Clock:
     def __init__(self):
-        self.now = datetime.now(timezone.utc)
+        self.now = datetime(2026, 7, 27, 18, 0, tzinfo=timezone.utc)
 
     def __call__(self):
         return self.now
