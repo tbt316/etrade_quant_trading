@@ -1,30 +1,30 @@
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import configparser
 import random
 import re
+from live_trading.runtime_safety import (
+    RuntimeSafetyError,
+    configure_owner_only_logger,
+    payload_fingerprint,
+    redact_http_headers,
+)
 
 # loading configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 
 class Order:
 
     def __init__(self, session, account, base_url):
-        self.session = session
-        self.account = account
-        self.base_url = base_url
+        raise RuntimeSafetyError(
+            "legacy interactive Order client is quarantined; use order.order_bo.Order "
+            "with a RuntimeSafetyBoundary"
+        )
 
     def preview_order(self):
         """
@@ -70,8 +70,8 @@ class Order:
 
         # Make API call for POST request
         response = self.session.post(url, header_auth=True, headers=headers, data=payload)
-        logger.debug("Request Header: %s", response.request.headers)
-        logger.debug("Request payload: %s", payload)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
         # Handle and parse response
         if response is not None and response.status_code == 200:
@@ -205,8 +205,8 @@ class Order:
 
                     # Make API call for POST request
                     response = session.post(url, header_auth=True, headers=headers, data=payload)
-                    logger.debug("Request Header: %s", response.request.headers)
-                    logger.debug("Request payload: %s", payload)
+                    logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+                    logger.debug("Request payload: %s", payload_fingerprint(payload))
 
                     # Handle and parse response
                     if response is not None and response.status_code == 200:
@@ -472,7 +472,7 @@ class Order:
             # Make API call for GET request
             response_open = self.session.get(url, header_auth=True, params=params_open, headers=headers)
 
-            logger.debug("Request Header: %s", response_open.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_open.request.headers))
             logger.debug("Response Body: %s", response_open.text)
 
             print("\nOpen Orders: ")
@@ -586,8 +586,8 @@ class Order:
 
                         # Add payload for PUT Request
                         response = self.session.put(url, header_auth=True, headers=headers, data=payload)
-                        logger.debug("Request Header: %s", response.request.headers)
-                        logger.debug("Request payload: %s", payload)
+                        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+                        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
                         # Handle and parse response
                         if response is not None and response.status_code == 200:
@@ -600,7 +600,7 @@ class Order:
                                     data["CancelOrderResponse"]["orderId"]) + " successfully Cancelled.")
                             else:
                                 # Handle errors
-                                logger.debug("Response Headers: %s", response.headers)
+                                logger.debug("Response Headers: %s", redact_http_headers(response.headers))
                                 logger.debug("Response Body: %s", response.text)
                                 data = response.json()
                                 if 'Error' in data and 'message' in data["Error"] \
@@ -610,7 +610,7 @@ class Order:
                                     print("Error: Cancel Order API service error")
                         else:
                             # Handle errors
-                            logger.debug("Response Headers: %s", response.headers)
+                            logger.debug("Response Headers: %s", redact_http_headers(response.headers))
                             logger.debug("Response Body: %s", response.text)
                             data = response.json()
                             if 'Error' in data and 'message' in data["Error"] and data["Error"]["message"] is not None:
@@ -674,7 +674,7 @@ class Order:
             prev_orders = []
 
             # Open orders
-            logger.debug("Request Header: %s", response_open.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_open.request.headers))
             logger.debug("Response Body: %s", response_open.text)
 
             print("\nOpen Orders:")
@@ -691,9 +691,9 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "open"))
 
             # Executed orders
-            logger.debug("Request Header: %s", response_executed.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_executed.request.headers))
             logger.debug("Response Body: %s", response_executed.text)
-            logger.debug(response_executed.text)
+            logger.debug("Response Body: %s", response_executed.text)
 
             print("\nExecuted Orders:")
             # Handle and parse response
@@ -709,7 +709,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "executed"))
 
             # Individual fills orders
-            logger.debug("Request Header: %s", response_indiv_fills.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_indiv_fills.request.headers))
             logger.debug("Response Body: %s", response_indiv_fills.text)
 
             print("\nIndividual Fills Orders:")
@@ -726,7 +726,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "indiv_fills"))
 
             # Cancelled orders
-            logger.debug("Request Header: %s", response_cancelled.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_cancelled.request.headers))
             logger.debug("Response Body: %s", response_cancelled.text)
 
             print("\nCancelled Orders:")
@@ -743,7 +743,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "cancelled"))
 
             # Rejected orders
-            logger.debug("Request Header: %s", response_rejected.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_rejected.request.headers))
             logger.debug("Response Body: %s", response_rejected.text)
 
             print("\nRejected Orders:")

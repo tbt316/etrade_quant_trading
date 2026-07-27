@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import configparser
 import random
 import re
@@ -16,19 +15,21 @@ import logging
 import requests
 from xml.etree import ElementTree as ET
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+from live_trading.runtime_safety import (
+    RuntimeSafetyBoundary,
+    RuntimeSafetyError,
+    configure_owner_only_logger,
+    payload_fingerprint,
+    redact_http_headers,
+    resolve_etrade_consumer_key,
+)
 
 # loading configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 
 class Order:
@@ -62,15 +63,41 @@ class Order:
 
         return float(max(tick_dec, snapped))
 
-    def __init__(self, session, account, base_url, use_sandbox):
+    def __init__(
+        self,
+        session,
+        account,
+        base_url,
+        use_sandbox,
+        consumer_key=None,
+        runtime_safety: RuntimeSafetyBoundary | None = None,
+    ):
         self.session = session
         self.account = account
         self.base_url = base_url
         self.use_sandbox = use_sandbox
-        if self.use_sandbox:
-            self.consumer_key = config["DEFAULT"]["SANDBOX_CONSUMER_KEY"]
-        else: 
-            self.consumer_key = config["DEFAULT"]["PROD_CONSUMER_KEY"]
+        self.runtime_safety = runtime_safety
+        if runtime_safety is not None:
+            if runtime_safety.use_sandbox != use_sandbox:
+                raise RuntimeSafetyError("order client environment conflicts with runtime safety boundary")
+            runtime_safety.verify_account(account)
+        config_key = "SANDBOX_CONSUMER_KEY" if self.use_sandbox else "PROD_CONSUMER_KEY"
+        self.consumer_key = resolve_etrade_consumer_key(
+            self.use_sandbox,
+            consumer_key=consumer_key,
+            config_value=config["DEFAULT"].get(config_key),
+        )
+
+    def _assert_order_api_access(self) -> None:
+        """Revalidate the arm and exact account at every order API boundary."""
+
+        if self.runtime_safety is None:
+            raise RuntimeSafetyError(
+                "order API access requires an authenticated RuntimeSafetyBoundary"
+            )
+        if self.runtime_safety.use_sandbox != self.use_sandbox:
+            raise RuntimeSafetyError("order client environment conflicts with runtime safety boundary")
+        self.runtime_safety.verify_account(self.account)
 
     def _refresh_auth_session_if_possible(self, reason):
         callback = getattr(self, "auth_refresh_callback", None)
@@ -205,9 +232,10 @@ class Order:
             </PreviewOrderRequest>
             """
         # Make the API call for POST request
+        self._assert_order_api_access()
         response = self.session.post(url, headers=headers, data=payload)
-        logger.debug("Request Header: %s", response.request.headers)
-        logger.debug("Request payload: %s", payload)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
         # Print the status code and response text for debugging
         if response.status_code != 200:
@@ -221,7 +249,7 @@ class Order:
             else:
                 print(order)
                 print(response.text)
-                print(payload)
+                print("Order request payload withheld; metadata:", payload_fingerprint(payload))
 
         # Handle and parse response
         if response and response.status_code == 200:
@@ -295,10 +323,11 @@ class Order:
                                  order["limitPrice"], order["symbol"], order["orderAction"], order["quantity"])
 
         # Make API call for POST request
-        print(payload)
+        print("Order request payload withheld; metadata:", payload_fingerprint(payload))
+        self._assert_order_api_access()
         response = self.session.post(url, header_auth=True, headers=headers, data=payload)
-        logger.debug("Request Header: %s", response.request.headers)
-        logger.debug("Request payload: %s", payload)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+        logger.debug("Request payload: %s", payload_fingerprint(payload))
         print(response)
 
         # Handle and parse response
@@ -514,9 +543,10 @@ class Order:
             """
 
         # Make API call for POST request
+        self._assert_order_api_access()
         response = self.session.post(url, headers=headers, data=payload)
-        logger.debug("Request Header: %s", response.request.headers)
-        logger.debug("Request payload: %s", payload)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
         if response.status_code != 200:
             print("Preview order Status Code:", response.status_code)
@@ -529,7 +559,7 @@ class Order:
             else:
                 print(order)
                 print(response.text)
-                print(payload)
+                print("Order request payload withheld; metadata:", payload_fingerprint(payload))
 
         # Handle and parse response
         if response and response.status_code == 200:
@@ -600,9 +630,10 @@ class Order:
                                  order["orderTerm"], order["limitPrice"], order["symbol"], order["orderAction"], order["quantity"])
 
         # Make API call for POST request
+        self._assert_order_api_access()
         response = self.session.post(url, header_auth=True, headers=headers, data=payload)
-        logger.debug("Request Header: %s", response.request.headers)
-        logger.debug("Request payload: %s", payload)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
         # Handle and parse response
         if response is not None and response.status_code == 200:
@@ -742,6 +773,7 @@ class Order:
 
         preview_url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/orders/preview"
         preview_headers = {"Content-Type": "application/xml", "Accept": "application/json", "consumerKey": self.consumer_key}
+        self._assert_order_api_access()
         pr = self.session.post(preview_url, headers=preview_headers, data=preview_payload)
         if pr.status_code != 200:
             print(f"Failed to preview change for order {order_id}: {pr.text}")
@@ -790,6 +822,7 @@ class Order:
 
         place_url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/orders/{order_id}/change/place"
         place_headers = {"Content-Type": "application/xml", "Accept": "application/json", "consumerKey": self.consumer_key}
+        self._assert_order_api_access()
         pl = self.session.put(place_url, headers=place_headers, data=place_payload)
         if pl.status_code == 200:
             new_id = None
@@ -929,9 +962,16 @@ class Order:
                 options_select = input("Please select an option: ")
 
                 if options_select.isdigit() and 0 < int(options_select) < len(prev_orders) + 1:
+                    if (
+                        not isinstance(account, dict)
+                        or account.get("accountIdKey") != self.account.get("accountIdKey")
+                    ):
+                        raise RuntimeSafetyError(
+                            "preview account conflicts with the runtime-bound order account"
+                        )
 
                     # URL for the API endpoint
-                    url = self.base_url + "/v1/accounts/" + account["accountIdKey"] + "/orders/preview.json"
+                    url = self.base_url + "/v1/accounts/" + self.account["accountIdKey"] + "/orders/preview.json"
 
                     # Add parameters and header information
                     headers = {"Content-Type": "application/xml", "consumerKey": self.consumer_key}
@@ -972,9 +1012,10 @@ class Order:
                                              prev_orders[options_select - 1]["quantity"])
 
                     # Make API call for POST request
-                    response = session.post(url, header_auth=True, headers=headers, data=payload)
-                    logger.debug("Request Header: %s", response.request.headers)
-                    logger.debug("Request payload: %s", payload)
+                    self._assert_order_api_access()
+                    response = self.session.post(url, header_auth=True, headers=headers, data=payload)
+                    logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+                    logger.debug("Request payload: %s", payload_fingerprint(payload))
 
                     # Handle and parse response
                     if response is not None and response.status_code == 200:
@@ -1333,7 +1374,7 @@ class Order:
             # Make API call for GET request
             response_open = self.session.get(url, header_auth=True, params=params_open, headers=headers)
 
-            logger.debug("Request Header: %s", response_open.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_open.request.headers))
             logger.debug("Response Body: %s", response_open.text)
 
             print("\nOpen Orders: ")
@@ -1447,9 +1488,10 @@ class Order:
                         payload = payload.format(order_list[int(selection) - 1])
 
                         # Add payload for PUT Request
+                        self._assert_order_api_access()
                         response = self.session.put(url, header_auth=True, headers=headers, data=payload)
-                        logger.debug("Request Header: %s", response.request.headers)
-                        logger.debug("Request payload: %s", payload)
+                        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+                        logger.debug("Request payload: %s", payload_fingerprint(payload))
 
                         # Handle and parse response
                         if response is not None and response.status_code == 200:
@@ -1462,7 +1504,7 @@ class Order:
                                     data["CancelOrderResponse"]["orderId"]) + " successfully Cancelled.")
                             else:
                                 # Handle errors
-                                logger.debug("Response Headers: %s", response.headers)
+                                logger.debug("Response Headers: %s", redact_http_headers(response.headers))
                                 logger.debug("Response Body: %s", response.text)
                                 data = response.json()
                                 if 'Error' in data and 'message' in data["Error"] \
@@ -1472,7 +1514,7 @@ class Order:
                                     print("Error: Cancel Order API service error")
                         else:
                             # Handle errors
-                            logger.debug("Response Headers: %s", response.headers)
+                            logger.debug("Response Headers: %s", redact_http_headers(response.headers))
                             logger.debug("Response Body: %s", response.text)
                             data = response.json()
                             if 'Error' in data and 'message' in data["Error"] and data["Error"]["message"] is not None:
@@ -1537,7 +1579,7 @@ class Order:
             prev_orders = []
 
             # Open orders
-            logger.debug("Request Header: %s", response_open.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_open.request.headers))
             logger.debug("Response Body: %s", response_open.text)
 
             print("\nOpen Orders:")
@@ -1554,9 +1596,9 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "open"))
 
             # Executed orders
-            logger.debug("Request Header: %s", response_executed.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_executed.request.headers))
             logger.debug("Response Body: %s", response_executed.text)
-            logger.debug(response_executed.text)
+            logger.debug("Response Body: %s", response_executed.text)
 
             print("\nExecuted Orders:")
             # Handle and parse response
@@ -1574,7 +1616,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "executed"))
 
             # Individual fills orders
-            logger.debug("Request Header: %s", response_indiv_fills.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_indiv_fills.request.headers))
             logger.debug("Response Body: %s", response_indiv_fills.text)
 
             print("\nIndividual Fills Orders:")
@@ -1591,7 +1633,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "indiv_fills"))
 
             # Cancelled orders
-            logger.debug("Request Header: %s", response_cancelled.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_cancelled.request.headers))
             logger.debug("Response Body: %s", response_cancelled.text)
 
             print("\nCancelled Orders:")
@@ -1608,7 +1650,7 @@ class Order:
                 prev_orders.extend(self.print_orders(data, "cancelled"))
 
             # Rejected orders
-            logger.debug("Request Header: %s", response_rejected.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_rejected.request.headers))
             logger.debug("Response Body: %s", response_rejected.text)
 
             print("\nRejected Orders:")
@@ -1689,9 +1731,9 @@ class Order:
             prev_orders = []
 
             # Executed orders
-            logger.debug("Request Header: %s", response_filter.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response_filter.request.headers))
             logger.debug("Response Body: %s", response_filter.text)
-            logger.debug(response_filter.text)
+            logger.debug("Response Body: %s", response_filter.text)
 
             print("\nExecuted Orders:")
             # Handle and parse response
@@ -1742,7 +1784,7 @@ class Order:
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
         if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("open orders fetch"):
             response = self.session.get(url, header_auth=True, params=params, headers=headers)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
         logger.debug("Response Body: %s", response.text)
 
         open_orders_list = []
@@ -1800,7 +1842,7 @@ class Order:
         params = {"status": "CANCELLED"}
 
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
         logger.debug("Response Body: %s", response.text)
 
         cancelled_orders_list = []
@@ -1865,7 +1907,7 @@ class Order:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
         logger.debug("Response Body: %s", response.text)
 
         executed_orders_list = []
@@ -1931,7 +1973,7 @@ class Order:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
         logger.debug("Response Body: %s", response.text)
 
         opened_orders_list = []
@@ -2019,6 +2061,7 @@ class Order:
             }
 
             # Make the API request to place the order
+            self._assert_order_api_access()
             response = self.session.post(url, json=order_payload)
 
             # Check if the request was successful
@@ -2640,7 +2683,7 @@ class Order:
         
         # Make API call for GET request
         response_open = self.session.get(url, header_auth=True, params=params_open, headers=headers)
-        logger.debug("Request Header: %s", response_open.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response_open.request.headers))
         logger.debug("Response Body: %s", response_open.text)
         
         print("\nOpen Orders:")
@@ -2718,9 +2761,10 @@ class Order:
                             payload = payload.format(order_id)
                             
                             # Make API call for PUT request
+                            self._assert_order_api_access()
                             response = self.session.put(cancel_url, header_auth=True, headers=cancel_headers, data=payload)
-                            logger.debug("Request Header: %s", response.request.headers)
-                            logger.debug("Request payload: %s", payload)
+                            logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
+                            logger.debug("Request payload: %s", payload_fingerprint(payload))
                             
                             # Handle and parse response
                             if response is not None and response.status_code == 200:
@@ -2874,6 +2918,7 @@ class Order:
                         "consumerKey": self.consumer_key,
                     }
                     
+                    self._assert_order_api_access()
                     change_response = self.session.put(change_url, headers=change_headers, data=payload)
                     
                     if change_response.status_code == 200:
@@ -2883,7 +2928,7 @@ class Order:
                         print("Failed to update order %s: Status Code: %s, Response: %s", 
                                     order_id, change_response.status_code, change_response.text)
                         print(change_url)
-                        print(payload)
+                        print("Order request payload withheld; metadata:", payload_fingerprint(payload))
             # Wait 10 seconds before next iteration
             time.sleep(10)
 
@@ -2975,6 +3020,7 @@ class Order:
                         "consumerKey": self.consumer_key,
                     }
 
+                    self._assert_order_api_access()
                     preview_response = self.session.post(preview_url, headers=preview_headers, data=preview_payload)
                     if preview_response.status_code != 200:
                         print("Failed to preview change for order %s: %s", order_id, preview_response.text)
@@ -3022,6 +3068,7 @@ class Order:
                         "consumerKey": self.consumer_key,
                     }
 
+                    self._assert_order_api_access()
                     place_response = self.session.put(place_url, headers=place_headers, data=place_payload)
                     if place_response.status_code == 200:
                         print("Successfully updated order %s to new limit price %.2f", order_id, new_limit_price)

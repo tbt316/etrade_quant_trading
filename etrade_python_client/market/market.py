@@ -1,15 +1,9 @@
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+from live_trading.runtime_safety import configure_owner_only_logger, redact_http_headers
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 
 class Market:
@@ -30,7 +24,7 @@ class Market:
 
         # Make API call for GET request
         response = self.session.get(url)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         if response is not None and response.status_code == 200:
 

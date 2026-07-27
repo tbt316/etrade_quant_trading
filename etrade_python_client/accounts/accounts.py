@@ -1,21 +1,15 @@
 import json
 import logging
 import configparser
-from logging.handlers import RotatingFileHandler
 from order.order import Order
+from live_trading.runtime_safety import configure_owner_only_logger, redact_http_headers
 
 # loading configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 
 class Accounts:
@@ -41,7 +35,7 @@ class Accounts:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         # Handle and parse response
         if response is not None and response.status_code == 200:
@@ -113,7 +107,7 @@ class Accounts:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         print("\nPortfolio:")
 
@@ -187,8 +181,8 @@ class Accounts:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True, params=params, headers=headers)
-        logger.debug("Request url: %s", url)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Account balance request issued")
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         # Handle and parse response
         if response is not None and response.status_code == 200:

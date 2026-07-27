@@ -12,9 +12,11 @@ import json
 import ast
 import os
 import sys
+import stat
 import traceback
 import random
 import secrets
+import tempfile
 import hmac
 import hashlib
 import smtplib
@@ -25,7 +27,6 @@ from email.mime.text import MIMEText
 from datetime import timedelta
 from datetime import datetime, date
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
 import logging
 import pandas as pd
 from live_trading.ev_engine import (
@@ -43,7 +44,6 @@ from accounts.accounts_bo import StockPosition
 from core_api.stock_trade_class import *
 import webbrowser
 from rauth import OAuth1Service
-from logging.handlers import RotatingFileHandler
 from accounts.accounts_bo import Accounts, calculate_std_dev, calculate_margin, print_margin_report, find_highest_margin_ratios, _select_nearest_expiration, is_etrade_token_expired_response
 from market.market_bo import Market
 import configparser
@@ -61,11 +61,22 @@ from live_trading.regime_shadow_store import (
     RegimeShadowStore,
     unavailable_dashboard_payload,
 )
+from live_trading.runtime_safety import (
+    RuntimeSafetyError,
+    build_runtime_safety_boundary,
+    configure_owner_only_logger,
+    read_owner_only_json,
+    secure_append_text,
+    secure_lock_file,
+    validate_dashboard_credentials,
+    write_owner_only_json,
+)
 from live_trading.spy_position_tracker import update_spy_daily_snapshot, record_closed_spy_gain
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import base64
+import io
 TRADE_STATUS_FILE = "trade_status.json"
 DASHBOARD_LOG_FILE = "dashboard_requests.log"
 AUDIT_LOG_FILE = "order_audit_log.csv"
@@ -98,17 +109,17 @@ def log_order_execution(order_info, reason, status="PLACED"):
     try:
         file_exists = os.path.exists(AUDIT_LOG_FILE)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(AUDIT_LOG_FILE, "a") as f:
-            if not file_exists:
-                f.write("timestamp,ticker,type,strikes,qty,reason,order_id,status\n")
-            
-            ticker = order_info.get('ticker', 'N/A')
-            order_type = "CLOSE" if order_info.get('is_close') else "OPEN"
-            strikes = f"{order_info.get('sell_strike', 'N/A')}/{order_info.get('long_strike', 'N/A')}"
-            qty = order_info.get('pair_quantity', order_info.get('qty', 1))
-            order_id = order_info.get('order_id', 'N/A')
-            
-            f.write(f"{timestamp},{ticker},{order_type},{strikes},{qty},{reason},{order_id},{status}\n")
+        ticker = order_info.get('ticker', 'N/A')
+        order_type = "CLOSE" if order_info.get('is_close') else "OPEN"
+        strikes = f"{order_info.get('sell_strike', 'N/A')}/{order_info.get('long_strike', 'N/A')}"
+        qty = order_info.get('pair_quantity', order_info.get('qty', 1))
+        order_id = order_info.get('order_id', 'N/A')
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        if not file_exists:
+            writer.writerow(("timestamp", "ticker", "type", "strikes", "qty", "reason", "order_id", "status"))
+        writer.writerow((timestamp, ticker, order_type, strikes, qty, reason, order_id, status))
+        secure_append_text(AUDIT_LOG_FILE, buffer.getvalue())
     except Exception as e:
         print(f"⚠️ Error writing to audit log: {e}")
 
@@ -157,22 +168,39 @@ def send_trade_notification_email(order_info, reason):
     except Exception as e:
         print(f"⚠️ Failed to send notification email: {e}")
 
+_DASHBOARD_LOG_SECRET_MARKERS = (
+    "pin", "pass", "password", "secret", "token", "credential", "oauth",
+    "consumer", "authorization", "auth",
+)
+
+
+def _redact_dashboard_log_data(value):
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if any(marker in str(key).lower() for marker in _DASHBOARD_LOG_SECRET_MARKERS)
+                else _redact_dashboard_log_data(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_dashboard_log_data(item) for item in value]
+    return value
+
+
 def log_dashboard_request(path, data):
-    """Log all dashboard API requests to a persistent file."""
+    """Log request metadata without persisting credentials or action secrets."""
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Strip PIN for security in logs
-        log_data = data.copy() if isinstance(data, dict) else data
-        if isinstance(log_data, dict) and 'pin' in log_data:
-            log_data['pin'] = "****"
+        log_data = _redact_dashboard_log_data(data)
             
         entry = {
             "timestamp": timestamp,
             "path": path,
             "data": log_data
         }
-        with open(DASHBOARD_LOG_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        secure_append_text(DASHBOARD_LOG_FILE, json.dumps(entry) + "\n")
     except Exception as e:
         print(f"⚠️ Error logging dashboard request: {e}")
 
@@ -912,11 +940,53 @@ LIVE_SETTINGS_FILE = "live_trading_settings.json"
 DASHBOARD_SESSION_COOKIE = "etrade_dashboard_session"
 DASHBOARD_SESSION_DAYS = 7
 
+
+def _validate_live_settings_parent():
+    parent = Path(LIVE_SETTINGS_FILE).parent
+    try:
+        parent_metadata = os.lstat(parent)
+        if (
+            stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        ):
+            raise RuntimeSafetyError("live settings parent is unsafe")
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise RuntimeSafetyError("live settings parent is unsafe") from exc
+    try:
+        opened_parent = os.fstat(parent_descriptor)
+        if (
+            opened_parent.st_dev != parent_metadata.st_dev
+            or opened_parent.st_ino != parent_metadata.st_ino
+        ):
+            raise RuntimeSafetyError("live settings parent is unsafe")
+    finally:
+        os.close(parent_descriptor)
+    return parent
+
+
 def load_live_settings():
     """Load trading settings from JSON file."""
     try:
-        if os.path.exists(LIVE_SETTINGS_FILE):
-            with open(LIVE_SETTINGS_FILE, "r") as f:
+        if os.path.lexists(LIVE_SETTINGS_FILE):
+            _validate_live_settings_parent()
+            metadata = os.stat(LIVE_SETTINGS_FILE, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise RuntimeSafetyError("live settings must be an owner-only regular file")
+            descriptor = os.open(
+                LIVE_SETTINGS_FILE,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(descriptor, "r", encoding="utf-8") as f:
                 settings = json.load(f)
                 # Dynamic self-healing migration for SPY & SPX spread width and pair quantity settings
                 modified = False
@@ -944,6 +1014,8 @@ def load_live_settings():
                 if modified:
                     save_live_settings(settings)
                 return settings
+    except RuntimeSafetyError:
+        raise
     except Exception as e:
         print(f"⚠️ Error loading settings: {e}")
     
@@ -965,17 +1037,48 @@ def load_live_settings():
         "spy_target_expiration": None,
         "spx_target_expiration": None,
         "auto_open_enabled": False,
-        "pin": "1234",
+        "pin": "",
         "dashboard_user": "",
         "dashboard_pass": "",
         "dashboard_auth_secret": secrets.token_hex(32)
     }
 
 def save_live_settings(settings):
-    """Save trading settings to JSON file."""
+    """Atomically save validated dashboard settings as an owner-only file."""
     try:
-        with open(LIVE_SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=4)
+        validate_dashboard_credentials(settings)
+        target = Path(LIVE_SETTINGS_FILE)
+        parent = _validate_live_settings_parent()
+        if os.path.lexists(target) and stat.S_ISLNK(os.lstat(target).st_mode):
+            raise RuntimeSafetyError("live settings path must not be a symlink")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=parent,
+            text=True,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                json.dump(settings, handle, indent=4)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, target)
+            temporary_name = None
+            parent_descriptor = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name)
+                except OSError:
+                    pass
         return True
     except Exception as e:
         print(f"⚠️ Error saving settings: {e}")
@@ -2147,11 +2250,14 @@ class RefreshHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(code)
             self.send_header('Content-Type', content_type)
-            self.send_header('Access-Control-Allow-Origin', '*')
             response_headers = {
                 'Cache-Control': 'no-store, max-age=0',
                 'Pragma': 'no-cache',
                 'Expires': '0',
+                'X-Content-Type-Options': 'nosniff',
+                'X-Frame-Options': 'DENY',
+                'Referrer-Policy': 'no-referrer',
+                'Cross-Origin-Resource-Policy': 'same-origin',
             }
             response_headers.update(headers or {})
             for key, value in response_headers.items():
@@ -2200,19 +2306,9 @@ class RefreshHandler(BaseHTTPRequestHandler):
             print("⚠️ Error sending private dashboard response.")
 
     def do_OPTIONS(self):
-        """Handle CORS preflight requests."""
+        """Reject cross-origin preflight for this same-origin dashboard."""
         try:
-            if self.path.split("?", 1)[0] == "/api/regime_v2_shadow":
-                self._send_private_json_response(
-                    405,
-                    {"error": "Method not allowed"},
-                )
-                return
-            self.send_response(200)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-            self.end_headers()
+            self._send_private_json_response(405, {"error": "Method not allowed"})
         except (BrokenPipeError, ConnectionResetError):
             pass
     
@@ -2841,15 +2937,14 @@ def start_ngrok_tunnel(config, port):
     except Exception as e:
         print(f"⚠️ Error starting ngrok tunnel: {e}")
 
-def start_refresh_server(port=8765):
-    """Start the HTTP refresh server in a background thread."""
-    server = ThreadingHTTPServer(('0.0.0.0', port), RefreshHandler)
+def start_refresh_server(port=8765, host="127.0.0.1"):
+    """Start the order-capable dashboard on loopback only."""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise RuntimeSafetyError("dashboard host must be loopback")
+    server = ThreadingHTTPServer((host, port), RefreshHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     print(f"🌐 [Refresh Server] Started on http://localhost:{port}")
-    
-    # Start ngrok tunnel if configured
-    start_ngrok_tunnel(config, port)
     
     return server
 
@@ -2877,13 +2972,7 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5*1024*1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 '''
     Grab the option expire dates and option chains for the specified symbol.
     Save as a JSON file
@@ -2891,17 +2980,35 @@ logger.addHandler(handler)
 '''
 OAUTH_KEYS = {
     "sandbox": {
-        "consumer_key": config['DEFAULT'].get('SANDBOX_CONSUMER_KEY', os.getenv("ETRADE_SANDBOX_CONSUMER_KEY", "default_sandbox_key")),
-        "consumer_secret": config['DEFAULT'].get('SANDBOX_CONSUMER_SECRET', os.getenv("ETRADE_SANDBOX_CONSUMER_SECRET", "default_sandbox_secret")),
+        "consumer_key": config['DEFAULT'].get('SANDBOX_CONSUMER_KEY', os.getenv("ETRADE_SANDBOX_CONSUMER_KEY")),
+        "consumer_secret": config['DEFAULT'].get('SANDBOX_CONSUMER_SECRET', os.getenv("ETRADE_SANDBOX_CONSUMER_SECRET")),
     },
     "live": {
-        "consumer_key": config['DEFAULT'].get('PROD_CONSUMER_KEY', os.getenv("ETRADE_LIVE_CONSUMER_KEY", "default_live_key")),
-        "consumer_secret": config['DEFAULT'].get('PROD_CONSUMER_SECRET', os.getenv("ETRADE_LIVE_CONSUMER_SECRET", "default_live_secret")),
+        "consumer_key": config['DEFAULT'].get('PROD_CONSUMER_KEY', os.getenv("ETRADE_LIVE_CONSUMER_KEY")),
+        "consumer_secret": config['DEFAULT'].get('PROD_CONSUMER_SECRET', os.getenv("ETRADE_LIVE_CONSUMER_SECRET")),
     }
 }
 
 # File to cache OAuth tokens so you don't have to re-authenticate each time
 ETRADE_OAUTH_FILE = ".etrade_oauth"
+
+
+def configured_oauth_keys(use_sandbox):
+    """Return non-placeholder client credentials or fail before broker I/O."""
+
+    prefix = "SANDBOX" if use_sandbox else "LIVE"
+    config_key = "SANDBOX" if use_sandbox else "PROD"
+    consumer_key = os.getenv(f"ETRADE_{prefix}_CONSUMER_KEY") or config["DEFAULT"].get(f"{config_key}_CONSUMER_KEY")
+    consumer_secret = os.getenv(f"ETRADE_{prefix}_CONSUMER_SECRET") or config["DEFAULT"].get(f"{config_key}_CONSUMER_SECRET")
+    placeholders = {"", "default_live_key", "default_live_secret", "default_sandbox_key", "default_sandbox_secret"}
+    if (
+        not isinstance(consumer_key, str)
+        or not isinstance(consumer_secret, str)
+        or consumer_key.strip() in placeholders
+        or consumer_secret.strip() in placeholders
+    ):
+        raise RuntimeSafetyError("E*TRADE client credentials are not configured")
+    return {"consumer_key": consumer_key.strip(), "consumer_secret": consumer_secret.strip()}
 
 def is_trading_day(check_date):
     """
@@ -3261,7 +3368,7 @@ def release_margin(all_positions, cover_call_list=None, etrade_instance=None, ma
 
     # Process each order generated for the selected candidates
     for order in orders:
-        print(f"Processing order: {order}")
+        print("Processing generated close order; payload withheld.")
         if etrade_instance:
             preview_response = etrade_instance.order.place_order(order, preview_only=True)
             print(f"Preview response: {preview_response}")
@@ -4109,39 +4216,38 @@ def environment_key(use_sandbox) -> str:
 
 def get_etrade_oauth(use_sandbox) -> dict:
     try:
-        with open(ETRADE_OAUTH_FILE) as f:
-            tokens = json.load(f)
-            return tokens[environment_key(use_sandbox)]
-    except (KeyError, TypeError, FileNotFoundError, JSONDecodeError) as err:
-        print("Couldn't find/parse cached OAuth in {} ({}: {})".format(ETRADE_OAUTH_FILE, err))
+        tokens = read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache")
+        return tokens[environment_key(use_sandbox)]
+    except (KeyError, TypeError, RuntimeSafetyError):
+        print("Couldn't load cached OAuth safely.")
         return None
 
 # Save the token, merging in with existing tokens
 def save_etrade_oauth(token, use_sandbox) -> bool:
     try:
-        try:
-            with open(ETRADE_OAUTH_FILE) as f:
-                tokens = json.load(f)
-        except FileNotFoundError:
+        if os.path.lexists(ETRADE_OAUTH_FILE):
+            tokens = read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache")
+        else:
             tokens = {}
         tokens[environment_key(use_sandbox)] = token
-        with open(os.open(ETRADE_OAUTH_FILE, os.O_CREAT | os.O_WRONLY, 0o600), "w") as f:
-            f.write(json.dumps(tokens))
-    except (KeyError, JSONDecodeError) as err:
-        print("Couldn't write cached OAuth in {} ({})".format(ETRADE_OAUTH_FILE, err))
-        sys.exit(1)
+        write_owner_only_json(ETRADE_OAUTH_FILE, tokens)
+        return True
+    except (KeyError, TypeError, RuntimeSafetyError):
+        print("Couldn't save cached OAuth safely.")
+        return False
 
 from urllib.parse import parse_qsl
 
 def oauth(use_sandbox, auto_login=True, username=None, password=None, headless=None):
     """Allows user authorization for the sample application with OAuth 1"""
-    keys = OAUTH_KEYS[environment_key(use_sandbox)]
+    if use_sandbox not in {True, False}:
+        raise RuntimeSafetyError("E*TRADE environment must be explicit")
+    keys = configured_oauth_keys(use_sandbox)
     consumer_key = keys["consumer_key"]
     consumer_secret = keys["consumer_secret"]
     
     print(f"Environment: {'Sandbox' if use_sandbox else 'Live'}")
     print(f"Base URL: {'https://apisb.etrade.com' if use_sandbox else 'https://api.etrade.com'}")
-    print(f"Consumer Key used: {consumer_key[:4]}...{consumer_key[-4:]}")
     sys.stdout.flush()
 
     if use_sandbox:
@@ -4165,11 +4271,14 @@ def oauth(use_sandbox, auto_login=True, username=None, password=None, headless=N
         base_url=base_url
     )
 
-    token_file = ".etrade_oauth"
+    token_file = ETRADE_OAUTH_FILE
 
-    if os.path.exists(token_file):
-        with open(token_file, 'r') as f:
-            tokens = json.load(f)
+    tokens = (
+        read_owner_only_json(token_file, label="OAuth cache")
+        if os.path.lexists(token_file)
+        else None
+    )
+    if isinstance(tokens, dict) and {"access_token", "access_token_secret"} <= set(tokens):
         
         session = etrade.get_session((tokens['access_token'], tokens['access_token_secret']))
         
@@ -4263,8 +4372,7 @@ def oauth(use_sandbox, auto_login=True, username=None, password=None, headless=N
         'access_token': session.access_token,
         'access_token_secret': session.access_token_secret
     }
-    with open(token_file, 'w') as f:
-        json.dump(tokens, f)
+    write_owner_only_json(token_file, tokens)
 
     print("New session created and tokens saved.")
     return session, base_url
@@ -4285,6 +4393,18 @@ def _attach_etrade_auth_refresh_callbacks():
             setattr(client, "auth_refresh_callback", callback)
 
 
+def _select_runtime_account(account_client):
+    """Resolve the selected account through the immutable runtime boundary."""
+
+    safety = globals().get("runtime_safety")
+    if safety is None:
+        # Importable helpers retain legacy sandbox behavior outside the main process.
+        return account_client.account_list(1)
+    account_client.account_list(**safety.account_selection_kwargs)
+    safety.verify_account(account_client.account)
+    return account_client.account
+
+
 def _refresh_etrade_session(reason="E*TRADE request"):
     with ETRADE_SESSION_REFRESH_LOCK:
         use_sandbox_value = globals().get("use_sandbox", False)
@@ -4296,15 +4416,25 @@ def _refresh_etrade_session(reason="E*TRADE request"):
         globals()["last_renewal_time"] = datetime.now()
 
         if globals().get("accounts") is not None:
-            refreshed_accounts = Accounts(new_session, new_base_url, use_sandbox=use_sandbox_value)
-            refreshed_accounts.account_list(1)
+            refreshed_accounts = Accounts(
+                new_session, new_base_url, use_sandbox=use_sandbox_value,
+                consumer_key=globals().get("runtime_consumer_key"),
+            )
+            _select_runtime_account(refreshed_accounts)
             globals()["accounts"] = refreshed_accounts
         if globals().get("market") is not None:
-            globals()["market"] = Market(new_session, new_base_url, use_sandbox=use_sandbox_value)
+            globals()["market"] = Market(
+                new_session, new_base_url, use_sandbox=use_sandbox_value,
+                consumer_key=globals().get("runtime_consumer_key"),
+            )
 
         etrade = globals().get("etrade_instance")
         if etrade is not None:
             etrade.refresh_session(new_session, new_base_url)
+            safety = globals().get("runtime_safety")
+            if safety is None:
+                raise RuntimeSafetyError("runtime account safety is unavailable during refresh")
+            safety.verify_account(etrade.account.account)
 
         _attach_etrade_auth_refresh_callbacks()
         return new_session, new_base_url
@@ -4313,26 +4443,44 @@ def _refresh_etrade_session(reason="E*TRADE request"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Grab all the option chains for the specified symbol',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--sandbox', help='use sandbox?', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--environment', choices=('sandbox', 'production'))
+    parser.add_argument('--sandbox', help='legacy explicit sandbox mode', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--trade', help='start live trade?', action=argparse.BooleanOptionalAction)
     parser.add_argument('--use_existing_file', help='re-use the backtest results?', action=argparse.BooleanOptionalAction)
     parser.add_argument('--no-regime', help='skip heavy market regime detection?', action='store_true')
+    parser.add_argument('--expected-account-id')
+    parser.add_argument('--expected-account-id-key')
+    parser.add_argument('--expected-institution-type')
+    parser.add_argument('--production-arm-file', type=Path)
 
     parser.add_argument('--username', help='username for login', type=str, required=False)
     parser.add_argument('--password', help='password for login', type=str, required=False)
     parser.add_argument('--no-headless', help='disable headless mode for login', action='store_true')
     args = parser.parse_args()
 
-    # --- SINGLETON LOCK ---
-    import fcntl
-    lock_file_path = '/tmp/etrade_trader.lock'
-    lock_file = open(lock_file_path, 'w')
+    if args.trade is not True:
+        parser.error("--trade is required for this order-capable process")
+
     try:
-        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        print(f"❌ Error: Another instance of etrade_cover_call_new is already running.")
-        sys.exit(1)
-    use_sandbox = args.sandbox
+        runtime_safety = build_runtime_safety_boundary(
+            environment=args.environment,
+            legacy_sandbox=args.sandbox,
+            expected_account_id=args.expected_account_id,
+            expected_account_id_key=args.expected_account_id_key,
+            expected_institution_type=args.expected_institution_type,
+            production_arm_file=args.production_arm_file,
+            production_arm_secret=os.getenv("ETRADE_PRODUCTION_ARMING_SECRET"),
+        )
+    except RuntimeSafetyError as exc:
+        parser.error(str(exc))
+
+    # --- SINGLETON LOCK ---
+    try:
+        lock_file = secure_lock_file(Path.cwd() / "etrade_trader.lock")
+    except RuntimeSafetyError as exc:
+        parser.error(str(exc))
+    use_sandbox = runtime_safety.use_sandbox
+    runtime_consumer_key = configured_oauth_keys(use_sandbox)["consumer_key"]
     start_trade = args.trade
     use_existing_file = args.use_existing_file
     no_regime = args.no_regime
@@ -4367,9 +4515,12 @@ if __name__ == "__main__":
     start_log = False
     end_log = False
 
-    keys = OAUTH_KEYS[environment_key(use_sandbox)]
-    consumer_key = keys["consumer_key"]
-    consumer_secret = keys["consumer_secret"]
+    try:
+        live_settings = load_live_settings()
+        validate_dashboard_credentials(live_settings)
+        configured_oauth_keys(use_sandbox)
+    except RuntimeSafetyError as exc:
+        parser.error(str(exc))
 
     trade_executed_flag = False # flag to be reset every ticks, indicating the trade strategy had been exeucted for the current tick
     # Add these lines
@@ -4390,8 +4541,7 @@ if __name__ == "__main__":
 
     authenticated = 0
     
-    # Load dynamic settings
-    live_settings = load_live_settings()
+    # Load dynamic settings only after the safety boundary has accepted them.
     trade_start_time = datetime.strptime(live_settings.get('trade_start_time', '07:15:00'), '%H:%M:%S').time()
     trade_end_time = datetime.strptime(live_settings.get('trade_end_time', '13:30:00'), '%H:%M:%S').time()
 
@@ -4404,14 +4554,27 @@ if __name__ == "__main__":
 
     if start_trade:
         if not bypass_etrade: 
-            etrade_instance = LiveTradeAgent(None,session,base_url, use_sandbox=use_sandbox)
+            selection = runtime_safety.account_selection_kwargs
+            etrade_instance = LiveTradeAgent(
+                None,
+                session,
+                base_url,
+                selected_account=selection["selected_account_id"],
+                use_sandbox=use_sandbox,
+                expected_account_id_key=runtime_safety.expected_account_id_key,
+                expected_account_id=runtime_safety.expected_account_id,
+                expected_institution_type=runtime_safety.expected_institution_type,
+                runtime_safety=runtime_safety,
+                consumer_key=runtime_consumer_key,
+            )
+            runtime_safety.verify_account(etrade_instance.account.account)
         else:
             etrade_instance = LiveTradeAgent()
         print('Live trade agent id: ', etrade_instance.agent_id)
 
-        accounts = Accounts(session, base_url)
-        accounts.account_list(1) # Select the Individual Brokerage account ending in 8703
-        market = Market(session, base_url)
+        accounts = Accounts(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
+        _select_runtime_account(accounts)
+        market = Market(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
         _attach_etrade_auth_refresh_callbacks()
 
 
@@ -4484,7 +4647,7 @@ if __name__ == "__main__":
     # Guard: Ensure --trade flag was passed, otherwise accounts/etrade_instance are undefined
     if not start_trade:
         print("❌ Error: You must run with --trade flag for the refresh functionality to work.")
-        print("   Example: python3 etrade_cover_call_new.py --no-sandbox --trade --username <user> --password <pass>")
+        print("   See live_trading/README.md for explicit environment and production-arm usage.")
         sys.exit(1)
     
     while True:
@@ -4526,11 +4689,12 @@ if __name__ == "__main__":
                 try:
                     session, base_url = oauth(use_sandbox)
                     last_renewal_time = datetime.now()
-                    accounts = Accounts(session, base_url)
-                    market = Market(session, base_url)
-                    accounts.account_list(1)
+                    accounts = Accounts(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
+                    market = Market(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
+                    _select_runtime_account(accounts)
                     if start_trade and not bypass_etrade:
                         etrade_instance.refresh_session(session, base_url)
+                        runtime_safety.verify_account(etrade_instance.account.account)
                     _attach_etrade_auth_refresh_callbacks()
                 except LoginFailureException as e:
                     logging.error(f"Failed to renew session (LoginFailure): {e}")
@@ -4577,7 +4741,7 @@ if __name__ == "__main__":
             if is_manual_refresh and not is_manual_trade:
                 print(f"🔄 [Manual Refresh] Regenerating portfolio HTML ({market_status})...")
                 try:
-                    accounts.account_list(1)
+                    _select_runtime_account(accounts)
                     refresh_positions = accounts.portfolio(print_enable=False, require_success=True)
                     from copy import deepcopy
                     refresh_screened = accounts.screen_option(deepcopy(refresh_positions))
@@ -4729,7 +4893,7 @@ if __name__ == "__main__":
                 if is_manual_refresh:
                     print("🔄 [Manual Refresh] Fetching portfolio and updating HTML (market closed)...")
                     try:
-                        accounts.account_list(1)
+                        _select_runtime_account(accounts)
                         all_positions = accounts.portfolio(print_enable=False, require_success=True)
                         screened = accounts.screen_option(all_positions)
                         html_path = accounts.render_screened_option_pairs_html(screened, out_path="screened_option_pairs.html", order_instance=etrade_instance.order, show_refresh=False)
@@ -4762,7 +4926,7 @@ if __name__ == "__main__":
 
             # ── Market is a trading day (PRE_MARKET, OPEN, or AFTER_HOURS) ──
             # Run read-only account/portfolio operations
-            accounts.account_list(1)
+            _select_runtime_account(accounts)
             today = datetime.now()
             passed_monday = today - timedelta(days=((today.weekday()) % 7))
             etrade_instance.order.option_gain_new(passed_monday.strftime("%Y-%m-%d"))
