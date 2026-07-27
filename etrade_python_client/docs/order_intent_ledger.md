@@ -1,7 +1,7 @@
 # Durable Order Intent Ledger
 
 **Delivery status:** R7a ledger + R7b transport + R7c coordinator + R7d
-durable reader, isolated
+durable reader + R7e terminal-risk absorption, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
 
@@ -23,9 +23,12 @@ legacy order paths.
 - No new closing orders until a later slice supplies typed position and open-order
   capacity evidence. Previously persisted closing orders remain readable and
   reconcilable after migration, but cannot be newly claimed or amended.
+- Exact zero-fill cancellation/rejection/expiration and exact full-fill
+  position absorption are supported. Partial fills, replacement chains,
+  transformed lots, assignment/exercise, and ambiguous position evidence
+  remain blocked.
 - No equity orders, naked opening options, arbitrary multi-leg spreads, bulk
-  cancellation, or terminal reservation release. Unsupported operations fail
-  closed.
+  cancellation, or closing orders. Unsupported operations fail closed.
 
 ## State and crash boundary
 
@@ -72,10 +75,12 @@ remains blocked rather than guessed or retried.
   evidence. The caller's asserted maximum loss cannot be below the exposure
   derived from strike width, price, contract multiplier, and quantity.
 - An opening terminal state retains its reservation as
-  `FILLED_PENDING_ABSORPTION`. The schema-11 R7a–R7d stack never releases it:
-  neither a newer timestamp nor a different account digest proves that a
-  specific partial or terminal fill is reflected in positions. A later
-  position-absorption slice must add order-bound position evidence.
+  `FILLED_PENDING_ABSORPTION`. Schema 12 releases it only after a fresh,
+  exact order re-query proves either zero filled quantity with complete cancel
+  arithmetic, or a complete balanced fill whose order-bound position lots are
+  present in a newer stable portfolio snapshot. Full-fill margin remains in
+  account risk utilization after release, so restart cannot recycle it into a
+  new opening order.
 - Evidence dataclasses and their security-critical string, timestamp, integer,
   byte, and `Decimal` fields must use exact built-in types. Subclass overrides
   cannot replace validation or comparison behavior.
@@ -88,7 +93,7 @@ remains blocked rather than guessed or retried.
   Strategy commands cannot raise it. Reconciliation requires the reader's
   normalized order payload to match the durable original, pending amendment, or
   latest completed amendment hash.
-- Capacity can be set only from a content-addressed schema-11 manifest. A
+- Capacity can be set only from a content-addressed broker-read manifest. A
   complete manifest brackets two independent scans with exact account-list
   reads; fully traverses balance, every portfolio page, and all reviewed active
   order status lanes; and requires both economic scans to match. Moving balance
@@ -112,13 +117,21 @@ remains blocked rather than guessed or retried.
 
 ## Schema policy
 
-Schema 11 adds raw broker-read receipts, ordered semantic manifests, durable
-capacity decisions, and provenance foreign keys on caps, reservations, and
-events. Additive schema 8→9→10→11 migration is one explicit SQLite transaction
-and verifies required columns, foreign keys, append-only triggers, journal
-mode, foreign-key integrity, and `quick_check` before version promotion.
-Unknown or malformed schemas fail closed. A production operator must still
-take an atomic private backup and complete a rollback drill before migration.
+Schema 12 adds immutable terminal-reservation absorption receipts, their
+baseline/order/post-capacity evidence chain, and append-only transition guards.
+It retains schema 11 raw broker-read receipts, ordered semantic manifests,
+durable capacity decisions, and provenance foreign keys. Additive schema
+8→9→10→11→12 migration is one explicit SQLite transaction and verifies
+required columns, foreign keys, append-only triggers, journal mode, foreign-key
+integrity, and `quick_check` before version promotion. Unknown or malformed
+schemas fail closed. A production operator must still take an atomic private
+backup and complete a rollback drill before migration.
+
+Schema 8/9 opening intents that predate durable reservations are migrated with
+a conservative reservation equal to their immutable maximum exposure. Live
+states remain active and terminal states remain pending absorption. Those
+records have no fabricated capacity decision: full-fill absorption therefore
+stays blocked, while a fresh exact zero-fill terminal can still release risk.
 
 ## Remaining production release gates
 
@@ -126,9 +139,9 @@ The isolated R7 stack must not be used as evidence that live execution is
 production-ready. The following remain required before any order-capable
 process is enabled:
 
-1. Position-level fill evidence must safely absorb terminal opening
-   reservations, including partial fills, replacements, assignment/exercise,
-   and zero-fill proof for cancelled/rejected/expired orders.
+1. Partial fills, replacements, transformed lots, and assignment/exercise
+   remain unsupported and blocked; supervised recovery procedures are still
+   required for those states.
 2. Closing-position capacity and one-shot per-intent cancellation need durable,
    crash-tested protocols. Bulk cancellation remains disabled.
 3. The live composition root must construct the exact ledger, reader,
@@ -142,9 +155,10 @@ process is enabled:
    observation of the exact served/live artifacts.
 
 The focused ledger/reader/transport/coordinator suites exercise raw-parser
-binding, pagination and marker drift, two-scan stability, schema rollback,
-exact payload reconciliation, mutation fencing, and crash/timeout behavior.
-They contain 112 deterministic tests; the maintained repository `tests/` suite
-contains 277 passing tests in the clean Python 3.10 environment. This is source
-verification only; position, cancellation/closing, live composition, and
-operational migration gates above remain open.
+binding, pagination and marker drift, lot-aware two-scan stability, schema
+rollback, exact payload/fill reconciliation, terminal absorption, retained
+filled risk, mutation fencing, and crash/timeout behavior. They contain 153
+deterministic tests; the maintained repository `tests/` suite contains 318
+passing tests in the clean Python 3.10 environment. This is source verification
+only; partial/complex terminal states, cancellation/closing, live composition,
+and operational migration gates above remain open.

@@ -19,6 +19,7 @@ from rauth import OAuth1Session
 import live_trading.etrade_order_gateway as gateway_module
 from live_trading.etrade_broker_reader import (
     ETradeBrokerReader as ConcreteETradeBrokerReader,
+    ETradeBrokerReaderUnavailable,
     _PARSER_CODE_SHA256,
     _PARSER_CONFIG_SHA256,
     _PARSER_SCHEMA,
@@ -235,6 +236,8 @@ class FakeReader:
         self.environment = environment
         self.capacity_digest = "a" * 64
         self.capacity_complete = True
+        self.capacity_order_ids = ()
+        self.capacity_calls = []
         self.selected_hook = None
         self.query_behaviors = {}
         self.query_calls = []
@@ -263,6 +266,7 @@ class FakeReader:
         return self.account
 
     def read_capacity(self, account):
+        self.capacity_calls.append(account)
         if account != self.account:
             raise RuntimeSafetyError("reader account mismatch")
         if not self.capacity_complete:
@@ -294,9 +298,12 @@ class FakeReader:
                 ),
             )
 
+        if self.capacity_order_ids:
+            self.clock.advance(1)
         binding = self._binding()
         encoded_account = quote(self.account.account_id_key, safe="")
         as_of = str(int(self.clock.now.timestamp() * 1_000))
+        positions = self._filled_positions()
         sources = [
             (
                 "binding.start",
@@ -335,7 +342,7 @@ class FakeReader:
                         f"/v1/accounts/{encoded_account}/portfolio.json",
                         (
                             ("count", "50"),
-                            ("lotsRequired", "false"),
+                            ("lotsRequired", "true"),
                             ("marketSession", "REGULAR"),
                             ("pageNumber", "1"),
                             ("sortBy", "SYMBOL"),
@@ -349,7 +356,7 @@ class FakeReader:
                             "total_pages": 1,
                             "metadata_field": "totalNoOfPages",
                             "next_page": None,
-                            "positions": [],
+                            "positions": positions,
                         },
                     ),
                 )
@@ -395,18 +402,18 @@ class FakeReader:
                 )
             )
         economic_state = {
-            "schema": "etrade-capacity.v1",
+            "schema": "etrade-capacity.v2",
             "account_status": "ACTIVE",
             "account_mode": "MARGIN",
             "account_type": "INDIVIDUAL",
             "broker_buying_power": "2000",
-            "positions": [],
+            "positions": positions,
             "open_orders": [],
         }
         result = dict(economic_state)
         result["broker_buying_power_as_of"] = as_of
         result["state_sha256"] = _domain_json_sha256(
-            b"etrade-capacity-state.v1\0", economic_state
+            b"etrade-capacity-state.v2\0", economic_state
         )
         return self.ledger.record_broker_read_manifest(
             BrokerReadManifestEvidence(
@@ -423,6 +430,56 @@ class FakeReader:
             ),
             tuple(members),
         )
+
+    def _filled_positions(self):
+        positions = []
+        acquired = str(int(self.clock.now.timestamp() * 1_000) - 1)
+        for offset, broker_order_id in enumerate(
+            self.capacity_order_ids, start=1
+        ):
+            for leg_no, (strike, quantity, position_type) in enumerate(
+                (("620", "-1", "SHORT"), ("615", "1", "LONG")),
+                start=1,
+            ):
+                position_id = str(
+                    int(broker_order_id) * 100 + offset * 10 + leg_no
+                )
+                positions.append(
+                    {
+                        "position_id": position_id,
+                        "account_id": self.account.account_id,
+                        "product": {
+                            "symbol": "SPY",
+                            "security_type": "OPTN",
+                            "call_put": "PUT",
+                            "expiry_year": "2027",
+                            "expiry_month": "1",
+                            "expiry_day": "15",
+                            "strike_price": strike,
+                            "product_id": None,
+                        },
+                        "quantity": quantity,
+                        "position_type": position_type,
+                        "position_indicator": "TYPE1",
+                        "osi_key": None,
+                        "lots": [
+                            {
+                                "position_id": position_id,
+                                "position_lot_id": str(
+                                    int(position_id) * 100 + 1
+                                ),
+                                "order_no": broker_order_id,
+                                "leg_no": str(leg_no),
+                                "original_quantity": quantity,
+                                "remaining_quantity": quantity,
+                                "available_quantity": quantity,
+                                "acquired_date_epoch_ms": acquired,
+                            }
+                        ],
+                    }
+                )
+        positions.sort(key=lambda item: item["position_id"])
+        return positions
 
     def query_order(self, account, broker_order_id):
         self.query_calls.append((account, broker_order_id))
@@ -534,7 +591,10 @@ class FakeReader:
                             {
                                 "accountId": self.account.account_id,
                                 "totalNoOfPages": "1",
-                                "Position": [],
+                                "Position": [
+                                    self._raw_position(position)
+                                    for position in parsed["positions"]
+                                ],
                             }
                         ]
                     }
@@ -585,6 +645,45 @@ class FakeReader:
         )
         return receipt
 
+    @staticmethod
+    def _raw_position(position):
+        product = position["product"]
+        raw_product = {
+            "symbol": product["symbol"],
+            "securityType": product["security_type"],
+        }
+        for raw_name, normalized_name in (
+            ("callPut", "call_put"),
+            ("expiryYear", "expiry_year"),
+            ("expiryMonth", "expiry_month"),
+            ("expiryDay", "expiry_day"),
+            ("strikePrice", "strike_price"),
+        ):
+            value = product[normalized_name]
+            if value is not None:
+                raw_product[raw_name] = value
+        return {
+            "positionId": position["position_id"],
+            "accountId": position["account_id"],
+            "Product": raw_product,
+            "quantity": position["quantity"],
+            "positionType": position["position_type"],
+            "positionIndicator": position["position_indicator"],
+            "PositionLot": [
+                {
+                    "positionId": lot["position_id"],
+                    "positionLotId": lot["position_lot_id"],
+                    "orderNo": lot["order_no"],
+                    "legNo": lot["leg_no"],
+                    "originalQty": lot["original_quantity"],
+                    "remainingQty": lot["remaining_quantity"],
+                    "availableQty": lot["available_quantity"],
+                    "acquiredDate": lot["acquired_date_epoch_ms"],
+                }
+                for lot in position["lots"]
+            ],
+        }
+
     def _order_manifest(
         self,
         *,
@@ -601,6 +700,18 @@ class FakeReader:
             route="/v1/accounts/list.json",
             raw=b'{"AccountListResponse":{"binding":"query-start"}}',
             parsed=binding,
+        )
+        terminal = outcome in {
+            "FILLED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+        }
+        placed_time = str(
+            int((self.clock.now - timedelta(seconds=2)).timestamp() * 1_000)
+        )
+        executed_time = str(
+            int((self.clock.now - timedelta(seconds=1)).timestamp() * 1_000)
         )
         raw = (
             b""
@@ -621,6 +732,12 @@ class FakeReader:
                                             if outcome == "FILLED"
                                             else outcome
                                         ),
+                                        "placedTime": placed_time,
+                                        **(
+                                            {"executedTime": executed_time}
+                                            if outcome == "FILLED"
+                                            else {}
+                                        ),
                                         "priceType": "NET_CREDIT",
                                         "limitPrice": (
                                             "1.50"
@@ -637,11 +754,19 @@ class FakeReader:
                                                 "SELL_OPEN",
                                                 "620",
                                                 filled=outcome == "FILLED",
+                                                cancelled=(
+                                                    terminal
+                                                    and outcome != "FILLED"
+                                                ),
                                             ),
                                             self._known_leg(
                                                 "BUY_OPEN",
                                                 "615",
                                                 filled=outcome == "FILLED",
+                                                cancelled=(
+                                                    terminal
+                                                    and outcome != "FILLED"
+                                                ),
                                             ),
                                         ],
                                     }
@@ -674,10 +799,11 @@ class FakeReader:
             final_response=True,
         )
         result = {
-            "schema": "etrade-order-query.v1",
+            "schema": "etrade-order-query.v2",
             "broker_order_id": broker_order_id,
             "raw_status": parsed["raw_status"],
             "outcome": parsed["outcome"],
+            "fill_summary": parsed["fill_summary"],
             "order_payload_hashes": parsed["order_payload_hashes"],
             "http_status": 404 if not_found else 200,
             "raw_response_digest": hashlib.sha256(raw).hexdigest(),
@@ -713,7 +839,7 @@ class FakeReader:
             ),
         )
 
-    def _known_leg(self, action, strike, *, filled):
+    def _known_leg(self, action, strike, *, filled, cancelled=False):
         return {
             "Product": {
                 "symbol": "SPY",
@@ -728,7 +854,7 @@ class FakeReader:
             "quantityType": "QUANTITY",
             "orderedQuantity": "1",
             "filledQuantity": "1" if filled else "0",
-            "cancelQuantity": "0",
+            "cancelQuantity": "1" if cancelled else "0",
         }
 
     def _receipt_parsed_json(self, receipt_sha256):
@@ -841,6 +967,54 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         self.harness.add(preview_result(), place_result())
         return self.gateway.submit_opening(self.command())
 
+    def make_pending_terminal(
+        self,
+        *,
+        key,
+        decision,
+        broker_order_id,
+        outcome,
+    ):
+        submitted = self.submit_named_order(
+            key=key,
+            decision=decision,
+            broker_order_id=broker_order_id,
+        )
+        self.terminalize(submitted, broker_order_id, outcome)
+        return submitted
+
+    def submit_named_order(self, *, key, decision, broker_order_id):
+        self.harness.add(
+            preview_result(preview_id=str(1_020_563_000 + int(broker_order_id))),
+            place_result(order_id=broker_order_id),
+        )
+        return self.gateway.submit_opening(
+            self.command(key=key, decision=decision)
+        )
+
+    def terminalize(self, submitted, broker_order_id, outcome):
+        snapshot = BrokerOrderSnapshot(
+            account=self.account,
+            environment="sandbox",
+            broker_order_id=broker_order_id,
+            outcome=outcome,
+            observed_at=self.clock.now,
+            http_status=200,
+            raw_response_digest="4" * 64,
+            order_payload_hash=order_payload_hash(),
+            complete=True,
+        )
+        self.reader.query_behaviors[broker_order_id] = snapshot
+        read = self.reader.query_order(self.account, broker_order_id)
+        terminal_evidence = self.ledger.broker_evidence_from_read(
+            submitted.intent_id, read, operation="ORDER_QUERY"
+        )
+        self.assertIsNotNone(terminal_evidence)
+        self.ledger.reconcile_terminal(
+            submitted.intent_id, outcome, terminal_evidence
+        )
+        self.reader.query_calls.clear()
+
     def test_real_transport_submission_is_idempotent_and_places_once(self):
         first = self.submit_success()
         replay = self.gateway.submit_opening(self.command())
@@ -930,6 +1104,9 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             order_payload_hash=order_payload_hash(),
             complete=True,
         )
+        # A newer stable portfolio may contain unrelated lots, but it cannot
+        # absorb this fill without lots bound to broker order 94.
+        reader.capacity_order_ids = ("93",)
         restarted, ledger, _ = self.restart(reader=reader)
 
         with self.assertRaises(GatewayReconciliationRequired):
@@ -942,6 +1119,322 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_start_absorbs_zero_fill_terminal_without_capacity_or_mutation(
+        self,
+    ):
+        pending = self.make_pending_terminal(
+            key="zero-fill",
+            decision="zero-fill-decision",
+            broker_order_id="94",
+            outcome="CANCELLED",
+        )
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            account=self.account,
+            environment="sandbox",
+            broker_order_id="94",
+            outcome="CANCELLED",
+            observed_at=self.clock.now,
+            http_status=200,
+            raw_response_digest="5" * 64,
+            order_payload_hash=order_payload_hash(),
+            complete=True,
+        )
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(
+            ledger.get_margin_reservation(pending.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(reader.query_calls, [(self.account, "94")])
+        self.assertEqual(reader.capacity_calls, [])
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_start_absorbs_full_fill_and_restart_is_idempotent(self):
+        pending = self.make_pending_terminal(
+            key="full-fill",
+            decision="full-fill-decision",
+            broker_order_id="94",
+            outcome="FILLED",
+        )
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            account=self.account,
+            environment="sandbox",
+            broker_order_id="94",
+            outcome="FILLED",
+            observed_at=self.clock.now,
+            http_status=200,
+            raw_response_digest="5" * 64,
+            order_payload_hash=order_payload_hash(),
+            complete=True,
+        )
+        reader.capacity_order_ids = ("94",)
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(
+            ledger.get_margin_reservation(pending.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(reader.query_calls, [(self.account, "94")])
+        self.assertEqual(reader.capacity_calls, [self.account])
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+        replay_reader = FakeReader(self.clock, self.account)
+        replay, replay_ledger, replay_reader = self.restart(
+            reader=replay_reader
+        )
+        replay.start()
+        self.assertEqual(replay_reader.query_calls, [])
+        self.assertEqual(replay_reader.capacity_calls, [])
+        self.assertEqual(
+            replay_ledger.get_margin_reservation(pending.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_start_processes_multiple_pending_reservations_in_order(self):
+        first = self.submit_named_order(
+            key="terminal-first",
+            decision="terminal-first-decision",
+            broker_order_id="94",
+        )
+        self.clock.advance(1)
+        second = self.submit_named_order(
+            key="terminal-second",
+            decision="terminal-second-decision",
+            broker_order_id="95",
+        )
+        self.terminalize(first, "94", "CANCELLED")
+        self.terminalize(second, "95", "FILLED")
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors.update(
+            {
+                "94": BrokerOrderSnapshot(
+                    self.account,
+                    "sandbox",
+                    "94",
+                    "CANCELLED",
+                    self.clock.now,
+                    200,
+                    "6" * 64,
+                    order_payload_hash(),
+                    True,
+                ),
+                "95": BrokerOrderSnapshot(
+                    self.account,
+                    "sandbox",
+                    "95",
+                    "FILLED",
+                    self.clock.now,
+                    200,
+                    "7" * 64,
+                    order_payload_hash(),
+                    True,
+                ),
+            }
+        )
+        reader.capacity_order_ids = ("95",)
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(
+            reader.query_calls,
+            [(self.account, "94"), (self.account, "95")],
+        )
+        self.assertEqual(reader.capacity_calls, [self.account])
+        self.assertEqual(
+            ledger.get_margin_reservation(first.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(
+            ledger.get_margin_reservation(second.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_start_reuses_one_capacity_scan_for_multiple_full_fills(self):
+        first = self.submit_named_order(
+            key="full-fill-first",
+            decision="full-fill-first-decision",
+            broker_order_id="94",
+        )
+        self.clock.advance(1)
+        second = self.submit_named_order(
+            key="full-fill-second",
+            decision="full-fill-second-decision",
+            broker_order_id="95",
+        )
+        self.terminalize(first, "94", "FILLED")
+        self.terminalize(second, "95", "FILLED")
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors.update(
+            {
+                broker_order_id: BrokerOrderSnapshot(
+                    self.account,
+                    "sandbox",
+                    broker_order_id,
+                    "FILLED",
+                    self.clock.now,
+                    200,
+                    digest * 64,
+                    order_payload_hash(),
+                    True,
+                )
+                for broker_order_id, digest in (
+                    ("94", "6"),
+                    ("95", "7"),
+                )
+            }
+        )
+        reader.capacity_order_ids = ("94", "95")
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(
+            reader.query_calls,
+            [(self.account, "94"), (self.account, "95")],
+        )
+        self.assertEqual(reader.capacity_calls, [self.account])
+        self.assertEqual(
+            ledger.get_margin_reservation(first.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(
+            ledger.get_margin_reservation(second.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(
+            ledger.active_reserved_margin(ACCOUNT_ID, "sandbox"),
+            Decimal("1000"),
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_unavailable_pending_does_not_prevent_later_safe_absorption(
+        self,
+    ):
+        first = self.submit_named_order(
+            key="unavailable-first",
+            decision="unavailable-first-decision",
+            broker_order_id="94",
+        )
+        self.clock.advance(1)
+        second = self.submit_named_order(
+            key="safe-second",
+            decision="safe-second-decision",
+            broker_order_id="95",
+        )
+        self.terminalize(first, "94", "FILLED")
+        self.terminalize(second, "95", "CANCELLED")
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = ETradeBrokerReaderUnavailable(
+            "simulated read outage"
+        )
+        reader.query_behaviors["95"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "95",
+            "CANCELLED",
+            self.clock.now,
+            200,
+            "8" * 64,
+            order_payload_hash(),
+            True,
+        )
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        with self.assertRaises(GatewayReconciliationRequired):
+            restarted.start()
+
+        self.assertEqual(
+            reader.query_calls,
+            [(self.account, "94"), (self.account, "95")],
+        )
+        self.assertEqual(
+            ledger.get_margin_reservation(first.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        self.assertEqual(
+            ledger.get_margin_reservation(second.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_full_fill_without_order_bound_lots_stays_read_only(self):
+        pending = self.make_pending_terminal(
+            key="missing-lots",
+            decision="missing-lots-decision",
+            broker_order_id="94",
+            outcome="FILLED",
+        )
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "FILLED",
+            self.clock.now,
+            200,
+            "9" * 64,
+            order_payload_hash(),
+            True,
+        )
+        reader.capacity_order_ids = ("93",)
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        with self.assertRaises(GatewayReconciliationRequired):
+            restarted.start()
+
+        self.assertEqual(
+            ledger.get_margin_reservation(pending.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        self.assertEqual(reader.capacity_calls, [self.account])
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+        reader.capacity_order_ids = ("94",)
+        restarted.start()
+        self.assertEqual(
+            ledger.get_margin_reservation(pending.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
+
+    def test_invalid_terminal_read_reference_fails_closed_without_mutation(
+        self,
+    ):
+        pending = self.make_pending_terminal(
+            key="invalid-reference",
+            decision="invalid-reference-decision",
+            broker_order_id="94",
+            outcome="CANCELLED",
+        )
+        mutation_calls = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = object()
+        restarted, ledger, _ = self.restart(reader=reader)
+
+        with self.assertRaises(GatewayValidationError):
+            restarted.start()
+
+        self.assertEqual(
+            ledger.get_margin_reservation(pending.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        self.assertEqual(len(self.harness.calls), mutation_calls)
 
     def test_known_hold_reconciles_open_and_allows_next_opening(self):
         self.harness.add(

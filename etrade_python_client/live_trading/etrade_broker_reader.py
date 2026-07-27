@@ -52,6 +52,7 @@ _MAX_JSON_NODES = 50_000
 _MAX_JSON_DEPTH = 48
 _MAX_PORTFOLIO_PAGES = 100
 _MAX_POSITIONS = 5_000
+_MAX_POSITION_LOTS = 20_000
 _MAX_ORDER_PAGES = 100
 _MAX_ORDERS = 10_000
 _MAX_BROKER_INT64 = 9_223_372_036_854_775_807
@@ -60,7 +61,7 @@ _ACTIVE_ORDER_STATUSES = (
     "CANCEL_REQUESTED",
     "INDIVIDUAL_FILLS",
 )
-_PARSER_SCHEMA = "etrade-broker-reader.v1"
+_PARSER_SCHEMA = "etrade-broker-reader.v2"
 _PARSER_CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _PARSER_CONFIG_SHA256 = hashlib.sha256(
     json.dumps(
@@ -71,6 +72,7 @@ _PARSER_CONFIG_SHA256 = hashlib.sha256(
             "max_order_pages": _MAX_ORDER_PAGES,
             "max_orders": _MAX_ORDERS,
             "max_portfolio_pages": _MAX_PORTFOLIO_PAGES,
+            "max_position_lots": _MAX_POSITION_LOTS,
             "max_positions": _MAX_POSITIONS,
             "max_raw_response_bytes": _MAX_RAW_RESPONSE_BYTES,
         },
@@ -296,10 +298,11 @@ class ETradeBrokerReader:
                 )
             parsed = order_read.parsed
             result = {
-                "schema": "etrade-order-query.v1",
+                "schema": "etrade-order-query.v2",
                 "broker_order_id": target,
                 "raw_status": parsed["raw_status"],
                 "outcome": parsed["outcome"],
+                "fill_summary": parsed["fill_summary"],
                 "order_payload_hashes": parsed["order_payload_hashes"],
                 "http_status": order_read.http_status,
                 "raw_response_digest": order_read.raw_response_digest,
@@ -447,7 +450,7 @@ class ETradeBrokerReader:
         )
         orders, order_members, orders_completed = self._read_active_orders()
         result = {
-            "schema": "etrade-capacity.v1",
+            "schema": "etrade-capacity.v2",
             "account_status": binding.account_status,
             "account_mode": binding.account_mode,
             "account_type": binding.account_type,
@@ -461,7 +464,7 @@ class ETradeBrokerReader:
         economic_state = dict(result)
         economic_state.pop("broker_buying_power_as_of")
         state_sha256 = _domain_json_hash(
-            b"etrade-capacity-state.v1\0", economic_state
+            b"etrade-capacity-state.v2\0", economic_state
         )
         members = (
             BrokerReadManifestMember(
@@ -577,6 +580,7 @@ class ETradeBrokerReader:
         positions: list[dict[str, Any]] = []
         members: list[BrokerReadManifestMember] = []
         seen_position_ids: set[str] = set()
+        seen_position_lot_ids: set[str] = set()
         expected_total_pages: int | None = None
         expected_metadata_field: str | None = None
         page_number = 1
@@ -591,7 +595,7 @@ class ETradeBrokerReader:
                 route=f"/v1/accounts/{encoded_account}/portfolio.json",
                 query=(
                     ("count", "50"),
-                    ("lotsRequired", "false"),
+                    ("lotsRequired", "true"),
                     ("marketSession", "REGULAR"),
                     ("pageNumber", str(page_number)),
                     ("sortBy", "SYMBOL"),
@@ -602,7 +606,9 @@ class ETradeBrokerReader:
                 target_broker_order_id=None,
                 allowed_statuses={200, 204},
                 parser=lambda status, raw, page=page_number: (
-                    self._parse_portfolio_page(status, raw, page)
+                    self._parse_portfolio_page(
+                        status, raw, page, lots_required=True
+                    )
                 ),
             )
             parsed = read.parsed
@@ -632,6 +638,17 @@ class ETradeBrokerReader:
                         "portfolio contains a duplicate position id"
                     )
                 seen_position_ids.add(position_id)
+                for lot in position["lots"]:
+                    lot_id = lot["position_lot_id"]
+                    if lot_id in seen_position_lot_ids:
+                        raise ETradeBrokerReaderIntegrityError(
+                            "portfolio contains a duplicate position lot id"
+                        )
+                    seen_position_lot_ids.add(lot_id)
+                    if len(seen_position_lot_ids) > _MAX_POSITION_LOTS:
+                        raise ETradeBrokerReaderIntegrityError(
+                            "portfolio exceeded its fixed position-lot bound"
+                        )
                 positions.append(position)
                 if len(positions) > _MAX_POSITIONS:
                     raise ETradeBrokerReaderIntegrityError(
@@ -653,7 +670,12 @@ class ETradeBrokerReader:
         return positions, tuple(members), completed_at
 
     def _parse_portfolio_page(
-        self, status: int, raw: bytes, page_number: int
+        self,
+        status: int,
+        raw: bytes,
+        page_number: int,
+        *,
+        lots_required: bool,
     ) -> tuple[
         dict[str, Any], Literal["COMPLETE", "HAS_NEXT"]
     ]:
@@ -718,7 +740,9 @@ class ETradeBrokerReader:
                 "AccountPortfolio.Position must be an array"
             )
         positions = [
-            self._normalize_position(position)
+            self._normalize_position(
+                position, lots_required=lots_required
+            )
             for position in raw_positions
         ]
         raw_next_page = account_portfolio.get("nextPageNo")
@@ -747,7 +771,9 @@ class ETradeBrokerReader:
             "positions": positions,
         }, completeness
 
-    def _normalize_position(self, value: Any) -> dict[str, Any]:
+    def _normalize_position(
+        self, value: Any, *, lots_required: bool
+    ) -> dict[str, Any]:
         position = _object(value, "Position")
         position_id = _broker_int64_text(
             position.get("positionId"), "position id"
@@ -776,7 +802,7 @@ class ETradeBrokerReader:
         osi_key = _optional_ascii_text(
             position.get("osiKey"), "position osi key"
         )
-        return {
+        normalized = {
             "position_id": position_id,
             "account_id": account_id,
             "product": product,
@@ -785,6 +811,34 @@ class ETradeBrokerReader:
             "position_indicator": position_indicator,
             "osi_key": osi_key,
         }
+        if not lots_required:
+            return normalized
+        lot_fields = [
+            field
+            for field in ("PositionLot", "positionLot")
+            if field in position
+        ]
+        if len(lot_fields) > 1:
+            raise ETradeBrokerReaderIntegrityError(
+                "position uses conflicting PositionLot fields"
+            )
+        raw_lots = position.get(lot_fields[0], []) if lot_fields else []
+        if type(raw_lots) is not list:
+            raise ETradeBrokerReaderIntegrityError(
+                "PositionLot must be an array"
+            )
+        lots = [
+            _normalize_position_lot(lot, position_id)
+            for lot in raw_lots
+        ]
+        lot_ids = [lot["position_lot_id"] for lot in lots]
+        if len(lot_ids) != len(set(lot_ids)):
+            raise ETradeBrokerReaderIntegrityError(
+                "position contains duplicate position lot ids"
+            )
+        lots.sort(key=_canonical_json)
+        normalized["lots"] = lots
+        return normalized
 
     def _read_active_orders(
         self,
@@ -1047,6 +1101,12 @@ class ETradeBrokerReader:
                 "not_found": True,
                 "raw_status": "NOT_FOUND",
                 "outcome": "UNRESOLVED",
+                "fill_summary": {
+                    "classification": "UNRESOLVED",
+                    "placed_time_epoch_ms": None,
+                    "executed_time_epoch_ms": None,
+                    "legs": [],
+                },
                 "order_payload_hashes": [],
                 "replacement_links": {},
                 "normalized_order": None,
@@ -1082,13 +1142,23 @@ class ETradeBrokerReader:
             raise ETradeBrokerReaderIntegrityError(
                 "known R7 order must contain exactly one OrderDetail"
             )
-        normalized, outcome, hashes, replacement_links = (
+        normalized, fill_summary, hashes, replacement_links = (
             self._normalize_known_vertical(order, details[0])
         )
+        classification = fill_summary["classification"]
+        if classification == "OPEN":
+            outcome = "OPEN"
+        elif classification == "FULL_FILL":
+            outcome = "FILLED"
+        elif classification == "ZERO_FILL_TERMINAL":
+            outcome = normalized["status"]
+        else:
+            outcome = "UNRESOLVED"
         return {
             "not_found": False,
             "raw_status": normalized["status"],
             "outcome": outcome,
+            "fill_summary": fill_summary,
             "order_payload_hashes": hashes,
             "replacement_links": replacement_links,
             "normalized_order": normalized,
@@ -1098,14 +1168,7 @@ class ETradeBrokerReader:
         self, order: dict[str, Any], raw_detail: Any
     ) -> tuple[
         dict[str, Any],
-        Literal[
-            "OPEN",
-            "FILLED",
-            "CANCELLED",
-            "REJECTED",
-            "EXPIRED",
-            "UNRESOLVED",
-        ],
+        dict[str, Any],
         list[str],
         dict[str, str | None],
     ]:
@@ -1134,6 +1197,20 @@ class ETradeBrokerReader:
                 "known order number conflicts with outer order id"
             )
         status = _ascii_text(detail.get("status"), "known order status")
+        placed_time = _optional_epoch_milliseconds_text(
+            detail.get("placedTime"), "known order placed time"
+        )
+        executed_time = _optional_epoch_milliseconds_text(
+            detail.get("executedTime"), "known order executed time"
+        )
+        if (
+            placed_time is not None
+            and executed_time is not None
+            and int(executed_time) < int(placed_time)
+        ):
+            raise ETradeBrokerReaderIntegrityError(
+                "known order executed time precedes placed time"
+            )
         price_type = _ascii_text(
             detail.get("priceType"), "known order price type"
         )
@@ -1180,16 +1257,19 @@ class ETradeBrokerReader:
                 "known vertical must contain exactly two option legs"
             )
         legs = [
-            _normalize_known_leg(instrument)
-            for instrument in raw_instruments
+            _normalize_known_leg(instrument, leg_number=index)
+            for index, instrument in enumerate(raw_instruments, start=1)
         ]
+        if {leg["legNumber"] for leg in legs} != {1, 2}:
+            raise ETradeBrokerReaderIntegrityError(
+                "known vertical leg numbers must be exactly 1 and 2"
+            )
         reference = (
             legs[0]["symbol"],
             legs[0]["callPut"],
             legs[0]["expiryYear"],
             legs[0]["expiryMonth"],
             legs[0]["expiryDay"],
-            legs[0]["quantity"],
         )
         if any(
             (
@@ -1198,14 +1278,14 @@ class ETradeBrokerReader:
                 leg["expiryYear"],
                 leg["expiryMonth"],
                 leg["expiryDay"],
-                leg["quantity"],
             )
             != reference
             for leg in legs
         ):
             raise ETradeBrokerReaderIntegrityError(
-                "known vertical leg identity/quantity is inconsistent"
+                "known vertical leg identity is inconsistent"
             )
+        balanced = len({leg["quantity"] for leg in legs}) == 1
         if (
             {leg["orderAction"] for leg in legs}
             != {"BUY_OPEN", "SELL_OPEN"}
@@ -1222,38 +1302,59 @@ class ETradeBrokerReader:
             "orderTerm": "GOOD_FOR_DAY",
             "spreadType": "VERTICAL",
         }
-        payload_hashes = sorted(
-            {
-                canonical_order_payload_hash(
-                    {
-                        **payload_base,
-                        "legs": [
-                            {
-                                "symbol": leg["symbol"],
-                                "callPut": leg["callPut"],
-                                "expiryYear": int(leg["expiryYear"]),
-                                "expiryMonth": int(leg["expiryMonth"]),
-                                "expiryDay": int(leg["expiryDay"]),
-                                "strikePrice": Decimal(
-                                    leg["strikePrice"]
-                                ),
-                                "orderAction": leg["orderAction"],
-                                "quantity": int(leg["quantity"]),
-                            }
-                            for leg in permutation
-                        ],
-                    }
-                )
-                for permutation in (legs, list(reversed(legs)))
-            }
+        payload_hashes = (
+            sorted(
+                {
+                    canonical_order_payload_hash(
+                        {
+                            **payload_base,
+                            "legs": [
+                                {
+                                    "symbol": leg["symbol"],
+                                    "callPut": leg["callPut"],
+                                    "expiryYear": int(
+                                        leg["expiryYear"]
+                                    ),
+                                    "expiryMonth": int(
+                                        leg["expiryMonth"]
+                                    ),
+                                    "expiryDay": int(leg["expiryDay"]),
+                                    "strikePrice": Decimal(
+                                        leg["strikePrice"]
+                                    ),
+                                    "orderAction": leg["orderAction"],
+                                    "quantity": int(leg["quantity"]),
+                                }
+                                for leg in permutation
+                            ],
+                        }
+                    )
+                    for permutation in (
+                        legs,
+                        list(reversed(legs)),
+                    )
+                }
+            )
+            if balanced
+            else []
         )
         fills_complete = all(
             Decimal(leg["filledQuantity"])
             == Decimal(leg["quantity"])
+            and Decimal(leg["cancelQuantity"]) == 0
             for leg in legs
         )
-        any_fill = any(
-            Decimal(leg["filledQuantity"]) > 0 for leg in legs
+        all_zero_fill = all(
+            Decimal(leg["filledQuantity"]) == 0 for leg in legs
+        )
+        all_zero_cancel = all(
+            Decimal(leg["cancelQuantity"]) == 0 for leg in legs
+        )
+        cancel_arithmetic_complete = all(
+            Decimal(leg["filledQuantity"])
+            + Decimal(leg["cancelQuantity"])
+            == Decimal(leg["quantity"])
+            for leg in legs
         )
         replacement_links = {
             "replaces_order_id": _first_optional_broker_id(
@@ -1271,18 +1372,39 @@ class ETradeBrokerReader:
             value is not None for value in replacement_links.values()
         )
         if has_replacement_link:
-            outcome = "UNRESOLVED"
-        elif status == "OPEN" and not any_fill:
-            outcome = "OPEN"
-        elif status == "EXECUTED" and fills_complete:
-            outcome = "FILLED"
+            classification = "UNRESOLVED"
+        elif (
+            status == "OPEN"
+            and balanced
+            and all_zero_fill
+            and all_zero_cancel
+            and executed_time is None
+        ):
+            classification = "OPEN"
+        elif (
+            status == "EXECUTED"
+            and balanced
+            and fills_complete
+            and executed_time is not None
+        ):
+            classification = "FULL_FILL"
         elif (
             status in {"CANCELLED", "REJECTED", "EXPIRED"}
-            and not any_fill
+            and balanced
+            and all_zero_fill
+            and cancel_arithmetic_complete
+            and executed_time is None
         ):
-            outcome = status
+            classification = "ZERO_FILL_TERMINAL"
         else:
-            outcome = "UNRESOLVED"
+            classification = "UNRESOLVED"
+        fill_legs = _canonical_fill_summary_legs(legs)
+        fill_summary = {
+            "classification": classification,
+            "placed_time_epoch_ms": placed_time,
+            "executed_time_epoch_ms": executed_time,
+            "legs": fill_legs,
+        }
         return {
             "account_id": account_id,
             "status": status,
@@ -1299,7 +1421,9 @@ class ETradeBrokerReader:
                 )
             ),
             "legs": legs,
-        }, outcome, payload_hashes, replacement_links
+            "placed_time_epoch_ms": placed_time,
+            "executed_time_epoch_ms": executed_time,
+        }, fill_summary, payload_hashes, replacement_links
 
     def _get(
         self,
@@ -1524,10 +1648,20 @@ def _reparse_broker_read_response(
                 query.get("pageNumber"),
                 "durable portfolio page number",
             )
+            raw_lots_required = query.get("lotsRequired")
+            if raw_lots_required == "true":
+                lots_required = True
+            elif raw_lots_required == "false":
+                lots_required = False
+            else:
+                raise ETradeBrokerReaderIntegrityError(
+                    "durable portfolio lotsRequired query is unsupported"
+                )
             parsed, completeness = parser._parse_portfolio_page(
                 evidence.http_status,
                 evidence.raw_response_bytes,
                 page_number,
+                lots_required=lots_required,
             )
         elif evidence.read_kind == "OPEN_ORDERS_PAGE":
             lane = _ascii_text(
@@ -1943,10 +2077,44 @@ def _broker_int64_text(value: Any, label: str) -> str:
     return text
 
 
+def _signed_broker_int64_text(value: Any, label: str) -> str:
+    text = _integer_text(value, label)
+    number = int(text)
+    if (
+        number < -_MAX_BROKER_INT64 - 1
+        or number > _MAX_BROKER_INT64
+    ):
+        raise ETradeBrokerReaderIntegrityError(
+            f"{label} exceeds signed broker int64"
+        )
+    return text
+
+
+def _optional_nonnegative_broker_int64_text(
+    value: Any, label: str
+) -> str | None:
+    if value is None:
+        return None
+    text = _integer_text(value, label, nonnegative=True)
+    if int(text) > _MAX_BROKER_INT64:
+        raise ETradeBrokerReaderIntegrityError(
+            f"{label} exceeds signed broker int64"
+        )
+    return text
+
+
 def _optional_broker_id(value: Any, label: str) -> str | None:
     if value is None:
         return None
     return _broker_int64_text(value, label)
+
+
+def _optional_epoch_milliseconds_text(
+    value: Any, label: str
+) -> str | None:
+    if value is None:
+        return None
+    return _epoch_milliseconds_text(value, label)
 
 
 def _first_optional_broker_id(
@@ -2090,6 +2258,54 @@ def _normalize_product(value: Any, label: str) -> dict[str, Any]:
     }
 
 
+def _normalize_position_lot(
+    value: Any, parent_position_id: str
+) -> dict[str, Any]:
+    lot = _object(value, "PositionLot")
+    position_id = _broker_int64_text(
+        lot.get("positionId"), "position lot parent position id"
+    )
+    if position_id != parent_position_id:
+        raise ETradeBrokerReaderIntegrityError(
+            "position lot parent id does not match its position"
+        )
+    raw_leg_no = lot.get("legNo")
+    if raw_leg_no is None:
+        leg_no = None
+    else:
+        leg_no = _integer_text(
+            raw_leg_no,
+            "position lot leg number",
+            nonnegative=True,
+        )
+        if int(leg_no) > 2_147_483_647:
+            raise ETradeBrokerReaderIntegrityError(
+                "position lot leg number exceeds signed int32"
+            )
+    return {
+        "position_id": position_id,
+        "position_lot_id": _broker_int64_text(
+            lot.get("positionLotId"), "position lot id"
+        ),
+        "order_no": _optional_nonnegative_broker_int64_text(
+            lot.get("orderNo"), "position lot order number"
+        ),
+        "leg_no": leg_no,
+        "original_quantity": _decimal_text(
+            lot.get("originalQty"), "position lot original quantity"
+        ),
+        "remaining_quantity": _decimal_text(
+            lot.get("remainingQty"), "position lot remaining quantity"
+        ),
+        "available_quantity": _decimal_text(
+            lot.get("availableQty"), "position lot available quantity"
+        ),
+        "acquired_date_epoch_ms": _signed_broker_int64_text(
+            lot.get("acquiredDate"), "position lot acquired date"
+        ),
+    }
+
+
 def _normalize_generic_instrument(value: Any) -> dict[str, Any]:
     instrument = _object(value, "Instrument")
     ordered = instrument.get(
@@ -2102,16 +2318,28 @@ def _normalize_generic_instrument(value: Any) -> dict[str, Any]:
     ordered_text = _decimal_text(
         ordered, "instrument ordered quantity", nonnegative=True
     )
+    if "filledQuantity" not in instrument:
+        raise ETradeBrokerReaderIntegrityError(
+            "active-order instrument lacks filled quantity"
+        )
+    if "cancelQuantity" not in instrument:
+        raise ETradeBrokerReaderIntegrityError(
+            "active-order instrument lacks cancel quantity"
+        )
     filled_text = _decimal_text(
-        instrument.get("filledQuantity", "0"),
+        instrument["filledQuantity"],
         "instrument filled quantity",
         nonnegative=True,
     )
     cancel_text = _decimal_text(
-        instrument.get("cancelQuantity", "0"),
+        instrument["cancelQuantity"],
         "instrument cancel quantity",
         nonnegative=True,
     )
+    if Decimal(filled_text) + Decimal(cancel_text) > Decimal(ordered_text):
+        raise ETradeBrokerReaderIntegrityError(
+            "instrument fill/cancel quantities exceed ordered quantity"
+        )
     return {
         "product": _normalize_product(
             instrument.get("Product"), "instrument product"
@@ -2128,7 +2356,13 @@ def _normalize_generic_instrument(value: Any) -> dict[str, Any]:
     }
 
 
-def _normalize_known_leg(value: Any) -> dict[str, Any]:
+def _normalize_known_leg(
+    value: Any, *, leg_number: int
+) -> dict[str, Any]:
+    if type(leg_number) is not int or leg_number not in {1, 2}:
+        raise ETradeBrokerReaderIntegrityError(
+            "known vertical leg number must be 1 or 2"
+        )
     instrument = _object(value, "known Instrument")
     product = _normalize_product(
         instrument.get("Product"), "known option product"
@@ -2162,14 +2396,27 @@ def _normalize_known_leg(value: Any) -> dict[str, Any]:
         "known ordered quantity",
         positive=True,
     )
+    if "filledQuantity" not in instrument:
+        raise ETradeBrokerReaderIntegrityError(
+            "known vertical leg lacks filled quantity"
+        )
+    if "cancelQuantity" not in instrument:
+        raise ETradeBrokerReaderIntegrityError(
+            "known vertical leg lacks cancel quantity"
+        )
     filled = _integral_decimal_text(
-        instrument.get("filledQuantity", "0"),
+        instrument["filledQuantity"],
         "known filled quantity",
         nonnegative=True,
     )
-    if int(filled) > int(quantity):
+    cancelled = _integral_decimal_text(
+        instrument["cancelQuantity"],
+        "known cancel quantity",
+        nonnegative=True,
+    )
+    if int(filled) + int(cancelled) > int(quantity):
         raise ETradeBrokerReaderIntegrityError(
-            "known filled quantity exceeds ordered quantity"
+            "known filled/cancel quantities exceed ordered quantity"
         )
     action = _ascii_text(
         instrument.get("orderAction"), "known order action"
@@ -2179,6 +2426,7 @@ def _normalize_known_leg(value: Any) -> dict[str, Any]:
             "known vertical leg is not opening exposure"
         )
     return {
+        "legNumber": leg_number,
         "symbol": product["symbol"],
         "securityType": product["security_type"],
         "callPut": product["call_put"],
@@ -2186,8 +2434,45 @@ def _normalize_known_leg(value: Any) -> dict[str, Any]:
         "expiryMonth": product["expiry_month"],
         "expiryDay": product["expiry_day"],
         "strikePrice": product["strike_price"],
+        "productId": product["product_id"],
         "orderAction": action,
         "quantityType": "QUANTITY",
         "quantity": quantity,
         "filledQuantity": filled,
+        "cancelQuantity": cancelled,
     }
+
+
+def _canonical_fill_summary_legs(
+    legs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if (
+        type(legs) is not list
+        or len(legs) != 2
+        or {leg.get("legNumber") for leg in legs} != {1, 2}
+    ):
+        raise ETradeBrokerReaderIntegrityError(
+            "fill summary requires unique leg numbers 1 and 2"
+        )
+    result = [
+        {
+            "leg_number": leg["legNumber"],
+            "product": {
+                "symbol": leg["symbol"],
+                "security_type": leg["securityType"],
+                "call_put": leg["callPut"],
+                "expiry_year": leg["expiryYear"],
+                "expiry_month": leg["expiryMonth"],
+                "expiry_day": leg["expiryDay"],
+                "strike_price": leg["strikePrice"],
+                "product_id": leg["productId"],
+            },
+            "order_action": leg["orderAction"],
+            "ordered_quantity": leg["quantity"],
+            "filled_quantity": leg["filledQuantity"],
+            "cancel_quantity": leg["cancelQuantity"],
+        }
+        for leg in legs
+    ]
+    result.sort(key=_canonical_json)
+    return result

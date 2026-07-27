@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from live_trading.etrade_broker_reader import (
     _PARSER_CODE_SHA256,
@@ -29,8 +30,11 @@ from live_trading.order_intent_ledger import (
     OrderIntentIntegrityError,
     OrderIntentLedger,
     OrderIntentLedgerError,
+    OrderIntentReconciliationRequired,
+    OrderIntentReservationError,
     OrderIntentValidationError,
     RiskEvidence,
+    _validate_capacity_manifest_result,
     canonical_order_payload_hash,
 )
 
@@ -146,7 +150,56 @@ def _balance_raw(buying_power: str, as_of_date: str) -> bytes:
     ).encode("ascii")
 
 
-def _portfolio_raw() -> bytes:
+def _portfolio_raw(
+    positions: list[dict[str, Any]] | None = None,
+) -> bytes:
+    raw_positions = []
+    for position in positions or []:
+        product = position["product"]
+        raw_product = {
+            "symbol": product["symbol"],
+            "securityType": product["security_type"],
+        }
+        for normalized, broker in (
+            ("call_put", "callPut"),
+            ("expiry_year", "expiryYear"),
+            ("expiry_month", "expiryMonth"),
+            ("expiry_day", "expiryDay"),
+            ("strike_price", "strikePrice"),
+        ):
+            if product[normalized] is not None:
+                raw_product[broker] = product[normalized]
+        if product["product_id"] is not None:
+            raw_product["ProductId"] = {
+                "symbol": product["product_id"]["symbol"],
+                "typeCode": product["product_id"]["type_code"],
+            }
+        raw_positions.append(
+            {
+                "positionId": position["position_id"],
+                "accountId": position["account_id"],
+                "Product": raw_product,
+                "quantity": position["quantity"],
+                "positionType": position["position_type"],
+                "positionIndicator": position["position_indicator"],
+                "osiKey": position["osi_key"],
+                "PositionLot": [
+                    {
+                        "positionId": lot["position_id"],
+                        "positionLotId": lot["position_lot_id"],
+                        "orderNo": lot["order_no"],
+                        "legNo": lot["leg_no"],
+                        "originalQty": lot["original_quantity"],
+                        "remainingQty": lot["remaining_quantity"],
+                        "availableQty": lot["available_quantity"],
+                        "acquiredDate": lot[
+                            "acquired_date_epoch_ms"
+                        ],
+                    }
+                    for lot in position.get("lots", [])
+                ],
+            }
+        )
     return _canonical_json(
         {
             "PortfolioResponse": {
@@ -154,7 +207,7 @@ def _portfolio_raw() -> bytes:
                     {
                         "accountId": ACCOUNT_ID,
                         "totalNoOfPages": "1",
-                        "Position": [],
+                        "Position": raw_positions,
                     }
                 ]
             }
@@ -173,7 +226,15 @@ def _known_order_raw(
     *,
     limit_price: str = "1.25",
     status: str = "OPEN",
+    product_id_type: str | None = None,
 ) -> bytes:
+    placed_time = "1785167940000"
+    executed = status == "EXECUTED"
+    zero_fill_terminal = status in {
+        "CANCELLED",
+        "REJECTED",
+        "EXPIRED",
+    }
     return _canonical_json(
         {
             "OrdersResponse": {
@@ -186,6 +247,12 @@ def _known_order_raw(
                                 "accountId": ACCOUNT_ID,
                                 "orderNumber": broker_order_id,
                                 "status": status,
+                                "placedTime": placed_time,
+                                **(
+                                    {"executedTime": "1785167970000"}
+                                    if executed
+                                    else {}
+                                ),
                                 "priceType": "NET_CREDIT",
                                 "limitPrice": limit_price,
                                 "orderTerm": "GOOD_FOR_DAY",
@@ -202,12 +269,30 @@ def _known_order_raw(
                                             "expiryMonth": "8",
                                             "expiryDay": "21",
                                             "strikePrice": "620",
+                                            **(
+                                                {
+                                                    "ProductId": {
+                                                        "symbol": "SPY",
+                                                        "typeCode":
+                                                            product_id_type,
+                                                    }
+                                                }
+                                                if product_id_type
+                                                is not None
+                                                else {}
+                                            ),
                                         },
                                         "orderAction": "SELL_OPEN",
                                         "quantityType": "QUANTITY",
                                         "orderedQuantity": "1",
-                                        "filledQuantity": "0",
-                                        "cancelQuantity": "0",
+                                        "filledQuantity": (
+                                            "1" if executed else "0"
+                                        ),
+                                        "cancelQuantity": (
+                                            "1"
+                                            if zero_fill_terminal
+                                            else "0"
+                                        ),
                                     },
                                     {
                                         "Product": {
@@ -218,12 +303,30 @@ def _known_order_raw(
                                             "expiryMonth": "8",
                                             "expiryDay": "21",
                                             "strikePrice": "615",
+                                            **(
+                                                {
+                                                    "ProductId": {
+                                                        "symbol": "SPY",
+                                                        "typeCode":
+                                                            product_id_type,
+                                                    }
+                                                }
+                                                if product_id_type
+                                                is not None
+                                                else {}
+                                            ),
                                         },
                                         "orderAction": "BUY_OPEN",
                                         "quantityType": "QUANTITY",
                                         "orderedQuantity": "1",
-                                        "filledQuantity": "0",
-                                        "cancelQuantity": "0",
+                                        "filledQuantity": (
+                                            "1" if executed else "0"
+                                        ),
+                                        "cancelQuantity": (
+                                            "1"
+                                            if zero_fill_terminal
+                                            else "0"
+                                        ),
                                     },
                                 ],
                             }
@@ -243,6 +346,77 @@ def _vertical_hashes(limit_price: str) -> tuple[str, ...]:
     reverse_payload["legs"] = list(reversed(payload["legs"]))
     reverse = canonical_order_payload_hash(reverse_payload)
     return tuple(sorted({forward, reverse}))
+
+
+def _filled_vertical_positions(
+    broker_order_id: str,
+) -> list[dict[str, Any]]:
+    products = (
+        {
+            "symbol": "SPY",
+            "security_type": "OPTN",
+            "call_put": "PUT",
+            "expiry_year": "2026",
+            "expiry_month": "8",
+            "expiry_day": "21",
+            "strike_price": "620",
+            "product_id": None,
+        },
+        {
+            "symbol": "SPY",
+            "security_type": "OPTN",
+            "call_put": "PUT",
+            "expiry_year": "2026",
+            "expiry_month": "8",
+            "expiry_day": "21",
+            "strike_price": "615",
+            "product_id": None,
+        },
+    )
+    return [
+        {
+            "position_id": "101",
+            "account_id": ACCOUNT_ID,
+            "product": products[0],
+            "quantity": "-1",
+            "position_type": "SHORT",
+            "position_indicator": "TYPE1",
+            "osi_key": "SPY---260821P00620000",
+            "lots": [
+                {
+                    "position_id": "101",
+                    "position_lot_id": "1001",
+                    "order_no": broker_order_id,
+                    "leg_no": "1",
+                    "original_quantity": "-1",
+                    "remaining_quantity": "-1",
+                    "available_quantity": "-1",
+                    "acquired_date_epoch_ms": "1785167970000",
+                }
+            ],
+        },
+        {
+            "position_id": "102",
+            "account_id": ACCOUNT_ID,
+            "product": products[1],
+            "quantity": "1",
+            "position_type": "LONG",
+            "position_indicator": "TYPE1",
+            "osi_key": "SPY---260821P00615000",
+            "lots": [
+                {
+                    "position_id": "102",
+                    "position_lot_id": "1002",
+                    "order_no": broker_order_id,
+                    "leg_no": "2",
+                    "original_quantity": "1",
+                    "remaining_quantity": "1",
+                    "available_quantity": "1",
+                    "acquired_date_epoch_ms": "1785167970000",
+                }
+            ],
+        },
+    ]
 
 
 class BrokerReadLedgerTests(unittest.TestCase):
@@ -346,8 +520,19 @@ class BrokerReadLedgerTests(unittest.TestCase):
         return parsed
 
     def _capacity_manifest(
-        self, *, buying_power: str = "1000"
+        self,
+        *,
+        buying_power: str = "1000",
+        positions: list[dict[str, Any]] | None = None,
+        schema: str = "etrade-capacity.v1",
     ) -> tuple[BrokerReadEvidenceRef, str, tuple[str, ...]]:
+        if schema not in {
+            "etrade-capacity.v1",
+            "etrade-capacity.v2",
+        }:
+            raise AssertionError("unsupported capacity test schema")
+        normalized_positions = positions or []
+        lots_required = schema == "etrade-capacity.v2"
         buying_power_as_of = str(
             int(
                 (
@@ -388,7 +573,10 @@ class BrokerReadLedgerTests(unittest.TestCase):
                         f"/v1/accounts/{ACCOUNT_ID_KEY}/portfolio.json",
                         (
                             ("count", "50"),
-                            ("lotsRequired", "false"),
+                            (
+                                "lotsRequired",
+                                "true" if lots_required else "false",
+                            ),
                             ("marketSession", "REGULAR"),
                             ("pageNumber", "1"),
                             ("sortBy", "SYMBOL"),
@@ -396,7 +584,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
                             ("totalsRequired", "false"),
                             ("view", "COMPLETE"),
                         ),
-                        _portfolio_raw(),
+                        _portfolio_raw(normalized_positions),
                     ),
                 )
             )
@@ -441,19 +629,24 @@ class BrokerReadLedgerTests(unittest.TestCase):
             )
 
         state = {
-            "schema": "etrade-capacity.v1",
+            "schema": schema,
             "account_status": "ACTIVE",
             "account_mode": "MARGIN",
             "account_type": "INDIVIDUAL",
             "broker_buying_power": buying_power,
             "broker_buying_power_as_of": buying_power_as_of,
-            "positions": [],
+            "positions": normalized_positions,
             "open_orders": [],
         }
         economic_state = dict(state)
         economic_state.pop("broker_buying_power_as_of")
         state_sha256 = _domain_json_sha256(
-            b"etrade-capacity-state.v1\0", economic_state
+            (
+                b"etrade-capacity-state.v2\0"
+                if lots_required
+                else b"etrade-capacity-state.v1\0"
+            ),
+            economic_state,
         )
         result = dict(state)
         result["state_sha256"] = state_sha256
@@ -480,6 +673,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         broker_order_id: str,
         payload_hashes: tuple[str, ...],
         outcome: str = "OPEN",
+        product_id_type: str | None = None,
     ) -> tuple[BrokerReadEvidenceRef, str]:
         default_hashes = _vertical_hashes("1.25")
         limit_price = (
@@ -490,7 +684,8 @@ class BrokerReadLedgerTests(unittest.TestCase):
         raw = _known_order_raw(
             broker_order_id,
             limit_price=limit_price,
-            status=outcome,
+            status="EXECUTED" if outcome == "FILLED" else outcome,
+            product_id_type=product_id_type,
         )
         binding_start = self._record_response(
             read_kind="ACCOUNT_LIST",
@@ -514,10 +709,11 @@ class BrokerReadLedgerTests(unittest.TestCase):
             final_response=True,
         )
         result = {
-            "schema": "etrade-order-query.v1",
+            "schema": "etrade-order-query.v2",
             "broker_order_id": broker_order_id,
             "raw_status": parsed["raw_status"],
             "outcome": parsed["outcome"],
+            "fill_summary": parsed["fill_summary"],
             "order_payload_hashes": parsed["order_payload_hashes"],
             "http_status": 200,
             "raw_response_digest": hashlib.sha256(raw).hexdigest(),
@@ -613,6 +809,36 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 )
             )
 
+    def test_capacity_v2_rejects_position_from_different_account(
+        self,
+    ) -> None:
+        positions = _filled_vertical_positions("9000000")
+        positions[0]["account_id"] = "999999999"
+        state = {
+            "schema": "etrade-capacity.v2",
+            "account_status": "ACTIVE",
+            "account_mode": "MARGIN",
+            "account_type": "INDIVIDUAL",
+            "broker_buying_power": "1000",
+            "positions": positions,
+            "open_orders": [],
+        }
+        result = {
+            **state,
+            "broker_buying_power_as_of": "1785167970000",
+            "state_sha256": _domain_json_sha256(
+                b"etrade-capacity-state.v2\0", state
+            ),
+        }
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError,
+            "different account",
+        ):
+            _validate_capacity_manifest_result(
+                result,
+                expected_account_id=ACCOUNT_ID,
+            )
+
     def test_complete_capacity_manifest_drives_decision_and_reservation(
         self,
     ) -> None:
@@ -706,6 +932,94 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 ),
             )
 
+    def test_mutable_cap_row_cannot_override_content_addressed_decision(
+        self,
+    ) -> None:
+        first, decision = self._create_reserved_unknown_intent()
+        second = self.ledger.create_intent(
+            _opening_intent(key="cap-row-tamper")
+        ).intent
+        risk = RiskEvidence(
+            decision_id=second.envelope.decision_id,
+            max_loss_amount=Decimal("500"),
+            collateral_amount=Decimal("500"),
+            quote_observed_at=self.clock.now,
+            quote_digest="d" * 64,
+            portfolio_observed_at=decision.observed_at,
+            portfolio_snapshot_digest=(
+                decision.portfolio_snapshot_digest
+            ),
+            capacity_decision_sha256=decision.decision_sha256,
+        )
+        with self.assertRaises(OrderIntentReservationError):
+            self.ledger.reserve_margin(second.intent_id, risk)
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                UPDATE reservation_caps SET cap_amount = '1000'
+                WHERE account_id = ? AND environment = ?
+                """,
+                (first.envelope.account_id, first.envelope.environment),
+            )
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.reserve_margin(second.intent_id, risk)
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="cap-row-tamper-restart",
+            )
+
+    def test_active_risk_fails_closed_after_reservation_identity_tamper(
+        self,
+    ) -> None:
+        self._create_reserved_unknown_intent()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER prevent_margin_reservation_identity_update"
+            )
+            connection.execute(
+                """
+                UPDATE margin_reservations SET account_id = ?
+                WHERE account_id = ? AND environment = ?
+                """,
+                ("moved-account", ACCOUNT_ID, ENVIRONMENT),
+            )
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="reservation-identity-tamper-restart",
+            )
+
+    def test_active_risk_fails_closed_after_reservation_deletion(
+        self,
+    ) -> None:
+        self._create_reserved_unknown_intent()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER prevent_margin_reservation_delete"
+            )
+            connection.execute("DELETE FROM margin_reservations")
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="reservation-deletion-restart",
+            )
+
     def test_query_manifest_provenance_and_economic_mismatch_rejection(
         self,
     ) -> None:
@@ -752,6 +1066,381 @@ class BrokerReadLedgerTests(unittest.TestCase):
             .broker_read_evidence_sha256,
             valid_query.evidence_sha256,
         )
+
+    def test_latest_head_verification_does_not_replay_older_history(
+        self,
+    ) -> None:
+        broker_order_id = "9000093"
+        record, _ = self._create_reserved_unknown_intent()
+        historical = []
+        for _index in range(16):
+            manifest, _ = self._order_query_manifest(
+                broker_order_id=broker_order_id,
+                payload_hashes=(record.envelope.payload_hash,),
+                outcome="CANCELLED",
+            )
+            historical.append(manifest.evidence_sha256)
+            self.clock.now += timedelta(seconds=1)
+        terminal = self.ledger.broker_evidence_from_read(
+            record.intent_id,
+            BrokerReadEvidenceRef(
+                historical[-1], "ORDER_QUERY"
+            ),
+            operation="ORDER_QUERY",
+        )
+        self.assertIsNotNone(terminal)
+        self.ledger.reconcile_terminal(
+            record.intent_id, "CANCELLED", terminal
+        )
+        latest, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="CANCELLED",
+        )
+
+        with patch.object(
+            self.ledger,
+            "_verified_broker_read_manifest",
+            wraps=self.ledger._verified_broker_read_manifest,
+        ) as verified:
+            requirement = (
+                self.ledger.terminal_absorption_requirement(
+                    record.intent_id, latest
+                )
+            )
+        self.assertEqual(requirement.classification, "ZERO_FILL")
+        replayed = {
+            call.args[-1] for call in verified.call_args_list
+        }
+        self.assertEqual(replayed, {latest.evidence_sha256})
+        self.assertTrue(set(historical).isdisjoint(replayed))
+
+    def test_full_fill_absorption_retains_verified_risk_and_lot_chain(
+        self,
+    ) -> None:
+        broker_order_id = "9000094"
+        record, baseline = self._create_reserved_unknown_intent()
+        terminal_read, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="FILLED",
+            product_id_type="ORDER",
+        )
+        terminal = self.ledger.broker_evidence_from_read(
+            record.intent_id,
+            terminal_read,
+            operation="ORDER_QUERY",
+        )
+        self.assertIsNotNone(terminal)
+        self.ledger.reconcile_terminal(
+            record.intent_id, "FILLED", terminal
+        )
+        self.clock.now += timedelta(seconds=1)
+        superseded_terminal, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="FILLED",
+            product_id_type="ORDER",
+        )
+        self.clock.now += timedelta(seconds=1)
+        fresh_terminal, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="FILLED",
+            product_id_type="ORDER",
+        )
+        with self.assertRaisesRegex(
+            OrderIntentReconciliationRequired, "superseded"
+        ):
+            self.ledger.terminal_absorption_requirement(
+                record.intent_id, superseded_terminal
+            )
+        terminal_observed_at = self.clock.now
+        requirement = self.ledger.terminal_absorption_requirement(
+            record.intent_id, fresh_terminal
+        )
+        self.assertEqual(requirement.classification, "FULL_FILL")
+        self.assertTrue(requirement.post_capacity_required)
+        self.assertEqual(
+            requirement.baseline_capacity_decision_sha256,
+            baseline.decision_sha256,
+        )
+        positions = _filled_vertical_positions(broker_order_id)
+        self.clock.now += timedelta(seconds=1)
+        overlapping_capacity, _, _ = self._capacity_manifest(
+            positions=positions,
+            schema="etrade-capacity.v2",
+        )
+        overlapping_post = self.ledger.set_reservation_cap_from_read(
+            overlapping_capacity, risk_budget=Decimal("750")
+        )
+        with self.assertRaisesRegex(
+            OrderIntentReconciliationRequired,
+            "began before terminal order evidence",
+        ):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                fresh_terminal,
+                post_capacity_decision=overlapping_post,
+            )
+        # Every request in the post-fill capacity scan must begin strictly
+        # after the selected terminal order observation. This fixture models a
+        # bounded 30-second read window.
+        self.clock.now += timedelta(seconds=31)
+        legacy_capacity, _, _ = self._capacity_manifest()
+        legacy_post = self.ledger.set_reservation_cap_from_read(
+            legacy_capacity, risk_budget=Decimal("750")
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                fresh_terminal,
+                post_capacity_decision=legacy_post,
+            )
+
+        conflicting_positions = _filled_vertical_positions(
+            broker_order_id
+        )
+        conflicting_positions[0]["product"] = {
+            **conflicting_positions[0]["product"],
+            "product_id": {
+                "symbol": "SPY",
+                "type_code": "OPTN",
+            },
+        }
+        self.clock.now += timedelta(seconds=1)
+        capacity, _, _ = self._capacity_manifest(
+            positions=conflicting_positions,
+            schema="etrade-capacity.v2",
+        )
+        conflicting_post = self.ledger.set_reservation_cap_from_read(
+            capacity, risk_budget=Decimal("750")
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                fresh_terminal,
+                post_capacity_decision=conflicting_post,
+            )
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+
+        self.clock.now += timedelta(seconds=1)
+        superseded_capacity, _, _ = self._capacity_manifest(
+            positions=positions,
+            schema="etrade-capacity.v2",
+        )
+        superseded_post = self.ledger.set_reservation_cap_from_read(
+            superseded_capacity, risk_budget=Decimal("750")
+        )
+        self.clock.now += timedelta(seconds=1)
+        compatible_capacity, _, _ = self._capacity_manifest(
+            positions=positions,
+            schema="etrade-capacity.v2",
+        )
+        post = self.ledger.set_reservation_cap_from_read(
+            compatible_capacity, risk_budget=Decimal("750")
+        )
+        post_observed_at = self.clock.now
+        with self.assertRaisesRegex(
+            OrderIntentReconciliationRequired, "superseded"
+        ):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                fresh_terminal,
+                post_capacity_decision=superseded_post,
+            )
+        receipt = self.ledger.absorb_terminal_reservation(
+            record.intent_id,
+            fresh_terminal,
+            post_capacity_decision=post,
+        )
+        self.assertEqual(receipt.classification, "FULL_FILL")
+        self.assertEqual(
+            receipt.baseline_capacity_decision_sha256,
+            baseline.decision_sha256,
+        )
+        self.assertEqual(
+            receipt.post_capacity_decision_sha256,
+            post.decision_sha256,
+        )
+        self.assertEqual(
+            receipt.absorbed_margin_amount, Decimal("500")
+        )
+        self.assertEqual(receipt.observed_at, post_observed_at)
+        final_event = self.ledger.events(record.intent_id)[-1]
+        self.assertEqual(final_event.event_type, "FILLED_ABSORBED")
+        self.assertEqual(final_event.observed_at, terminal_observed_at)
+        self.assertNotEqual(
+            final_event.observed_at, receipt.observed_at
+        )
+        with patch.object(
+            self.ledger,
+            "_verified_capacity_decision_row",
+            wraps=self.ledger._verified_capacity_decision_row,
+        ) as verified_decision, patch.object(
+            self.ledger,
+            "_reservation_absorption_from_row",
+            wraps=self.ledger._reservation_absorption_from_row,
+        ) as verified_absorption:
+            active_margin = self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            )
+        self.assertEqual(
+            active_margin, Decimal("500")
+        )
+        self.assertEqual(verified_absorption.call_count, 1)
+        decision_replays = [
+            call.args[-1]
+            for call in verified_decision.call_args_list
+        ]
+        self.assertEqual(
+            decision_replays.count(baseline.decision_sha256), 1
+        )
+        self.assertEqual(
+            decision_replays.count(post.decision_sha256), 1
+        )
+        self.assertEqual(len(decision_replays), 2)
+        self.assertEqual(
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                fresh_terminal,
+                post_capacity_decision=post,
+            ),
+            receipt,
+        )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id, fresh_terminal
+            )
+
+        second = self.ledger.create_intent(
+            _opening_intent(key="absorbed-cap-not-recycled")
+        ).intent
+        with self.assertRaisesRegex(
+            OrderIntentReservationError,
+            "exceeds account/environment cap",
+        ):
+            self.ledger.reserve_margin(
+                second.intent_id,
+                RiskEvidence(
+                    decision_id=second.envelope.decision_id,
+                    max_loss_amount=Decimal("500"),
+                    collateral_amount=Decimal("500"),
+                    quote_observed_at=self.clock.now,
+                    quote_digest="d" * 64,
+                    portfolio_observed_at=post.observed_at,
+                    portfolio_snapshot_digest=(
+                        post.portfolio_snapshot_digest
+                    ),
+                    capacity_decision_sha256=post.decision_sha256,
+                ),
+            )
+
+        with sqlite3.connect(self.path) as connection:
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """
+                    UPDATE reservation_absorptions
+                    SET absorbed_margin_amount = '1'
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                )
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """
+                    UPDATE margin_reservations
+                    SET released_reason_code = 'tampered'
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                )
+            connection.execute(
+                "DROP TRIGGER prevent_reservation_absorption_update"
+            )
+            connection.execute(
+                """
+                UPDATE reservation_absorptions
+                SET absorbed_margin_amount = '1'
+                WHERE intent_id = ?
+                """,
+                (record.intent_id,),
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            )
+
+    def test_deleted_full_fill_receipt_never_recycles_risk(
+        self,
+    ) -> None:
+        broker_order_id = "9000095"
+        record, _baseline = self._create_reserved_unknown_intent()
+        terminal_read, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="FILLED",
+        )
+        terminal = self.ledger.broker_evidence_from_read(
+            record.intent_id,
+            terminal_read,
+            operation="ORDER_QUERY",
+        )
+        self.assertIsNotNone(terminal)
+        self.ledger.reconcile_terminal(
+            record.intent_id, "FILLED", terminal
+        )
+        self.clock.now += timedelta(seconds=1)
+        fresh_terminal, _ = self._order_query_manifest(
+            broker_order_id=broker_order_id,
+            payload_hashes=(record.envelope.payload_hash,),
+            outcome="FILLED",
+        )
+        self.clock.now += timedelta(seconds=31)
+        capacity, _, _ = self._capacity_manifest(
+            positions=_filled_vertical_positions(broker_order_id),
+            schema="etrade-capacity.v2",
+        )
+        post = self.ledger.set_reservation_cap_from_read(
+            capacity, risk_budget=Decimal("750")
+        )
+        self.ledger.absorb_terminal_reservation(
+            record.intent_id,
+            fresh_terminal,
+            post_capacity_decision=post,
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            ),
+            Decimal("500"),
+        )
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER prevent_reservation_absorption_delete"
+            )
+            connection.execute(
+                """
+                DELETE FROM reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (record.intent_id,),
+            )
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, ENVIRONMENT
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="deleted-full-fill-receipt-restart",
+            )
 
     def test_query_manifest_rejects_receipt_for_a_different_order(
         self,
@@ -1020,8 +1709,27 @@ class BrokerReadLedgerTests(unittest.TestCase):
             ("reservation_caps", "capacity_decisions"),
             ("margin_reservations", "capacity_decisions"),
             ("order_events", "broker_read_manifests"),
+            ("reservation_absorptions", "order_intents"),
+            ("reservation_absorptions", "broker_read_manifests"),
+            ("reservation_absorptions", "capacity_decisions"),
         }
         required_triggers = {
+            "prevent_order_event_update": "before update",
+            "prevent_order_event_delete": "before delete",
+            "prevent_amendment_history_update": "before update",
+            "prevent_amendment_history_delete": "before delete",
+            "prevent_outbound_authorization_update": "before update",
+            "prevent_outbound_authorization_delete": "before delete",
+            "prevent_transport_send_attempt_update": "before update",
+            "prevent_transport_send_attempt_delete": "before delete",
+            "prevent_broker_preview_receipt_update": "before update",
+            "prevent_broker_preview_receipt_delete": "before delete",
+            "prevent_transport_response_receipt_update": "before update",
+            "prevent_transport_response_receipt_delete": "before delete",
+            "prevent_broker_order_history_update": "before update",
+            "prevent_broker_order_history_delete": "before delete",
+            "prevent_intent_identity_mutation": "before update",
+            "prevent_terminal_rewrite": "before update",
             "prevent_broker_read_receipt_update": "before update",
             "prevent_broker_read_receipt_delete": "before delete",
             "prevent_broker_read_manifest_update": "before update",
@@ -1030,6 +1738,17 @@ class BrokerReadLedgerTests(unittest.TestCase):
             "prevent_broker_read_member_delete": "before delete",
             "prevent_capacity_decision_update": "before update",
             "prevent_capacity_decision_delete": "before delete",
+            "prevent_reservation_absorption_update": "before update",
+            "prevent_reservation_absorption_delete": "before delete",
+            "prevent_margin_reservation_delete": "before delete",
+            "prevent_margin_reservation_identity_update": "before update",
+            "prevent_margin_reservation_invalid_transition": "before update",
+            "prevent_margin_reservation_release_rewrite": "before update",
+            "validate_margin_reservation_insert": "before insert",
+            "validate_reservation_created_event_insert": "before insert",
+            "validate_margin_reservation_pre_post_release": "before update",
+            "validate_reservation_absorption_insert": "before insert",
+            "require_terminal_absorption_receipt": "before update",
         }
         with sqlite3.connect(self.path) as connection:
             actual_foreign_keys = {
@@ -1056,6 +1775,132 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 normalized = " ".join(triggers[name].lower().split())
                 self.assertIn(expected_action, normalized)
                 self.assertIn("raise(abort", normalized)
+
+    def test_durable_legacy_triggers_are_repaired_or_rejected_exactly(
+        self,
+    ) -> None:
+        triggers = (
+            ("prevent_order_event_update", "UPDATE", "order_events"),
+            ("prevent_order_event_delete", "DELETE", "order_events"),
+            (
+                "prevent_amendment_history_update",
+                "UPDATE",
+                "amendment_history",
+            ),
+            (
+                "prevent_amendment_history_delete",
+                "DELETE",
+                "amendment_history",
+            ),
+            (
+                "prevent_outbound_authorization_update",
+                "UPDATE",
+                "outbound_authorizations",
+            ),
+            (
+                "prevent_outbound_authorization_delete",
+                "DELETE",
+                "outbound_authorizations",
+            ),
+            (
+                "prevent_transport_send_attempt_update",
+                "UPDATE",
+                "transport_send_attempts",
+            ),
+            (
+                "prevent_transport_send_attempt_delete",
+                "DELETE",
+                "transport_send_attempts",
+            ),
+            (
+                "prevent_broker_preview_receipt_update",
+                "UPDATE",
+                "broker_preview_receipts",
+            ),
+            (
+                "prevent_broker_preview_receipt_delete",
+                "DELETE",
+                "broker_preview_receipts",
+            ),
+            (
+                "prevent_transport_response_receipt_update",
+                "UPDATE",
+                "transport_response_receipts",
+            ),
+            (
+                "prevent_transport_response_receipt_delete",
+                "DELETE",
+                "transport_response_receipts",
+            ),
+            (
+                "prevent_broker_order_history_update",
+                "UPDATE",
+                "broker_order_history",
+            ),
+            (
+                "prevent_broker_order_history_delete",
+                "DELETE",
+                "broker_order_history",
+            ),
+            (
+                "prevent_intent_identity_mutation",
+                "UPDATE",
+                "order_intents",
+            ),
+            ("prevent_terminal_rewrite", "UPDATE", "order_intents"),
+        )
+        for name, operation, table in triggers:
+            with self.subTest(trigger=name):
+                path = (
+                    Path(self.tmp.name)
+                    / "durable-trigger-audit"
+                    / f"{name}.sqlite3"
+                )
+                OrderIntentLedger(
+                    path,
+                    clock=self.clock,
+                    run_id=f"before-drop-{name}",
+                )
+                with sqlite3.connect(path) as connection:
+                    connection.execute(f'DROP TRIGGER "{name}"')
+
+                OrderIntentLedger(
+                    path,
+                    clock=self.clock,
+                    run_id=f"repair-{name}",
+                )
+                with sqlite3.connect(path) as connection:
+                    sql = connection.execute(
+                        """
+                        SELECT sql FROM sqlite_master
+                        WHERE type = 'trigger' AND name = ?
+                        """,
+                        (name,),
+                    ).fetchone()[0]
+                    normalized = " ".join(sql.lower().split())
+                    self.assertIn(
+                        f"before {operation.lower()} on {table}",
+                        normalized,
+                    )
+                    self.assertIn("raise(abort", normalized)
+                    connection.execute(f'DROP TRIGGER "{name}"')
+                    connection.execute(
+                        f"""
+                        CREATE TRIGGER "{name}"
+                        BEFORE {operation} ON "{table}"
+                        WHEN 0
+                        BEGIN
+                            SELECT RAISE(ABORT, 'never runs');
+                        END
+                        """
+                    )
+
+                with self.assertRaises(OrderIntentLedgerError):
+                    OrderIntentLedger(
+                        path,
+                        clock=self.clock,
+                        run_id=f"reject-replacement-{name}",
+                    )
 
     def test_malformed_provenance_schema_does_not_promote_metadata(
         self,
@@ -1096,6 +1941,64 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 10,
             )
 
+    def test_schema_11_migrates_to_immutable_absorption_receipts(
+        self,
+    ) -> None:
+        new_triggers = (
+            "prevent_reservation_absorption_update",
+            "prevent_reservation_absorption_delete",
+            "prevent_margin_reservation_delete",
+            "prevent_margin_reservation_identity_update",
+            "prevent_margin_reservation_invalid_transition",
+            "prevent_margin_reservation_release_rewrite",
+            "validate_margin_reservation_insert",
+            "validate_reservation_created_event_insert",
+            "validate_margin_reservation_pre_post_release",
+            "validate_reservation_absorption_insert",
+            "require_terminal_absorption_receipt",
+        )
+        with sqlite3.connect(self.path) as connection:
+            for trigger in new_triggers:
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute("DROP TABLE reservation_absorptions")
+            connection.execute(
+                """
+                UPDATE ledger_metadata SET schema_version = 11
+                WHERE singleton = 1
+                """
+            )
+
+        migrated = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="schema-11-migration"
+        )
+        self.assertIsNotNone(migrated)
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT schema_version FROM ledger_metadata"
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            self.assertIsNotNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'reservation_absorptions'
+                    """
+                ).fetchone()
+            )
+            trigger_names = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'trigger'
+                    """
+                )
+            }
+            self.assertTrue(set(new_triggers) <= trigger_names)
+
         malformed_trigger_path = (
             Path(self.tmp.name)
             / "malformed-trigger"
@@ -1132,6 +2035,39 @@ class BrokerReadLedgerTests(unittest.TestCase):
                     "SELECT schema_version FROM ledger_metadata"
                 ).fetchone()[0],
                 10,
+            )
+
+    def test_schema_verifier_rejects_inert_required_trigger(
+        self,
+    ) -> None:
+        inert_trigger_path = (
+            Path(self.tmp.name)
+            / "inert-trigger"
+            / "orders.sqlite3"
+        )
+        OrderIntentLedger(
+            inert_trigger_path,
+            clock=self.clock,
+            run_id="valid-before-inert-trigger",
+        )
+        with sqlite3.connect(inert_trigger_path) as connection:
+            connection.executescript(
+                """
+                DROP TRIGGER require_terminal_absorption_receipt;
+                CREATE TRIGGER require_terminal_absorption_receipt
+                BEFORE UPDATE ON margin_reservations
+                WHEN 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'never runs');
+                END;
+                """
+            )
+
+        with self.assertRaises(OrderIntentLedgerError):
+            OrderIntentLedger(
+                inert_trigger_path,
+                clock=self.clock,
+                run_id="inert-trigger",
             )
 
     def test_schema_10_migration_adds_read_provenance_columns(self) -> None:
