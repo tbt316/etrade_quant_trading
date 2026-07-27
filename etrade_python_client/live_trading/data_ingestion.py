@@ -11,6 +11,75 @@ import logging
 import threading
 import time
 from copy import deepcopy
+from dataclasses import dataclass
+import hashlib
+import json
+
+
+CAUSAL_FEATURE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class StationarityDecision:
+    """One transformation selected from an explicit historical fit prefix."""
+
+    column: str
+    fractional_d: float
+    training_adf_pvalue: float
+
+
+@dataclass(frozen=True)
+class CausalFeatureManifest:
+    """Immutable preprocessing choices needed to reproduce model inputs."""
+
+    fit_end: str
+    feature_names: tuple[str, ...]
+    stationarity: tuple[StationarityDecision, ...]
+    missing_ratio_limit: float
+    scaler_window: int
+    scaler_min_periods: int
+    availability: str
+    training_data_sha256: str
+    feature_hash: str
+    schema_version: int = CAUSAL_FEATURE_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class CausalFeatureResult:
+    """Stationary and causally scaled values plus their fitted manifest."""
+
+    stationary: pd.DataFrame
+    scaled: pd.DataFrame
+    manifest: CausalFeatureManifest
+
+
+def _causal_frame_sha256(df):
+    """Hash one ordered numeric feature prefix without locale formatting."""
+
+    rows = []
+    for index_value, values in zip(df.index, df.to_numpy(dtype=float)):
+        rows.append(
+            [
+                pd.Timestamp(index_value).isoformat(),
+                [
+                    None if not np.isfinite(value) else float(value).hex()
+                    for value in values
+                ],
+            ]
+        )
+    payload = {
+        "domain": "causal_feature_training_prefix_v1",
+        "columns": list(df.columns),
+        "rows": rows,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
 
 class RollingRobustScaler:
     """
@@ -59,7 +128,7 @@ class RollingRobustScaler:
             return df * np.nan
         return (df * self.scale_) + self.center_
 
-    def batch_rolling_transform(self, df, include_current=True):
+    def batch_rolling_transform(self, df, include_current=True, min_periods=20):
         """
         Mandate 8.4: Batch version using numpy stride_tricks for maximum performance.
         Avoids iterative loops by calculating all rolling windows at once.
@@ -68,42 +137,28 @@ class RollingRobustScaler:
         the close. Set include_current=False when the transformed value will be
         used for an intraday or same-session decision before row T is observable.
         """
-        data = df.astype(float).values
-        n_samples, n_features = data.shape
-        if n_samples < 20:
-            return df * np.nan
-            
-        # Use a smaller window for batch if the full window is too large for memory
-        # but here we use self.window
-        w = min(self.window, n_samples)
-        
-        # Create rolling windows using stride_tricks
-        # Shape: (n_samples - w + 1, w, n_features)
-        from numpy.lib.stride_tricks import sliding_window_view
-        windows = sliding_window_view(data, (w, n_features)).squeeze()
-        # windows shape might be (n_samples-w+1, w) if n_features=1, or (n_samples-w+1, w, n_features)
-        
-        if n_features == 1:
-            windows = windows[:, :, np.newaxis]
-            
-        # Calculate rolling medians and IQRs
-        centers = np.median(windows, axis=1)
-        q1 = np.percentile(windows, 25, axis=1)
-        q3 = np.percentile(windows, 75, axis=1)
-        scales = q3 - q1
-        scales = np.where(scales == 0, 1.0, scales)
-        
-        result = np.full(data.shape, np.nan, dtype=float)
-        if include_current:
-            # The result at index t corresponds to the window ending at t.
-            # This is causal for close_T reporting, but not same-session entry.
-            result[w-1:] = (data[w-1:] - centers) / scales
-        else:
-            # The result at index t uses the window ending at t-1.
-            # centers[0] covers rows 0..w-1 and transforms row w.
-            result[w:] = (data[w:] - centers[:-1]) / scales[:-1]
-        
-        return pd.DataFrame(result, index=df.index, columns=df.columns)
+        if type(min_periods) is not int or min_periods < 2:
+            raise ValueError("min_periods must be an integer >= 2")
+        if type(self.window) is not int or self.window < min_periods:
+            raise ValueError("window must be an integer >= min_periods")
+
+        numeric = df.astype(float)
+        history = numeric if include_current else numeric.shift(1)
+
+        # These are pandas' vectorized rolling kernels, not rolling.apply().
+        # Unlike the previous min(window, request_length) construction, the
+        # window definition is independent of the requested suffix. Therefore
+        # appending future rows cannot rewrite any earlier scaled value.
+        rolling = history.rolling(
+            window=self.window,
+            min_periods=min_periods,
+            center=False,
+        )
+        centers = rolling.median()
+        q1 = rolling.quantile(0.25)
+        q3 = rolling.quantile(0.75)
+        scales = (q3 - q1).mask((q3 - q1) == 0.0, 1.0)
+        return (numeric - centers) / scales
 
 # Adjust path for project imports
 import sys
@@ -611,11 +666,11 @@ class DataIngestor:
         try:
             rate_df = pd.read_csv(rate_path, index_col=0)
             rate_df.index = pd.to_datetime(rate_df.index).tz_localize(None).normalize()
-            rate_series = (rate_df.iloc[:, 0].astype(float) / 100.0).reindex(pd.to_datetime(dates)).ffill().bfill()
+            rate_series = (rate_df.iloc[:, 0].astype(float) / 100.0).reindex(pd.to_datetime(dates)).ffill()
         except Exception:
             rate_series = pd.Series(index=pd.to_datetime(dates), data=0.0, dtype=float)
 
-        spot_series = spot_series.reindex(pd.to_datetime(dates)).ffill().bfill()
+        spot_series = spot_series.reindex(pd.to_datetime(dates)).ffill()
         dates_df = pd.DataFrame(index=pd.to_datetime(dates))
         dates_df['year'] = dates_df.index.strftime("%Y")
         
@@ -790,68 +845,202 @@ class DataIngestor:
             
         return diff_series
 
-    def ensure_stationarity(self, df):
-        """Apply ADF test and fractional differencing to ensure all features are stationary."""
-        stationary_df = df.copy()
-        for col in df.columns:
-            series = df[col].dropna()
-            if series.empty:
-                continue
-            
-            # FIX: VIX is naturally mean-reverting and structurally stationary. 
-            # Differencing it (even d=0.2) pulls the mean toward zero and breaks labeling logic.
-            if any(kw in col for kw in ['VIX', 'VVIX', 'Ratio', 'Log_Return', 'Skew', 'Momentum', 'GEX']):
-                logger.info(f"Feature {col} is inherently stationary/bounded. Skipping differencing.")
-                continue
+    @staticmethod
+    def _normalized_fit_end(df, fit_end):
+        if fit_end is None:
+            raise ValueError("EXPLICIT_FEATURE_FIT_END_REQUIRED")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("Feature input requires a DatetimeIndex")
+        if df.index.has_duplicates or not df.index.is_monotonic_increasing:
+            raise ValueError("Feature input index must be sorted and unique")
+        fit_ts = pd.Timestamp(fit_end).tz_localize(None).normalize()
+        if fit_ts < df.index.min() or fit_ts > df.index.max():
+            raise ValueError("FEATURE_FIT_END_OUTSIDE_INPUT_RANGE")
+        return fit_ts
 
-            # REMOVED Hardcoded d=0.2 for levels: The required d is dynamic (e.g. higher in rate-hike cycles).
-            # We now run a dynamic ADF search for all features to find the minimum d (floor 0.15) 
-            # that achieves stationarity while maximizing memory preservation.
+    def _select_stationarity_decision(self, series, column, alpha=0.05):
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+        if len(clean) < 20:
+            raise ValueError(f"INSUFFICIENT_STATIONARITY_TRAINING_ROWS:{column}")
+        if not np.isfinite(clean.to_numpy(dtype=float)).all():
+            raise ValueError(f"NONFINITE_STATIONARITY_TRAINING_VALUES:{column}")
+        if float(clean.var()) < 1e-12:
+            raise ValueError(f"CONSTANT_FEATURE_NOT_ALLOWED:{column}")
 
-            if series.var() < 1e-12:
-                logger.info(f"Feature {col} has near-zero variance. Differencing to maintain stationarity.")
-                stationary_df[col] = series.diff()
+        candidates = [0.0] + [round(float(d), 2) for d in np.arange(0.15, 1.05, 0.05)]
+        failures = []
+        for d in candidates:
+            transformed = clean if d == 0.0 else self.fractional_diff(clean, d).dropna()
+            if len(transformed) < 20 or float(transformed.var()) < 1e-12:
                 continue
-
             try:
-                # Check for stationarity on the raw series
-                res = adfuller(series, autolag='AIC')
-                p_value = res[1]
-                threshold = 0.05
+                p_value = float(adfuller(transformed, autolag="AIC")[1])
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                failures.append(type(exc).__name__)
+                continue
+            if np.isfinite(p_value) and p_value < alpha:
+                return StationarityDecision(
+                    column=column,
+                    fractional_d=d,
+                    training_adf_pvalue=p_value,
+                )
 
-                if p_value > threshold:
-                    logger.info(f"Feature {col} is non-stationary (p={p_value:.4f}). Searching for optimal d...")
-                    
-                    best_d = None
-                    # Search from d=0.15 (memory preservation) to d=1.0 (first-order diff)
-                    for d in np.arange(0.15, 1.05, 0.05):
-                        diffed = self.fractional_diff(series, d)
-                        diffed_clean = diffed.dropna()
-                        if not diffed_clean.empty and diffed_clean.var() > 1e-12:
-                            try:
-                                if adfuller(diffed_clean)[1] < threshold:
-                                    best_d = d
-                                    break
-                            except Exception:
-                                pass
-                    
-                    if best_d is None:
-                        logger.info(f"Fractional diff failed to achieve stationarity for {col}. Falling back to first-order diff (d=1.0)")
-                        stationary_df[col] = series.diff()
-                    else:
-                        logger.info(f"Optimal fractional d for {col} = {best_d:.2f}")
-                        stationary_df[col] = self.fractional_diff(series, best_d)
-                else:
-                    # Feature is already stationary
-                    stationary_df[col] = series
-            except Exception as e:
-                if "is constant" in str(e):
-                    logger.info(f"Feature {col} is constant. Differencing.")
-                    stationary_df[col] = series.diff()
-                else:
-                    logger.warning(f"ADF test failed for {col}: {e}")
-        
-        return stationary_df.dropna()
+        detail = ",".join(sorted(set(failures))) or "no_candidate_passed"
+        raise ValueError(f"STATIONARITY_NOT_PROVEN:{column}:{detail}")
+
+    def prepare_causal_features(
+        self,
+        df,
+        *,
+        fit_end,
+        required_columns=None,
+        missing_ratio_limit=0.80,
+        scaler_window=252 * 5,
+        scaler_min_periods=20,
+        include_current=True,
+    ):
+        """Fit preprocessing choices on one explicit prefix and transform causally.
+
+        Column eligibility and fractional-d selection use only rows through
+        ``fit_end``. Forward filling, differencing, and rolling scaling are
+        trailing. The resulting prefix is invariant to appended future rows.
+        """
+        if not 0.0 <= float(missing_ratio_limit) < 1.0:
+            raise ValueError("missing_ratio_limit must be in [0, 1)")
+        if (
+            type(scaler_window) is not int
+            or type(scaler_min_periods) is not int
+            or scaler_min_periods < 2
+            or scaler_window < scaler_min_periods
+        ):
+            raise ValueError("invalid causal scaler window")
+        if type(include_current) is not bool:
+            raise ValueError("include_current must be an exact boolean")
+        if (
+            any(type(column) is not str or not column for column in df.columns)
+            or len(df.columns) != len(set(df.columns))
+        ):
+            raise ValueError("Feature columns must be unique non-empty strings")
+        fit_ts = self._normalized_fit_end(df, fit_end)
+        numeric = df.apply(pd.to_numeric, errors="coerce").copy()
+        numeric = numeric.replace([np.inf, -np.inf], np.nan)
+        training = numeric.loc[:fit_ts]
+        if len(training) < max(20, scaler_min_periods):
+            raise ValueError("INSUFFICIENT_FEATURE_FIT_PREFIX")
+
+        if required_columns is None:
+            selected = [
+                str(column)
+                for column in numeric.columns
+                if float(training[column].isna().mean()) <= missing_ratio_limit
+                and int(training[column].notna().sum()) >= 20
+                and float(training[column].dropna().var()) >= 1e-12
+            ]
+        else:
+            selected = [str(column) for column in required_columns]
+            if not selected or len(selected) != len(set(selected)):
+                raise ValueError("INVALID_REQUIRED_FEATURE_COLUMNS")
+            missing = [column for column in selected if column not in numeric.columns]
+            if missing:
+                raise ValueError(f"REQUIRED_FEATURES_MISSING:{','.join(missing)}")
+            invalid = [
+                column
+                for column in selected
+                if float(training[column].isna().mean()) > missing_ratio_limit
+                or int(training[column].notna().sum()) < 20
+                or float(training[column].dropna().var()) < 1e-12
+            ]
+            if invalid:
+                raise ValueError(f"REQUIRED_FEATURES_UNFIT:{','.join(invalid)}")
+
+        if not selected:
+            raise ValueError("NO_CAUSAL_FEATURES_SELECTED")
+
+        # Forward fill is causal. Backward fill is prohibited because it would
+        # manufacture early values from later observations.
+        selected_df = numeric.loc[:, selected].ffill()
+        training_data_sha256 = _causal_frame_sha256(
+            selected_df.loc[:fit_ts]
+        )
+        decisions = tuple(
+            self._select_stationarity_decision(
+                selected_df.loc[:fit_ts, column],
+                column,
+            )
+            for column in selected
+        )
+        stationary = pd.DataFrame(index=selected_df.index)
+        for decision in decisions:
+            series = selected_df[decision.column]
+            stationary[decision.column] = (
+                series
+                if decision.fractional_d == 0.0
+                else self.fractional_diff(series, decision.fractional_d)
+            )
+        stationary = stationary.dropna(how="any")
+        training_stationary = stationary.loc[:fit_ts]
+        if len(training_stationary) < max(20, scaler_min_periods):
+            raise ValueError("INSUFFICIENT_STATIONARY_FIT_PREFIX")
+
+        scaler = RollingRobustScaler(window=int(scaler_window))
+        scaled = scaler.batch_rolling_transform(
+            stationary,
+            include_current=include_current,
+            min_periods=int(scaler_min_periods),
+        ).dropna(how="any")
+        if scaled.empty or scaled.loc[:fit_ts].empty:
+            raise ValueError("CAUSAL_SCALER_PRODUCED_NO_TRAINING_ROWS")
+
+        decision_payload = [
+            {
+                "column": item.column,
+                "fractional_d": item.fractional_d,
+                "training_adf_pvalue": format(item.training_adf_pvalue, ".17g"),
+            }
+            for item in decisions
+        ]
+        hash_payload = {
+            "schema_version": CAUSAL_FEATURE_SCHEMA_VERSION,
+            "fit_end": fit_ts.strftime("%Y-%m-%d"),
+            "feature_names": selected,
+            "stationarity": decision_payload,
+            "missing_ratio_limit": float(missing_ratio_limit),
+            "scaler_window": int(scaler_window),
+            "scaler_min_periods": int(scaler_min_periods),
+            "availability": "close_T_for_next_session",
+            "training_data_sha256": training_data_sha256,
+        }
+        feature_hash = hashlib.sha256(
+            json.dumps(
+                hash_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest = CausalFeatureManifest(
+            fit_end=fit_ts.strftime("%Y-%m-%d"),
+            feature_names=tuple(selected),
+            stationarity=decisions,
+            missing_ratio_limit=float(missing_ratio_limit),
+            scaler_window=int(scaler_window),
+            scaler_min_periods=int(scaler_min_periods),
+            availability="close_T_for_next_session",
+            training_data_sha256=training_data_sha256,
+            feature_hash=feature_hash,
+        )
+        return CausalFeatureResult(
+            stationary=stationary,
+            scaled=scaled,
+            manifest=manifest,
+        )
+
+    def ensure_stationarity(self, df, *, fit_end=None, required_columns=None):
+        """Return stationary values selected only from an explicit fit prefix."""
+        return self.prepare_causal_features(
+            df,
+            fit_end=fit_end,
+            required_columns=required_columns,
+        ).stationary
 
     def fit_scaler(self, df, window=252*5):
         """
@@ -891,12 +1080,20 @@ class DataIngestor:
         """
         scaler = RollingRobustScaler(window=window)
         # Use optimized batch transform if possible
-        scaled_df = scaler.batch_rolling_transform(df, include_current=include_current)
+        scaled_df = scaler.batch_rolling_transform(
+            df,
+            include_current=include_current,
+            min_periods=20,
+        )
         
         # Update self.rolling_scaler with the final state
         self.rolling_scaler = scaler
-        # We need to manually populate history for future updates
-        self.rolling_scaler.history = df.values[-window:]
+        history = df.astype(float).values[-window:]
+        self.rolling_scaler.history = history
+        self.rolling_scaler.center_ = np.median(history, axis=0)
+        q1 = np.percentile(history, 25, axis=0)
+        q3 = np.percentile(history, 75, axis=0)
+        self.rolling_scaler.scale_ = np.where(q3 - q1 == 0.0, 1.0, q3 - q1)
         
         return scaled_df
 
@@ -917,8 +1114,21 @@ class DataIngestor:
         logger.info("Verification Checkpoint 1 passed.")
         return True
 
-    async def build_fused_dataset(self, start_date, end_date, underlying="SPY", scale=True, rolling=False, wait=True):
-        """Main pipeline to build the high-dimensional feature set."""
+    async def build_fused_dataset(
+        self,
+        start_date,
+        end_date,
+        underlying="SPY",
+        scale=True,
+        rolling=False,
+        wait=True,
+        *,
+        fit_end=None,
+        required_columns=None,
+    ):
+        """Build features with preprocessing choices fit on an explicit prefix."""
+        if fit_end is None:
+            raise ValueError("EXPLICIT_FEATURE_FIT_END_REQUIRED")
         fred_df = self.fetch_fred_data(start_date, end_date, wait=wait)
         yf_df = self.fetch_yf_data(start_date, end_date, wait=wait)
         
@@ -931,7 +1141,11 @@ class DataIngestor:
         
         # Drop columns that completely failed to download (e.g. due to yfinance rate limits)
         # before we run dropna(), otherwise an all-NaN column wipes out all rows!
-        missing_ratios = combined.isna().mean()
+        fit_ts = pd.Timestamp(fit_end).tz_localize(None).normalize()
+        fit_prefix = combined.loc[:fit_ts]
+        if fit_prefix.empty:
+            raise ValueError("FEATURE_FIT_PREFIX_EMPTY")
+        missing_ratios = fit_prefix.isna().mean()
         bad_cols = missing_ratios[missing_ratios > 0.8].index # Be more lenient with macro data
         if len(bad_cols) > 0:
             logger.warning(f"Dropping features with >80% missing data: {list(bad_cols)}")
@@ -952,7 +1166,7 @@ class DataIngestor:
         logger.info("Successfully integrated Implied_Skew feature.")
 
         # Re-run the missingness filter after adding the expensive option features.
-        missing_ratios = combined.isna().mean()
+        missing_ratios = combined.loc[:fit_ts].isna().mean()
         bad_cols = missing_ratios[missing_ratios > 0.8].index
         if len(bad_cols) > 0:
             logger.warning(f"Dropping features with >80% missing data after enrichment: {list(bad_cols)}")
@@ -978,15 +1192,26 @@ class DataIngestor:
             combined[col] = combined[col].rolling(window=5, center=False, min_periods=1).median().ffill()
             logger.info(f"Applied earnings-neutral median filter to {col}")
 
-        # Stationarity
-        stationary = self.ensure_stationarity(combined)
+        prepared = self.prepare_causal_features(
+            combined,
+            fit_end=fit_ts,
+            required_columns=required_columns,
+        )
+        stationary = prepared.stationary
+        stationary.attrs["causal_feature_manifest"] = prepared.manifest
+        self.last_feature_manifest = prepared.manifest
         
         # Verification
         self.verify_data(stationary)
         
         # Scaling
         if scale:
-            scaled = self.scale_features(stationary, rolling=rolling)
+            if not rolling:
+                raise ValueError(
+                    "GLOBAL_OR_AMBIENT_SCALING_DISABLED_USE_ROLLING_TRUE"
+                )
+            scaled = prepared.scaled
+            scaled.attrs["causal_feature_manifest"] = prepared.manifest
             return scaled
             
         return stationary
@@ -999,7 +1224,12 @@ if __name__ == "__main__":
     end = datetime.now().strftime("%Y-%m-%d")
     
     async def run():
-        df = await ingestor.build_fused_dataset(start, end)
+        df = await ingestor.build_fused_dataset(
+            start,
+            end,
+            fit_end=end,
+            rolling=True,
+        )
         print("\n--- Fused Feature Set (First 5 rows) ---")
         print(df.head())
         print(f"\nFinal Features: {list(df.columns)}")

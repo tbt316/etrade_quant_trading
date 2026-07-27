@@ -4,7 +4,6 @@ import time
 import functools
 import hashlib
 import re
-import multiprocessing as mp
 from copy import deepcopy
 import numpy as np
 import pandas as pd
@@ -29,6 +28,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PROBABILITY_ENGINE_SCHEMA_VERSION = 1
 MIN_REGIME_BUCKET_OBSERVATIONS = 10
+CAUSAL_MODEL_PREPARATION_SCHEMA_VERSION = 1
 
 
 class ProbabilityEngineUnavailable(RuntimeError):
@@ -37,6 +37,24 @@ class ProbabilityEngineUnavailable(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+@dataclass(frozen=True)
+class CausalModelPreparationManifest:
+    """Model-selection decisions bound to one causal feature fit prefix."""
+
+    feature_hash: str
+    fit_end: str
+    model_feature_names: tuple[str, ...]
+    pca_components: int
+    requested_hmm_components: int | str
+    inference_mode: str
+    scaler_mode: str
+    refit_interval_days: int
+    signal_timestamp: str = "close_T_for_next_session"
+    validity_status: str = "UNVERIFIED"
+    execution_eligible: bool = False
+    schema_version: int = CAUSAL_MODEL_PREPARATION_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -53,6 +71,9 @@ class ProbabilityEngineResult:
     projected_probabilities: tuple[float, ...]
     models: tuple[dict[str, Any], ...] = field(repr=False, compare=False)
     current_probabilities: tuple[float, ...]
+    input_feature_hash: str = ""
+    model_as_of_date: str = ""
+    inference_mode: str = ""
     validity_status: str = "UNVERIFIED"
     execution_eligible: bool = False
     schema_version: int = PROBABILITY_ENGINE_SCHEMA_VERSION
@@ -74,6 +95,19 @@ class ProbabilityEngineResult:
             raise ProbabilityEngineUnavailable(
                 "UNCERTIFIED_ENGINE_CANNOT_AUTHORIZE_EXECUTION"
             )
+        if not re.fullmatch(r"[0-9a-f]{64}", self.input_feature_hash):
+            raise ProbabilityEngineUnavailable("INVALID_FEATURE_PROVENANCE")
+        try:
+            parsed_as_of = pd.Timestamp(self.model_as_of_date)
+        except (TypeError, ValueError) as exc:
+            raise ProbabilityEngineUnavailable("INVALID_MODEL_AS_OF_DATE") from exc
+        if parsed_as_of.tzinfo is not None or parsed_as_of != parsed_as_of.normalize():
+            raise ProbabilityEngineUnavailable("INVALID_MODEL_AS_OF_DATE")
+        if self.inference_mode not in {
+            "walk_forward_refit",
+            "fixed_snapshot_prefix_filter",
+        }:
+            raise ProbabilityEngineUnavailable("INVALID_INFERENCE_MODE")
         if type(self.models) is not tuple or not self.models:
             raise ProbabilityEngineUnavailable("INVALID_REGIME_MODELS")
         for name, probabilities in (
@@ -322,29 +356,6 @@ def _align_hmm_states_by_variance(model):
     return model, order.tolist()
 
 
-def _fallback_pca_components(n_components, n_features, previous_loadings=None):
-    """Deterministic PCA fallback used when a causal window is degenerate."""
-    if previous_loadings is not None:
-        prev = np.asarray(previous_loadings, dtype=float)
-        if prev.ndim == 2 and prev.shape == (n_components, n_features):
-            return prev.copy()
-
-    components = np.zeros((n_components, n_features), dtype=float)
-    for i in range(n_components):
-        components[i, i % n_features] = 1.0
-    return components
-
-
-def _project_with_components(window_df, row_df, components):
-    """Project a row using explicit PCA components and the window mean."""
-    window_vals = np.asarray(window_df, dtype=float)
-    row_vals = np.asarray(row_df, dtype=float)
-    if window_vals.ndim != 2 or row_vals.ndim != 2:
-        raise ValueError("Expected 2D inputs for fallback projection.")
-    centered = row_vals - np.nanmean(window_vals, axis=0, keepdims=True)
-    return centered @ np.asarray(components, dtype=float).T
-
-
 def _finalize_hmm_alignment(model, previous_model=None, method="fresh", fallback_reason=None):
     """Apply prior continuity and variance sorting, then attach diagnostics."""
     prior_order = None
@@ -369,59 +380,6 @@ def _finalize_hmm_alignment(model, previous_model=None, method="fresh", fallback
             "state_variances": variances,
         }
     return model
-
-def _causal_pca_worker(args):
-    """Worker function for parallel causal PCA computation.
-    Processes a chunk of time steps, using anchor_loadings for sign/rank consistency.
-    Returns (indices, pc_values, final_loadings) for the chunk.
-    """
-    chunk_indices, scaled_values, scaled_columns, anchor_loadings, n_components, alpha = args
-    from live_trading.pca_fusion import PCAFusion
-    from scipy.spatial.distance import cdist
-    from scipy.optimize import linear_sum_assignment
-
-    n_features = scaled_values.shape[1]
-    pc_results = np.full((len(chunk_indices), n_components), np.nan)
-    prev_loadings = anchor_loadings  # Start from the anchor
-
-    for local_i, t in enumerate(chunk_indices):
-        # Regulation 3.1: PCA loadings at time t derived from data 0..t-1
-        window_end = t - 1 if t > 20 else t
-        window_data = scaled_values[:window_end]
-        if len(window_data) < 20:
-            window_data = scaled_values[:t]
-
-        fusion = PCAFusion(n_components=n_components, alpha=alpha, use_sparse=False)
-        window_df = pd.DataFrame(window_data, columns=scaled_columns)
-        point = pd.DataFrame(
-            scaled_values[t-1:t],
-            columns=scaled_columns,
-        )
-
-        try:
-            fusion.fit(window_df)
-            current_loadings = fusion.sparse_pca.components_
-            if prev_loadings is not None:
-                sim_matrix = 1 - cdist(current_loadings, prev_loadings, metric='cosine')
-                new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
-                fusion.sparse_pca.components_ = fusion.sparse_pca.components_[new_idx]
-                current_loadings = fusion.sparse_pca.components_
-                for i in range(len(current_loadings)):
-                    if np.dot(current_loadings[i], prev_loadings[old_idx[i]]) < 0:
-                        fusion.sparse_pca.components_[i] *= -1
-
-            prev_loadings = fusion.sparse_pca.components_.copy()
-            pc_results[local_i] = fusion.transform(point).values[0]
-        except Exception:
-            fallback_loadings = _fallback_pca_components(
-                n_components,
-                len(scaled_columns),
-                previous_loadings=prev_loadings,
-            )
-            pc_results[local_i] = _project_with_components(window_df, point, fallback_loadings)[0]
-            prev_loadings = fallback_loadings.copy()
-
-    return chunk_indices, pc_results, prev_loadings
 
 
 def _make_hmm(k, n_iter=100, init_params="mc", persistence=0.98, n_mix=1, model_class="gaussian"):
@@ -684,7 +642,7 @@ COST_PER_SPREAD = 1.0
 YF_QUOTE_CACHE_PATH = os.path.join(PROJECT_ROOT, "s_and_p_data", "yf_quote_cache.json")
 REGIME_CACHE_FILE = os.path.join(PROJECT_ROOT, "market_regime_results.pkl")
 REGIME_SNAPSHOT_CACHE_DIR = os.path.join(PROJECT_ROOT, "backtest_cache", "regime_snapshots")
-REGIME_SNAPSHOT_PIPELINE_VERSION = 1
+REGIME_SNAPSHOT_PIPELINE_VERSION = 2
 REGIME_HMM_REFIT_INTERVAL_DAYS = 20
 GMM_MIN_OBS_PER_COMPONENT = 15
 GMM_MAX_COMPONENTS = 5
@@ -788,10 +746,57 @@ def prepare_hmm_features(df):
     features = df[cols].values
     return features, df
 
-def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_features=None, pca_components=None):
+
+def _select_pca_dimension(
+    scaled_df,
+    *,
+    fit_end,
+    requested_components=None,
+    retained_variance=0.85,
+):
+    """Select PCA dimension using only the declared training prefix."""
+    training = scaled_df.loc[:pd.Timestamp(fit_end).normalize()].dropna()
+    if len(training) < 20 or training.shape[1] == 0:
+        raise ValueError("INSUFFICIENT_PCA_SELECTION_PREFIX")
+    max_components = min(training.shape)
+    if requested_components is not None:
+        if (
+            type(requested_components) is not int
+            or requested_components < 1
+            or requested_components > max_components
+        ):
+            raise ValueError("INVALID_PCA_COMPONENT_COUNT")
+        return requested_components
+
+    from sklearn.decomposition import PCA as _PCA
+
+    selector = _PCA()
+    selector.fit(training.to_numpy(dtype=float))
+    cumulative = np.cumsum(selector.explained_variance_ratio_)
+    selected = int(np.searchsorted(cumulative, retained_variance, side="left") + 1)
+    return min(max_components, max(1, selected))
+
+def train_regime_hmm(
+    df,
+    n_components=3,
+    expanding_window=False,
+    exclude_features=None,
+    pca_components=None,
+    *,
+    fit_end=None,
+):
     """
     Upgraded HMM training using PCA-fused features and BIC optimization.
     """
+    if expanding_window and fit_end is None:
+        raise ValueError("EXPLICIT_FEATURE_FIT_END_REQUIRED")
+    if (
+        expanding_window
+        and pd.Timestamp(fit_end).normalize()
+        >= pd.Timestamp(df.index.max()).normalize()
+    ):
+        raise ValueError("WALK_FORWARD_REQUIRES_OUT_OF_SAMPLE_ROWS")
+
     # 1. High-Dimensional Data Ingestion
     ingestor = DataIngestor()
     # Use sync wrapper for async data fetching
@@ -812,7 +817,22 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
             future = executor.submit(asyncio.run, coro)
             return future.result()
 
-    stationary_df = run_async(ingestor.build_fused_dataset(start_date, end_date, scale=False))
+    feature_fit_end = (
+        pd.Timestamp(fit_end).normalize()
+        if fit_end is not None
+        else pd.Timestamp(end_date).normalize()
+    )
+    stationary_df = run_async(
+        ingestor.build_fused_dataset(
+            start_date,
+            end_date,
+            scale=False,
+            fit_end=feature_fit_end,
+        )
+    )
+    feature_manifest = stationary_df.attrs.get("causal_feature_manifest")
+    if feature_manifest is None:
+        raise ValueError("CAUSAL_FEATURE_MANIFEST_MISSING")
     
     # ENSURE WE ONLY USE DATA UP TO THE PROVIDED DF'S END DATE (Double check)
     stationary_df = stationary_df[stationary_df.index <= df.index.max()]
@@ -833,7 +853,11 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
         print(f"  [Step 1/4] Rolling robust scaling on {len(model_df)} rows...", flush=True)
         _t0_scale = time.time()
         # Use rolling scale from DataIngestor
-        scaled_df = ingestor.scale_features(model_df, rolling=True, window=min(252*5, len(model_df)-1))
+        scaled_df = ingestor.scale_features(
+            model_df,
+            rolling=True,
+            window=252 * 5,
+        )
         
         # Drop leading NaNs from rolling robust scaling to prevent zero-padding variance-collapse
         scaled_df = scaled_df.dropna()
@@ -843,143 +867,87 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
         
         print(f"  [Step 1/4] Scaling done in {time.time()-_t0_scale:.1f}s.", flush=True)
 
-        # Auto-select PCA components for ≥85% variance retention
-        if pca_components is None:
-            from sklearn.decomposition import PCA as _PCA
-            _clean = scaled_df.dropna()
-            if len(_clean) > 20:
-                _auto_pca = _PCA()
-                _auto_pca.fit(_clean.values)
-                _cumvar = np.cumsum(_auto_pca.explained_variance_ratio_)
-                pca_components = max(2, int(np.argmax(_cumvar >= 0.85) + 1))
-                print(f"  [PCA] Auto-selected {pca_components} components "
-                      f"(retains {_cumvar[pca_components-1]:.1%} variance, target ≥85%)", flush=True)
-            else:
-                pca_components = 2
-                print(f"  [PCA] Insufficient data for auto-selection, using {pca_components} components", flush=True)
+        pca_components = _select_pca_dimension(
+            scaled_df,
+            fit_end=feature_fit_end,
+            requested_components=pca_components,
+        )
+        print(
+            f"  [PCA] Prefix-selected {pca_components} components "
+            f"using rows through {feature_fit_end.date()}",
+            flush=True,
+        )
         
-        # Causal PCA: For each point t, we need the PCA projection based on data up to t
-        pc_values = np.full((len(scaled_df), pca_components), np.nan)
+        # The walk-forward loop below fits PCA on the prior prefix and stores
+        # only the one newly scored row. Precomputing a request-wide PCA trace
+        # would make chunk boundaries and sign anchors depend on future rows.
         fusion = PCAFusion(n_components=pca_components, use_sparse=False)
-        
-        warmup = min(252, len(scaled_df)-1)
-        prev_loadings = None
-        total_pca_steps = len(scaled_df) + 1 - warmup
-        all_t_indices = list(range(warmup, len(scaled_df) + 1))
-        
-        n_workers = min(mp.cpu_count(), 8)
-        # Shared numpy array for multiprocessing (converted from DataFrame)
-        scaled_values = scaled_df.values
-        scaled_columns = scaled_df.columns.tolist()
-        
-        print(f"  [Step 2/4] Causal PCA projection: {total_pca_steps} steps (warmup={warmup}), "
-              f"using {n_workers} parallel workers...", flush=True)
-        _t0_pca = time.time()
-        
-        # === PARALLEL CHUNKED CAUSAL PCA ===
-        # Strategy: Divide time steps into N chunks. For each chunk, compute an
-        # "anchor" loading at the chunk boundary (serially, fast) then parallelize
-        # all steps within the chunk using that anchor for sign/rank consistency.
-        
-        # Step A: Compute anchor loadings at chunk boundaries (serial, ~N fits)
-        chunk_size = max(50, total_pca_steps // n_workers)
-        chunks = []
-        for start in range(0, len(all_t_indices), chunk_size):
-            end = min(start + chunk_size, len(all_t_indices))
-            chunks.append(all_t_indices[start:end])
-        
-        print(f"    Split into {len(chunks)} chunks (avg {chunk_size} steps each)", flush=True)
-        
-        # Compute anchor loadings at each chunk boundary serially
-        anchor_loadings_list = [None]  # First chunk has no anchor
-        for chunk_idx in range(1, len(chunks)):
-            boundary_t = chunks[chunk_idx][0]
-            window_data = scaled_df.iloc[:boundary_t-1]
-            if len(window_data) < 20:
-                window_data = scaled_df.iloc[:boundary_t]
-            anchor_fusion = PCAFusion(n_components=pca_components, use_sparse=False)
-            try:
-                anchor_fusion.fit(window_data)
-                # Apply sign consistency against previous anchor
-                if anchor_loadings_list[-1] is not None:
-                    curr = anchor_fusion.sparse_pca.components_
-                    prev = anchor_loadings_list[-1]
-                    sim_matrix = 1 - cdist(curr, prev, metric='cosine')
-                    new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
-                    anchor_fusion.sparse_pca.components_ = anchor_fusion.sparse_pca.components_[new_idx]
-                    for i in range(len(anchor_fusion.sparse_pca.components_)):
-                        if np.dot(anchor_fusion.sparse_pca.components_[i], prev[old_idx[i]]) < 0:
-                            anchor_fusion.sparse_pca.components_[i] *= -1
-                anchor_loadings_list.append(anchor_fusion.sparse_pca.components_.copy())
-            except Exception:
-                anchor_loadings_list.append(
-                    _fallback_pca_components(
-                        pca_components,
-                        window_data.shape[1],
-                        previous_loadings=anchor_loadings_list[-1],
-                    )
-                )
-        
-        print(f"    Anchor loadings computed in {time.time()-_t0_pca:.1f}s. Launching parallel PCA...", flush=True)
-        
-        # Step B: Dispatch chunks to worker pool
-        # Use 'spawn' context on macOS for stability.
-        # Safe because workers only use numpy/scipy/sklearn.
-        worker_args = [
-            (chunks[i], scaled_values, scaled_columns, anchor_loadings_list[i], pca_components, 0.1)
-            for i in range(len(chunks))
-        ]
-        
-        ctx = mp.get_context('spawn')
-        with ctx.Pool(processes=n_workers) as pool:
-            results = pool.map(_causal_pca_worker, worker_args)
-        
-        # Step C: Reassemble results
-        for chunk_indices, pc_chunk, final_loadings in results:
-            for local_i, t in enumerate(chunk_indices):
-                pc_values[t-1] = pc_chunk[local_i]
-        
-        # Keep the last anchor loadings for downstream use
-        _, _, prev_loadings = results[-1]
-        # Re-fit final fusion object on full data for downstream use
-        fusion.fit(scaled_df)
-        if prev_loadings is not None:
-            curr = fusion.sparse_pca.components_
-            sim_matrix = 1 - cdist(curr, prev_loadings, metric='cosine')
-            new_idx, old_idx = linear_sum_assignment(-np.abs(sim_matrix))
-            fusion.sparse_pca.components_ = fusion.sparse_pca.components_[new_idx]
-            for i in range(len(fusion.sparse_pca.components_)):
-                if np.dot(fusion.sparse_pca.components_[i], prev_loadings[old_idx[i]]) < 0:
-                    fusion.sparse_pca.components_[i] *= -1
-        
-        elapsed_pca = time.time() - _t0_pca
-        print(f"  [Step 2/4] Parallel Causal PCA done in {elapsed_pca:.1f}s "
-              f"({n_workers} workers, {total_pca_steps} steps).", flush=True)
-        pc_df = pd.DataFrame(pc_values, index=scaled_df.index, columns=[f'PC{i+1}' for i in range(pca_components)])
+        first_eval_position = scaled_df.index.searchsorted(
+            feature_fit_end,
+            side="right",
+        )
+        if first_eval_position >= len(scaled_df):
+            raise ValueError("WALK_FORWARD_REQUIRES_OUT_OF_SAMPLE_ROWS")
+        pc_df = pd.DataFrame(
+            np.zeros(
+                (len(scaled_df) - first_eval_position, pca_components),
+                dtype=float,
+            ),
+            index=scaled_df.index[first_eval_position:],
+            columns=[f"PC{i+1}" for i in range(pca_components)],
+        )
         scaler = None 
     else:
-        # LOCAL WINDOW SCALING (Fixed window training)
+        # Fixed-OOS scaling: fit only on the declared calibration prefix.
+        scaler_training = model_df.loc[:feature_fit_end].dropna()
+        if len(scaler_training) < 20:
+            raise ValueError("INSUFFICIENT_FIXED_OOS_SCALER_PREFIX")
         scaler = RobustScaler()
-        scaled_values = scaler.fit_transform(model_df)
+        scaler.fit(scaler_training)
+        scaled_values = scaler.transform(model_df)
         scaled_df = pd.DataFrame(scaled_values, index=model_df.index, columns=model_df.columns)
         
-        # Auto-select PCA components for ≥85% variance retention (non-expanding)
-        if pca_components is None:
-            from sklearn.decomposition import PCA as _PCA
-            _auto_pca = _PCA()
-            _auto_pca.fit(scaled_df.values)
-            _cumvar = np.cumsum(_auto_pca.explained_variance_ratio_)
-            pca_components = max(2, int(np.argmax(_cumvar >= 0.85) + 1))
-            print(f"  [PCA] Auto-selected {pca_components} components "
-                  f"(retains {_cumvar[pca_components-1]:.1%} variance, target ≥85%)", flush=True)
+        pca_components = _select_pca_dimension(
+            scaled_df,
+            fit_end=feature_fit_end,
+            requested_components=pca_components,
+        )
 
         # LOCAL PCA FUSION
         fusion = PCAFusion(n_components=pca_components, use_sparse=False)
-        pc_df = fusion.fit_transform(scaled_df)
+        fusion.fit(scaled_df.loc[:feature_fit_end])
+        pc_df = fusion.transform(scaled_df)
     
     features_scaled = pc_df.dropna().values
     valid_index = pc_df.dropna().index
     pc_df = pc_df.loc[valid_index]
+    preparation_mode = (
+        "walk_forward_refit"
+        if expanding_window
+        else (
+            "fixed_out_of_sample"
+            if feature_fit_end < pd.Timestamp(pc_df.index.max()).normalize()
+            else "as_of_snapshot_fit"
+        )
+    )
+    model_preparation_manifest = CausalModelPreparationManifest(
+        feature_hash=feature_manifest.feature_hash,
+        fit_end=feature_manifest.fit_end,
+        model_feature_names=tuple(model_df.columns),
+        pca_components=int(pca_components),
+        requested_hmm_components=(
+            int(n_components) if n_components is not None else "bic_each_refit"
+        ),
+        inference_mode=preparation_mode,
+        scaler_mode=(
+            "causal_rolling_close_inclusive"
+            if expanding_window
+            else "fixed_prefix_robust"
+        ),
+        refit_interval_days=(
+            REGIME_HMM_REFIT_INTERVAL_DAYS if expanding_window else 0
+        ),
+    )
     
     # REMOVED EMA Smoothing: Gaussian HMMs assume conditionally independent emissions.
     # EMA forces artificial autocorrelation, causing overestimated persistence and lagging signals.
@@ -1005,6 +973,7 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
         causal_states = []
         causal_labels = []
         causal_probs = []
+        causal_pc_values = []
         causal_refit_ids = []
         causal_refit_dates = []
         causal_refit_methods = []
@@ -1089,6 +1058,9 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
                         window=min(252 * 5, len(current_window_raw)),
                     )
                     current_hmm.feature_names_ = model_df.columns.tolist()
+                    current_hmm.feature_manifest_ = feature_manifest
+                    current_hmm.feature_fit_end_ = feature_manifest.fit_end
+                    current_hmm.model_preparation_manifest_ = model_preparation_manifest
                     current_fusion = stable_fusion
                     prev_refit_loadings = stable_fusion.sparse_pca.components_.copy()
                     next_refit_i = i + refit_interval
@@ -1106,6 +1078,7 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
                 continue
             current_window_projected = current_fusion.transform(current_window_scaled).values
             current_prob = current_hmm.predict_proba(current_window_projected)[-1]
+            causal_pc_values.append(current_window_projected[-1].copy())
 
             potential_state = int(np.argmax(current_prob))
             if not causal_states:
@@ -1148,7 +1121,11 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
 
         causal_probs_arr = np.vstack(causal_probs)
         result_index = pc_df.index[-len(causal_states):]
-        pc_df = pc_df.loc[result_index].copy()
+        pc_df = pd.DataFrame(
+            np.vstack(causal_pc_values),
+            index=result_index,
+            columns=[f"PC{i+1}" for i in range(pca_components)],
+        )
         pc_df['HMM_State'] = np.asarray(causal_states, dtype=int)
         pc_df['Regime_Label'] = causal_labels
         pc_df['HMM_Refit_ID'] = causal_refit_ids
@@ -1165,12 +1142,25 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
         pc_df.attrs['regime_inference_mode'] = 'walk_forward_refit'
         for k in range(current_k):
             pc_df[f'prob_state_{k}'] = causal_probs_arr[:, k]
+        current_hmm.causal_tail_probability_ = causal_probs_arr[-1].copy()
+        current_hmm.causal_tail_as_of_ = pd.Timestamp(pc_df.index[-1]).strftime("%Y-%m-%d")
+        current_hmm.causal_inference_mode_ = "walk_forward_refit"
         pc_df = _apply_causal_stress_overlay(pc_df, df, current_k)
         return current_hmm, current_k, pc_df
 
+    fixed_oos = (
+        not expanding_window
+        and feature_fit_end < pd.Timestamp(pc_df.index.max()).normalize()
+    )
+    hmm_fit_features = (
+        pc_df.loc[:feature_fit_end].dropna().values
+        if fixed_oos
+        else features_input
+    )
+
     try:
         best_hmm, best_k = _fit_hmm_model(
-            features_input,
+            hmm_fit_features,
             n_components=n_components,
             previous_model=None,
         )
@@ -1188,6 +1178,9 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
     best_hmm.fusion_ = fusion
     best_hmm.scaler_ = ingestor.rolling_scaler if expanding_window else scaler
     best_hmm.feature_names_ = model_df.columns.tolist()
+    best_hmm.feature_manifest_ = feature_manifest
+    best_hmm.feature_fit_end_ = feature_manifest.fit_end
+    best_hmm.model_preparation_manifest_ = model_preparation_manifest
 
     # Mandate 10.2: Causal Viterbi Decoding
     # During live trading or backtesting, if the agent runs .predict(), 
@@ -1244,6 +1237,17 @@ def train_regime_hmm(df, n_components=3, expanding_window=False, exclude_feature
     pc_df.attrs['regime_inference_mode'] = 'walk_forward_refit' if expanding_window else 'full_sample_research_only'
     for k in range(best_k):
         pc_df[f'prob_state_{k}'] = causal_probs[:, k]
+    if fixed_oos:
+        pc_df = pc_df.loc[pc_df.index > feature_fit_end].copy()
+        if pc_df.empty:
+            raise ValueError("FIXED_OOS_EVALUATION_EMPTY")
+        tail_probs = pc_df[[f"prob_state_{k}" for k in range(best_k)]].iloc[-1].to_numpy(dtype=float)
+        best_hmm.causal_tail_probability_ = tail_probs
+        best_hmm.causal_tail_as_of_ = pd.Timestamp(pc_df.index[-1]).strftime("%Y-%m-%d")
+        best_hmm.causal_inference_mode_ = "fixed_snapshot_prefix_filter"
+        pc_df["Regime_Signal_Timestamp"] = "close_T_for_next_session"
+        pc_df.attrs["regime_signal_timestamp"] = "close_T_for_next_session"
+        pc_df.attrs["regime_inference_mode"] = "fixed_out_of_sample"
     
     # Return the LAST model from the expanding window as the "live" model
     if expanding_window and n_samples > warmup:
@@ -1412,6 +1416,32 @@ def save_regime_snapshot(regime_dict, hmm_model, daily_models, metadata=None):
             metadata.setdefault("fitted_n_components", getattr(hmm_model, "n_components", None))
             metadata.setdefault("feature_hash", _feature_hash(getattr(hmm_model, "feature_names_", [])))
             metadata.setdefault("feature_names", getattr(hmm_model, "feature_names_", []))
+            feature_manifest = getattr(hmm_model, "feature_manifest_", None)
+            preparation = getattr(hmm_model, "model_preparation_manifest_", None)
+            metadata.setdefault(
+                "causal_feature_hash",
+                getattr(feature_manifest, "feature_hash", None),
+            )
+            metadata.setdefault(
+                "feature_fit_end",
+                getattr(feature_manifest, "fit_end", None),
+            )
+            metadata.setdefault(
+                "feature_training_data_sha256",
+                getattr(feature_manifest, "training_data_sha256", None),
+            )
+            metadata.setdefault(
+                "pca_components",
+                getattr(preparation, "pca_components", None),
+            )
+            metadata.setdefault(
+                "model_feature_names",
+                list(getattr(preparation, "model_feature_names", ())),
+            )
+            metadata.setdefault(
+                "scaler_mode",
+                getattr(preparation, "scaler_mode", None),
+            )
 
         data = {
             "regime_dict": regime_dict,
@@ -1464,6 +1494,32 @@ def save_regime_cache(regime_dict, hmm_model, daily_models, metadata=None):
             metadata.setdefault("fitted_n_components", getattr(hmm_model, "n_components", None))
             metadata.setdefault("feature_hash", _feature_hash(getattr(hmm_model, "feature_names_", [])))
             metadata.setdefault("feature_names", getattr(hmm_model, "feature_names_", []))
+            feature_manifest = getattr(hmm_model, "feature_manifest_", None)
+            preparation = getattr(hmm_model, "model_preparation_manifest_", None)
+            metadata.setdefault(
+                "causal_feature_hash",
+                getattr(feature_manifest, "feature_hash", None),
+            )
+            metadata.setdefault(
+                "feature_fit_end",
+                getattr(feature_manifest, "fit_end", None),
+            )
+            metadata.setdefault(
+                "feature_training_data_sha256",
+                getattr(feature_manifest, "training_data_sha256", None),
+            )
+            metadata.setdefault(
+                "pca_components",
+                getattr(preparation, "pca_components", None),
+            )
+            metadata.setdefault(
+                "model_feature_names",
+                list(getattr(preparation, "model_feature_names", ())),
+            )
+            metadata.setdefault(
+                "scaler_mode",
+                getattr(preparation, "scaler_mode", None),
+            )
         data = {
             "regime_dict": regime_dict,
             "hmm_model": hmm_model,
@@ -1536,6 +1592,19 @@ def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_dat
     """Score a causal dataframe with a cached HMM snapshot."""
     if hmm_model is None or not hasattr(hmm_model, "fusion_"):
         raise ValueError("Cached HMM snapshot is missing the fitted fusion pipeline.")
+    feature_manifest = getattr(hmm_model, "feature_manifest_", None)
+    preparation = getattr(hmm_model, "model_preparation_manifest_", None)
+    if (
+        feature_manifest is None
+        or not getattr(hmm_model, "feature_fit_end_", None)
+        or not isinstance(preparation, CausalModelPreparationManifest)
+        or preparation.feature_hash != feature_manifest.feature_hash
+        or preparation.fit_end != feature_manifest.fit_end
+        or preparation.scaler_mode != "fixed_prefix_robust"
+        or preparation.inference_mode
+        not in {"as_of_snapshot_fit", "fixed_out_of_sample"}
+    ):
+        raise ValueError("Cached HMM snapshot is missing causal feature provenance.")
 
     ingestor = DataIngestor()
     start_date = causal_df.index.min().strftime("%Y-%m-%d")
@@ -1552,26 +1621,59 @@ def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_dat
             future = executor.submit(asyncio.run, coro)
             return future.result()
 
-    stationary_df = run_async(ingestor.build_fused_dataset(start_date, end_date, scale=False))
+    stationary_df = run_async(
+        ingestor.build_fused_dataset(
+            start_date,
+            end_date,
+            scale=False,
+            fit_end=hmm_model.feature_fit_end_,
+            required_columns=feature_manifest.feature_names,
+        )
+    )
+    rebuilt_manifest = stationary_df.attrs.get("causal_feature_manifest")
+    if (
+        rebuilt_manifest is None
+        or rebuilt_manifest.feature_hash != feature_manifest.feature_hash
+    ):
+        raise ValueError("CAUSAL_FEATURE_MANIFEST_MISMATCH")
     stationary_df = stationary_df[stationary_df.index <= pd.Timestamp(as_of_ts)].copy()
 
-    if exclude_features:
-        cols_to_drop = [c for c in exclude_features if c in stationary_df.columns]
-        if cols_to_drop:
-            stationary_df = stationary_df.drop(columns=cols_to_drop)
+    expected_model_features = tuple(preparation.model_feature_names)
+    if (
+        not expected_model_features
+        or tuple(getattr(hmm_model, "feature_names_", ()))
+        != expected_model_features
+        or any(column not in stationary_df.columns for column in expected_model_features)
+    ):
+        raise ValueError("CACHED_MODEL_FEATURE_SET_MISMATCH")
+    if exclude_features and any(
+        column in set(exclude_features)
+        for column in expected_model_features
+    ):
+        raise ValueError("CACHED_MODEL_FEATURE_SET_MISMATCH")
 
-    model_df = stationary_df.drop(columns=["VIX_Close"], errors="ignore")
+    model_df = stationary_df.loc[:, list(expected_model_features)].copy()
     if "VIX_Close" in stationary_df.columns:
         print("  [Feature Selection] Dropped VIX_Close from cached HMM emissions; retained for overlays.")
 
     if model_df.empty:
         return pd.DataFrame()
 
-    print(f"  [Step 1/4] Rolling robust scaling on {len(model_df)} rows...", flush=True)
+    print(f"  [Step 1/4] Frozen-prefix robust scaling on {len(model_df)} rows...", flush=True)
     _t0_scale = time.time()
-    scale_window = max(20, min(252 * 5, len(model_df) - 1))
-    scaled_df = ingestor.scale_features(model_df, rolling=True, window=scale_window)
-    # Drop leading NaNs from rolling robust scaling to prevent zero-padding variance-collapse
+    scaler = getattr(hmm_model, "scaler_", None)
+    if (
+        not isinstance(scaler, RobustScaler)
+        or not hasattr(scaler, "center_")
+        or len(np.asarray(scaler.center_).reshape(-1))
+        != len(expected_model_features)
+    ):
+        raise ValueError("CACHED_MODEL_SCALER_MISMATCH")
+    scaled_df = pd.DataFrame(
+        scaler.transform(model_df),
+        index=model_df.index,
+        columns=model_df.columns,
+    )
     scaled_df = scaled_df.dropna()
     if scaled_df.empty:
         return pd.DataFrame()
@@ -1641,6 +1743,9 @@ def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_dat
     for k in range(causal_probs.shape[1]):
         pc_df[f"prob_state_{k}"] = causal_probs[:, k]
 
+    hmm_model.causal_tail_probability_ = causal_probs[-1].copy()
+    hmm_model.causal_tail_as_of_ = pd.Timestamp(pc_df.index[-1]).strftime("%Y-%m-%d")
+    hmm_model.causal_inference_mode_ = "fixed_snapshot_prefix_filter"
     pc_df = _apply_causal_stress_overlay(pc_df, stationary_df, hmm_model.n_components)
     return pc_df
 
@@ -1702,7 +1807,12 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=3, forc
         )
         try:
             # For historical analysis, we MUST use expanding_window=True to eliminate parameter look-ahead bias
-            best_hmm, best_k, _ = train_regime_hmm(hmm_train_df, n_components=n_components, expanding_window=True)
+            best_hmm, best_k, _ = train_regime_hmm(
+                hmm_train_df,
+                n_components=n_components,
+                expanding_window=False,
+                fit_end=hmm_anchor_date,
+            )
         except Exception as e:
             from live_trading.data_ingestion import red_alert
             red_alert(f"Failed to train HMM: {e}")
@@ -1905,68 +2015,84 @@ def get_probability_engine(
             )
         normalized_buckets.append(bucket)
 
-    ingestor = DataIngestor()
-    start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-    end = datetime.now().strftime("%Y-%m-%d")
-
+    feature_manifest = getattr(hmm_model, "feature_manifest_", None)
+    preparation_manifest = getattr(
+        hmm_model,
+        "model_preparation_manifest_",
+        None,
+    )
+    feature_hash = getattr(feature_manifest, "feature_hash", "")
+    tail_as_of = getattr(hmm_model, "causal_tail_as_of_", "")
+    inference_mode = getattr(hmm_model, "causal_inference_mode_", "")
     try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            stationary_df = asyncio.run(
-                ingestor.build_fused_dataset(start, end, scale=False)
-            )
-        else:
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    ingestor.build_fused_dataset(start, end, scale=False),
-                )
-                stationary_df = future.result()
-
-        if not isinstance(stationary_df, pd.DataFrame) or stationary_df.empty:
-            raise ProbabilityEngineUnavailable("FEATURE_DATA_UNAVAILABLE")
-        scaled_values = hmm_model.scaler_.transform(stationary_df)
-        scaled_df = pd.DataFrame(
-            scaled_values,
-            index=stationary_df.index,
-            columns=stationary_df.columns,
-        )
-        pcs = hmm_model.fusion_.sparse_pca.transform(scaled_df)
-    except ProbabilityEngineUnavailable:
-        raise
-    except Exception as exc:
+        current_probs = np.asarray(
+            getattr(hmm_model, "causal_tail_probability_"),
+            dtype=float,
+        ).reshape(-1)
+    except (AttributeError, TypeError, ValueError) as exc:
         raise ProbabilityEngineUnavailable(
-            "MODEL_INPUT_TRANSFORM_FAILED"
+            "CAUSAL_TAIL_PROBABILITY_UNAVAILABLE"
         ) from exc
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(feature_hash))
+        or not isinstance(
+            preparation_manifest,
+            CausalModelPreparationManifest,
+        )
+        or preparation_manifest.feature_hash != feature_hash
+        or preparation_manifest.fit_end
+        != getattr(feature_manifest, "fit_end", None)
+        or tuple(preparation_manifest.model_feature_names)
+        != tuple(getattr(hmm_model, "feature_names_", ()))
+        or not preparation_manifest.model_feature_names
+        or preparation_manifest.scaler_mode
+        not in {
+            "causal_rolling_close_inclusive",
+            "fixed_prefix_robust",
+        }
+        or preparation_manifest.validity_status != "UNVERIFIED"
+        or preparation_manifest.execution_eligible
+        or not tail_as_of
+        or inference_mode not in {
+            "walk_forward_refit",
+            "fixed_snapshot_prefix_filter",
+        }
+        or (
+            inference_mode == "walk_forward_refit"
+            and (
+                preparation_manifest.inference_mode
+                != "walk_forward_refit"
+                or preparation_manifest.scaler_mode
+                != "causal_rolling_close_inclusive"
+            )
+        )
+        or (
+            inference_mode == "fixed_snapshot_prefix_filter"
+            and (
+                preparation_manifest.inference_mode
+                not in {"fixed_out_of_sample", "as_of_snapshot_fit"}
+                or preparation_manifest.scaler_mode
+                != "fixed_prefix_robust"
+            )
+        )
+    ):
+        raise ProbabilityEngineUnavailable("MODEL_FEATURE_PROVENANCE_UNAVAILABLE")
+    if (
+        current_probs.shape != (state_count,)
+        or not np.isfinite(current_probs).all()
+        or np.any(current_probs < 0.0)
+        or not np.isclose(current_probs.sum(), 1.0, atol=1e-8)
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_HMM_POSTERIORS")
 
     quality_ok, _quality_diagnostics = validate_hmm_quality(
         hmm_model,
-        pcs,
+        features=None,
     )
     if not quality_ok:
         raise ProbabilityEngineUnavailable("HMM_QUALITY_REJECTED")
 
     try:
-        all_posteriors = np.asarray(
-            hmm_model.predict_proba(pcs),
-            dtype=float,
-        )
-        if (
-            all_posteriors.ndim != 2
-            or all_posteriors.shape != (len(pcs), state_count)
-            or not np.isfinite(all_posteriors).all()
-            or np.any(all_posteriors < 0.0)
-            or not np.allclose(
-                all_posteriors.sum(axis=1),
-                1.0,
-                atol=1e-8,
-            )
-        ):
-            raise ProbabilityEngineUnavailable("INVALID_HMM_POSTERIORS")
-        current_probs = all_posteriors[-1]
         trading_horizon = calendar_days_to_trading_days(horizon)
         if USE_MARKOV_TRANSITIONS:
             transition_matrix = np.asarray(
@@ -2027,6 +2153,9 @@ def get_probability_engine(
         current_probabilities=tuple(
             float(value) for value in current_probs
         ),
+        input_feature_hash=str(feature_hash),
+        model_as_of_date=str(tail_as_of),
+        inference_mode=str(inference_mode),
     )
 
 def calculate_probability_of_touch(current_state_probs, trans_matrix, gmm_models, dte, strike_pct_drop, num_paths=1000, option_type="put"):

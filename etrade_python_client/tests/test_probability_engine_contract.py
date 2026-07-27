@@ -7,6 +7,7 @@ import pandas as pd
 
 import live_trading.ev_engine as engine_module
 from live_trading.ev_engine import (
+    CausalModelPreparationManifest,
     MIN_REGIME_BUCKET_OBSERVATIONS,
     ProbabilityEngineResult,
     ProbabilityEngineUnavailable,
@@ -14,36 +15,27 @@ from live_trading.ev_engine import (
 )
 
 
-class _FakeScaler:
-    def transform(self, frame):
-        return frame.to_numpy(dtype=float)
-
-
-class _FakePCA:
-    def transform(self, frame):
-        return np.asarray(frame, dtype=float)
-
-
 class _FakeHMM:
     n_components = 2
-    scaler_ = _FakeScaler()
-    fusion_ = SimpleNamespace(sparse_pca=_FakePCA())
     transmat_ = np.array([[0.90, 0.10], [0.20, 0.80]])
-
-    def predict_proba(self, values):
-        return np.tile(np.array([[0.25, 0.75]]), (len(values), 1))
-
-
-class _FakeIngestor:
-    async def build_fused_dataset(self, *_args, **_kwargs):
-        return pd.DataFrame(
-            {
-                "feature_a": np.linspace(-1.0, 1.0, 30),
-                "feature_b": np.linspace(1.0, -1.0, 30),
-            },
-            index=pd.date_range("2026-01-02", periods=30, freq="B"),
-        )
-
+    feature_names_ = ["SPY_Log_Return", "VIX_Change"]
+    feature_manifest_ = SimpleNamespace(
+        feature_hash="a" * 64,
+        fit_end="2026-01-30",
+    )
+    model_preparation_manifest_ = CausalModelPreparationManifest(
+        feature_hash="a" * 64,
+        fit_end="2026-01-30",
+        model_feature_names=tuple(feature_names_),
+        pca_components=2,
+        requested_hmm_components=2,
+        inference_mode="fixed_out_of_sample",
+        scaler_mode="fixed_prefix_robust",
+        refit_interval_days=0,
+    )
+    causal_tail_probability_ = np.array([0.25, 0.75])
+    causal_tail_as_of_ = "2026-07-24"
+    causal_inference_mode_ = "fixed_snapshot_prefix_filter"
 
 def _buckets():
     count = MIN_REGIME_BUCKET_OBSERVATIONS
@@ -86,7 +78,13 @@ class ProbabilityEngineContractTests(unittest.TestCase):
             return 0.20 if model["regime_label"] == "State_0" else 0.60
 
         with (
-            patch.object(engine_module, "DataIngestor", _FakeIngestor),
+            patch.object(
+                engine_module,
+                "DataIngestor",
+                side_effect=AssertionError(
+                    "probability construction must not reacquire feature data"
+                ),
+            ),
             patch.object(
                 engine_module,
                 "validate_hmm_quality",
@@ -115,7 +113,13 @@ class ProbabilityEngineContractTests(unittest.TestCase):
 
     def test_statistically_collapsed_hmm_is_unavailable(self):
         with (
-            patch.object(engine_module, "DataIngestor", _FakeIngestor),
+            patch.object(
+                engine_module,
+                "DataIngestor",
+                side_effect=AssertionError(
+                    "probability construction must not reacquire feature data"
+                ),
+            ),
             patch.object(
                 engine_module,
                 "validate_hmm_quality",
@@ -156,6 +160,9 @@ class ProbabilityEngineContractTests(unittest.TestCase):
             projected_probabilities=(1.0,),
             models=({"type": "fixture"},),
             current_probabilities=(1.0,),
+            input_feature_hash="a" * 64,
+            model_as_of_date="2026-07-24",
+            inference_mode="fixed_snapshot_prefix_filter",
         )
         with self.assertRaisesRegex(
             ProbabilityEngineUnavailable,
@@ -167,6 +174,21 @@ class ProbabilityEngineContractTests(unittest.TestCase):
             "INVALID_STRIKE",
         ):
             result.probability(float("nan"))
+
+    def test_missing_causal_tail_provenance_is_unavailable(self):
+        model = _FakeHMM()
+        model.causal_inference_mode_ = ""
+        with self.assertRaisesRegex(
+            ProbabilityEngineUnavailable,
+            "MODEL_FEATURE_PROVENANCE_UNAVAILABLE",
+        ):
+            get_probability_engine(
+                500.0,
+                20.0,
+                _buckets(),
+                horizon=7,
+                hmm_model=model,
+            )
 
 
 if __name__ == "__main__":
