@@ -1,5 +1,5 @@
-# etrade_quant_trading/scripts/run_daily.py
-# Note for Codex: install prerequisite packages specified in requirements.txt before running this script.
+# scripts/run_daily.py
+# Install the hash-locked runtime described in requirements/README.md first.
 # Note for Codex: Use test_integration_run_daily.py for testing the changes, which will avoid calling 3rd part API. Do not use run_daily.py for testing.
 
 from __future__ import annotations
@@ -8,18 +8,10 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 
-# Support running as a top-level package (etrade_quant_trading.scripts.run_daily)
-# or from within the package directory (scripts.run_daily)
-try:  # package-style imports from repo root or installed package
-    from etrade_quant_trading.polygonio.logging_setup import init_logging
-    from etrade_quant_trading.polygonio.recursive_backtest import monthly_recursive_backtest
-    from etrade_quant_trading.polygonio.daily_report import print_opened_and_closed_for_date
-    from etrade_quant_trading.polygonio.plot_results import plot_from_backtest_results
-except Exception:  # fallback for running from inside etrade_quant_trading folder
-    from polygonio.logging_setup import init_logging
-    from polygonio.recursive_backtest import monthly_recursive_backtest
-    from polygonio.daily_report import print_opened_and_closed_for_date
-    from polygonio.plot_results import plot_from_backtest_results
+from polygonio.daily_report import print_opened_and_closed_for_date
+from polygonio.logging_setup import init_logging
+from polygonio.plot_results import plot_from_backtest_results
+from polygonio.recursive_backtest import monthly_recursive_backtest
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         dest="stop_profit_percent",
         type=float,
         default=None,
-        help="Take-profit threshold (e.g., 0.5 = +50% profit on credit).",
+        help="Take-profit threshold (e.g., 0.5 = +50%% profit on credit).",
     )
     p.add_argument(
         "--stop-loss-action",

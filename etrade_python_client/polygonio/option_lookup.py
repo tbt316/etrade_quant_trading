@@ -11,6 +11,7 @@ import logging
 import requests
 
 from .config import get_settings
+from .http_safety import safe_exception_summary
 
 log = logging.getLogger(__name__)
 
@@ -84,9 +85,10 @@ def get_option_quote(
                 }
             )
         return out or {"error": "No valid bid/ask"}
-    except requests.RequestException as e:
-        log.error("Polygon quote request failed: %s", e)
-        return {"error": str(e)}
+    except requests.RequestException as error:
+        summary = safe_exception_summary(error)
+        log.error("Polygon quote request failed: %s", summary)
+        return {"error": summary}
 
 
 def query_polygon_for_option_price(
@@ -103,4 +105,3 @@ def query_polygon_for_option_price(
     if not data:
         return {}
     return data[0]
-

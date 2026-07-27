@@ -522,6 +522,21 @@ archive and fails before remote work when tracked state is dirty. This is index
 hygiene, not a Git-history purge; exposed credentials still require external
 revocation/rotation and coordinated all-ref cleanup.
 
+R8b makes `etrade_python_client/` the only package source root and
+`../pyproject.toml` the only direct package/dependency definition. Ten
+compatibility packages are explicitly allowlisted; the wheel includes only the
+dashboard template and three strategy YAML files beyond Python sources. The
+empty root `accounts` and `yfinance` shadows, misspelled package initializers,
+legacy `setup.py`, and per-directory requirement inputs are removed. CPython
+3.10.20, direct dependencies, build tools, and complete runtime/test graphs are
+pinned; every resolved distribution has an accepted hash. `pyetrade` and
+`rauth` are the only source-distribution exceptions and build under a separate
+hash-locked toolchain with isolation disabled. Runtime package installation is
+removed, Polygon import is credential-free, and Pi bootstrap joins service
+installation/restart in failing closed. R8c remains necessary to build from an
+exact clean archive and run every maintained test against the installed wheel
+without a source-tree `PYTHONPATH`.
+
 Deliver:
 
 1. Choose one package root and one `../pyproject.toml`; remove legacy

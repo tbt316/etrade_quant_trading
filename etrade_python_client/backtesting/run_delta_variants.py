@@ -2,11 +2,7 @@ import subprocess
 import sys
 import os
 import json
-try:
-    from tqdm import tqdm
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
-    from tqdm import tqdm
+from tqdm import tqdm
 
 START_DATE = "2019-01-01"
 END_DATE = "2026-05-17"

@@ -12,6 +12,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "deploy" / "install_pi_service.sh"
+BOOTSTRAP = REPO_ROOT / "deploy" / "pi_bootstrap.sh"
 SYNC = REPO_ROOT / "deploy" / "sync_to_pi.sh"
 
 
@@ -185,6 +186,31 @@ def test_installer_fails_before_any_privileged_or_service_action(
     assert not marker.exists()
     source = INSTALLER.read_text(encoding="utf-8")
     for forbidden in ("sudo ", "systemctl ", "ExecStart=", "START_NOW"):
+        assert forbidden not in source
+
+
+def test_bootstrap_fails_before_any_install_or_privileged_action(
+    tmp_path: Path,
+) -> None:
+    environment, marker = _probe_environment(tmp_path)
+    bin_dir = tmp_path / "bin"
+    for command in ("apt-get", "uname", "python3", "mkdir"):
+        _write_probe(bin_dir, command, marker)
+
+    completed = subprocess.run(
+        ["bash", str(BOOTSTRAP)],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert "bootstrap is suspended" in completed.stderr
+    assert not marker.exists()
+    source = BOOTSTRAP.read_text(encoding="utf-8")
+    for forbidden in ("sudo ", "apt-get", "-m pip", "-m venv", "mkdir "):
         assert forbidden not in source
 
 
@@ -621,7 +647,7 @@ def test_archive_failure_cleans_snapshot_before_any_remote_action(
 
 
 def test_deployment_scripts_are_valid_bash() -> None:
-    for script in (INSTALLER, SYNC):
+    for script in (INSTALLER, BOOTSTRAP, SYNC):
         completed = subprocess.run(
             ["bash", "-n", str(script)],
             cwd=REPO_ROOT,

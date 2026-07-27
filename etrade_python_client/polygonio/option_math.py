@@ -132,4 +132,3 @@ __all__ = [
     "vega",
     "calculate_implied_volatility",
 ]
-

@@ -14,19 +14,35 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.10.20'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/build.lock
+            requirements/runtime.lock
+            requirements/test.lock
 
       - name: Enforce repository hygiene
         working-directory: etrade_python_client
         run: python scripts/check_repo_hygiene.py
 
-      - name: Install project & test deps
+      - name: Install hash-locked build tools
         run: |
-          python -m pip install -U pip
-          pip install -e .
-          # minimal runtime libs your path is using
-          # pip install pytest pandas numpy matplotlib requests python-dateutil pytz pandas_market_calendars aiohttp
-          pip install -r requirements.txt
+          python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r requirements/build.lock
+
+      - name: Install hash-locked test environment
+        run: |
+          python -m pip install \
+            --require-hashes \
+            --no-build-isolation \
+            --only-binary=:all: \
+            --no-binary=pyetrade,rauth \
+            -r requirements/test.lock
+          python -m pip install --no-deps --no-build-isolation .
+          python -m pip check
           
       - name: Enforce E*TRADE mutation boundary
         working-directory: etrade_python_client

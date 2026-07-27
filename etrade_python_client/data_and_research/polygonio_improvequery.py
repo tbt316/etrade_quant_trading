@@ -17,8 +17,8 @@ import ssl
 import logging
 import time
 from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import urlencode
 from backtesting.monthly_cpu_bound import run_monthly_backtest_cpu_bound
+from polygonio.http_safety import redacted_request_url, safe_exception_summary
 from concurrent.futures import ProcessPoolExecutor
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
@@ -877,11 +877,19 @@ class PolygonAPIClient:
                     print(list(strike_dict.keys()))  # Debug: print sorted strike prices
                 return strike_dict
             
-        except aiohttp.ClientResponseError as e:
-            logging.error(f"RequestException fetching option chain for {ticker}: {e}")
+        except aiohttp.ClientResponseError as error:
+            logging.error(
+                "RequestException fetching option chain for %s: %s",
+                ticker,
+                safe_exception_summary(error),
+            )
             return {}
-        except Exception as e:
-            logging.error(f"Unexpected error fetching option chain for {ticker}: {e}")
+        except Exception as error:
+            logging.error(
+                "Unexpected error fetching option chain for %s: %s",
+                ticker,
+                safe_exception_summary(error),
+            )
             return {}
 
     async def get_option_chains_batch_async(
@@ -921,7 +929,10 @@ class PolygonAPIClient:
         chain_data = {ticker: {}}
         for (expiration_str, as_of_str, call_put), result in zip(deduped_requests, fetched_data):
             if isinstance(result, Exception):
-                logging.error(f"Error fetching option chain: {result}")
+                logging.error(
+                    "Error fetching option chain: %s",
+                    safe_exception_summary(result),
+                )
                 # Store empty result for this specific request
                 result = {}
             
@@ -962,13 +973,27 @@ class PolygonAPIClient:
                     return fetched_data
                 else:
                     raise ValueError("No valid data received.")
-            except Exception as e:
+            except Exception as error:
                 if attempt == self.retries:
-                    logging.error(f"Max retries exceeded for {ticker}, Strike: {strike_price}, Type: {call_put}. Error: {e}")
+                    logging.error(
+                        "Max retries exceeded for %s, Strike: %s, Type: %s. Error: %s",
+                        ticker,
+                        strike_price,
+                        call_put,
+                        safe_exception_summary(error),
+                    )
                     return {}
                 wait_time = self.backoff_factor * (2 ** (attempt - 1))
-                logging.warning(f"Attempt {attempt} failed for {ticker}, Strike: {strike_price}, Type: {call_put}. "
-                                f"Retrying in {wait_time} seconds. Error: {e}")
+                logging.warning(
+                    "Attempt %s failed for %s, Strike: %s, Type: %s. "
+                    "Retrying in %s seconds. Error: %s",
+                    attempt,
+                    ticker,
+                    strike_price,
+                    call_put,
+                    wait_time,
+                    safe_exception_summary(error),
+                )
                 await asyncio.sleep(wait_time)
 
     async def _fetch_and_store_option_data(
@@ -1048,7 +1073,7 @@ class PolygonAPIClient:
                 async with self.session.get(url, params=params) as response:
                     logging.debug(f"Fetching {'close' if use_close_price else 'option data'} for {option_symbol}")
                     if response.status != 200:
-                        full_url = f"{url}?{urlencode(params)}"
+                        full_url = redacted_request_url(url, params)
                         logging.error(f"Failed to fetch {'close price' if use_close_price else 'option data'} for {option_symbol}: HTTP {response.status}")
                         logging.error(f"Request URL: {full_url}")
                         update_memory_invalid_data(use_close_price)
@@ -1130,11 +1155,21 @@ class PolygonAPIClient:
                             logging.warning(f"No close price found for {option_symbol} on {pricing_date}.")
                             update_memory_invalid_data(use_close_price)
                             return {}
-        except aiohttp.ClientError as e:
-            logging.error(f"ClientError while fetching {'close price' if use_close_price else 'option data'} for {option_symbol}: {e}")
+        except aiohttp.ClientError as error:
+            logging.error(
+                "ClientError while fetching %s for %s: %s",
+                "close price" if use_close_price else "option data",
+                option_symbol,
+                safe_exception_summary(error),
+            )
             return {}
-        except Exception as e:
-            logging.error(f"Unexpected error while fetching {'close price' if use_close_price else 'option data'} for {option_symbol}: {e}")
+        except Exception as error:
+            logging.error(
+                "Unexpected error while fetching %s for %s: %s",
+                "close price" if use_close_price else "option data",
+                option_symbol,
+                safe_exception_summary(error),
+            )
             return {}
         
     async def get_option_prices_batch_async(
@@ -1238,12 +1273,14 @@ def get_option_quote(underlying_ticker, strike_price, call_put, expiration_date,
         else:
             logging.warning(f"No valid data found in the response for {option_symbol}: {data}")
             return {"error": "No valid data found in the response."}
-    except requests.exceptions.RequestException as e:
-        logging.error(f"RequestException fetching {option_symbol}: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logging.error(f"Unexpected error fetching {option_symbol}: {e}")
-        return {"error": str(e)}
+    except requests.exceptions.RequestException as error:
+        summary = safe_exception_summary(error)
+        logging.error("RequestException fetching %s: %s", option_symbol, summary)
+        return {"error": summary}
+    except Exception as error:
+        summary = safe_exception_summary(error)
+        logging.error("Unexpected error fetching %s: %s", option_symbol, summary)
+        return {"error": summary}
 
 def query_polygon_for_option_price(ticker, strike_price, call_put, expiration_date, pricing_date):
     """

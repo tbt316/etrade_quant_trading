@@ -7,12 +7,10 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import aiohttp
 import certifi
 import ssl
-import polygonio_config
 
 from .config import get_settings, resolve_premium_field, resolve_premium_mode
 from .cache_io import (
@@ -21,49 +19,22 @@ from .cache_io import (
     merge_nested_dicts_with_count,
     record_unsaved_option_entries,
 )
+from .http_safety import redacted_request_url, safe_exception_summary
 
 import requests
 
-def _resolve_api_key() -> str:
-    """
-    Prefer env var POLYGON_API_KEY.
-    Fall back to legacy polygonio_config.py if present.
-    """
-    key = os.getenv("POLYGON_API_KEY")
-    if key:
-        return key
-
-    # Legacy fallback (not recommended): polygonio_config.py in repo root
-    try:
-        import importlib
-        cfg = importlib.import_module("polygonio_config")
-        key = getattr(cfg, "POLYGON_API_KEY", None) or getattr(cfg, "API_KEY", None)
-    except Exception:
-        key = None
-
-    if not key:
-        raise RuntimeError(
-            "Missing Polygon API key. Set POLYGON_API_KEY in your environment "
-            "(preferred), or provide polygonio_config.py with POLYGON_API_KEY."
-        )
-    return key
-
 log = logging.getLogger(__name__)
 
-def _load_polygon_key_from_config() -> str:
-    """Load POLYGON_API_KEY from env or ~/.etrade_quant/config.json.
-    Env var wins. Returns empty string if not found or on error.
-    """
-    key = os.getenv("POLYGON_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        key = polygonio_config.API_KEY
+
+def _resolve_api_key(explicit_key: Optional[str], settings_key: str) -> str:
+    """Resolve a Polygon key without importing local credential modules."""
+    for candidate in (explicit_key, settings_key, os.getenv("POLYGON_API_KEY")):
+        key = (candidate or "").strip()
         if key:
             return key
-    except Exception as e:
-        log.warning("Failed to read Polygon key from")
-    return ""
+    raise RuntimeError(
+        "Missing Polygon API key. Pass api_key explicitly or set POLYGON_API_KEY."
+    )
 
 
 @dataclass(frozen=True)
@@ -92,12 +63,10 @@ class PolygonAPIClient:
         backoff_factor: float = _Retry.backoff_factor,
     ) -> None:
         s = get_settings()
-        # prefer explicit arg -> settings -> config/env fallback
-        self.api_key = api_key or getattr(s, "polygon_api_key", "") or _load_polygon_key_from_config()
-        if not self.api_key:
-            log.warning("Polygon API key is empty")
-            print(f"[WARNING] Polygon API key is empty")
-            breakpoint()
+        self.api_key = _resolve_api_key(
+            api_key,
+            getattr(s, "polygon_api_key", ""),
+        )
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.retries = retries
         self.backoff_factor = backoff_factor
@@ -189,7 +158,10 @@ class PolygonAPIClient:
             try:
                 async with self.semaphore:
                     async with self.session.get(url, params=params) as resp:
-                        print(f"[DEBUG] Querying Polygon for option chain: {url}?{urlencode(params)}")
+                        print(
+                            "[DEBUG] Querying Polygon for option chain: "
+                            f"{redacted_request_url(url, params)}"
+                        )
                         resp.raise_for_status()
                         data = await resp.json()
                 for item in data.get("results", []) or []:
@@ -198,10 +170,16 @@ class PolygonAPIClient:
                     if sp is not None and sym:
                         results[sp] = sym
                         # print(f"[DEBUG] Fetched option: {ticker} {call_put} exp={expiration_date} as_of={as_of} strike={sp} symbol={sym}")
-            except aiohttp.ClientResponseError as e:
-                print(f"Polygon chain error ({ticker} {expiration_date} {call_put} {as_of}): {e}")
-            except Exception as e:
-                print(f"Unexpected chain error: {e}")
+            except aiohttp.ClientResponseError as error:
+                print(
+                    f"Polygon chain error ({ticker} {expiration_date} "
+                    f"{call_put} {as_of}): {safe_exception_summary(error)}"
+                )
+            except Exception as error:
+                print(
+                    "Unexpected Polygon chain error: "
+                    f"{safe_exception_summary(error)}"
+                )
         return results
 
     async def get_option_contracts_in_range(
@@ -242,7 +220,10 @@ class PolygonAPIClient:
         try:
             async with self.semaphore:
                 async with self.session.get(url, params=params) as resp:
-                    print(f"[DEBUG] Querying Polygon contracts range: {url}?{urlencode(params)}")
+                    print(
+                        "[DEBUG] Querying Polygon contracts range: "
+                        f"{redacted_request_url(url, params)}"
+                    )
                     resp.raise_for_status()
                     data = await resp.json()
             for item in data.get("results", []) or []:
@@ -253,8 +234,11 @@ class PolygonAPIClient:
                     continue
                 m = by_exp.setdefault(exp_s, {})
                 m[float(sp)] = sym
-        except Exception as e:
-            print(f"[WARN] contracts range fetch failed for {ticker} {call_put} {as_of}: {e}")
+        except Exception as error:
+            print(
+                f"[WARN] contracts range fetch failed for {ticker} "
+                f"{call_put} {as_of}: {safe_exception_summary(error)}"
+            )
         return by_exp
 
     async def get_option_chains_batch_async(
@@ -276,7 +260,10 @@ class PolygonAPIClient:
         out: Dict[str, Dict[str, Dict[str, Dict[str, Dict[float, str]]]]] = {ticker: {}}
         for (exp, as_of, cp), result in zip(unique_chain_requests, fetched):
             if isinstance(result, Exception):
-                log.error("Error fetching option chain: %s", result)
+                log.error(
+                    "Error fetching option chain: %s",
+                    safe_exception_summary(result),
+                )
                 result = {}
             try:
                 strikes_count = len(result) if isinstance(result, dict) else 0
@@ -430,7 +417,10 @@ class PolygonAPIClient:
                 if parse is not None:
                     async with self.semaphore:
                         async with session.get(url, params=params) as resp:
-                            print(f"[DEBUG] Querying Polygon for option price: {url}?{urlencode(params)}")
+                            print(
+                                "[DEBUG] Querying Polygon for option price: "
+                                f"{redacted_request_url(url, params)}"
+                            )
                             resp.raise_for_status()
                             data = await resp.json()
                     payload = parse(data)
@@ -461,7 +451,10 @@ class PolygonAPIClient:
                     fetch_results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
                     for fr in fetch_results:
                         if isinstance(fr, Exception):
-                            log.warning("Polygon price window fetch failed: %s", fr)
+                            log.warning(
+                                "Polygon price window fetch failed: %s",
+                                safe_exception_summary(fr),
+                            )
                             continue
                         params_for_log = dict(fr.get("params") or params)
                         data_part = fr.get("data") or {}
@@ -594,19 +587,26 @@ class PolygonAPIClient:
                         f"Stored invalid {ticker},Strike:{strike_price},{call_put},Expire:{expiration_date}, Pricing:{pricing_date}"
                     )
                 return {}
-            except Exception as e:
+            except Exception as error:
                 if attempt >= self.retries:
                     print(
-                        f"Max retries exceeded for {ticker} {call_put} {strike_price}@{pricing_date}: {e}"
+                        f"Max retries exceeded for {ticker} {call_put} "
+                        f"{strike_price}@{pricing_date}: "
+                        f"{safe_exception_summary(error)}"
                     )
                     return {}
                 wait = self.backoff_factor * (2 ** (attempt - 1))
-                log.warning("Attempt %d failed (%s). Retrying in %.2fs", attempt, e, wait)
+                log.warning(
+                    "Attempt %d failed (%s). Retrying in %.2fs",
+                    attempt,
+                    safe_exception_summary(error),
+                    wait,
+                )
                 await asyncio.sleep(wait)
                 try:
                     print(
                         f"[DEBUG] Polygon retry #{attempt} for {ticker} {call_put} {strike_price} @{pricing_date} "
-                        f"(wait {wait:.2f}s): {e}"
+                        f"(wait {wait:.2f}s): {safe_exception_summary(error)}"
                     )
                 except Exception:
                     pass
