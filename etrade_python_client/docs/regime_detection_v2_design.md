@@ -536,9 +536,10 @@ silently turn into a persistent background classification.
 
 The 2025 calendar year is a retrospective validation window and is never used
 for candidate selection. The March–April and June–July 2026 windows are
-retrospective case studies only. The committed prospective observation window
-starts on 2026-07-27; it cannot authorize trading and must accumulate before a
-later paper-promotion review.
+retrospective case studies only. A prospective window beginning 2026-07-27 was
+pre-registered, but its pre-open activation prerequisites were not satisfied.
+It is permanently blocked, has no observations, cannot be backfilled, and
+cannot authorize trading. A later study requires a newly frozen future window.
 
 Selection-fold results on the unverified legacy cache are:
 
@@ -757,7 +758,7 @@ Every regime experiment must persist:
 | Field | V2 prototype status | Production requirement |
 |---|---|---|
 | Training/calibration end date | Selection folds end 2024-12-31; retrospective outcomes resolve through 2026-02-02; exact folds and hashes are stored | Rebuild on verified provider evidence before paper promotion |
-| Test date range | 2025 is retrospective validation; 2026 examples are retrospective case studies; prospective observation starts 2026-07-27 | Accumulate and review the untouched prospective window without changing the frozen plan |
+| Test date range | 2025 is retrospective validation; 2026 examples are retrospective case studies; the 2026-07-27 prospective window failed pre-open activation and has zero rows | After entitlement, authentication, timestamp anchoring, and verified calibration are ready, pre-register a future window without retuning the detector |
 | Inference method | `causal_prefix_filter`, bound in the plan and artifact | Preserve the same method in backtest, shadow, and live consumers |
 | Regime lag | Exactly one session; close-T labels begin post-lag outcomes at close T+1 | Assert the same exact trade-entry mapping in R4 |
 | Return-bucket causality | Fold reference outcomes resolve strictly before evaluation; post-lag labels resolve at T+h+1 | R4 must use the same resolved-only convention and taxonomy |
@@ -870,6 +871,137 @@ and skipped-trade effects must be included.
 - Persist what the order would have been without the regime rule.
 - Require rollback to disable the regime policy without disabling monitoring.
 
+## Prospective promotion boundary
+
+R6 adds contracts needed by a future untouched prospective window without
+weakening the R4/R5 execution abstention. It does **not** activate a study,
+connect the detector to E*TRADE, or connect to an order gateway or execution
+ledger.
+
+### Frozen prospective protocol
+
+`docs/regime_v2_prospective_review_protocol.json` is canonical,
+content-addressed pre-registration
+`78f3480f6b803681be9e29f38b75c4823168cfa64e8d8400922a62b01c73aad3`.
+It pins:
+
+- The existing calibration plan, research artifact, selected configuration,
+  detector/calibration source identities, and runtime fingerprint.
+- An observation window from 2026-07-27 through 2027-01-14, exactly 120 NYSE
+  sessions.
+- A one-session signal lag and five-/20-session outcome horizons.
+- Final outcome resolution and earliest review on 2027-02-16.
+- At least 120 signal rows, at least 120 fully resolved outcome rows, 99%
+  outcome coverage, and zero missing expected signal sessions.
+- Explicit rules that unresolved outcomes remain incomplete, missing outcomes
+  block after resolution, and retrospective backfill after the effective
+  session opens is forbidden.
+- Required retained/non-display/derived-use entitlement scopes for both raw
+  SPY and VIX sources, with a fresh external entitlement check.
+- A no-retuning covenant and `execution_eligible=false`.
+
+Changing any value creates a different protocol hash; it cannot silently amend
+the preregistration.
+
+This specific July 27 protocol is explicitly
+`activation_status=blocked_preregistration`. It has no activation timestamp or
+activation receipt and records three blocking reasons: the journal was not
+active at the holdout start, provider entitlement was unresolved, and
+provider-verified calibration was unimplemented. Its 13:00 UTC activation
+deadline is strictly before the first holdout session's 13:30 UTC NYSE open, so
+intraday information cannot be used to decide whether to activate. Therefore:
+
+- no July 27 or later observation may be appended under this protocol;
+- its planned dates are retained only as an immutable record of a study that
+  did not activate;
+- it can never be repaired by retrospective backfill;
+- a real study requires a new protocol with a future start, an externally
+  reviewed activation receipt recorded before its frozen deadline, and an
+  intentional update of the deployment protocol pin;
+- activation must also predeclare an external trusted timestamp/head-anchoring
+  mechanism; the local process clock alone is not authoritative proof of when
+  a journal head first existed.
+
+Creating that later protocol does not permit detector retuning; it moves the
+untouched observation window only because the original window never started.
+
+### Durable prospective journal
+
+`live_trading/regime_prospective.py` defines immutable entitlement receipts and
+hash-chained journal entries. Each entry binds the exact:
+
+- typed signal and signal hash;
+- verified decision-time snapshot and evidence manifest;
+- detector version/code, configuration, calibration plan/artifact/code, and
+  runtime fingerprint;
+- secret-free external entitlement receipt, scope, validity interval, terms,
+  retention policy, deletion policy, and reviewer identities.
+
+`live_trading/regime_prospective_journal.py` is the operational append store.
+It writes one owner-only `0600` file named by sequence and content hash into a
+trusted owner-only directory. The store obtains the recording time from its
+own UTC clock while holding the append lock; callers cannot provide a
+historical recording timestamp. This removes an in-process backdating input but
+is not an external timestamp authority. A future activation must anchor journal
+heads outside this process. The store writes and fsyncs a private pending file,
+atomically hard-links that content into its final no-overwrite hash name,
+removes the pending link, and fsyncs the directory. Restart safely resolves
+either an uncommitted pending inode or the second link left after an
+interrupted commit. It never deletes an `EEXIST` target.
+
+Restart reads also verify lock-path identity, file identity, canonical
+serialization, filename hash, exact type, monotonic session order, and the
+complete predecessor chain. There is no update/delete API or mutable head file.
+The journal independently rechecks that `Signal_Available_At` is no earlier
+than joint SPY/VIX finalization and that both availability and durable
+recording precede the effective session open.
+
+The journal deliberately remains disconnected from the current publisher. A
+signal without deployment-pinned calibration, verified decision-time evidence,
+fresh entitlement scope, or pre-open prospective recording is rejected.
+
+### Promotion gate
+
+`RegimePromotionGate` has the closed result type `INCOMPLETE`, `BLOCKED`, or
+`PASS`, and every result has `may_authorize_execution=false`. The current R6
+implementation is intentionally pinned to the exact blocked protocol above and
+has `PROMOTION_AUTHENTICATION_IMPLEMENTED=false`. Consequently it returns
+`BLOCKED`; no combination of caller-created hashes, booleans, outcomes, or
+review receipts can produce `PASS`.
+
+The immutable receipt classes currently provide schema and content bindings,
+not issuer authenticity. Before the authentication flag can change, a separate
+reviewed milestone must add pinned cryptographic issuer/reviewer verification,
+load the exact entitlement/replay/outcome/report bytes, enforce reviewer
+independence and current revocation state, and execute pre-registered
+statistical thresholds rather than trusting a supplied verdict. It must also
+verify externally timestamped journal-head anchors. Even then, `PASS` would
+mean evidence readiness for a separate human-approved paper-risk integration
+milestone, never permission to trade.
+
+### Counterfactual monotonic risk policy
+
+`live_trading/regime_risk_policy.py` supplies a pure research projection for
+recording what exposure a future overlay would have allowed. Its default
+background caps are calm 100%, elevated 60%, and persistent stress 0%; shock
+caps are none 100%, aftershock 50%, and active 0%. The combined cap is the
+minimum of the two axes. Any unavailable or abstaining signal blocks new short
+puts.
+
+Constructors reject any configuration that increases exposure as either axis
+worsens or permits exposure during persistent stress, an active shock,
+unavailability, or abstention. Every decision is marked
+`counterfactual_only=true` and `may_authorize_execution=false`; the module has
+no brokerage or gateway imports. These caps are safety-first shadow defaults,
+not statistically promoted strategy parameters.
+
+Every current typed `RegimeSignal` contains the R4 non-authoritative abstention,
+so `evaluate_signal()` correctly produces a zero cap. The raw-state method is
+only a deterministic hypothetical/property-test surface until a future
+authenticated, non-abstaining paper-signal schema is approved. Counterfactual
+decisions are not yet persisted or included in the blocked prospective
+protocol.
+
 ## Prototype artifacts and verification
 
 - Detector: `live_trading/regime_detector_v2.py`
@@ -881,10 +1013,18 @@ and skipped-trade effects must be included.
 - Typed shadow contract: `live_trading/regime_signal.py`
 - Entitlement-gated publisher: `live_trading/regime_shadow_publish.py`
 - Atomic dashboard read model: `live_trading/regime_shadow_store.py`
+- Prospective protocol, evidence contracts, and promotion gate:
+  `live_trading/regime_prospective.py`
+- Append-only content-addressed prospective journal:
+  `live_trading/regime_prospective_journal.py`
+- Pure monotonic counterfactual risk policy:
+  `live_trading/regime_risk_policy.py`
 - Authenticated dashboard consumer:
   `live_trading/etrade_cover_call_new.py` and
   `live_trading/dashboard_template.html`
 - Frozen calibration plan: `docs/regime_v2_calibration_plan.json`
+- Frozen prospective review protocol:
+  `docs/regime_v2_prospective_review_protocol.json`
 - Research artifact:
   `research_reports/regime_v2_calibration_artifact.json`
 - Release gate: `docs/regime_data_provider_entitlements.md`
@@ -897,7 +1037,9 @@ and skipped-trade effects must be included.
   `tests/test_regime_backtest_parity.py`,
   `tests/test_regime_shadow_publish.py`,
   `tests/test_regime_shadow_store.py`, and
-  `tests/test_regime_shadow_dashboard.py`
+  `tests/test_regime_shadow_dashboard.py`,
+  `tests/test_regime_prospective.py`, and
+  `tests/test_regime_risk_policy.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
 - Deterministic calibration runner:
   `scratch/regime_detector_v2_calibrate.py`
@@ -923,6 +1065,18 @@ The focused tests verify:
 - Exact T-to-T+1 backtest annotations with no fill or action effect.
 - Deployment artifact pins, immutable trace attributes, and strict
   pre-entry return-outcome resolution.
+- Canonical immutable prospective dates, row/resolution requirements,
+  missing-data rules, and no-retuning covenant.
+- Crash-safe append/restart, exact-type, entitlement-scope, late-backfill,
+  permission, and content/filename/chain tamper rejection.
+- The missed July 27 activation is permanently blocked, arbitrary protocol
+  hashes are rejected, and self-attested evidence cannot produce `PASS`.
+- The store owns the append clock, rechecks exact joint finalization, preserves
+  an `EEXIST` target, and recovers a commit interrupted between atomic link and
+  pending-link cleanup.
+- Exhaustive two-axis monotonicity: worsening either background or shock state
+  never increases counterfactual short-put exposure; unavailable and abstaining
+  inputs—including the current typed R4 signal—block.
 
 The read-only replay prints the causal record and reproduces the 2026 comparison
 without downloading or mutating data.
