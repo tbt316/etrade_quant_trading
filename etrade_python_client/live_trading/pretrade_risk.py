@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -770,6 +770,131 @@ class RiskDecision:
             _invalid("RISK_DECISION_DIGEST_MISMATCH")
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class OpeningRiskAuthorization:
+    """Exact replayable inputs for one content-addressed risk decision.
+
+    The decision alone proves internal consistency, but it cannot prove which
+    typed inputs produced its request, policy, and evidence hashes.  This
+    immutable bundle keeps those inputs together so a durable execution
+    boundary can independently re-run the pure policy before reserving or
+    sending an order.
+    """
+
+    spread: OpeningSpreadRequest = field(repr=False)
+    limits: RiskLimits = field(repr=False)
+    authority: AuthorityEvidence = field(repr=False)
+    quotes: QuoteSnapshotEvidence = field(repr=False)
+    portfolio: PortfolioRiskEvidence = field(repr=False)
+    overlays: tuple[RiskOverlayEvidence, ...] = field(repr=False)
+    decision: RiskDecision
+
+    def __post_init__(self) -> None:
+        _require_exact(
+            self.spread, OpeningSpreadRequest, "INVALID_OPENING_REQUEST"
+        )
+        _require_exact(self.limits, RiskLimits, "INVALID_RISK_LIMITS")
+        _require_exact(
+            self.authority,
+            AuthorityEvidence,
+            "INVALID_AUTHORITY_EVIDENCE",
+        )
+        _require_exact(
+            self.quotes,
+            QuoteSnapshotEvidence,
+            "INVALID_QUOTE_EVIDENCE",
+        )
+        _require_exact(
+            self.portfolio,
+            PortfolioRiskEvidence,
+            "INVALID_PORTFOLIO_EVIDENCE",
+        )
+        if type(self.overlays) is not tuple:
+            _invalid("INVALID_RISK_OVERLAYS")
+        for overlay in self.overlays:
+            _require_exact(
+                overlay, RiskOverlayEvidence, "INVALID_RISK_OVERLAY"
+            )
+        _require_exact(
+            self.decision, RiskDecision, "INVALID_RISK_DECISION"
+        )
+        expected = evaluate_pretrade(
+            self.spread,
+            self.limits,
+            self.authority,
+            self.quotes,
+            self.portfolio,
+            self.overlays,
+            evaluated_at=self.decision.evaluated_at,
+        )
+        if self.decision != expected:
+            _invalid("RISK_AUTHORIZATION_DECISION_MISMATCH")
+
+    def __repr__(self) -> str:
+        return (
+            "OpeningRiskAuthorization("
+            f"decision_sha256={self.decision.decision_sha256!r},"
+            "[EVIDENCE REDACTED])"
+        )
+
+    @property
+    def request_sha256(self) -> str:
+        return opening_request_sha256(self.spread)
+
+    @property
+    def policy_sha256(self) -> str:
+        return risk_policy_sha256(self.limits)
+
+    @property
+    def authority_sha256(self) -> str:
+        return authority_evidence_sha256(self.authority)
+
+    @property
+    def quote_evidence_sha256(self) -> str:
+        return quote_evidence_sha256(self.quotes)
+
+    @property
+    def portfolio_evidence_sha256(self) -> str:
+        return portfolio_evidence_sha256(self.portfolio)
+
+    @property
+    def overlays_sha256(self) -> str:
+        return overlay_evidence_sha256(self.overlays)
+
+    @property
+    def evidence_sha256(self) -> str:
+        return combined_evidence_sha256(
+            self.authority,
+            self.quotes,
+            self.portfolio,
+            self.overlays,
+        )
+
+    @property
+    def valid_until(self) -> datetime:
+        """Return the conservative instant after which this bundle is stale."""
+
+        deadlines = [
+            self.authority.observed_at
+            + _seconds(self.limits.max_authority_age_seconds),
+            self.authority.arm_expires_at,
+            self.authority.session_closes_at,
+            self.portfolio.observed_at
+            + _seconds(self.limits.max_portfolio_age_seconds),
+        ]
+        deadlines.extend(
+            quote.observed_at
+            + _seconds(self.limits.max_quote_age_seconds)
+            for quote in self.quotes.quotes
+        )
+        deadlines.extend(
+            overlay.observed_at
+            + _seconds(self.limits.max_overlay_age_seconds)
+            for overlay in self.overlays
+        )
+        return min(deadlines)
+
+
 @dataclass(frozen=True, slots=True)
 class _DerivedRisk:
     order_notional_cents: int = 0
@@ -832,22 +957,13 @@ def evaluate_pretrade(
 
     reason_codes = tuple(sorted(reasons)) if reasons else ("RISK_ALLOWED",)
     allowed = not reasons
-    request_sha256 = _digest(
-        ("request", request.canonical_material)
-    )
-    policy_sha256 = _digest(("policy", limits.canonical_material))
-    evidence_sha256 = _digest(
-        (
-            "evidence",
-            authority.canonical_material,
-            quotes.canonical_material,
-            portfolio.canonical_material,
-            tuple(
-                sorted(
-                    overlay.canonical_material for overlay in overlays
-                )
-            ),
-        )
+    request_sha256 = opening_request_sha256(request)
+    policy_sha256 = risk_policy_sha256(limits)
+    evidence_sha256 = combined_evidence_sha256(
+        authority,
+        quotes,
+        portfolio,
+        overlays,
     )
     decision_material = (
         _DECISION_DOMAIN,
@@ -880,6 +996,136 @@ def evaluate_pretrade(
         fee_cents=derived.fee_cents,
         projected_portfolio_delta=projected_portfolio_delta,
         projected_symbol_delta=projected_symbol_delta,
+    )
+
+
+def validate_opening_risk_authorization(
+    authorization: OpeningRiskAuthorization,
+    *,
+    at: datetime,
+) -> None:
+    """Require an exact allowed decision whose evidence remains usable at ``at``."""
+
+    _require_exact(
+        authorization,
+        OpeningRiskAuthorization,
+        "INVALID_RISK_AUTHORIZATION",
+    )
+    _validate_datetime(at, "INVALID_AUTHORIZATION_CHECK_TIMESTAMP")
+    decision = authorization.decision
+    if not decision.allowed:
+        _invalid("RISK_DECISION_DENIED")
+    if decision.evaluated_at > at:
+        _invalid("RISK_AUTHORIZATION_FROM_FUTURE")
+    exact = evaluate_pretrade(
+        authorization.spread,
+        authorization.limits,
+        authorization.authority,
+        authorization.quotes,
+        authorization.portfolio,
+        authorization.overlays,
+        evaluated_at=decision.evaluated_at,
+    )
+    if decision != exact:
+        _invalid("RISK_AUTHORIZATION_DECISION_MISMATCH")
+    current = evaluate_pretrade(
+        authorization.spread,
+        authorization.limits,
+        authorization.authority,
+        authorization.quotes,
+        authorization.portfolio,
+        authorization.overlays,
+        evaluated_at=at,
+    )
+    if not current.allowed or at >= authorization.valid_until:
+        _invalid("RISK_AUTHORIZATION_NOT_CURRENT")
+
+
+def opening_request_sha256(request: OpeningSpreadRequest) -> str:
+    _require_exact(request, OpeningSpreadRequest, "INVALID_OPENING_REQUEST")
+    return _digest(("request", request.canonical_material))
+
+
+def risk_policy_sha256(limits: RiskLimits) -> str:
+    _require_exact(limits, RiskLimits, "INVALID_RISK_LIMITS")
+    return _digest(("policy", limits.canonical_material))
+
+
+def authority_evidence_sha256(evidence: AuthorityEvidence) -> str:
+    _require_exact(
+        evidence, AuthorityEvidence, "INVALID_AUTHORITY_EVIDENCE"
+    )
+    return _digest(("authority", evidence.canonical_material))
+
+
+def quote_evidence_sha256(evidence: QuoteSnapshotEvidence) -> str:
+    _require_exact(
+        evidence, QuoteSnapshotEvidence, "INVALID_QUOTE_EVIDENCE"
+    )
+    return _digest(("quotes", evidence.canonical_material))
+
+
+def portfolio_evidence_sha256(evidence: PortfolioRiskEvidence) -> str:
+    _require_exact(
+        evidence, PortfolioRiskEvidence, "INVALID_PORTFOLIO_EVIDENCE"
+    )
+    return _digest(("portfolio", evidence.canonical_material))
+
+
+def overlay_evidence_sha256(
+    overlays: tuple[RiskOverlayEvidence, ...],
+) -> str:
+    if type(overlays) is not tuple:
+        _invalid("INVALID_RISK_OVERLAYS")
+    for overlay in overlays:
+        _require_exact(
+            overlay, RiskOverlayEvidence, "INVALID_RISK_OVERLAY"
+        )
+    return _digest(
+        (
+            "overlays",
+            tuple(
+                sorted(
+                    overlay.canonical_material for overlay in overlays
+                )
+            ),
+        )
+    )
+
+
+def combined_evidence_sha256(
+    authority: AuthorityEvidence,
+    quotes: QuoteSnapshotEvidence,
+    portfolio: PortfolioRiskEvidence,
+    overlays: tuple[RiskOverlayEvidence, ...],
+) -> str:
+    _require_exact(
+        authority, AuthorityEvidence, "INVALID_AUTHORITY_EVIDENCE"
+    )
+    _require_exact(
+        quotes, QuoteSnapshotEvidence, "INVALID_QUOTE_EVIDENCE"
+    )
+    _require_exact(
+        portfolio, PortfolioRiskEvidence, "INVALID_PORTFOLIO_EVIDENCE"
+    )
+    if type(overlays) is not tuple:
+        _invalid("INVALID_RISK_OVERLAYS")
+    for overlay in overlays:
+        _require_exact(
+            overlay, RiskOverlayEvidence, "INVALID_RISK_OVERLAY"
+        )
+    return _digest(
+        (
+            "evidence",
+            authority.canonical_material,
+            quotes.canonical_material,
+            portfolio.canonical_material,
+            tuple(
+                sorted(
+                    overlay.canonical_material for overlay in overlays
+                )
+            ),
+        )
     )
 
 
@@ -1353,7 +1599,17 @@ def _validate_account_fields(
     institution_type: Any,
 ) -> None:
     _validate_identity(account_id, "INVALID_ACCOUNT_ID")
-    _validate_identity(account_id_key, "INVALID_ACCOUNT_ID_KEY")
+    if (
+        type(account_id_key) is not str
+        or not account_id_key
+        or len(account_id_key) > _MAX_TEXT
+        or not account_id_key.isascii()
+        or any(
+            ord(character) < 33 or ord(character) > 126
+            for character in account_id_key
+        )
+    ):
+        _invalid("INVALID_ACCOUNT_ID_KEY")
     if (
         type(institution_type) is not str
         or not institution_type
@@ -1484,6 +1740,10 @@ def _datetime_text(value: datetime) -> str:
     return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _seconds(value: int) -> timedelta:
+    return timedelta(seconds=value)
+
+
 def _digest(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -1502,6 +1762,7 @@ def _invalid(code: str) -> None:
 __all__ = [
     "AuthorityEvidence",
     "ContractQuote",
+    "OpeningRiskAuthorization",
     "OpeningLeg",
     "OpeningSpreadRequest",
     "PRETRADE_RISK_SCHEMA_VERSION",
@@ -1511,5 +1772,13 @@ __all__ = [
     "RiskDecision",
     "RiskLimits",
     "RiskOverlayEvidence",
+    "authority_evidence_sha256",
+    "combined_evidence_sha256",
     "evaluate_pretrade",
+    "opening_request_sha256",
+    "overlay_evidence_sha256",
+    "portfolio_evidence_sha256",
+    "quote_evidence_sha256",
+    "risk_policy_sha256",
+    "validate_opening_risk_authorization",
 ]

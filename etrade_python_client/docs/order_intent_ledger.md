@@ -1,8 +1,8 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7 durable execution core plus crash-safe cancellation,
-exact closing-capacity reservations, terminal absorption, and legacy mutation
-quarantine, isolated
+**Delivery status:** R7 durable execution core plus schema-15 non-authorizing
+opening-risk persistence, crash-safe cancellation, exact closing-capacity
+reservations, terminal absorption, and legacy mutation quarantine, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
 
@@ -84,9 +84,23 @@ remains blocked rather than guessed or retried.
 - `BEGIN IMMEDIATE` serializes account-capacity decisions and state
   transitions. New account mutations stop while any submission or amendment is
   unresolved.
-- Opening reservations use fresh, typed quote, portfolio, and buying-power
-  evidence. The caller's asserted maximum loss cannot be below the exposure
-  derived from strike width, price, contract multiplier, and quantity.
+- Legacy opening reservations use fresh, typed quote, portfolio, and
+  buying-power evidence. Their caller-asserted maximum loss cannot be below the
+  exposure derived from strike width, price, contract multiplier, and
+  quantity. They remain outside the new pure-risk proof and no production
+  composition root uses either path.
+- Schema 15 can atomically persist an exact allowed `RiskDecision`, its
+  request/policy/aggregate and component evidence hashes, exact standard
+  vertical payload/economics, account identity, capacity decision/manifest,
+  portfolio state digest, and calculated collateral/max-loss amounts. The
+  append-only record is deliberately `INDEPENDENT_EVIDENCE_PENDING`; it creates
+  no margin reservation, consumes no account cap, and cannot be claimed,
+  previewed, or placed. Current durable reads do not independently replay raw
+  quotes or the portfolio open-risk, concentration, delta, daily-limit, and
+  conflict-set aggregates consumed by policy; a caller-supplied digest is not
+  promoted to broker evidence. A future promotion must atomically revalidate
+  fresh independent evidence and reserve capacity rather than upgrading this
+  historical proof in place.
 - Closing reservations are content-addressed and bind the intent payload to the
   complete capacity evidence, exact contracts/lots, active broker closes, and
   projected post-fill positions. A second process cannot reserve an overlapping
@@ -142,17 +156,19 @@ remains blocked rather than guessed or retried.
 
 ## Schema policy
 
-Schema 14 adds immutable closing reservations, pre-place void receipts, and
-terminal closing-absorption receipts, together with exact capacity provenance
-and append-only guards. It retains schema 13 cancellation records and
-send/response/resolution receipts, schema 12 opening terminal-absorption
-receipts, schema 11 raw broker-read receipts and semantic manifests, and the
-existing durable capacity decisions. Additive schema
-8→9→10→11→12→13→14 migration is one explicit SQLite transaction and verifies
-required columns, foreign keys, append-only triggers, journal mode, foreign-key
-integrity, and `quick_check` before version promotion. Unknown or malformed
-schemas fail closed. A production operator must still take an atomic private
-backup and complete a rollback drill before migration.
+Schema 15 adds append-only `opening_risk_prerequisites` and exact intent,
+capacity-decision, and manifest cross-binding guards. These rows are
+persistence prerequisites, never placement authority or capacity claims.
+It retains schema 14 immutable closing reservations, pre-place void receipts,
+and terminal closing-absorption receipts; schema 13 cancellation records;
+schema 12 opening terminal-absorption receipts; schema 11 raw broker-read
+receipts and semantic manifests; and the existing durable capacity decisions.
+Additive schema 8→9→10→11→12→13→14→15 migration is one explicit SQLite
+transaction and verifies required columns, foreign keys, append-only triggers,
+journal mode, foreign-key integrity, and `quick_check` before version
+promotion. Unknown or malformed schemas fail closed. A production operator
+must still take an atomic private backup and complete a rollback drill before
+migration.
 
 Schema 8/9 opening intents that predate durable reservations are migrated with
 a conservative reservation equal to their immutable maximum exposure. Live
@@ -175,10 +191,15 @@ process is enabled:
    transport, and coordinator. R7f already rejects direct legacy mutation,
    transport bypass, reflection, and tombstone drift across all tracked
    application Python in CI; the future root must preserve that gate.
-4. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
+4. Opening placement needs durable raw quote manifests and an independently
+   replayable derivation of every portfolio-risk aggregate consumed by the pure
+   policy. A later schema must keep the persisted prerequisite historical,
+   revalidate fresh evidence, and atomically create a separate authorization
+   plus capacity reservation before any send can become eligible.
+5. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
    every nonterminal/terminal broker status, replacement chains, cancellation,
    closing, and process death at each durable/I/O boundary.
-5. Operational migration needs a private database backup, integrity check,
+6. Operational migration needs a private database backup, integrity check,
    rollback drill, credential rotation/history purge, deployment restart, and
    observation of the exact served/live artifacts.
 

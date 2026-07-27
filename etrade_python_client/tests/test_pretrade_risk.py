@@ -11,13 +11,22 @@ from live_trading.pretrade_risk import (
     AuthorityEvidence,
     ContractQuote,
     OpeningLeg,
+    OpeningRiskAuthorization,
     OpeningSpreadRequest,
     PortfolioRiskEvidence,
     PretradeRiskValidationError,
     QuoteSnapshotEvidence,
     RiskLimits,
     RiskOverlayEvidence,
+    authority_evidence_sha256,
+    combined_evidence_sha256,
     evaluate_pretrade,
+    opening_request_sha256,
+    overlay_evidence_sha256,
+    portfolio_evidence_sha256,
+    quote_evidence_sha256,
+    risk_policy_sha256,
+    validate_opening_risk_authorization,
 )
 
 
@@ -263,6 +272,41 @@ def _evaluate(
     )
 
 
+def _authorization(
+    *,
+    request: OpeningSpreadRequest | None = None,
+    limits: RiskLimits | None = None,
+    authority: AuthorityEvidence | None = None,
+    quotes: QuoteSnapshotEvidence | None = None,
+    portfolio: PortfolioRiskEvidence | None = None,
+    overlays: tuple[RiskOverlayEvidence, ...] = (),
+    evaluated_at: datetime = NOW,
+) -> OpeningRiskAuthorization:
+    selected_request = request or _request()
+    selected_limits = limits or _limits()
+    selected_authority = authority or _authority()
+    selected_quotes = quotes or _quotes(selected_request)
+    selected_portfolio = portfolio or _portfolio()
+    decision = evaluate_pretrade(
+        selected_request,
+        selected_limits,
+        selected_authority,
+        selected_quotes,
+        selected_portfolio,
+        overlays,
+        evaluated_at=evaluated_at,
+    )
+    return OpeningRiskAuthorization(
+        selected_request,
+        selected_limits,
+        selected_authority,
+        selected_quotes,
+        selected_portfolio,
+        overlays,
+        decision,
+    )
+
+
 def test_allows_exact_vertical_and_derives_economics_and_delta() -> None:
     decision = _evaluate()
 
@@ -317,6 +361,87 @@ def test_decision_is_frozen_and_content_addressed_deterministically() -> None:
         PretradeRiskValidationError, match="RISK_DECISION_DIGEST_MISMATCH"
     ):
         replace(first, decision_sha256=HASH_D)
+
+
+def test_authorization_replays_exact_decision_and_exposes_component_hashes() -> None:
+    model = _overlay("MODEL", max_contracts=4)
+    regime = _overlay("REGIME", max_new_risk_cents=200_000)
+    authorization = _authorization(overlays=(regime, model))
+
+    assert authorization.decision.allowed is True
+    assert authorization.request_sha256 == opening_request_sha256(
+        authorization.spread
+    )
+    assert authorization.policy_sha256 == risk_policy_sha256(
+        authorization.limits
+    )
+    assert authorization.authority_sha256 == authority_evidence_sha256(
+        authorization.authority
+    )
+    assert (
+        authorization.quote_evidence_sha256
+        == quote_evidence_sha256(authorization.quotes)
+    )
+    assert (
+        authorization.portfolio_evidence_sha256
+        == portfolio_evidence_sha256(authorization.portfolio)
+    )
+    assert authorization.overlays_sha256 == overlay_evidence_sha256(
+        authorization.overlays
+    )
+    assert authorization.evidence_sha256 == combined_evidence_sha256(
+        authorization.authority,
+        authorization.quotes,
+        authorization.portfolio,
+        authorization.overlays,
+    )
+    assert authorization.decision.request_sha256 == (
+        authorization.request_sha256
+    )
+    assert authorization.decision.policy_sha256 == (
+        authorization.policy_sha256
+    )
+    assert authorization.decision.evidence_sha256 == (
+        authorization.evidence_sha256
+    )
+    validate_opening_risk_authorization(authorization, at=NOW)
+
+
+def test_authorization_rejects_denied_stale_and_post_construction_tamper() -> None:
+    denied = _authorization(
+        limits=_limits(allowed_symbols=("QQQ",))
+    )
+    assert denied.decision.allowed is False
+    with pytest.raises(
+        PretradeRiskValidationError, match="RISK_DECISION_DENIED"
+    ):
+        validate_opening_risk_authorization(denied, at=NOW)
+
+    allowed = _authorization()
+    with pytest.raises(
+        PretradeRiskValidationError,
+        match="RISK_AUTHORIZATION_NOT_CURRENT",
+    ):
+        validate_opening_risk_authorization(
+            allowed, at=NOW + timedelta(seconds=31)
+        )
+
+    future = _authorization(
+        evaluated_at=NOW + timedelta(seconds=20)
+    )
+    with pytest.raises(
+        PretradeRiskValidationError,
+        match="RISK_AUTHORIZATION_FROM_FUTURE",
+    ):
+        validate_opening_risk_authorization(future, at=NOW)
+
+    other = _authorization(request=_request(price_cents=101))
+    object.__setattr__(allowed, "decision", other.decision)
+    with pytest.raises(
+        PretradeRiskValidationError,
+        match="RISK_AUTHORIZATION_DECISION_MISMATCH",
+    ):
+        validate_opening_risk_authorization(allowed, at=NOW)
 
 
 def test_any_material_evidence_change_changes_decision_hash() -> None:

@@ -40,10 +40,18 @@ from live_trading.order_domain import (
     PositionLotCapacity,
     evaluate_order as _evaluate_closing_order,
 )
+from live_trading.pretrade_risk import (
+    OpeningRiskAuthorization,
+    PretradeRiskValidationError,
+    RiskDecision,
+    validate_opening_risk_authorization,
+)
 
 
-SCHEMA_VERSION = 14
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11, 12, 13})
+SCHEMA_VERSION = 15
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset(
+    {8, 9, 10, 11, 12, 13, 14}
+)
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
@@ -104,6 +112,9 @@ _CLOSING_ABSORPTION_HASH_DOMAIN = (
 )
 _CLOSING_POSITION_PROOF_HASH_DOMAIN = (
     b"etrade-closing-position-proof.v1\0"
+)
+_OPENING_RISK_PREREQUISITE_HASH_DOMAIN = (
+    b"etrade-opening-risk-prerequisite.v1\0"
 )
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
@@ -583,6 +594,8 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
           OR OLD.canonical_payload != NEW.canonical_payload
           OR OLD.payload_hash != NEW.payload_hash
           OR OLD.client_order_id != NEW.client_order_id
+          OR OLD.opening_risk_prerequisite_sha256
+             IS NOT NEW.opening_risk_prerequisite_sha256
         BEGIN
             SELECT RAISE(ABORT, 'order intent identity is immutable');
         END
@@ -650,6 +663,85 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON capacity_decisions
         BEGIN
             SELECT RAISE(ABORT, 'capacity decisions are append-only');
+        END
+    """,
+    "prevent_opening_risk_prerequisite_update": """
+        CREATE TRIGGER prevent_opening_risk_prerequisite_update
+        BEFORE UPDATE ON opening_risk_prerequisites
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk prerequisites are append-only');
+        END
+    """,
+    "prevent_opening_risk_prerequisite_delete": """
+        CREATE TRIGGER prevent_opening_risk_prerequisite_delete
+        BEFORE DELETE ON opening_risk_prerequisites
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk prerequisites are append-only');
+        END
+    """,
+    "validate_opening_risk_prerequisite_insert": """
+        CREATE TRIGGER validate_opening_risk_prerequisite_insert
+        BEFORE INSERT ON opening_risk_prerequisites
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM order_intents AS intent
+            JOIN capacity_decisions AS capacity
+              ON capacity.capacity_decision_sha256 =
+                    NEW.capacity_decision_sha256
+            JOIN broker_read_manifests AS manifest
+              ON manifest.evidence_sha256 =
+                    NEW.portfolio_broker_read_evidence_sha256
+            WHERE intent.intent_id = NEW.intent_id
+              AND intent.intent_kind = 'OPENING'
+              AND intent.state = 'INTENT'
+              AND intent.broker_order_id IS NULL
+              AND intent.account_id = NEW.account_id
+              AND intent.environment = NEW.environment
+              AND intent.strategy_id = NEW.strategy_id
+              AND intent.decision_id = NEW.strategy_decision_id
+              AND intent.payload_hash = NEW.payload_hash
+              AND intent.opening_risk_prerequisite_sha256 =
+                    NEW.binding_sha256
+              AND capacity.account_id = NEW.account_id
+              AND capacity.environment = NEW.environment
+              AND capacity.evidence_sha256 =
+                    NEW.portfolio_broker_read_evidence_sha256
+              AND capacity.capacity_snapshot_sha256 =
+                    NEW.portfolio_snapshot_sha256
+              AND capacity.observed_at = NEW.portfolio_observed_at
+              AND manifest.evidence_kind = 'CAPACITY'
+              AND manifest.completeness = 'COMPLETE'
+              AND manifest.target_broker_order_id IS NULL
+              AND manifest.account_id = NEW.account_id
+              AND manifest.account_id_key = NEW.account_id_key
+              AND manifest.institution_type = NEW.institution_type
+              AND manifest.environment = NEW.environment
+              AND NEW.risk_schema_version = 1
+              AND NEW.allowed = 1
+              AND NEW.reason_codes_json = '["RISK_ALLOWED"]'
+              AND NEW.authorization_state =
+                    'INDEPENDENT_EVIDENCE_PENDING'
+              AND NEW.created_at >= intent.created_at
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM margin_reservations AS reservation
+                    WHERE reservation.intent_id = NEW.intent_id
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'opening risk prerequisite lacks exact durable provenance');
+        END
+    """,
+    "prevent_opening_risk_reservation_insert": """
+        CREATE TRIGGER prevent_opening_risk_reservation_insert
+        BEFORE INSERT ON margin_reservations
+        WHEN EXISTS (
+            SELECT 1
+            FROM opening_risk_prerequisites AS risk
+            WHERE risk.intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'non-authorizing opening risk prerequisite cannot reserve capacity');
         END
     """,
     "prevent_reservation_absorption_update": """
@@ -739,6 +831,7 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
                   AND intent.intent_kind = 'OPENING'
                   AND intent.state = 'INTENT'
                   AND intent.broker_order_id IS NULL
+                  AND intent.opening_risk_prerequisite_sha256 IS NULL
                   AND NEW.account_id = intent.account_id
                   AND NEW.environment = intent.environment
                   AND NEW.risk_decision_id = intent.decision_id
@@ -787,6 +880,7 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
                   AND intent.intent_id = NEW.intent_id
                   AND intent.intent_kind = 'OPENING'
                   AND intent.state != 'FAILED'
+                  AND intent.opening_risk_prerequisite_sha256 IS NULL
                   AND NEW.account_id = intent.account_id
                   AND NEW.environment = intent.environment
                   AND NEW.risk_decision_id =
@@ -1559,6 +1653,48 @@ class MarginReservation:
     released_at: datetime | None
 
 
+@dataclass(frozen=True, repr=False)
+class OpeningRiskPrerequisite:
+    """Persisted pure-risk proof that is deliberately not placement authority.
+
+    Quote inputs do not yet have a durable raw-response manifest, and the
+    portfolio aggregates consumed by policy cannot yet be independently
+    replayed from the capacity manifest plus ledger.  The record preserves the
+    exact allowed decision and all currently provable bindings, while
+    ``authorization_state`` keeps the intent fail-closed until a future schema
+    can cross-bind every missing derivation.
+    """
+
+    binding_sha256: str
+    intent_id: str
+    decision_sha256: str
+    capacity_decision_sha256: str
+    payload_hash: str
+    request_sha256: str
+    policy_sha256: str
+    evidence_sha256: str
+    quote_evidence_sha256: str
+    portfolio_evidence_sha256: str
+    quote_snapshot_sha256: str
+    portfolio_snapshot_sha256: str
+    portfolio_broker_read_evidence_sha256: str
+    max_loss_amount: Decimal
+    collateral_amount: Decimal
+    evaluated_at: datetime
+    valid_until: datetime
+    authorization_state: Literal["INDEPENDENT_EVIDENCE_PENDING"]
+    created_at: datetime
+
+    def __repr__(self) -> str:
+        return (
+            "OpeningRiskPrerequisite("
+            f"intent_id={self.intent_id!r},"
+            f"decision_sha256={self.decision_sha256!r},"
+            f"authorization_state={self.authorization_state!r},"
+            "[ACCOUNT EVIDENCE REDACTED])"
+        )
+
+
 @dataclass(frozen=True)
 class BrokerEvidence:
     """Typed, persisted broker evidence; callers cannot supply opaque receipts."""
@@ -1885,8 +2021,8 @@ class OrderIntentLedger:
         requested_id = intent_id or uuid.uuid4().hex
         _validate_identity("intent_id", requested_id)
         client_order_id = stable_client_order_id(envelope)
-        now = self._now_us()
         with self._transaction() as conn:
+            now = self._now_us()
             existing = conn.execute(
                 """
                 SELECT * FROM order_intents
@@ -1961,6 +2097,359 @@ class OrderIntentLedger:
                 conn, requested_id, "INTENT_CREATED", None, "INTENT", "system", "INTENT_CREATED", now
             )
             return CreateIntentResult(self._intent_from_row(self._require_intent(conn, requested_id)), True)
+
+    def create_opening_risk_prerequisite(
+        self,
+        envelope: OrderIntent,
+        authorization: OpeningRiskAuthorization,
+        capacity_decision_sha256: str,
+        *,
+        intent_id: str | None = None,
+    ) -> CreateIntentResult:
+        """Atomically persist an exact opening decision without send authority.
+
+        The repository has durable account-capacity reads but no equivalent
+        independently replayable quote and derived portfolio-risk lineage.
+        This method therefore creates the intent and append-only pure-risk
+        proof as one transaction, but makes no capacity reservation.  The proof
+        remains ``INDEPENDENT_EVIDENCE_PENDING`` and submission claims reject
+        it.  A future promotion must revalidate fresh independent evidence and
+        reserve capacity atomically.
+        """
+
+        if type(envelope) is not OrderIntent:
+            raise OrderIntentValidationError(
+                "opening risk persistence requires an exact OrderIntent"
+            )
+        _validate_envelope(envelope)
+        if envelope.intent_kind != "OPENING":
+            raise OrderIntentValidationError(
+                "opening risk persistence requires an OPENING envelope"
+            )
+        if type(authorization) is not OpeningRiskAuthorization:
+            raise OrderIntentValidationError(
+                "opening risk persistence requires exact typed authorization"
+            )
+        try:
+            exact_authorization = OpeningRiskAuthorization(
+                spread=authorization.spread,
+                limits=authorization.limits,
+                authority=authorization.authority,
+                quotes=authorization.quotes,
+                portfolio=authorization.portfolio,
+                overlays=authorization.overlays,
+                decision=authorization.decision,
+            )
+        except PretradeRiskValidationError as exc:
+            raise OrderIntentValidationError(
+                f"opening risk authorization is invalid: {exc.code}"
+            ) from exc
+        if exact_authorization != authorization:
+            raise OrderIntentValidationError(
+                "opening risk authorization identity changed"
+            )
+        _validate_sha256(
+            "capacity_decision_sha256", capacity_decision_sha256
+        )
+        _validate_opening_risk_payload_binding(envelope, authorization)
+        requested_id = intent_id or uuid.uuid4().hex
+        _validate_identity("intent_id", requested_id)
+        client_order_id = stable_client_order_id(envelope)
+        with self._transaction() as conn:
+            now = self._now_us()
+            existing = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE account_id = ? AND environment = ?
+                  AND idempotency_scope = ? AND idempotency_key = ?
+                """,
+                (
+                    envelope.account_id,
+                    envelope.environment,
+                    envelope.idempotency_scope,
+                    envelope.idempotency_key,
+                ),
+            ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM order_intents WHERE intent_id = ?
+                    """,
+                    (requested_id,),
+                ).fetchone()
+            if existing is not None:
+                record = self._intent_from_row(existing)
+                if record.envelope != envelope:
+                    raise OrderIntentIntegrityError(
+                        "opening risk idempotency identity is already bound"
+                    )
+                risk_row = conn.execute(
+                    """
+                    SELECT * FROM opening_risk_prerequisites
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()
+                reservation = conn.execute(
+                    """
+                    SELECT 1 FROM margin_reservations WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()
+                if risk_row is None or reservation is not None:
+                    raise OrderIntentIntegrityError(
+                        "persisted opening risk intent is incomplete"
+                    )
+                persisted = self._opening_risk_prerequisite_from_row(
+                    conn, risk_row
+                )
+                if not _opening_risk_prerequisite_matches(
+                    persisted,
+                    envelope,
+                    authorization,
+                    capacity_decision_sha256,
+                ):
+                    raise OrderIntentIntegrityError(
+                        "opening risk replay changed immutable evidence"
+                    )
+                return CreateIntentResult(record, created=False)
+
+            try:
+                validate_opening_risk_authorization(
+                    authorization, at=_from_us(now)
+                )
+            except PretradeRiskValidationError as exc:
+                raise OrderIntentValidationError(
+                    f"opening risk authorization is not usable: {exc.code}"
+                ) from exc
+            collision = conn.execute(
+                """
+                SELECT intent_id FROM order_intents
+                WHERE client_order_id = ?
+                """,
+                (client_order_id,),
+            ).fetchone()
+            if collision is not None:
+                raise OrderIntentIntegrityError(
+                    "stable client-order-id collision; opening risk not persisted"
+                )
+            amendment_collision = conn.execute(
+                """
+                SELECT intent_id FROM amendment_leases
+                WHERE client_order_id = ?
+                UNION ALL
+                SELECT intent_id FROM amendment_history
+                WHERE client_order_id = ?
+                LIMIT 1
+                """,
+                (client_order_id, client_order_id),
+            ).fetchone()
+            if amendment_collision is not None:
+                raise OrderIntentIntegrityError(
+                    "opening client-order-id collides with an amendment"
+                )
+            self._expire_claimed_leases(
+                conn, envelope.account_id, envelope.environment, now
+            )
+            self._expire_amendment_leases(
+                conn, envelope.account_id, envelope.environment, now
+            )
+            if (
+                self._blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._amendment_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._cancellation_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._closing_uncertainty_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._terminal_closing_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "account/environment has unresolved broker work"
+                )
+            capacity, manifest, capacity_result = (
+                self._verified_capacity_decision_row(
+                    conn, capacity_decision_sha256
+                )
+            )
+            _validate_opening_capacity_binding(
+                envelope,
+                authorization,
+                capacity,
+                manifest,
+                capacity_result,
+            )
+            self._require_latest_complete_manifest_head(
+                conn, manifest, recorded_at_boundary=now
+            )
+            cap = conn.execute(
+                """
+                SELECT * FROM reservation_caps
+                WHERE account_id = ? AND environment = ?
+                """,
+                (envelope.account_id, envelope.environment),
+            ).fetchone()
+            if (
+                cap is None
+                or cap["capacity_decision_sha256"]
+                != capacity_decision_sha256
+            ):
+                raise OrderIntentReservationError(
+                    "opening risk prerequisite requires the current exact cap"
+                )
+            self._verified_reservation_cap_row(conn, cap)
+            collateral_amount = _cents_amount(
+                authorization.decision.collateral_cents
+            )
+            max_loss_amount = _cents_amount(
+                authorization.decision.max_loss_cents
+            )
+            exposure_floor = _opening_exposure_floor(
+                json.loads(envelope.wire_payload)
+            )
+            if (
+                collateral_amount < exposure_floor
+                or max_loss_amount < exposure_floor
+            ):
+                raise OrderIntentReservationError(
+                    "pure risk economics understate immutable opening exposure"
+                )
+            active = self._active_reservation_total(
+                conn, envelope.account_id, envelope.environment
+            )
+            with localcontext() as decimal_context:
+                decimal_context.prec = _DECIMAL_PRECISION
+                exceeds_cap = (
+                    active + collateral_amount
+                    > Decimal(cap["cap_amount"])
+                )
+            if exceeds_cap:
+                raise OrderIntentReservationError(
+                    "opening risk prerequisite exceeds the durable cap"
+                )
+            risk_material = _opening_risk_prerequisite_material(
+                requested_id,
+                envelope,
+                authorization,
+                capacity_decision_sha256,
+                created_at=now,
+            )
+            binding_sha256 = _domain_json_hash(
+                _OPENING_RISK_PREREQUISITE_HASH_DOMAIN,
+                risk_material,
+            )
+            conn.execute(
+                """
+                INSERT INTO order_intents (
+                    intent_id, account_id, environment, strategy_id,
+                    decision_id, idempotency_scope, idempotency_key,
+                    intent_kind, wire_payload, canonical_payload,
+                    payload_hash, client_order_id, state, broker_order_id,
+                    submission_fence, submission_lease_owner,
+                    submission_lease_expires_at, last_reconciled_run,
+                    opening_risk_prerequisite_sha256,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'OPENING', ?, ?, ?, ?,
+                    'INTENT', NULL, 0, NULL, NULL, NULL, ?, ?, ?
+                )
+                """,
+                (
+                    requested_id,
+                    envelope.account_id,
+                    envelope.environment,
+                    envelope.strategy_id,
+                    envelope.decision_id,
+                    envelope.idempotency_scope,
+                    envelope.idempotency_key,
+                    envelope.wire_payload,
+                    envelope.canonical_payload,
+                    envelope.payload_hash,
+                    client_order_id,
+                    binding_sha256,
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(
+                conn,
+                requested_id,
+                "INTENT_CREATED",
+                None,
+                "INTENT",
+                "system",
+                "INTENT_CREATED",
+                now,
+            )
+            conn.execute(
+                """
+                INSERT INTO opening_risk_prerequisites (
+                    binding_sha256, intent_id, risk_schema_version,
+                    decision_sha256, allowed, reason_codes_json,
+                    account_id, account_id_key, institution_type,
+                    environment, strategy_decision_id, strategy_id,
+                    trade_session, request_sha256, policy_sha256,
+                    evidence_sha256, authority_evidence_sha256,
+                    quote_evidence_sha256, portfolio_evidence_sha256,
+                    overlay_evidence_sha256, quote_snapshot_sha256,
+                    portfolio_snapshot_sha256,
+                    portfolio_broker_read_evidence_sha256,
+                    capacity_decision_sha256, payload_hash,
+                    quote_observed_at, portfolio_observed_at,
+                    evaluated_at, valid_until, order_notional_cents,
+                    max_loss_cents, collateral_cents, fee_cents,
+                    projected_portfolio_delta,
+                    projected_symbol_delta, max_loss_amount,
+                    collateral_amount, authorization_state, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                """,
+                (binding_sha256, *risk_material.values()),
+            )
+            risk_row = conn.execute(
+                """
+                SELECT * FROM opening_risk_prerequisites
+                WHERE intent_id = ?
+                """,
+                (requested_id,),
+            ).fetchone()
+            self._opening_risk_prerequisite_from_row(
+                conn, risk_row
+            )
+            return CreateIntentResult(
+                self._intent_from_row(
+                    self._require_intent(conn, requested_id)
+                ),
+                True,
+            )
+
+    def get_opening_risk_prerequisite(
+        self, intent_id: str
+    ) -> OpeningRiskPrerequisite | None:
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM opening_risk_prerequisites
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._opening_risk_prerequisite_from_row(
+                conn, row
+            )
 
     def create_closing_intent_from_read(
         self,
@@ -3929,6 +4418,19 @@ class OrderIntentLedger:
             intent = self._require_intent(conn, intent_id)
             if intent["intent_kind"] != "OPENING" or intent["state"] != "INTENT":
                 raise OrderIntentTransitionError("only a new opening intent may reserve margin")
+            if (
+                intent["opening_risk_prerequisite_sha256"] is not None
+                or conn.execute(
+                    """
+                    SELECT 1 FROM opening_risk_prerequisites
+                    WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone() is not None
+            ):
+                raise OrderIntentReservationError(
+                    "non-authorizing opening risk prerequisite cannot reserve capacity"
+                )
             if self._closing_uncertainty_blocker_rows(
                 conn, intent["account_id"], intent["environment"]
             ) or self._terminal_closing_blocker_rows(
@@ -5865,6 +6367,10 @@ class OrderIntentLedger:
                     pending_owner TEXT,
                     pending_fence INTEGER,
                     last_reconciled_run TEXT,
+                    opening_risk_prerequisite_sha256 TEXT CHECK (
+                        opening_risk_prerequisite_sha256 IS NULL
+                        OR length(opening_risk_prerequisite_sha256) = 64
+                    ),
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE (account_id, environment, idempotency_scope, idempotency_key),
@@ -5905,6 +6411,78 @@ class OrderIntentLedger:
                     CHECK (CAST(amount AS REAL) > 0 AND CAST(max_loss_amount AS REAL) > 0),
                     CHECK (length(quote_digest) = 64 AND length(portfolio_snapshot_digest) = 64),
                     CHECK ((state IN ('ACTIVE', 'FILLED_PENDING_ABSORPTION')) = (released_reason_code IS NULL AND released_at IS NULL))
+                );
+                CREATE TABLE IF NOT EXISTS opening_risk_prerequisites (
+                    binding_sha256 TEXT PRIMARY KEY
+                        CHECK (length(binding_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES order_intents(intent_id),
+                    risk_schema_version INTEGER NOT NULL
+                        CHECK (risk_schema_version = 1),
+                    decision_sha256 TEXT NOT NULL UNIQUE
+                        CHECK (length(decision_sha256) = 64),
+                    allowed INTEGER NOT NULL CHECK (allowed = 1),
+                    reason_codes_json TEXT NOT NULL
+                        CHECK (reason_codes_json = '["RISK_ALLOWED"]'),
+                    account_id TEXT NOT NULL,
+                    account_id_key TEXT NOT NULL,
+                    institution_type TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    strategy_decision_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    trade_session TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL
+                        CHECK (length(request_sha256) = 64),
+                    policy_sha256 TEXT NOT NULL
+                        CHECK (length(policy_sha256) = 64),
+                    evidence_sha256 TEXT NOT NULL
+                        CHECK (length(evidence_sha256) = 64),
+                    authority_evidence_sha256 TEXT NOT NULL
+                        CHECK (length(authority_evidence_sha256) = 64),
+                    quote_evidence_sha256 TEXT NOT NULL
+                        CHECK (length(quote_evidence_sha256) = 64),
+                    portfolio_evidence_sha256 TEXT NOT NULL
+                        CHECK (length(portfolio_evidence_sha256) = 64),
+                    overlay_evidence_sha256 TEXT NOT NULL
+                        CHECK (length(overlay_evidence_sha256) = 64),
+                    quote_snapshot_sha256 TEXT NOT NULL
+                        CHECK (length(quote_snapshot_sha256) = 64),
+                    portfolio_snapshot_sha256 TEXT NOT NULL
+                        CHECK (length(portfolio_snapshot_sha256) = 64),
+                    portfolio_broker_read_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    capacity_decision_sha256 TEXT NOT NULL
+                        REFERENCES capacity_decisions(
+                            capacity_decision_sha256
+                        ),
+                    payload_hash TEXT NOT NULL
+                        CHECK (length(payload_hash) = 64),
+                    quote_observed_at INTEGER NOT NULL,
+                    portfolio_observed_at INTEGER NOT NULL,
+                    evaluated_at INTEGER NOT NULL,
+                    valid_until INTEGER NOT NULL,
+                    order_notional_cents INTEGER NOT NULL
+                        CHECK (order_notional_cents >= 0),
+                    max_loss_cents INTEGER NOT NULL
+                        CHECK (max_loss_cents > 0),
+                    collateral_cents INTEGER NOT NULL
+                        CHECK (collateral_cents > 0),
+                    fee_cents INTEGER NOT NULL CHECK (fee_cents >= 0),
+                    projected_portfolio_delta TEXT NOT NULL,
+                    projected_symbol_delta TEXT NOT NULL,
+                    max_loss_amount TEXT NOT NULL,
+                    collateral_amount TEXT NOT NULL,
+                    authorization_state TEXT NOT NULL CHECK (
+                        authorization_state =
+                            'INDEPENDENT_EVIDENCE_PENDING'
+                    ),
+                    created_at INTEGER NOT NULL,
+                    CHECK (valid_until > evaluated_at),
+                    CHECK (
+                        CAST(max_loss_amount AS REAL) > 0
+                        AND CAST(collateral_amount AS REAL) > 0
+                    )
                 );
                 CREATE TABLE IF NOT EXISTS reservation_absorptions (
                     absorption_sha256 TEXT PRIMARY KEY
@@ -6328,6 +6906,10 @@ class OrderIntentLedger:
                 );
                 CREATE INDEX IF NOT EXISTS idx_intents_account_environment_state ON order_intents(account_id, environment, state);
                 CREATE INDEX IF NOT EXISTS idx_reservations_account_environment ON margin_reservations(account_id, environment, state);
+                CREATE INDEX IF NOT EXISTS idx_opening_risk_prerequisites_account
+                ON opening_risk_prerequisites(
+                    account_id, environment, authorization_state
+                );
                 CREATE INDEX IF NOT EXISTS idx_reservation_absorptions_account
                 ON reservation_absorptions(
                     account_id, environment, classification
@@ -6367,12 +6949,17 @@ class OrderIntentLedger:
                    OR OLD.idempotency_key != NEW.idempotency_key OR OLD.intent_kind != NEW.intent_kind
                    OR OLD.wire_payload != NEW.wire_payload OR OLD.canonical_payload != NEW.canonical_payload OR OLD.payload_hash != NEW.payload_hash
                    OR OLD.client_order_id != NEW.client_order_id
+                   OR OLD.opening_risk_prerequisite_sha256 IS NOT NEW.opening_risk_prerequisite_sha256
                 BEGIN SELECT RAISE(ABORT, 'order intent identity is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_terminal_rewrite BEFORE UPDATE ON order_intents
                 WHEN OLD.state IN ('FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'FAILED') AND NEW.state != OLD.state
                 BEGIN SELECT RAISE(ABORT, 'terminal order intent cannot transition'); END;
                 """
             )
+            if current_schema_version != SCHEMA_VERSION:
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS prevent_intent_identity_mutation"
+                )
             for definition in _REQUIRED_TRIGGER_DEFINITIONS.values():
                 conn.execute(
                     definition.replace(
@@ -6638,6 +7225,11 @@ class OrderIntentLedger:
             conn.execute(statement)
         column_upgrades = (
             (
+                "order_intents",
+                "opening_risk_prerequisite_sha256",
+                "TEXT CHECK (opening_risk_prerequisite_sha256 IS NULL OR length(opening_risk_prerequisite_sha256) = 64)",
+            ),
+            (
                 "broker_read_receipts",
                 "authorization_sha256",
                 "TEXT",
@@ -6687,6 +7279,7 @@ class OrderIntentLedger:
                 "ledger SQLite safety pragmas are not active"
             )
         required_columns = {
+            "order_intents": {"opening_risk_prerequisite_sha256"},
             "broker_read_receipts": {
                 "receipt_sha256",
                 "read_kind",
@@ -6750,6 +7343,47 @@ class OrderIntentLedger:
             },
             "reservation_caps": {"capacity_decision_sha256"},
             "margin_reservations": {"capacity_decision_sha256"},
+            "opening_risk_prerequisites": {
+                "binding_sha256",
+                "intent_id",
+                "risk_schema_version",
+                "decision_sha256",
+                "allowed",
+                "reason_codes_json",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "strategy_decision_id",
+                "strategy_id",
+                "trade_session",
+                "request_sha256",
+                "policy_sha256",
+                "evidence_sha256",
+                "authority_evidence_sha256",
+                "quote_evidence_sha256",
+                "portfolio_evidence_sha256",
+                "overlay_evidence_sha256",
+                "quote_snapshot_sha256",
+                "portfolio_snapshot_sha256",
+                "portfolio_broker_read_evidence_sha256",
+                "capacity_decision_sha256",
+                "payload_hash",
+                "quote_observed_at",
+                "portfolio_observed_at",
+                "evaluated_at",
+                "valid_until",
+                "order_notional_cents",
+                "max_loss_cents",
+                "collateral_cents",
+                "fee_cents",
+                "projected_portfolio_delta",
+                "projected_symbol_delta",
+                "max_loss_amount",
+                "collateral_amount",
+                "authorization_state",
+                "created_at",
+            },
             "order_events": {"broker_read_evidence_sha256"},
             "reservation_absorptions": {
                 "absorption_sha256",
@@ -6952,6 +7586,9 @@ class OrderIntentLedger:
             ("capacity_decisions", "broker_read_manifests"),
             ("reservation_caps", "capacity_decisions"),
             ("margin_reservations", "capacity_decisions"),
+            ("opening_risk_prerequisites", "order_intents"),
+            ("opening_risk_prerequisites", "capacity_decisions"),
+            ("opening_risk_prerequisites", "broker_read_manifests"),
             ("order_events", "broker_read_manifests"),
             ("reservation_absorptions", "order_intents"),
             ("reservation_absorptions", "broker_read_manifests"),
@@ -7353,7 +7990,47 @@ class OrderIntentLedger:
             )
 
     def _require_active_opening_reservation(self, conn: sqlite3.Connection, intent: sqlite3.Row, now: int) -> None:
-        reservation = conn.execute("SELECT * FROM margin_reservations WHERE intent_id = ?", (intent["intent_id"],)).fetchone()
+        pending_pure_risk = conn.execute(
+            """
+            SELECT *
+            FROM opening_risk_prerequisites
+            WHERE intent_id = ?
+            """,
+            (intent["intent_id"],),
+        ).fetchone()
+        reservation = conn.execute(
+            """
+            SELECT * FROM margin_reservations WHERE intent_id = ?
+            """,
+            (intent["intent_id"],),
+        ).fetchone()
+        marker = intent["opening_risk_prerequisite_sha256"]
+        if pending_pure_risk is not None:
+            if marker != pending_pure_risk["binding_sha256"]:
+                raise OrderIntentIntegrityError(
+                    "opening risk prerequisite diverges from its intent marker"
+                )
+            if reservation is not None:
+                raise OrderIntentIntegrityError(
+                    "non-authorizing opening risk prerequisite acquired a reservation"
+                )
+            self._opening_risk_prerequisite_from_row(
+                conn, pending_pure_risk
+            )
+            if (
+                pending_pure_risk["authorization_state"]
+                != "INDEPENDENT_EVIDENCE_PENDING"
+            ):
+                raise OrderIntentIntegrityError(
+                    "opening risk prerequisite has an unknown authority state"
+                )
+            raise OrderIntentReservationError(
+                "opening submission requires independently replayable quote and portfolio-risk evidence"
+            )
+        if marker is not None:
+            raise OrderIntentIntegrityError(
+                "opening intent lost its pure-risk prerequisite"
+            )
         cap = conn.execute(
             """
             SELECT cap_amount, observed_at, portfolio_snapshot_digest,
@@ -8650,6 +9327,7 @@ class OrderIntentLedger:
             )
         parameters: tuple[str, ...] = ()
         reservation_scope = ""
+        opening_risk_scope = ""
         intent_scope = ""
         absorption_scope = ""
         cap_scope = ""
@@ -8674,6 +9352,18 @@ class OrderIntentLedger:
                     )
                     OR
                     (
+                        intent.account_id = ?
+                        AND intent.environment = ?
+                    )
+                )
+            """
+            opening_risk_scope = """
+                WHERE (
+                    (
+                        risk.account_id = ?
+                        AND risk.environment = ?
+                    )
+                    OR (
                         intent.account_id = ?
                         AND intent.environment = ?
                     )
@@ -8737,6 +9427,28 @@ class OrderIntentLedger:
                 "opening intent lost its durable margin reservation"
             )
 
+        missing_opening_risk = conn.execute(
+            f"""
+            SELECT intent.intent_id
+            FROM order_intents AS intent
+            LEFT JOIN opening_risk_prerequisites AS risk
+              ON risk.intent_id = intent.intent_id
+            WHERE intent.opening_risk_prerequisite_sha256 IS NOT NULL
+              AND (
+                    risk.intent_id IS NULL
+                    OR risk.binding_sha256 !=
+                        intent.opening_risk_prerequisite_sha256
+                  )
+              {intent_scope}
+            LIMIT 1
+            """,
+            (() if account_id is None else (account_id, environment)),
+        ).fetchone()
+        if missing_opening_risk is not None:
+            raise OrderIntentIntegrityError(
+                "opening intent lost its pure-risk prerequisite"
+            )
+
         reservations = conn.execute(
             f"""
             SELECT reservation.*, intent.account_id AS intent_account_id,
@@ -8774,6 +9486,17 @@ class OrderIntentLedger:
             if amount <= 0:
                 raise OrderIntentIntegrityError(
                     "margin reservation amount is not positive"
+                )
+            bound_risk = conn.execute(
+                """
+                SELECT 1 FROM opening_risk_prerequisites
+                WHERE intent_id = ?
+                """,
+                (reservation["intent_id"],),
+            ).fetchone()
+            if bound_risk is not None:
+                raise OrderIntentIntegrityError(
+                    "non-authorizing opening risk prerequisite acquired a reservation"
                 )
             self._verify_reservation_creation_provenance(
                 conn, reservation, amount
@@ -8848,6 +9571,31 @@ class OrderIntentLedger:
                 raise OrderIntentIntegrityError(
                     "filled opening reservation was released without retained risk"
                 )
+
+        opening_risk_rows = conn.execute(
+            f"""
+            SELECT risk.*
+            FROM opening_risk_prerequisites AS risk
+            JOIN order_intents AS intent USING (intent_id)
+            {opening_risk_scope}
+            ORDER BY risk.intent_id
+            """,
+            parameters,
+        ).fetchall()
+        for risk_row in opening_risk_rows:
+            reservation = conn.execute(
+                """
+                SELECT * FROM margin_reservations WHERE intent_id = ?
+                """,
+                (risk_row["intent_id"],),
+            ).fetchone()
+            if reservation is not None:
+                raise OrderIntentIntegrityError(
+                    "non-authorizing opening risk prerequisite acquired a reservation"
+                )
+            self._opening_risk_prerequisite_from_row(
+                conn, risk_row
+            )
 
         absorptions = conn.execute(
             f"""
@@ -10716,6 +11464,184 @@ class OrderIntentLedger:
             last_reconciled_run=row["last_reconciled_run"], created_at=_from_us(row["created_at"]), updated_at=_from_us(row["updated_at"]),
         )
 
+    def _opening_risk_prerequisite_from_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> OpeningRiskPrerequisite:
+        if row is None:
+            raise OrderIntentIntegrityError(
+                "opening risk prerequisite is missing"
+            )
+        try:
+            reasons = json.loads(row["reason_codes_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrderIntentIntegrityError(
+                "opening risk reasons are invalid"
+            ) from exc
+        if (
+            reasons != ["RISK_ALLOWED"]
+            or row["reason_codes_json"] != '["RISK_ALLOWED"]'
+            or int(row["allowed"]) != 1
+            or row["authorization_state"]
+            != "INDEPENDENT_EVIDENCE_PENDING"
+        ):
+            raise OrderIntentIntegrityError(
+                "opening risk prerequisite was treated as placement authority"
+            )
+        try:
+            decision = RiskDecision(
+                schema_version=int(row["risk_schema_version"]),
+                decision_sha256=row["decision_sha256"],
+                allowed=True,
+                reason_codes=("RISK_ALLOWED",),
+                evaluated_at=_from_us(row["evaluated_at"]),
+                request_sha256=row["request_sha256"],
+                policy_sha256=row["policy_sha256"],
+                evidence_sha256=row["evidence_sha256"],
+                order_notional_cents=int(row["order_notional_cents"]),
+                max_loss_cents=int(row["max_loss_cents"]),
+                collateral_cents=int(row["collateral_cents"]),
+                fee_cents=int(row["fee_cents"]),
+                projected_portfolio_delta=Decimal(
+                    row["projected_portfolio_delta"]
+                ),
+                projected_symbol_delta=Decimal(
+                    row["projected_symbol_delta"]
+                ),
+            )
+        except (PretradeRiskValidationError, InvalidOperation, ValueError) as exc:
+            raise OrderIntentIntegrityError(
+                "persisted opening risk decision does not self-verify"
+            ) from exc
+        for name in (
+            "binding_sha256",
+            "decision_sha256",
+            "request_sha256",
+            "policy_sha256",
+            "evidence_sha256",
+            "authority_evidence_sha256",
+            "quote_evidence_sha256",
+            "portfolio_evidence_sha256",
+            "overlay_evidence_sha256",
+            "quote_snapshot_sha256",
+            "portfolio_snapshot_sha256",
+            "portfolio_broker_read_evidence_sha256",
+            "capacity_decision_sha256",
+            "payload_hash",
+        ):
+            _validate_sha256(name, row[name])
+        max_loss_amount = _canonical_signed_decimal_text(
+            row["max_loss_amount"], "opening risk max loss"
+        )
+        collateral_amount = _canonical_signed_decimal_text(
+            row["collateral_amount"], "opening risk collateral"
+        )
+        projected_portfolio_delta = _canonical_signed_decimal_text(
+            row["projected_portfolio_delta"],
+            "opening risk projected portfolio delta",
+        )
+        projected_symbol_delta = _canonical_signed_decimal_text(
+            row["projected_symbol_delta"],
+            "opening risk projected symbol delta",
+        )
+        if (
+            max_loss_amount != _cents_amount(decision.max_loss_cents)
+            or collateral_amount
+            != _cents_amount(decision.collateral_cents)
+            or projected_portfolio_delta
+            != decision.projected_portfolio_delta
+            or projected_symbol_delta != decision.projected_symbol_delta
+            or int(row["valid_until"]) <= int(row["evaluated_at"])
+        ):
+            raise OrderIntentIntegrityError(
+                "opening risk decision economics changed"
+            )
+        intent = self._require_intent(conn, row["intent_id"])
+        if (
+            intent["intent_kind"] != "OPENING"
+            or intent["account_id"] != row["account_id"]
+            or intent["environment"] != row["environment"]
+            or intent["strategy_id"] != row["strategy_id"]
+            or intent["decision_id"] != row["strategy_decision_id"]
+            or intent["payload_hash"] != row["payload_hash"]
+            or intent["opening_risk_prerequisite_sha256"]
+            != row["binding_sha256"]
+            or int(intent["created_at"]) != int(row["created_at"])
+        ):
+            raise OrderIntentIntegrityError(
+                "opening risk prerequisite diverges from its intent"
+            )
+        capacity, manifest, result = self._verified_capacity_decision_row(
+            conn, row["capacity_decision_sha256"]
+        )
+        if (
+            capacity["account_id"] != row["account_id"]
+            or capacity["environment"] != row["environment"]
+            or capacity["evidence_sha256"]
+            != row["portfolio_broker_read_evidence_sha256"]
+            or capacity["capacity_snapshot_sha256"]
+            != row["portfolio_snapshot_sha256"]
+            or int(capacity["observed_at"])
+            != int(row["portfolio_observed_at"])
+            or manifest["account_id_key"] != row["account_id_key"]
+            or manifest["institution_type"] != row["institution_type"]
+            or result["state_sha256"]
+            != row["portfolio_snapshot_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "opening risk capacity lineage changed"
+            )
+        reservation = conn.execute(
+            """
+            SELECT 1 FROM margin_reservations WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        if reservation is not None:
+            raise OrderIntentIntegrityError(
+                "non-authorizing opening risk prerequisite acquired a reservation"
+            )
+        material = _opening_risk_prerequisite_row_material(row)
+        expected_binding = _domain_json_hash(
+            _OPENING_RISK_PREREQUISITE_HASH_DOMAIN, material
+        )
+        if not hmac.compare_digest(
+            expected_binding, row["binding_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "opening risk prerequisite digest does not verify"
+            )
+        return OpeningRiskPrerequisite(
+            binding_sha256=row["binding_sha256"],
+            intent_id=row["intent_id"],
+            decision_sha256=row["decision_sha256"],
+            capacity_decision_sha256=row[
+                "capacity_decision_sha256"
+            ],
+            payload_hash=row["payload_hash"],
+            request_sha256=row["request_sha256"],
+            policy_sha256=row["policy_sha256"],
+            evidence_sha256=row["evidence_sha256"],
+            quote_evidence_sha256=row["quote_evidence_sha256"],
+            portfolio_evidence_sha256=row[
+                "portfolio_evidence_sha256"
+            ],
+            quote_snapshot_sha256=row["quote_snapshot_sha256"],
+            portfolio_snapshot_sha256=row[
+                "portfolio_snapshot_sha256"
+            ],
+            portfolio_broker_read_evidence_sha256=row[
+                "portfolio_broker_read_evidence_sha256"
+            ],
+            max_loss_amount=max_loss_amount,
+            collateral_amount=collateral_amount,
+            evaluated_at=decision.evaluated_at,
+            valid_until=_from_us(row["valid_until"]),
+            authorization_state=row["authorization_state"],
+            created_at=_from_us(row["created_at"]),
+        )
+
     @staticmethod
     def _reservation_from_row(row: sqlite3.Row) -> MarginReservation:
         return MarginReservation(intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], amount=Decimal(row["amount"]), risk_decision_id=row["risk_decision_id"], max_loss_amount=Decimal(row["max_loss_amount"]), quote_observed_at=_from_us(row["quote_observed_at"]), quote_digest=row["quote_digest"], portfolio_observed_at=_from_us(row["portfolio_observed_at"]), portfolio_snapshot_digest=row["portfolio_snapshot_digest"], capacity_decision_sha256=row["capacity_decision_sha256"], state=row["state"], released_reason_code=row["released_reason_code"], created_at=_from_us(row["created_at"]), released_at=_from_us(row["released_at"]) if row["released_at"] is not None else None)
@@ -10723,6 +11649,313 @@ class OrderIntentLedger:
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> IntentEvent:
         return IntentEvent(sequence=int(row["sequence"]), intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], client_order_id=row["client_order_id"], event_type=row["event_type"], from_state=row["from_state"], to_state=row["to_state"], actor=row["actor"], reason_code=row["reason_code"], broker_status=row["broker_status"], broker_order_id=row["broker_order_id"], observed_at=_from_us(row["observed_at"]) if row["observed_at"] is not None else None, evidence_operation=row["evidence_operation"], http_status=row["http_status"], raw_response_digest=row["raw_response_digest"], broker_read_evidence_sha256=row["broker_read_evidence_sha256"], created_at=_from_us(row["created_at"]))
+
+
+def _opening_risk_prerequisite_material(
+    intent_id: str,
+    envelope: OrderIntent,
+    authorization: OpeningRiskAuthorization,
+    capacity_decision_sha256: str,
+    *,
+    created_at: int,
+) -> dict[str, Any]:
+    spread = authorization.spread
+    decision = authorization.decision
+    quote_observed_at = min(
+        _to_us(quote.observed_at) for quote in authorization.quotes.quotes
+    )
+    return {
+        "intent_id": intent_id,
+        "risk_schema_version": decision.schema_version,
+        "decision_sha256": decision.decision_sha256,
+        "allowed": 1,
+        "reason_codes_json": '["RISK_ALLOWED"]',
+        "account_id": spread.account_id,
+        "account_id_key": spread.account_id_key,
+        "institution_type": spread.institution_type,
+        "environment": spread.environment,
+        "strategy_decision_id": spread.strategy_decision_id,
+        "strategy_id": spread.strategy_id,
+        "trade_session": spread.trade_session.isoformat(),
+        "request_sha256": authorization.request_sha256,
+        "policy_sha256": authorization.policy_sha256,
+        "evidence_sha256": authorization.evidence_sha256,
+        "authority_evidence_sha256": authorization.authority_sha256,
+        "quote_evidence_sha256":
+            authorization.quote_evidence_sha256,
+        "portfolio_evidence_sha256":
+            authorization.portfolio_evidence_sha256,
+        "overlay_evidence_sha256": authorization.overlays_sha256,
+        "quote_snapshot_sha256":
+            authorization.quotes.snapshot_sha256,
+        "portfolio_snapshot_sha256":
+            authorization.portfolio.snapshot_sha256,
+        "portfolio_broker_read_evidence_sha256":
+            authorization.portfolio.broker_read_evidence_sha256,
+        "capacity_decision_sha256": capacity_decision_sha256,
+        "payload_hash": envelope.payload_hash,
+        "quote_observed_at": quote_observed_at,
+        "portfolio_observed_at":
+            _to_us(authorization.portfolio.observed_at),
+        "evaluated_at": _to_us(decision.evaluated_at),
+        "valid_until": _to_us(authorization.valid_until),
+        "order_notional_cents": decision.order_notional_cents,
+        "max_loss_cents": decision.max_loss_cents,
+        "collateral_cents": decision.collateral_cents,
+        "fee_cents": decision.fee_cents,
+        "projected_portfolio_delta":
+            _signed_decimal_string(decision.projected_portfolio_delta),
+        "projected_symbol_delta":
+            _signed_decimal_string(decision.projected_symbol_delta),
+        "max_loss_amount":
+            _canonical_amount(_cents_amount(decision.max_loss_cents)),
+        "collateral_amount":
+            _canonical_amount(_cents_amount(decision.collateral_cents)),
+        "authorization_state": "INDEPENDENT_EVIDENCE_PENDING",
+        "created_at": created_at,
+    }
+
+
+def _opening_risk_prerequisite_row_material(
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    return {
+        "intent_id": row["intent_id"],
+        "risk_schema_version": int(row["risk_schema_version"]),
+        "decision_sha256": row["decision_sha256"],
+        "allowed": int(row["allowed"]),
+        "reason_codes_json": row["reason_codes_json"],
+        "account_id": row["account_id"],
+        "account_id_key": row["account_id_key"],
+        "institution_type": row["institution_type"],
+        "environment": row["environment"],
+        "strategy_decision_id": row["strategy_decision_id"],
+        "strategy_id": row["strategy_id"],
+        "trade_session": row["trade_session"],
+        "request_sha256": row["request_sha256"],
+        "policy_sha256": row["policy_sha256"],
+        "evidence_sha256": row["evidence_sha256"],
+        "authority_evidence_sha256":
+            row["authority_evidence_sha256"],
+        "quote_evidence_sha256": row["quote_evidence_sha256"],
+        "portfolio_evidence_sha256":
+            row["portfolio_evidence_sha256"],
+        "overlay_evidence_sha256": row["overlay_evidence_sha256"],
+        "quote_snapshot_sha256": row["quote_snapshot_sha256"],
+        "portfolio_snapshot_sha256":
+            row["portfolio_snapshot_sha256"],
+        "portfolio_broker_read_evidence_sha256":
+            row["portfolio_broker_read_evidence_sha256"],
+        "capacity_decision_sha256":
+            row["capacity_decision_sha256"],
+        "payload_hash": row["payload_hash"],
+        "quote_observed_at": int(row["quote_observed_at"]),
+        "portfolio_observed_at": int(row["portfolio_observed_at"]),
+        "evaluated_at": int(row["evaluated_at"]),
+        "valid_until": int(row["valid_until"]),
+        "order_notional_cents": int(row["order_notional_cents"]),
+        "max_loss_cents": int(row["max_loss_cents"]),
+        "collateral_cents": int(row["collateral_cents"]),
+        "fee_cents": int(row["fee_cents"]),
+        "projected_portfolio_delta":
+            row["projected_portfolio_delta"],
+        "projected_symbol_delta": row["projected_symbol_delta"],
+        "max_loss_amount": row["max_loss_amount"],
+        "collateral_amount": row["collateral_amount"],
+        "authorization_state": row["authorization_state"],
+        "created_at": int(row["created_at"]),
+    }
+
+
+def _opening_risk_prerequisite_matches(
+    persisted: OpeningRiskPrerequisite,
+    envelope: OrderIntent,
+    authorization: OpeningRiskAuthorization,
+    capacity_decision_sha256: str,
+) -> bool:
+    return (
+        persisted.decision_sha256
+        == authorization.decision.decision_sha256
+        and persisted.capacity_decision_sha256
+        == capacity_decision_sha256
+        and persisted.payload_hash == envelope.payload_hash
+        and persisted.request_sha256 == authorization.request_sha256
+        and persisted.policy_sha256 == authorization.policy_sha256
+        and persisted.evidence_sha256 == authorization.evidence_sha256
+        and persisted.quote_evidence_sha256
+        == authorization.quote_evidence_sha256
+        and persisted.portfolio_evidence_sha256
+        == authorization.portfolio_evidence_sha256
+        and persisted.quote_snapshot_sha256
+        == authorization.quotes.snapshot_sha256
+        and persisted.portfolio_snapshot_sha256
+        == authorization.portfolio.snapshot_sha256
+        and persisted.portfolio_broker_read_evidence_sha256
+        == authorization.portfolio.broker_read_evidence_sha256
+        and persisted.max_loss_amount
+        == _cents_amount(authorization.decision.max_loss_cents)
+        and persisted.collateral_amount
+        == _cents_amount(authorization.decision.collateral_cents)
+        and persisted.evaluated_at
+        == authorization.decision.evaluated_at
+        and persisted.valid_until == authorization.valid_until
+        and persisted.authorization_state
+        == "INDEPENDENT_EVIDENCE_PENDING"
+    )
+
+
+def _validate_opening_risk_payload_binding(
+    envelope: OrderIntent,
+    authorization: OpeningRiskAuthorization,
+) -> None:
+    spread = authorization.spread
+    if (
+        spread.account_id != envelope.account_id
+        or spread.environment != envelope.environment
+        or spread.strategy_id != envelope.strategy_id
+        or spread.strategy_decision_id != envelope.decision_id
+    ):
+        raise OrderIntentIntegrityError(
+            "opening risk identity does not match the immutable intent"
+        )
+    try:
+        payload = json.loads(envelope.wire_payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise OrderIntentIntegrityError(
+            "opening risk intent payload is invalid"
+        ) from exc
+    if (
+        type(payload) is not dict
+        or payload.get("securityType") != "OPTN"
+        or payload.get("orderAction") != "SPREAD"
+        or payload.get("spreadType") != "VERTICAL"
+        or payload.get("priceType") != spread.price_type
+        or type(payload.get("legs")) is not list
+        or len(payload["legs"]) != 2
+    ):
+        raise OrderIntentIntegrityError(
+            "opening risk requires the exact supported vertical payload"
+        )
+    try:
+        limit_cents = Decimal(str(payload["limitPrice"])) * Decimal("100")
+    except (InvalidOperation, KeyError, ValueError) as exc:
+        raise OrderIntentIntegrityError(
+            "opening risk payload has invalid net price"
+        ) from exc
+    if (
+        not limit_cents.is_finite()
+        or limit_cents != limit_cents.to_integral_value()
+        or int(limit_cents) != spread.limit_price_cents
+    ):
+        raise OrderIntentIntegrityError(
+            "risk decision net price differs from broker payload"
+        )
+    expected_legs = []
+    for leg in spread.legs:
+        if leg.contract.close_eligibility_code() is not None:
+            raise OrderIntentIntegrityError(
+                "risk decision contract economics are not standard"
+            )
+        expected_legs.append(
+            (
+                leg.contract.symbol,
+                leg.contract.call_put,
+                leg.contract.expiry.year,
+                leg.contract.expiry.month,
+                leg.contract.expiry.day,
+                leg.contract.strike,
+                leg.action,
+                spread.quantity,
+            )
+        )
+    actual_legs = []
+    for leg in payload["legs"]:
+        if type(leg) is not dict:
+            raise OrderIntentIntegrityError(
+                "opening risk broker leg is not an object"
+            )
+        try:
+            strike = Decimal(str(leg["strikePrice"]))
+            actual = (
+                leg["symbol"],
+                leg["callPut"],
+                leg["expiryYear"],
+                leg["expiryMonth"],
+                leg["expiryDay"],
+                strike,
+                leg["orderAction"],
+                leg["quantity"],
+            )
+        except (InvalidOperation, KeyError, ValueError) as exc:
+            raise OrderIntentIntegrityError(
+                "opening risk broker leg is invalid"
+            ) from exc
+        actual_legs.append(actual)
+    if sorted(expected_legs) != sorted(actual_legs):
+        raise OrderIntentIntegrityError(
+            "risk decision contracts differ from broker payload"
+        )
+
+
+def _validate_opening_capacity_binding(
+    envelope: OrderIntent,
+    authorization: OpeningRiskAuthorization,
+    capacity: sqlite3.Row,
+    manifest: sqlite3.Row,
+    capacity_result: dict[str, Any],
+) -> None:
+    spread = authorization.spread
+    portfolio = authorization.portfolio
+    with localcontext() as decimal_context:
+        decimal_context.prec = _DECIMAL_PRECISION
+        buying_power_cents = (
+            Decimal(capacity["broker_buying_power"]) * Decimal("100")
+        )
+    if (
+        capacity["account_id"] != envelope.account_id
+        or capacity["environment"] != envelope.environment
+        or capacity["evidence_sha256"]
+        != portfolio.broker_read_evidence_sha256
+        or capacity["capacity_snapshot_sha256"]
+        != portfolio.snapshot_sha256
+        or int(capacity["observed_at"])
+        != _to_us(portfolio.observed_at)
+        or manifest["evidence_kind"] != "CAPACITY"
+        or manifest["completeness"] != "COMPLETE"
+        or manifest["target_broker_order_id"] is not None
+        or manifest["account_id"] != spread.account_id
+        or manifest["account_id_key"] != spread.account_id_key
+        or manifest["institution_type"] != spread.institution_type
+        or manifest["environment"] != spread.environment
+        or capacity_result["state_sha256"]
+        != portfolio.snapshot_sha256
+        or buying_power_cents
+        != Decimal(portfolio.buying_power_cents)
+    ):
+        raise OrderIntentIntegrityError(
+            "portfolio risk evidence does not match durable capacity"
+        )
+
+
+def _cents_amount(value: int) -> Decimal:
+    if type(value) is not int or value < 0:
+        raise OrderIntentIntegrityError(
+            "risk cents must be a non-negative exact integer"
+        )
+    with localcontext() as decimal_context:
+        decimal_context.prec = _DECIMAL_PRECISION
+        return Decimal(value) / Decimal("100")
+
+
+def _signed_decimal_string(value: Decimal) -> str:
+    if type(value) is not Decimal or not value.is_finite():
+        raise OrderIntentIntegrityError(
+            "risk projection must be an exact finite Decimal"
+        )
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return "0" if rendered in {"", "-0"} else rendered
 
 
 def _transport_response_receipt(

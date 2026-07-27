@@ -20,6 +20,7 @@ from live_trading.order_intent_ledger import (
     OrderIntentReconciliationRequired,
     OrderIntentReservationError,
     OrderIntentValidationError,
+    SCHEMA_VERSION,
 )
 
 
@@ -442,7 +443,7 @@ class ClosingOrderLedgerTests(unittest.TestCase):
                 connection.execute(
                     "SELECT schema_version FROM ledger_metadata"
                 ).fetchone()[0],
-                14,
+                SCHEMA_VERSION,
             )
             tables = {
                 row[0]

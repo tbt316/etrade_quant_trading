@@ -7,8 +7,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -42,13 +43,31 @@ from live_trading.etrade_order_gateway import (
     SubmitOpeningCommand,
 )
 from live_trading.order_intent_ledger import (
+    SCHEMA_VERSION,
     BrokerReadManifestEvidence,
     BrokerReadManifestMember,
     BrokerReadResponseEvidence,
+    OrderIntent,
+    OrderIntentIntegrityError,
     OrderIntentLedger,
+    OrderIntentLedgerError,
     OrderIntentReconciliationRequired,
     OrderIntentReservationError,
+    OrderIntentValidationError,
+    RiskEvidence,
     canonical_order_payload_hash,
+)
+from live_trading.order_domain import OptionContractId
+from live_trading.pretrade_risk import (
+    AuthorityEvidence,
+    ContractQuote,
+    OpeningLeg,
+    OpeningRiskAuthorization,
+    OpeningSpreadRequest,
+    PortfolioRiskEvidence,
+    QuoteSnapshotEvidence,
+    RiskLimits,
+    evaluate_pretrade,
 )
 from live_trading.runtime_safety import (
     RuntimeSafetyBoundary,
@@ -1035,6 +1054,179 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             lease_seconds=lease_seconds,
         )
 
+    def opening_risk_prerequisite_inputs(
+        self,
+        *,
+        key="risk-prerequisite-1",
+        decision_id="risk-decision-1",
+    ):
+        capacity_ref = self.reader.read_capacity(self.account)
+        capacity = self.ledger.set_reservation_cap_from_read(
+            capacity_ref, risk_budget=Decimal("2000")
+        )
+
+        def contract(strike):
+            return OptionContractId(
+                symbol="SPY",
+                expiry=date(2027, 1, 15),
+                call_put="PUT",
+                strike=Decimal(strike),
+                osi_key=(
+                    f"{'SPY':<6}270115P"
+                    f"{int(strike) * 1000:08d}"
+                ),
+                multiplier=Decimal("100"),
+                adjusted=False,
+                deliverables=None,
+            )
+
+        short_contract = contract(620)
+        long_contract = contract(615)
+        spread = OpeningSpreadRequest(
+            strategy_decision_id=decision_id,
+            strategy_id="put-credit-spread",
+            environment="sandbox",
+            account_id=ACCOUNT_ID,
+            account_id_key=ACCOUNT_KEY,
+            institution_type=INSTITUTION_TYPE,
+            trade_session=self.clock.now.date(),
+            legs=(
+                OpeningLeg(short_contract, "SELL_OPEN"),
+                OpeningLeg(long_contract, "BUY_OPEN"),
+            ),
+            quantity=1,
+            price_type="NET_CREDIT",
+            limit_price_cents=125,
+        )
+        limits = RiskLimits(
+            allowed_environments=("sandbox",),
+            allowed_strategies=("put-credit-spread",),
+            allowed_symbols=("SPY",),
+            max_order_contracts=5,
+            max_order_notional_cents=10_000_000,
+            max_order_loss_cents=100_000,
+            max_order_collateral_cents=100_000,
+            max_account_open_risk_cents=200_000,
+            max_symbol_open_risk_cents=200_000,
+            min_remaining_buying_power_cents=0,
+            max_abs_portfolio_delta=Decimal("1000"),
+            max_abs_symbol_delta=Decimal("1000"),
+            max_daily_loss_cents=100_000,
+            max_daily_orders=100,
+            max_daily_new_risk_cents=200_000,
+            max_quote_age_seconds=60,
+            max_portfolio_age_seconds=60,
+            max_authority_age_seconds=60,
+            max_overlay_age_seconds=300,
+            max_option_ask_cents=1_000,
+            max_bid_ask_width_cents=10,
+            max_fee_cents_per_contract_per_leg=1,
+            min_open_interest=100,
+            min_volume=10,
+            require_model_provenance=False,
+            require_regime_provenance=False,
+        )
+        authority = AuthorityEvidence(
+            environment="sandbox",
+            account_id=ACCOUNT_ID,
+            account_id_key=ACCOUNT_KEY,
+            institution_type=INSTITUTION_TYPE,
+            session_date=self.clock.now.date(),
+            observed_at=self.clock.now,
+            arm_issued_at=self.clock.now - timedelta(seconds=1),
+            arm_expires_at=self.clock.now + timedelta(minutes=5),
+            session_opens_at=self.clock.now - timedelta(hours=1),
+            session_closes_at=self.clock.now + timedelta(hours=1),
+            complete=True,
+            mutations_enabled=True,
+            operator_armed=True,
+            kill_switch_clear=True,
+            session_open=True,
+            runtime_config_sha256="1" * 64,
+            arm_sha256="2" * 64,
+            session_sha256="3" * 64,
+        )
+        quotes = QuoteSnapshotEvidence(
+            complete=True,
+            snapshot_sha256="4" * 64,
+            quotes=(
+                ContractQuote(
+                    short_contract,
+                    200,
+                    205,
+                    Decimal("-0.20"),
+                    500,
+                    50,
+                    self.clock.now,
+                    "5" * 64,
+                ),
+                ContractQuote(
+                    long_contract,
+                    70,
+                    75,
+                    Decimal("-0.10"),
+                    500,
+                    50,
+                    self.clock.now,
+                    "6" * 64,
+                ),
+            ),
+        )
+        portfolio = PortfolioRiskEvidence(
+            environment="sandbox",
+            account_id=ACCOUNT_ID,
+            account_id_key=ACCOUNT_KEY,
+            institution_type=INSTITUTION_TYPE,
+            session_date=self.clock.now.date(),
+            symbol="SPY",
+            observed_at=capacity.observed_at,
+            complete=True,
+            stable=True,
+            buying_power_cents=int(
+                capacity.broker_buying_power * Decimal("100")
+            ),
+            open_risk_cents=0,
+            symbol_open_risk_cents=0,
+            portfolio_delta=Decimal("0"),
+            symbol_delta=Decimal("0"),
+            daily_pnl_cents=0,
+            daily_order_count=0,
+            daily_new_risk_cents=0,
+            position_contracts=(),
+            open_order_contracts=(),
+            snapshot_sha256=capacity.portfolio_snapshot_digest,
+            broker_read_evidence_sha256=capacity.evidence_sha256,
+        )
+        risk_decision = evaluate_pretrade(
+            spread,
+            limits,
+            authority,
+            quotes,
+            portfolio,
+            (),
+            evaluated_at=self.clock.now,
+        )
+        authorization = OpeningRiskAuthorization(
+            spread,
+            limits,
+            authority,
+            quotes,
+            portfolio,
+            (),
+            risk_decision,
+        )
+        envelope = OrderIntent.build(
+            account_id=ACCOUNT_ID,
+            environment="sandbox",
+            strategy_id=spread.strategy_id,
+            decision_id=decision_id,
+            idempotency_scope="decision",
+            idempotency_key=key,
+            intent_kind="OPENING",
+            order_payload=vertical_payload(),
+        )
+        return envelope, authorization, capacity
+
     def closing_command(
         self,
         *,
@@ -1152,6 +1344,718 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             submitted.intent_id, outcome, terminal_evidence
         )
         self.reader.query_calls.clear()
+
+    def test_pure_risk_prerequisite_is_durable_but_not_send_authority(
+        self,
+    ):
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs()
+        )
+        reserved_before = self.ledger.active_reserved_margin(
+            ACCOUNT_ID, "sandbox"
+        )
+
+        created = self.ledger.create_opening_risk_prerequisite(
+            envelope,
+            authorization,
+            capacity.decision_sha256,
+            intent_id="risk-prerequisite-intent",
+        )
+        persisted = self.ledger.get_opening_risk_prerequisite(
+            created.intent.intent_id
+        )
+        reservation = self.ledger.get_margin_reservation(
+            created.intent.intent_id
+        )
+
+        self.assertTrue(created.created)
+        self.assertEqual(
+            persisted.authorization_state,
+            "INDEPENDENT_EVIDENCE_PENDING",
+        )
+        self.assertEqual(
+            persisted.decision_sha256,
+            authorization.decision.decision_sha256,
+        )
+        self.assertEqual(
+            persisted.portfolio_broker_read_evidence_sha256,
+            capacity.evidence_sha256,
+        )
+        self.assertIsNone(reservation)
+        self.assertEqual(
+            persisted.collateral_amount, Decimal("500.02")
+        )
+        self.assertEqual(
+            persisted.max_loss_amount, Decimal("375.02")
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(ACCOUNT_ID, "sandbox"),
+            reserved_before,
+        )
+        self.assertEqual(
+            tuple(event.event_type for event in self.ledger.events(
+                created.intent.intent_id
+            )),
+            ("INTENT_CREATED",),
+        )
+        replay = self.ledger.create_opening_risk_prerequisite(
+            envelope,
+            authorization,
+            capacity.decision_sha256,
+            intent_id="different-replay-id",
+        )
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.intent.intent_id, created.intent.intent_id)
+
+        with self.assertRaisesRegex(
+            OrderIntentReservationError,
+            "independently replayable quote and portfolio-risk evidence",
+        ):
+            self.ledger.claim_submission(
+                created.intent.intent_id, OWNER, lease_seconds=30
+            )
+        self.assertEqual(self.harness.calls, [])
+
+        restarted = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="risk-restart"
+        )
+        self.assertEqual(
+            restarted.get_opening_risk_prerequisite(
+                created.intent.intent_id
+            ),
+            persisted,
+        )
+        with self.assertRaises(OrderIntentReservationError):
+            restarted.claim_submission(
+                created.intent.intent_id, OWNER, lease_seconds=30
+            )
+        self.assertEqual(self.harness.calls, [])
+
+    def test_pure_risk_and_legacy_reservation_lanes_cannot_mix(self):
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs(
+                key="risk-prerequisite-lane-mixing",
+                decision_id="risk-decision-lane-mixing",
+            )
+        )
+        legacy = self.ledger.create_intent(
+            envelope, intent_id="legacy-before-risk-proof"
+        )
+        self.ledger.reserve_margin(
+            legacy.intent.intent_id,
+            RiskEvidence(
+                decision_id=envelope.decision_id,
+                max_loss_amount=Decimal("375.02"),
+                collateral_amount=Decimal("500.02"),
+                quote_observed_at=self.clock.now,
+                quote_digest=authorization.quote_evidence_sha256,
+                portfolio_observed_at=capacity.observed_at,
+                portfolio_snapshot_digest=(
+                    capacity.portfolio_snapshot_digest
+                ),
+                capacity_decision_sha256=capacity.decision_sha256,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError,
+            "persisted opening risk intent is incomplete",
+        ):
+            self.ledger.create_opening_risk_prerequisite(
+                envelope,
+                authorization,
+                capacity.decision_sha256,
+                intent_id="ignored-risk-proof-id",
+            )
+        self.assertIsNone(
+            self.ledger.get_opening_risk_prerequisite(
+                legacy.intent.intent_id
+            )
+        )
+        self.assertIsNotNone(
+            self.ledger.get_margin_reservation(legacy.intent.intent_id)
+        )
+
+    def test_pure_risk_prerequisite_fails_before_partial_creation(
+        self,
+    ):
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs(
+                key="risk-prerequisite-adversarial",
+                decision_id="risk-decision-adversarial",
+            )
+        )
+        mismatched_payload = OrderIntent.build(
+            account_id=ACCOUNT_ID,
+            environment="sandbox",
+            strategy_id=envelope.strategy_id,
+            decision_id=envelope.decision_id,
+            idempotency_scope=envelope.idempotency_scope,
+            idempotency_key=envelope.idempotency_key,
+            intent_kind="OPENING",
+            order_payload=vertical_payload(1.30),
+        )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.create_opening_risk_prerequisite(
+                mismatched_payload,
+                authorization,
+                capacity.decision_sha256,
+                intent_id="mismatched-payload-intent",
+            )
+
+        denied_limits = replace(
+            authorization.limits, allowed_symbols=("QQQ",)
+        )
+        denied_decision = evaluate_pretrade(
+            authorization.spread,
+            denied_limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            evaluated_at=authorization.decision.evaluated_at,
+        )
+        denied = OpeningRiskAuthorization(
+            authorization.spread,
+            denied_limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            denied_decision,
+        )
+        self.assertFalse(denied.decision.allowed)
+        with self.assertRaises(OrderIntentValidationError):
+            self.ledger.create_opening_risk_prerequisite(
+                envelope,
+                denied,
+                capacity.decision_sha256,
+                intent_id="denied-risk-intent",
+            )
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.create_opening_risk_prerequisite(
+                envelope,
+                authorization,
+                "0" * 64,
+                intent_id="wrong-capacity-intent",
+            )
+
+        future_decision = evaluate_pretrade(
+            authorization.spread,
+            authorization.limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            evaluated_at=self.clock.now + timedelta(seconds=20),
+        )
+        future = OpeningRiskAuthorization(
+            authorization.spread,
+            authorization.limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            future_decision,
+        )
+        with self.assertRaisesRegex(
+            OrderIntentValidationError,
+            "RISK_AUTHORIZATION_FROM_FUTURE",
+        ):
+            self.ledger.create_opening_risk_prerequisite(
+                envelope,
+                future,
+                capacity.decision_sha256,
+                intent_id="future-risk-intent",
+            )
+
+        tight_limits = replace(
+            authorization.limits,
+            max_quote_age_seconds=1,
+            max_portfolio_age_seconds=1,
+            max_authority_age_seconds=1,
+        )
+        tight_decision = evaluate_pretrade(
+            authorization.spread,
+            tight_limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            evaluated_at=self.clock.now,
+        )
+        tight_authorization = OpeningRiskAuthorization(
+            authorization.spread,
+            tight_limits,
+            authorization.authority,
+            authorization.quotes,
+            authorization.portfolio,
+            authorization.overlays,
+            tight_decision,
+        )
+
+        class DelayedTransactionLedger(OrderIntentLedger):
+            @contextmanager
+            def _transaction(delayed_self):
+                with super()._transaction() as connection:
+                    self.clock.advance(2)
+                    yield connection
+
+        delayed_ledger = DelayedTransactionLedger(
+            self.path,
+            clock=self.clock,
+            run_id="delayed-risk-transaction",
+        )
+        with self.assertRaisesRegex(
+            OrderIntentValidationError,
+            "RISK_AUTHORIZATION_NOT_CURRENT",
+        ):
+            delayed_ledger.create_opening_risk_prerequisite(
+                envelope,
+                tight_authorization,
+                capacity.decision_sha256,
+                intent_id="contended-stale-risk-intent",
+            )
+
+        self.clock.advance(61)
+        with self.assertRaises(OrderIntentValidationError):
+            self.ledger.create_opening_risk_prerequisite(
+                envelope,
+                authorization,
+                capacity.decision_sha256,
+                intent_id="stale-risk-intent",
+            )
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM order_intents
+                    WHERE idempotency_key = ?
+                    """,
+                    (envelope.idempotency_key,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM opening_risk_prerequisites
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM margin_reservations"
+                ).fetchone()[0],
+                0,
+            )
+        self.assertEqual(self.harness.calls, [])
+
+    def test_pure_risk_prerequisite_is_append_only_and_self_verifying(
+        self,
+    ):
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs(
+                key="risk-prerequisite-tamper",
+                decision_id="risk-decision-tamper",
+            )
+        )
+        created = self.ledger.create_opening_risk_prerequisite(
+            envelope,
+            authorization,
+            capacity.decision_sha256,
+            intent_id="risk-tamper-intent",
+        )
+        unrelated = self.ledger.create_intent(
+            OrderIntent.build(
+                account_id=ACCOUNT_ID,
+                environment="sandbox",
+                strategy_id="unrelated-opening",
+                decision_id="unrelated-decision",
+                idempotency_scope="decision",
+                idempotency_key="unrelated-risk-binding",
+                intent_kind="OPENING",
+                order_payload=vertical_payload(),
+            ),
+            intent_id="unrelated-risk-intent",
+        )
+        self.ledger.reserve_margin(
+            unrelated.intent.intent_id,
+            RiskEvidence(
+                decision_id=unrelated.intent.envelope.decision_id,
+                max_loss_amount=Decimal("500"),
+                collateral_amount=Decimal("500"),
+                quote_observed_at=self.clock.now,
+                quote_digest="7" * 64,
+                portfolio_observed_at=capacity.observed_at,
+                portfolio_snapshot_digest=(
+                    capacity.portfolio_snapshot_digest
+                ),
+                capacity_decision_sha256=capacity.decision_sha256,
+            ),
+        )
+        with self.assertRaisesRegex(
+            OrderIntentReservationError,
+            "cannot reserve capacity",
+        ):
+            self.ledger.reserve_margin(
+                created.intent.intent_id,
+                RiskEvidence(
+                    decision_id=created.intent.envelope.decision_id,
+                    max_loss_amount=Decimal("500.02"),
+                    collateral_amount=Decimal("500.02"),
+                    quote_observed_at=self.clock.now,
+                    quote_digest=authorization.quote_evidence_sha256,
+                    portfolio_observed_at=capacity.observed_at,
+                    portfolio_snapshot_digest=(
+                        capacity.portfolio_snapshot_digest
+                    ),
+                    capacity_decision_sha256=capacity.decision_sha256,
+                ),
+            )
+        with self.ledger._connection() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    UPDATE order_intents
+                    SET opening_risk_prerequisite_sha256 = NULL
+                    WHERE intent_id = ?
+                    """,
+                    (created.intent.intent_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO margin_reservations (
+                        intent_id, account_id, environment, amount,
+                        risk_decision_id, max_loss_amount,
+                        quote_observed_at, quote_digest,
+                        portfolio_observed_at,
+                        portfolio_snapshot_digest,
+                        capacity_decision_sha256, state,
+                        released_reason_code, created_at, released_at
+                    )
+                    SELECT ?, account_id, environment, amount, ?,
+                           max_loss_amount, quote_observed_at, quote_digest,
+                           portfolio_observed_at,
+                           portfolio_snapshot_digest,
+                           capacity_decision_sha256, state,
+                           released_reason_code, created_at, released_at
+                    FROM margin_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        created.intent.intent_id,
+                        created.intent.envelope.decision_id,
+                        unrelated.intent.intent_id,
+                    ),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    UPDATE opening_risk_prerequisites
+                    SET request_sha256 = ?
+                    WHERE intent_id = ?
+                    """,
+                    ("0" * 64, created.intent.intent_id),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    DELETE FROM opening_risk_prerequisites
+                    WHERE intent_id = ?
+                    """,
+                    (created.intent.intent_id,),
+                )
+            connection.execute(
+                """
+                DROP TRIGGER prevent_opening_risk_prerequisite_update
+                """
+            )
+            connection.execute(
+                """
+                UPDATE opening_risk_prerequisites
+                SET request_sha256 = ?
+                WHERE intent_id = ?
+                """,
+                ("0" * 64, created.intent.intent_id),
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.get_opening_risk_prerequisite(
+                created.intent.intent_id
+            )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                DROP TRIGGER prevent_opening_risk_prerequisite_delete
+                """
+            )
+            connection.execute(
+                """
+                DELETE FROM opening_risk_prerequisites
+                WHERE intent_id = ?
+                """,
+                (created.intent.intent_id,),
+            )
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError,
+            "lost its pure-risk prerequisite",
+        ):
+            self.ledger.claim_submission(
+                created.intent.intent_id, OWNER, lease_seconds=30
+            )
+        with self.assertRaises(OrderIntentLedgerError):
+            OrderIntentLedger(
+                self.path, clock=self.clock, run_id="tamper-restart"
+            )
+        self.assertEqual(self.harness.calls, [])
+
+    def test_pure_risk_marker_blocks_reservation_after_proof_removal(
+        self,
+    ):
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs(
+                key="risk-prerequisite-marker-only",
+                decision_id="risk-decision-marker-only",
+            )
+        )
+        created = self.ledger.create_opening_risk_prerequisite(
+            envelope,
+            authorization,
+            capacity.decision_sha256,
+            intent_id="risk-marker-only-intent",
+        )
+        unrelated = self.ledger.create_intent(
+            OrderIntent.build(
+                account_id=ACCOUNT_ID,
+                environment="sandbox",
+                strategy_id="unrelated-opening",
+                decision_id="unrelated-marker-decision",
+                idempotency_scope="decision",
+                idempotency_key="unrelated-marker-binding",
+                intent_kind="OPENING",
+                order_payload=vertical_payload(),
+            ),
+            intent_id="unrelated-marker-intent",
+        )
+        self.ledger.reserve_margin(
+            unrelated.intent.intent_id,
+            RiskEvidence(
+                decision_id=unrelated.intent.envelope.decision_id,
+                max_loss_amount=Decimal("500"),
+                collateral_amount=Decimal("500"),
+                quote_observed_at=self.clock.now,
+                quote_digest="8" * 64,
+                portfolio_observed_at=capacity.observed_at,
+                portfolio_snapshot_digest=(
+                    capacity.portfolio_snapshot_digest
+                ),
+                capacity_decision_sha256=capacity.decision_sha256,
+            ),
+        )
+
+        with self.ledger._connection() as connection:
+            connection.execute(
+                """
+                DROP TRIGGER prevent_opening_risk_prerequisite_delete
+                """
+            )
+            connection.execute(
+                """
+                DELETE FROM opening_risk_prerequisites
+                WHERE intent_id = ?
+                """,
+                (created.intent.intent_id,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "margin reservation insert lacks exact risk provenance",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO margin_reservations (
+                        intent_id, account_id, environment, amount,
+                        risk_decision_id, max_loss_amount,
+                        quote_observed_at, quote_digest,
+                        portfolio_observed_at,
+                        portfolio_snapshot_digest,
+                        capacity_decision_sha256, state,
+                        released_reason_code, created_at, released_at
+                    )
+                    SELECT ?, account_id, environment, amount, ?,
+                           max_loss_amount, quote_observed_at, quote_digest,
+                           portfolio_observed_at,
+                           portfolio_snapshot_digest,
+                           capacity_decision_sha256, state,
+                           released_reason_code, created_at, released_at
+                    FROM margin_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        created.intent.intent_id,
+                        created.intent.envelope.decision_id,
+                        unrelated.intent.intent_id,
+                    ),
+                )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM margin_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (created.intent.intent_id,),
+                ).fetchone()[0],
+                0,
+            )
+
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError,
+            "lost its pure-risk prerequisite",
+        ):
+            self.ledger.claim_submission(
+                created.intent.intent_id, OWNER, lease_seconds=30
+            )
+        with self.assertRaises(OrderIntentLedgerError):
+            OrderIntentLedger(
+                self.path, clock=self.clock, run_id="marker-only-restart"
+            )
+        self.assertEqual(self.harness.calls, [])
+
+    def test_genuine_schema_14_shape_migrates_to_schema_15(self):
+        with sqlite3.connect(self.path) as connection:
+            for trigger in (
+                "prevent_opening_risk_prerequisite_update",
+                "prevent_opening_risk_prerequisite_delete",
+                "validate_opening_risk_prerequisite_insert",
+                "prevent_opening_risk_reservation_insert",
+                "prevent_intent_identity_mutation",
+                "validate_margin_reservation_insert",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                """
+                DROP INDEX idx_opening_risk_prerequisites_account
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE order_intents
+                DROP COLUMN opening_risk_prerequisite_sha256
+                """
+            )
+            connection.execute(
+                "DROP TABLE opening_risk_prerequisites"
+            )
+            connection.execute(
+                """
+                UPDATE ledger_metadata SET schema_version = 14
+                WHERE singleton = 1
+                """
+            )
+        migrated = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="schema-14-migration"
+        )
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT schema_version FROM ledger_metadata
+                    WHERE singleton = 1
+                    """
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            self.assertIsNotNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'opening_risk_prerequisites'
+                    """
+                ).fetchone()
+            )
+            self.assertNotIn(
+                "opening_risk_binding_sha256",
+                {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(margin_reservations)"
+                    )
+                },
+            )
+            self.assertIn(
+                "opening_risk_prerequisite_sha256",
+                {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(order_intents)"
+                    )
+                },
+            )
+
+        envelope, authorization, capacity = (
+            self.opening_risk_prerequisite_inputs(
+                key="post-schema-14-migration",
+                decision_id="post-schema-14-risk",
+            )
+        )
+        created = migrated.create_opening_risk_prerequisite(
+            envelope,
+            authorization,
+            capacity.decision_sha256,
+            intent_id="post-schema-14-intent",
+        )
+        self.assertIsNotNone(
+            migrated.get_opening_risk_prerequisite(
+                created.intent.intent_id
+            )
+        )
+        self.assertIsNone(
+            migrated.get_margin_reservation(created.intent.intent_id)
+        )
+        verified = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="schema-15-verified"
+        )
+        self.assertIsNotNone(
+            verified.get_opening_risk_prerequisite(
+                created.intent.intent_id
+            )
+        )
+        with self.assertRaises(OrderIntentReservationError):
+            verified.claim_submission(
+                created.intent.intent_id, OWNER, lease_seconds=30
+            )
+        self.assertEqual(self.harness.calls, [])
+
+    def test_pure_risk_proof_has_no_production_composition_and_legacy_is_outside(
+        self,
+    ):
+        legacy = self.ledger.create_intent(
+            OrderIntent.build(
+                account_id=ACCOUNT_ID,
+                environment="sandbox",
+                strategy_id="legacy-opening",
+                decision_id="legacy-decision",
+                idempotency_scope="decision",
+                idempotency_key="legacy-outside-proof",
+                intent_kind="OPENING",
+                order_payload=vertical_payload(),
+            )
+        )
+        self.assertIsNone(
+            self.ledger.get_opening_risk_prerequisite(
+                legacy.intent.intent_id
+            )
+        )
+        gateway_source = inspect.getsource(gateway_module)
+        self.assertNotIn(
+            "create_opening_risk_prerequisite", gateway_source
+        )
+        self.assertNotIn("OpeningRiskAuthorization", gateway_source)
+        self.assertEqual(self.harness.calls, [])
 
     def test_real_transport_submission_is_idempotent_and_places_once(self):
         first = self.submit_success()
