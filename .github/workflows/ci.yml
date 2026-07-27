@@ -146,6 +146,7 @@ jobs:
           "$RUNNER_TEMP/runtime-venv/bin/python" -m pip uninstall \
             --yes \
             pip \
+            poetry-core \
             setuptools \
             wheel
 

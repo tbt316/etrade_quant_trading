@@ -39,6 +39,7 @@ SUPPORTED_MODULES = (
 )
 FORBIDDEN_RUNTIME_DISTRIBUTIONS = (
     "pip",
+    "poetry-core",
     "setuptools",
     "wheel",
 )

@@ -211,6 +211,7 @@ def test_direct_runtime_pins_match_both_resolved_environments() -> None:
         package: build_resolved.get(package)
         for package in build
     } == build, "build dependency drift in build.lock"
+    assert build_resolved["poetry-core"] == "2.2.1"
 
 
 def test_ci_builds_and_tests_an_immutable_offline_artifact() -> None:
@@ -251,6 +252,7 @@ def test_ci_builds_and_tests_an_immutable_offline_artifact() -> None:
     assert "requirements/runtime.lock" in workflow
     assert "scripts/check_installed_runtime.py" in workflow
     assert '"$RUNNER_TEMP/runtime-venv/bin/python" -m pip uninstall' in workflow
+    assert "            poetry-core \\\n" in workflow
     assert "--offline-home" in workflow
     assert "--offline-temp" in workflow
     assert "sudo --preserve-env" not in workflow

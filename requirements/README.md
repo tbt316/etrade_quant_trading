@@ -38,7 +38,8 @@ python -m pip install \
 `pyetrade==2.1.1` and its OAuth dependency `rauth==0.7.3` are the only approved
 source-distribution exceptions because their publishers do not provide wheels.
 Their source archives are hash-pinned, build isolation is disabled, and each
-build runs only under `build.lock`.
+build runs only under `build.lock`. That bootstrap lock also pins
+`poetry-core`, the backend declared by the `pyetrade` source distribution.
 
 Regenerate both locks only with the Python version in `.python-version` and the
 pinned `pip-tools` version declared by the `dev` extra:
