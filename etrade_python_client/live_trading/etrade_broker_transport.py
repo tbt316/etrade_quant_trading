@@ -573,7 +573,7 @@ class ETradeBrokerTransport:
             _validate_prepared_request(prepared, trusted_request, url)
 
             try:
-                exchange = _isolated_exchange(
+                exchange = _isolated_mutation_exchange(
                     prepared,
                     timeout_seconds=_TOTAL_EXCHANGE_TIMEOUT_SECONDS,
                 )
@@ -1018,23 +1018,24 @@ def _stop_exchange_process(process: Any) -> None:
         pass
 
 
-def _isolated_exchange(
-    prepared: Any,
+def _run_isolated_exchange(
+    exchange: _PreparedExchange,
     *,
     timeout_seconds: float,
-    max_response_bytes: int = _MAX_MUTATION_RESPONSE_BYTES,
+    max_response_bytes: int,
 ) -> _ExchangeResult:
-    """Enforce one hard deadline over connect, headers, and response body."""
+    """Internal generic worker; callers must use a method-sealed wrapper."""
 
     if (
-        type(timeout_seconds) is not float
+        type(exchange) is not _PreparedExchange
+        or type(timeout_seconds) is not float
         or not 0 < timeout_seconds <= _TOTAL_EXCHANGE_TIMEOUT_SECONDS
         or type(max_response_bytes) is not int
         or max_response_bytes
         not in {_MAX_MUTATION_RESPONSE_BYTES, _MAX_RESPONSE_BYTES}
     ):
         raise ETradeBrokerTransportError("total exchange deadline is invalid")
-    exchange = _serialized_prepared_request(prepared)
+    _validate_prepared_exchange(exchange)
     context = multiprocessing.get_context("spawn")
     output = context.RawArray(
         "B",
@@ -1066,6 +1067,52 @@ def _isolated_exchange(
     finally:
         if started:
             _stop_exchange_process(process)
+
+
+def _isolated_mutation_exchange(
+    prepared: Any,
+    *,
+    timeout_seconds: float,
+    max_response_bytes: int = _MAX_MUTATION_RESPONSE_BYTES,
+) -> _ExchangeResult:
+    """Run one POST/PUT exchange through the mutation-only boundary."""
+
+    exchange = _serialized_prepared_request(prepared)
+    if (
+        exchange.method not in {"POST", "PUT"}
+        or max_response_bytes != _MAX_MUTATION_RESPONSE_BYTES
+    ):
+        raise ETradeBrokerTransportError(
+            "mutation exchange requires an exact POST/PUT request"
+        )
+    return _run_isolated_exchange(
+        exchange,
+        timeout_seconds=timeout_seconds,
+        max_response_bytes=max_response_bytes,
+    )
+
+
+def _isolated_get_exchange(
+    prepared: Any,
+    *,
+    timeout_seconds: float,
+    max_response_bytes: int = _MAX_RESPONSE_BYTES,
+) -> _ExchangeResult:
+    """Run one GET exchange; reject every mutation method at runtime."""
+
+    exchange = _serialized_prepared_request(prepared)
+    if (
+        exchange.method != "GET"
+        or max_response_bytes != _MAX_RESPONSE_BYTES
+    ):
+        raise ETradeBrokerTransportError(
+            "read exchange requires an exact GET request"
+        )
+    return _run_isolated_exchange(
+        exchange,
+        timeout_seconds=timeout_seconds,
+        max_response_bytes=max_response_bytes,
+    )
 
 
 def _prepare_oauth_request(

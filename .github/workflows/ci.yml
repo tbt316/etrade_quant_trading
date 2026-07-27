@@ -24,6 +24,10 @@ jobs:
           # pip install pytest pandas numpy matplotlib requests python-dateutil pytz pandas_market_calendars aiohttp
           pip install -r requirements.txt
           
+      - name: Enforce E*TRADE mutation boundary
+        working-directory: etrade_python_client
+        run: python scripts/check_etrade_mutation_boundary.py
+
       - name: Run deterministic tests
         working-directory: etrade_python_client
         env:

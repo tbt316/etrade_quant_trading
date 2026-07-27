@@ -1,7 +1,8 @@
 # Durable Order Intent Ledger
 
 **Delivery status:** R7a ledger + R7b transport + R7c coordinator + R7d
-durable reader + R7e terminal-risk absorption, isolated
+durable reader + R7e terminal-risk absorption + R7f legacy mutation
+quarantine, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
 
@@ -10,9 +11,11 @@ machine for order identity, capacity reservation, fencing, and ambiguous broker
 outcomes. It performs no network I/O. `etrade_broker_transport.py` owns the
 reviewed no-retry mutation exchange, `etrade_broker_reader.py` owns the exact
 origin-bound GET surface, and `etrade_order_gateway.py` coordinates opening
-submissions, price-only amendments, and restart reconciliation. The live agent
-still instantiates none of them, so this stack does not yet protect the current
-legacy order paths.
+submissions, price-only amendments, and restart reconciliation. R7f removes the
+gateway's public transport property and statically confines exact transport
+mutation calls to the gateway. The live agent still instantiates none of these
+components. Every known legacy mutation path is now an unconditional tombstone,
+so the current source is read-only rather than protected by the durable stack.
 
 ## Supported scope
 
@@ -145,8 +148,9 @@ process is enabled:
 2. Closing-position capacity and one-shot per-intent cancellation need durable,
    crash-tested protocols. Bulk cancellation remains disabled.
 3. The live composition root must construct the exact ledger, reader,
-   transport, and coordinator, and static enforcement must reject direct legacy
-   order mutations outside that root.
+   transport, and coordinator. R7f already rejects direct legacy mutation,
+   transport bypass, reflection, and tombstone drift across all tracked
+   application Python in CI; the future root must preserve that gate.
 4. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
    every nonterminal/terminal broker status, replacement chains, cancellation,
    closing, and process death at each durable/I/O boundary.
@@ -158,7 +162,8 @@ The focused ledger/reader/transport/coordinator suites exercise raw-parser
 binding, pagination and marker drift, lot-aware two-scan stability, schema
 rollback, exact payload/fill reconciliation, terminal absorption, retained
 filled risk, mutation fencing, and crash/timeout behavior. They contain 153
-deterministic tests; the maintained repository `tests/` suite contains 318
-passing tests in the clean Python 3.10 environment. This is source verification
-only; partial/complex terminal states, cancellation/closing, live composition,
-and operational migration gates above remain open.
+deterministic tests. R7f adds mutation-boundary, dashboard,
+legacy-tombstone, deployment-containment, and real local-handler visual
+verification. This is source verification only; partial/complex terminal
+states, cancellation/closing, live composition, and operational migration
+gates above remain open.

@@ -1,3 +1,9 @@
+"""Archived Phase 4 implementation fragment.
+
+This file was committed as an indented excerpt rather than an executable
+module.  It is retained as inert research history while production tooling
+requires every tracked ``.py`` file to parse deterministically.
+
         print("\n─── Phase 4: Executing strategy sequentially ───")
         current_cash = initial_capital
         active_trades: List[SpreadTrade] = []
@@ -251,3 +257,4 @@
                 )
             
             previously_panic = is_panic
+"""

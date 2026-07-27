@@ -885,7 +885,7 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         )
         self.harness = ExchangeHarness()
         self.patcher = patch(
-            "live_trading.etrade_broker_transport._isolated_exchange",
+            "live_trading.etrade_broker_transport._isolated_mutation_exchange",
             side_effect=self.harness.exchange,
         )
         self.patcher.start()
@@ -1069,6 +1069,8 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises((AttributeError, TypeError)):
                     setattr(self.gateway, name, value)
+        with self.assertRaises(AttributeError):
+            _ = self.gateway.transport
 
     def test_no_id_timeout_is_durable_and_cannot_be_auto_reconciled(self):
         self.harness.add(preview_result(), _ExchangeResult("TIMEOUT"))

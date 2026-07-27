@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
 """
-Production-grade E*TRADE Options Trading Application
+Quarantined legacy E*TRADE options prototype.
 
-This application handles OAuth authentication with E*TRADE, manages account portfolios,
-calculates margins, generates and places option orders, and executes trading strategies
-based on configurable parameters. It supports both sandbox and live environments.
-
-Key Features:
-- Secure OAuth token management with renewal.
-- Portfolio analysis and margin calculations.
-- Option spread generation and order placement.
-- VIX-adjusted premium targeting.
-- Earnings date checks to avoid high-risk periods.
-- Preview mode for orders before execution.
-- Logging and error handling for reliability.
-
-Configuration:
-- Use 'config.ini' for application settings.
-- Environment variables for sensitive credentials (recommended over hardcoding).
-
-Dependencies:
-- Listed in requirements.txt (create separately).
-
-Usage:
-python main.py --sandbox --trade --username <username> --password <password>
+This module is retained only for compatibility and offline code archaeology.
+It is not production-grade, and its authentication and broker-execution entry
+points fail closed. Broker mutations must use the durable E*TRADE order gateway.
 """
 
 import argparse
@@ -53,6 +34,7 @@ from live_trading.runtime_safety import (
     RuntimeSafetyError,
     configure_owner_only_logger,
     read_owner_only_json,
+    reject_legacy_execution,
     write_owner_only_json,
 )
 
@@ -180,75 +162,7 @@ def release_margin(
     max_positions: int = 5
 ) -> int:
     """Release margin by closing high-margin positions."""
-    already_closing = set()
-    positions_processed = 0
-
-    balance_start = accounts.balance()
-    logger.info(f"Initial Margin Buying Power: ${balance_start['Computed']['marginBuyingPower']:,.2f}")
-
-    total_margin, margin_details = calculate_margin(all_positions, cover_call_list)
-    candidates = find_highest_margin_ratios(margin_details, already_closing, top_n=max_positions)
-
-    orders = []
-    for candidate in candidates:
-        ticker, pair, ratio = candidate
-        position_id = (ticker, pair['expiry'], pair['type'], pair['short_strike'], pair['long_strike'])
-        already_closing.add(position_id)
-
-        short_position = StockPosition(
-            symbol=ticker,
-            quantity=pair.get('quantity', 1),
-            security_type="Option",
-            call_put=pair['type'],
-            strike_price=pair['short_strike'],
-            expiration_date=pair['expiry'],
-            last_price=round(pair.get('short_price', 0), 2)
-        )
-
-        long_position = StockPosition(
-            symbol=ticker,
-            quantity=pair.get('quantity', 1),
-            security_type="Option",
-            call_put=pair['type'],
-            strike_price=pair['long_strike'],
-            expiration_date=pair['expiry'],
-            last_price=round(pair.get('long_price', 0), 2)
-        )
-
-        close_short_order = accounts.generate_option_order(
-            single_leg_stock_position=short_position,
-            action="BUY_CLOSE",
-            priceType={"priceType": "LIMIT", "limitPrice": round(pair.get('short_price', 0) + 0.01, 2)}
-        )
-
-        close_long_order = accounts.generate_option_order(
-            single_leg_stock_position=long_position,
-            action="SELL_CLOSE",
-            priceType={"priceType": "LIMIT", "limitPrice": round(pair.get('long_price', 0) - 0.01, 2)}
-        )
-
-        orders.extend(close_short_order + close_long_order)
-
-    for order in orders:
-        if positions_processed >= max_positions:
-            break
-        try:
-            preview_response = etrade_instance.order.place_order(order, preview_only=True)
-            logger.info(f"Preview response: {preview_response}")
-            if order.get('limitPrice', 0) > 0.05:
-                user_input = input("Execute this order? (yes/no): ").strip().lower()
-                if user_input not in ['yes', 'y']:
-                    continue
-            order_id = etrade_instance.order.place_order(order, preview_only=False)
-            logger.info(f"Order placed: ID {order_id}")
-            positions_processed += 1
-        except Exception as e:
-            logger.error(f"Order processing failed: {e}")
-
-    balance_end = accounts.balance()
-    logger.info(f"Final Margin Buying Power: ${balance_end['Computed']['marginBuyingPower']:,.2f}")
-
-    return positions_processed
+    reject_legacy_execution("live_trading.etrade_put_credit_spread.release_margin")
 
 def main():
     parser = argparse.ArgumentParser(description="E*TRADE Options Trading Application")

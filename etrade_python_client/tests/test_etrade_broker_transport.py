@@ -16,6 +16,7 @@ from urllib.parse import quote
 from unittest.mock import patch
 
 from rauth import OAuth1Session
+from requests import Request
 from requests.adapters import HTTPAdapter
 from requests.exceptions import Timeout
 from xml.etree import ElementTree as ET
@@ -28,7 +29,8 @@ from live_trading.etrade_broker_transport import (
     _EXCHANGE_RESULT_BUFFER_BYTES,
     _ExchangeResult,
     _exchange_worker,
-    _isolated_exchange,
+    _isolated_get_exchange,
+    _isolated_mutation_exchange,
     _read_bounded_response,
     _read_exchange_result,
     _serialized_prepared_request,
@@ -539,7 +541,7 @@ class ETradeBrokerTransportTests(unittest.TestCase):
         )
         adapter = AdapterHarness(outcomes)
         patcher = patch(
-            "live_trading.etrade_broker_transport._isolated_exchange",
+            "live_trading.etrade_broker_transport._isolated_mutation_exchange",
             side_effect=adapter.exchange,
         )
         patcher.start()
@@ -1179,7 +1181,7 @@ class ETradeBrokerTransportTests(unittest.TestCase):
             "live_trading.etrade_broker_transport.multiprocessing.get_context",
             return_value=context,
         ):
-            result = _isolated_exchange(
+            result = _isolated_mutation_exchange(
                 prepared, timeout_seconds=0.01
             )
 
@@ -1190,6 +1192,86 @@ class ETradeBrokerTransportTests(unittest.TestCase):
         self.assertTrue(context.process.started)
         self.assertTrue(context.process.terminated)
         self.assertLessEqual(context.process.join_timeouts[0], 0.01)
+
+    def test_read_exchange_rejects_mutation_methods_before_worker_start(self):
+        body = b"<PreviewOrderRequest/>"
+        prepared = Request(
+            "POST",
+            f"{ORIGIN}/v1/accounts/{ACCOUNT_KEY}/orders/preview.json",
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "consumerKey": "consumer-key",
+                "Authorization": 'OAuth oauth_consumer_key="test"',
+                "Content-Type": "application/xml",
+                "Content-Length": str(len(body)),
+            },
+        ).prepare()
+
+        with self.assertRaisesRegex(
+            ETradeBrokerTransportError, "exact GET"
+        ), patch(
+            "live_trading.etrade_broker_transport.multiprocessing.get_context"
+        ) as context:
+            _isolated_get_exchange(
+                prepared,
+                timeout_seconds=1.0,
+                max_response_bytes=2 * 1024 * 1024,
+            )
+
+        context.assert_not_called()
+
+    def test_read_exchange_passes_one_frozen_validated_snapshot(self):
+        prepared = Request(
+            "GET",
+            f"{ORIGIN}/v1/accounts/list.json",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "consumerKey": "consumer-key",
+                "Authorization": 'OAuth oauth_consumer_key="test"',
+            },
+        ).prepare()
+        captured = []
+
+        def capture(
+            exchange,
+            *,
+            timeout_seconds,
+            max_response_bytes,
+        ):
+            prepared.method = "POST"
+            prepared.url = (
+                f"{ORIGIN}/v1/accounts/{ACCOUNT_KEY}/orders/preview.json"
+            )
+            captured.append(
+                (exchange, timeout_seconds, max_response_bytes)
+            )
+            return _ExchangeResult("TRANSPORT_ERROR")
+
+        with patch(
+            "live_trading.etrade_broker_transport._run_isolated_exchange",
+            side_effect=capture,
+        ):
+            result = _isolated_get_exchange(
+                prepared,
+                timeout_seconds=1.0,
+                max_response_bytes=2 * 1024 * 1024,
+            )
+
+        self.assertEqual(result.kind, "TRANSPORT_ERROR")
+        self.assertEqual(len(captured), 1)
+        frozen, timeout_seconds, max_response_bytes = captured[0]
+        self.assertEqual(frozen.method, "GET")
+        self.assertEqual(
+            frozen.url,
+            f"{ORIGIN}/v1/accounts/list.json",
+        )
+        self.assertEqual(frozen.body, b"")
+        self.assertEqual(timeout_seconds, 1.0)
+        self.assertEqual(max_response_bytes, 2 * 1024 * 1024)
+        self.assertEqual(prepared.method, "POST")
 
     def test_fixed_exchange_frame_rejects_partial_writer_and_accepts_max_body(self):
         incomplete = bytearray(_EXCHANGE_RESULT_BUFFER_BYTES)

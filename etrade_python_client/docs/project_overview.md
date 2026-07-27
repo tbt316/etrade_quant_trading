@@ -127,16 +127,17 @@ flowchart TD
     RPA -->|Saves tabular CSV audits| CSVS
 ```
 
-### 3. Live Startup Safety & Dashboard Containment
+### 3. Live Startup Safety & Mutation Quarantine
 
-R6 adds a fail-closed boundary around startup, account refresh, and the
-compatibility order client in the existing live monolith. The environment must
-be explicit. Production
-additionally requires an owner-only, HMAC-signed, short-lived arm document whose
-exact account ID, account key, and institution type match both the command line
-and the broker response. These checks run before broker construction, again
-when the selected account is refreshed, and immediately before every order API
-POST/PUT.
+R6 adds a fail-closed boundary around startup and account refresh. R7f then
+quarantines every known compatibility mutation path: legacy order methods are
+unconditional tombstones, dashboard execution routes return a fixed
+authenticated `503 LEGACY_EXECUTION_DISABLED` response before reading the body,
+the UI is permanently read-only, and service installation/restart is
+suspended. The environment must still be explicit. Production additionally
+requires an owner-only, HMAC-signed, short-lived arm document whose exact
+account ID, account key, and institution type match both the command line and
+the broker response.
 
 ```mermaid
 flowchart LR
@@ -147,8 +148,10 @@ flowchart LR
     OAUTH["E*TRADE OAuth Construction"]
     ACCOUNT["Exact Account Selection<br/>and Refresh Revalidation"]
     DASHCFG["Strong Dashboard Credentials<br/>Owner-Only Settings and Logs"]
-    DASH["Loopback-Only Dashboard<br/>No Automatic Tunnel / No Wildcard CORS"]
-    DIRECT["Compatibility Order Client<br/>(Per-Call Arm + Account Guard)"]
+    DASH["Loopback-Only Read-Only Dashboard<br/>No Execution Controls or Mutation Queue"]
+    LEGACY["Legacy Mutation Surfaces<br/>(Unconditional Tombstones)"]
+    STATIC["Tracked-Source Mutation Gate<br/>(CI + Local Checker)"]
+    DEPLOY["Install / Restart<br/>(Suspended)"]
     LEDGER["R7a Order Intent Ledger<br/>(Implemented, Isolated)"]
     TRANSPORT["R7b Mutation Transport<br/>(Implemented, Isolated)"]
     GATE["R7c Order Gateway<br/>(Implemented, Isolated)"]
@@ -161,9 +164,13 @@ flowchart LR
     ARM --> SAFE
     SAFE --> OAUTH --> ACCOUNT
     DASHCFG --> DASH
-    ACCOUNT --> DIRECT
-    DIRECT -->|"current, guarded but non-durable"| BROKER
-    DIRECT -.->|"future migration"| GATE
+    ACCOUNT --> LEGACY
+    DASH --> LEGACY
+    STATIC --> LEGACY
+    DEPLOY --> LEGACY
+    BLOCK["Rejected Before Broker I/O"]
+    LEGACY --> BLOCK
+    ACCOUNT -.->|"future composition root"| GATE
     GATE -->|"intent, reservation, reconciliation"| LEDGER
     GATE -->|"capacity and known-order reads"| READER
     GATE -->|"zero/full terminal proof"| ABSORB
@@ -175,9 +182,14 @@ flowchart LR
     TRANSPORT -.->|"not connected yet"| BROKER
 ```
 
-This is source-level containment, not a production-readiness claim. The
-compatibility order client now enforces the arm/account check for every order
-API call. R7a adds the durable intent ledger. R7b adds a private, no-retry
+This is source-level containment, not a production-readiness claim. R7f removes
+the live monolith's operative broker-mutation call sites and makes all retained
+compatibility methods reject without configuration or operator override. A
+tracked-source AST gate permits raw broker mutation only in the reviewed
+transport and exact transport calls only in the gateway. The dashboard and
+generated position artifact were rendered through the real local handler at
+desktop and mobile widths; this was isolated source verification, not
+inspection of the deployed Pi. R7a adds the durable intent ledger. R7b adds a private, no-retry
 mutation transport that claims every send before broker I/O and persists parsed
 responses. R7c composes those components into an opening/reprice coordinator
 with a gateway-owned risk ceiling, exact environment/account binding,
@@ -189,9 +201,9 @@ authorize capacity or reconciliation. R7e releases zero-fill terminal risk or
 absorbs a complete balanced fill only from a fresh exact order read plus newer
 order-bound position lots; absorbed full-fill margin remains counted against
 account risk. Partial/replacement/assignment states, cancellation/closing
-protocols, the single live composition root, and removal of legacy mutation
-paths remain mandatory before live wiring. The deployed service has not been
-restarted or inspected with R6 or R7.
+protocols, the single live composition root, a pure full pre-trade risk policy,
+and operational migration remain mandatory before live wiring. The deployed
+service has not been restarted or inspected with R6 or R7.
 
 ---
 
@@ -234,12 +246,13 @@ shadow/research-only and cannot affect E*TRADE order eligibility.
 ### 3. Live Runtime Safety
 
 *   **Runtime Safety Boundary** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py)): Resolves an explicit `sandbox` or `production` environment before OAuth construction. Production requires an exact account identity plus a versioned, signed arm file with a bounded lifetime; unsafe, missing, mismatched, future, or expired proof fails closed. The operator CLI writes the arm atomically as an owner-only file without accepting the signing secret as a command-line argument.
-*   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`order_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/order/order_bo.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh, and the compatibility order client repeats it immediately before every order API call. The isolated R7 reader, gateway, and transport preserve the same boundary; future live composition must make that gateway the sole mutation owner.
+*   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh. Compatibility order mutations are now disabled; the isolated R7 reader, gateway, and transport preserve the same identity boundary for future composition.
 *   **Durable Order Intent Ledger** ([`order_intent_ledger.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/order_intent_ledger.py), [`order_intent_ledger.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/order_intent_ledger.md)): R7a provides strict vertical-spread validation, account capacity reservations, stable identifiers, monotonic submission/amendment fences, immutable outbound authorizations, exact send/response receipts, and reconciliation-only handling after an ambiguous mutation.
 *   **Hardened Mutation Transport** ([`etrade_broker_transport.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_transport.py)): R7b is the only reviewed adapter permitted to derive E*TRADE mutation XML from a durable authorization. It disables ambient proxies, cookies, hooks, redirects, and retries; revalidates the armed account; claims the exact send before I/O; bounds the exchange in an isolated process; and records the parsed result before returning.
-*   **Order Gateway** ([`etrade_order_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_order_gateway.py)): R7c coordinates opening submissions and price-only amendments through the exact transport. R7e extends read-only startup reconciliation with deterministic terminal-reservation absorption: zero-fill terminals need no capacity read, while full fills require a newer lot-aware capacity decision bound to the same order. Startup stays blocked on partial, replacement-linked, stale, or ambiguous evidence. This component remains intentionally unreachable from the live agent until closing/cancellation, live composition/static enforcement, and operational validation are delivered.
+*   **Order Gateway** ([`etrade_order_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_order_gateway.py)): R7c coordinates opening submissions and price-only amendments through the exact transport. R7e extends read-only startup reconciliation with deterministic terminal-reservation absorption: zero-fill terminals need no capacity read, while full fills require a newer lot-aware capacity decision bound to the same order. Startup stays blocked on partial, replacement-linked, stale, or ambiguous evidence. R7f removes the public transport property. This component remains intentionally unreachable from the live agent until closing/cancellation, live composition, and operational validation are delivered.
 *   **Durable E*TRADE Reader** ([`etrade_broker_reader.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_reader.py)): R7d performs only exact origin-pinned, no-retry GETs in bounded disposable processes. R7e adds exact per-leg fill quantities/timestamps and requests `lotsRequired=true`; position lots retain order and leg identity, signed quantities, and canonical provenance across both stability scans. Known-order reconciliation still uses only a direct lookup of the durable broker order ID; missing, incomplete, ambiguous, or mismatched evidence remains blocked.
-*   **Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py)): Serves the order-capable dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. Startup rejects default or weak dashboard credentials, while local settings and touched logs use owner-only file handling.
+*   **Legacy Mutation Quarantine** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py), [`check_etrade_mutation_boundary.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scripts/check_etrade_mutation_boundary.py)): R7f makes every known legacy order, scheduler, close, repricing, and cancellation surface an exact unconditional tombstone. CI scans every tracked application Python file, including tracked scratch, for raw mutation I/O, request literals, forbidden transport access, reflection, and tombstone drift.
+*   **Read-Only Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py), [`dashboard_template.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/dashboard_template.html)): Serves the dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. The UI has no execute/close/neutralize controls, persisted auto-open is forced off, and five historical execution routes reject before body parsing or side effects. Current generated positions are frameable only by the same-origin dashboard and label every position read-only; missing, oversized, or pre-containment artifacts become a fixed `503` fallback whose CSP disables scripts, network connections, and form actions.
 *   **Credential Source Cleanup** ([`etrade_check_option.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_check_option.py), [`etrade_option_chains.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_option_chains.py)): Removes hardcoded OAuth credentials from the current source and requires local configuration or environment variables. Because the repository is currently public and those values remain in Git history, the affected keys must be treated as compromised until they are revoked and rotated externally; a coordinated history purge remains separate follow-up work.
 
 ---
@@ -304,7 +317,7 @@ When the user mentions a specific **dashboard**, **HTML**, or **chart**, check t
 | **[`experiments_dashboard.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/backtesting/experiments_dashboard.html)** | `generate_experiments_report.py` | The main leaderboard. Compiles terminal statistics, margin metrics, drawdowns, Sharpe ratios, and links for all simulated variants in the log. |
 | **[`backtesting/reports/report_*.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/backtesting/reports/)** | `backtest_runner.py` | Single backtest interactive report. Contains step-by-step trade logs, equity curves, drawdown curves, trade-by-trade details, and embedded strategy config details. |
 | **[`audit_plots/regime_probability_audit.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/audit_plots/regime_probability_audit.html)** | `regime_probability_audit.py` | Interactive statistical dashboard comparing SPY & SPX. Displays distribution overlays, moments tables, and option assignment edges. |
-| **[`live_trading/dashboard_template.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/dashboard_template.html)** | `RefreshHandler` serves the source template; `/api/regime_v2_shadow` reads `live_trading/runtime/regime_v2_shadow.json` | Authenticated, loopback-only operator dashboard. It requires strong local credentials, does not automatically start a public tunnel, and exposes no wildcard CORS. The V2 card displays a redacted background-plus-shock advisory beside the legacy lane and permanently states that it cannot authorize execution. |
+| **[`live_trading/dashboard_template.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/dashboard_template.html)** | `RefreshHandler` serves the source template; `/api/positions` serves the generated positions artifact; `/api/regime_v2_shadow` reads `live_trading/runtime/regime_v2_shadow.json` | Authenticated, loopback-only, permanently read-only dashboard. It has no order controls, forces auto-open off, and returns a fixed fail-closed response from retained historical execution routes. The V2 card displays a redacted background-plus-shock advisory that cannot authorize execution. |
 | **[`research_reports/regime_v2_calibration_artifact.json`](file:///Users/btian/EtradePythonClient/etrade_python_client/research_reports/regime_v2_calibration_artifact.json)** | `regime_detector_v2_calibrate.py` | Canonical R3 candidate metrics, causal folds, selected baseline, provenance limitations, and execution-ineligible promotion status. |
 | **[`s_and_p_data/regime_timeline_2015.png`](file:///Users/btian/EtradePythonClient/etrade_python_client/s_and_p_data/regime_timeline_2015.png)** | `ev_plots.py --timeline` | Visually maps out-of-sample HMM regimes (Expansion, Decline, Panic) as background colors overlaid on SPY Close and VIX. |
 | **[`s_and_p_data/spy_return_distributions_by_hmm.png`](file:///Users/btian/EtradePythonClient/etrade_python_client/s_and_p_data/spy_return_distributions_by_hmm.png)** | `ev_plots.py --distributions` | Multi-panel histogram displaying daily returns bucketed by HMM state and overlaid with fitted fat-tailed Student-t densities. |

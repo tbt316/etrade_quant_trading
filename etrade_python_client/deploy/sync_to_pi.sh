@@ -4,16 +4,15 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  ./deploy/sync_to_pi.sh [--state] [--restart]
+  ./deploy/sync_to_pi.sh [--state]
 
 Options:
   --state     Also sync private runtime state such as config.ini and OAuth/settings JSON files.
-  --restart   Restart the systemd service on the Pi after syncing code.
+  --restart   Rejected while live deployment is suspended.
 
 Environment:
   PI_TARGET       SSH target. Defaults to pi@raspberrypi.local.
   PI_DIR          Destination repo directory on the Pi. Defaults to /home/pi/etrade_python_client.
-  SERVICE_NAME    systemd service name. Defaults to etrade-live.
   SYNC_DELETE     Set to 1 to delete remote files that no longer exist locally.
 USAGE
 }
@@ -21,7 +20,6 @@ USAGE
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_TARGET="${PI_TARGET:-pi@raspberrypi.local}"
 PI_DIR="${PI_DIR:-/home/pi/etrade_python_client}"
-SERVICE_NAME="${SERVICE_NAME:-etrade-live}"
 SYNC_STATE=0
 RESTART=0
 
@@ -46,6 +44,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$RESTART" == "1" ]]; then
+  echo "Remote restart is suspended; no files were synced and no remote command ran." >&2
+  exit 78
+fi
 
 DELETE_ARG=""
 if [[ "${SYNC_DELETE:-0}" == "1" ]]; then
@@ -117,8 +120,4 @@ if [[ "$SYNC_STATE" == "1" ]]; then
   else
     echo "No private runtime state files found to sync."
   fi
-fi
-
-if [[ "$RESTART" == "1" ]]; then
-  ssh "$PI_TARGET" "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl --no-pager --full status '$SERVICE_NAME'"
 fi

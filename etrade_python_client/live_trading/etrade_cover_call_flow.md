@@ -1,65 +1,113 @@
-# E*TRADE Live Trading Agent Execution Flow
+# E*TRADE Read-Only Runtime Flow
 
-This document outlines the execution logic of `etrade_cover_call_new.py`. The trading agent acts as the backend for the local dashboard (`http://localhost:8765`), which serves as the primary UI and source of truth for all trading parameters.
+This document describes the R7f behavior of
+`live_trading/etrade_cover_call_new.py`. It replaces the historical automated
+trading flow. The current runtime is a local monitoring and analytics service;
+it has no supported broker-mutation path.
 
-## 1. Startup & Initialization
-- **Argument Parsing**: Reads `--trade`, `--sandbox`, `--username`, `--password`, etc.
-- **Authentication**: Performs OAuth login with E*TRADE. Supports auto-login via iMessage/Browser if configured.
-- **Account Selection**: Explicitly selects the designated brokerage account (e.g., Roth IRA ending in 8703) during initialization.
-- **Background Services**: 
-    - Starts an HTTP server (default port `8765`) to host the interactive Dashboard.
-    - Handles `/api/settings` to load/save user configurations.
-    - Handles `/api/preview_spread` and `/api/execute_manual_order` for manual trading.
-- **Time Setup**: Defines trading windows (07:15 - 13:30 PT) and log windows.
+## 1. Startup boundary
 
-## 2. The Dashboard Interaction Model
-The dashboard (`dashboard_template.html`) is the **absolute source of truth** for both manual and automated position openings. 
+1. Resolve an explicit `sandbox` or `production` environment.
+2. For production, validate the exact account ID, account key, institution
+   type, and an owner-only signed arm document.
+3. Construct OAuth and read-only E*TRADE collaborators only after the runtime
+   boundary succeeds.
+4. Select and revalidate the exact account identity.
+5. Start the authenticated HTTP server on loopback.
 
-- **Settings Management**: User configurations (Target Delta, Spread Width, Target Weeks, Auto-Open toggle, Trading Side) are stored in `live_trading_settings.json`.
-- **Live Preview**: The dashboard constantly queries `/api/preview_spread` to show the user the exact spread (Call, Put, or Both) that matches their current slider settings based on live E*TRADE quotes.
-- **Parameter Locking (Manual Trades)**: When the user clicks **"Execute Order Now"**, the dashboard sends the exact `sell_strike`, `buy_strike`, `expiration`, and `side` to the backend. The backend **bypasses any background search logic** and exclusively executes those specific strikes.
-- **Parameter Loading (Auto Trades)**: If Auto-Open is enabled, the backend reads `live_trading_settings.json` at the start of the trading day and searches for candidates using those precise UI-defined parameters.
+The legacy entry point still contains a historical `--trade` gate. It is not a
+supported live-trading command and cannot bypass R7f tombstones. The deployment
+scripts reject service installation and remote restart before privileged or
+remote actions.
 
-## 3. Main Execution Loop
-The script runs in an infinite loop, performing the following steps:
+## 2. Read-only monitoring loop
 
-### A. Session & Status Maintenance
-- **Session Renewal**: Renews the E*TRADE access token every 60 minutes.
-- **Market Status Gate**: Checks if the NYSE is `OPEN`, `PRE_MARKET`, `AFTER_HOURS`, or `CLOSED`.
-    - **Holiday/Weekend**: Sleeps until the next trading day.
-    - **Pre/After Hours**: Updates the HTML dashboard but skips active trading.
-    - **Manual Trade Override**: If a manual trade is requested via the dashboard, the engine immediately bypasses sleep/time gates to execute the trade.
-- **Data Refresh**: Fetches account balance, full portfolio, margin usage, and calculates portfolio-wide Net Delta.
+The retained loop may:
 
-### B. Risk Monitoring & Margin Tracking
-- **Extrinsic Value Alerts**: Scans for ITM short options with **<$1.00 extrinsic value**. Sends an email warning of assignment risk.
-- **Stale Limit Order Nudging**: Monitors open limit orders. If an order remains unfilled, it nudges the limit price by $0.01 every 30 seconds to chase the market, and it will keep following favorable price movement instead of blindly reverting a better price.
+- renew the OAuth session and revalidate the account boundary;
+- inspect market status;
+- fetch confirmed portfolio, balance, quote, option-chain, position, and order
+  history data;
+- update cash-flow, margin, position, quote-freshness, and assignment-risk
+  analytics;
+- render `screened_option_pairs.html`;
+- serve dashboard refresh, settings, status, GEX, preview-only analytics, and
+  the redacted V2 regime advisory.
 
-### C. Automated Management Actions
-- **Expiring ITM Put Close**: After 12:50 PM PT, the script automatically sends market orders to close any ITM put spreads expiring today to avoid assignment.
-- **High-Gain Close Proposals**:
-    - Detects spreads reaching the UI-defined **Auto-Close Target** (e.g., closing cost < $0.30 or >70% profit).
-    - Calculates mid-price from live quotes.
-    - Sends an **Approval Email** to the user.
-    - If approved (via dashboard or email), executes the closing trade with the price-chasing algorithm.
+Market windows and strategy parameters may still influence analytics or
+candidate previews. They do not authorize an order. Auto-open is forced off,
+and no scheduler or worker owns an operative place/change/cancel/close path.
 
-### D. New Trade Entry (Auto or Manual)
-- **Trigger**: Runs if `auto_open_enabled` is true (and no trade has occurred today) OR if `is_manual_trade` is true.
-- **Parameter Source**:
-    - **Manual**: Extracts explicit strikes and expirations sent from the dashboard.
-    - **Auto**: Loads `target_delta`, `target_weeks`, `hedge_spread`, and `trade_side` (Call/Put/Both) from `live_trading_settings.json`.
-- **Earnings Filter**: For auto-trades, skips tickers with earnings announcements prior to the target expiration.
-- **Strategy Selection**:
-    - Generates order JSON based purely on the defined/requested side (Call or Put).
-- **Approval Workflow**:
-    - For Auto-Trades: Sends an Order Approval Email with ROI and EV stats, pausing for up to 30 minutes.
-    - For Manual Trades: Skips email approval (since the user clicked "Execute Now" on the dashboard).
-- **Order Execution**:
-    - Refreshes prices immediately before submission.
-    - Places Limit orders.
-    - Engages the **Price Chasing (Nudge) logic** to ensure execution if the market moves away from the initial limit price.
+## 3. Dashboard flow
 
-### E. Error Handling & Logging
-- **Retries**: Implements exponential backoff for E*TRADE API rate limits (e.g., "Too Many Requests").
-- **Logging**: Detailed rotation logs in `python_client.log`.
-- **Notifications**: Sends Gmail notifications for login failures or critical errors.
+```text
+Authenticated browser on loopback
+  -> dashboard_template.html
+  -> read-only refresh/status/settings/preview requests
+  -> confirmed broker and local analytical data
+  -> generated positions artifact and advisory cards
+  -> no order mutation
+```
+
+The dashboard and generated position rows contain no execute, close, or
+neutralize controls. Preview labels explicitly state that submission is
+disabled. The V2 background/shock regime signal remains a shadow advisory and
+cannot affect order eligibility.
+
+## 4. Historical execution-route rejection
+
+These exact paths are retained only as compatibility tombstones:
+
+- `/api/execute_manual_order`
+- `/api/execute_neutralize_order`
+- `/api/review_close_position`
+- `/api/close_position`
+- `/api/execute_close_order`
+
+After authentication, each route returns HTTP `503` with:
+
+```json
+{
+  "code": "LEGACY_EXECUTION_DISABLED",
+  "error": "Trading actions are disabled.",
+  "read_only": true,
+  "execution_enabled": false
+}
+```
+
+The rejection occurs before request-body parsing, log/file mutation, queue
+changes, or collaborator calls. Legacy Python preview/place/change/cancel,
+repricing, automatic-close, margin-release, and facade mutation methods are
+also unconditional reject-only tombstones.
+
+## 5. Static containment
+
+`scripts/check_etrade_mutation_boundary.py` scans every tracked application
+Python source, including tracked scratch. CI runs it before the test suite. The
+gate restricts raw broker mutation to the reviewed transport, restricts exact
+transport calls to the gateway, rejects public transport exposure and legacy
+call sites, and verifies the fixed tombstone policy.
+
+```bash
+python scripts/check_etrade_mutation_boundary.py
+pytest -q tests
+```
+
+## 6. Intended future mutation flow
+
+```text
+single reviewed production composition root
+  -> pure pre-trade risk policy
+  -> durable ETradeOrderGateway
+     -> durable account/order reader
+     -> intent ledger and capacity reservation
+     -> uniquely fenced no-retry transport send
+     -> parsed response receipt
+     -> restart-safe reconciliation
+```
+
+The ledger, reader, opening/reprice gateway, transport, and zero/full
+terminal-risk absorption exist only as an isolated stack. Live composition is
+blocked until partial/replacement/assignment handling, per-intent
+cancellation, closing capacity, the full risk policy, operational migration,
+and deployed verification are complete.

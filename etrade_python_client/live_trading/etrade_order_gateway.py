@@ -200,10 +200,6 @@ class EtradeOrderGateway:
         return self._ledger
 
     @property
-    def transport(self) -> ETradeBrokerTransport:
-        return self._transport
-
-    @property
     def reader(self) -> ETradeBrokerReader:
         return self._reader
 
@@ -314,7 +310,7 @@ class EtradeOrderGateway:
             record.intent_id, command.owner, lease.fencing_token
         )
         try:
-            preview = self.transport.preview(authorization)
+            preview = self._transport.preview(authorization)
         except Exception:
             self._fail_unplaced_submission(
                 record.intent_id, command.owner, lease.fencing_token
@@ -342,7 +338,7 @@ class EtradeOrderGateway:
             )
             raise
         try:
-            placed = self.transport.place(authorization, preview)
+            placed = self._transport.place(authorization, preview)
         except ETradeBrokerTransportError:
             current = self._require_intent(record.intent_id)
             if current.state == "SUBMISSION_UNKNOWN":
@@ -442,7 +438,7 @@ class EtradeOrderGateway:
             record.intent_id, command.owner, lease.fencing_token
         )
         try:
-            preview = self.transport.preview_change(
+            preview = self._transport.preview_change(
                 lease.broker_order_id, authorization
             )
         except Exception:
@@ -464,7 +460,7 @@ class EtradeOrderGateway:
             )
         try:
             self._checked_account()
-            placed = self.transport.place_change(
+            placed = self._transport.place_change(
                 lease.broker_order_id, authorization, preview
             )
         except ETradeBrokerTransportError:
@@ -536,10 +532,10 @@ class EtradeOrderGateway:
             )
         initial_now = self._now()
         self.runtime_safety.assert_current(initial_now)
-        self.transport.assert_gateway_binding(
+        self._transport.assert_gateway_binding(
             self.ledger, self.runtime_safety
         )
-        transport_account = self.transport.selected_account()
+        transport_account = self._transport.selected_account()
         self.reader.assert_gateway_binding(
             self.ledger, self.runtime_safety
         )

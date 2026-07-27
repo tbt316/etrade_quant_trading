@@ -1,35 +1,70 @@
-# Core Trading Logic: Live Trading Agent
+# Live Runtime Logic
 
-This document outlines the specific trading logics currently implemented in the `live_trading` directory, primarily derived from the master `etrade_cover_call_new.py` execution script.
+## Current execution boundary
 
-## 1. Operating Window & Market Gating
-- **Trading Window:** The core trading loop is active between `07:15:00` and `13:30:00` Eastern Time.
-- **Market State Gate:** Operations are halted on holidays, weekends, or outside extended hours. Trades are skipped if the system detects the market as `CLOSED_HOLIDAY`. 
+R7f converts the legacy live agent into a read-only monitoring and analytics
+runtime. There is no supported E*TRADE place, change, cancel, close,
+neutralize, repricing, or margin-release path. Auto-open is forced off, and the
+historical `--trade` flag is not an instruction or override for live trading.
 
-## 2. Dynamic Target Premium & VIX Adjustment
-- The algorithm calculates a `days_to_expire` target (typically ~6 weeks out, maturing on a Friday).
-- **Baseline Premium Targeting:** Baseline premiums scale with the square root of the days to expiration (`days_to_expire ** 0.5`). Additionally, put spreads receive a `(1 + target_steer)` multiplier, and call spreads receive a `(1 - target_steer)` multiplier. 
-- **VIX Adjustment:** 
-  - The system checks the current VIX level against a baseline threshold (typically `20`).
-  - `adjust = vix_correlation` (e.g., typically `0.05`).
-  - Target call premiums are scaled down dynamically as VIX rises above the threshold (anticipating market rebounds).
-  - Target put premiums are scaled up dynamically as VIX rises, increasing collected premium for downside protection during volatility spikes. 
+The dashboard is authenticated and loopback-only. Service installation and
+remote restart remain suspended.
 
-## 3. Position Filtering & Strike Selection
-- **Earnings Date Skips:** The agent fetches known earnings dates for the underlying ticker. If an earnings event falls between the current date and the target expiration date, it automatically skips opening new positions for that ticker.
-- **Iterative Search:** Uses current price and days to expiration to scan the option chain for spreads matching the dynamically calculated target premium. If no matches are found, it decrements the target days to expiration by 7 days and tries again until a valid spread setup is found or `days_to_expire < 2`.
-- **Profitability Constraint:** Proposed spread orders are rejected locally if the net credit generated per spread drops below `$0.01` during the final price verification.
+## Retained analytical logic
 
-## 4. Risk Management & Extrinsic Value Monitoring
-- **Extrinsic Value Alerts:** Scans all active short Option positions that are In-The-Money (ITM). If the Extrinsic Value drops to `$1.00` or below (heightened assignment risk), it automatically triggers an email alert.
-- **Same-Day ITM Put Spread Market Auto-Close:** Specifically triggers after `12:50:00` ET. The script scans expiring put credit spreads. If the short leg is ITM (underlying price below short put strike), the system automatically attempts to close the entire spread at `MARKET` to prevent assignment.
+The runtime may still calculate and display:
 
-## 5. Early Profit Taking (High-Gain Spread Detection)
-- Continuously scans the portfolio for active spreads demonstrating strong profitability.
-- If it detects a spread with a `gain_loss_percentage > 70%`, it extracts the current Bid/Ask midpoints for the corresponding legs and automatically proposes an order to close the spread at a net debit matching the midpoint.
+- market-session status;
+- portfolio, balance, margin, position, and quote-freshness views;
+- option-chain and preview-only spread selection;
+- GEX and neutralization previews;
+- cash-flow and position history;
+- extrinsic-value and assignment-risk observations;
+- potential high-gain or expiry-risk conditions;
+- the shadow-only two-axis regime advisory.
 
-## 6. Execution & Auto-Adjustment Workflows
-- **Approval Flow:** Proposed orders (both opening and high-gain closing) are batched, sorted by Annualized ROI, and sent as an email payload.
-- **Execution Validation:** Before actually transacting after an approval, it checks if the refreshed market prices for the spread still result in a valid credit setup. 
-- **Auto-Adjustment:** Once an order is placed, if it is not immediately filled, the system initiates a monitoring loop that adjusts the order's limit price by `$0.01` every `30` seconds (up to ~90 minutes) until a fill is achieved.
-- **Margin Check Release:** If an order triggers an `INSUFFICIENT_FUNDS` error, the agent invokes a margin-release function, conditionally cancelling existing resting orders to free up buying power, before retrying.
+Target premium, VIX adjustment, DTE, delta, spread width, earnings filters,
+profit thresholds, and candidate rankings are analytical inputs only. They may
+describe or preview a possible strategy, but they do not authorize execution.
+Alerts and previews are not durable risk decisions.
+
+## Disabled historical actions
+
+The following dashboard routes are fixed authenticated tombstones and return
+HTTP `503 LEGACY_EXECUTION_DISABLED` before reading a body or causing side
+effects:
+
+- `/api/execute_manual_order`
+- `/api/execute_neutralize_order`
+- `/api/review_close_position`
+- `/api/close_position`
+- `/api/execute_close_order`
+
+Legacy Python methods for preview/place/change/cancel, stale-order nudging,
+automatic same-day ITM closing, high-gain closing, margin release, scheduler
+workers, and facade placement reject unconditionally. No settings value,
+action PIN, environment, arm file, or operator choice can enable them.
+
+## Enforcement and verification
+
+Run:
+
+```bash
+python scripts/check_etrade_mutation_boundary.py
+pytest -q tests
+```
+
+The static checker protects the reviewed mutation boundary and exact
+tombstones across tracked sources. R7f dashboard behavior was visually checked
+through an isolated real handler and generated position artifact at desktop
+and mobile sizes. The deployed service was not restarted or inspected, and no
+E*TRADE order path was exercised.
+
+## Promotion path
+
+Future live execution must use one reviewed composition root. It must compose
+the durable E*TRADE reader, intent ledger, order gateway, and no-retry mutation
+transport with a pure full pre-trade risk policy. The existing isolated stack
+is not connected to the live agent. Partial/replacement/assignment recovery,
+durable cancellation, closing capacity, operational migration, and deployed
+verification must be complete before that boundary can be promoted.
