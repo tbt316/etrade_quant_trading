@@ -79,6 +79,15 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
+def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        _same_file(left, right)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
 def _validate_trusted_directory(metadata: os.stat_result) -> None:
     if not stat.S_ISDIR(metadata.st_mode):
         raise RegimeShadowStoreError("shadow_store_parent_unsafe")
@@ -90,6 +99,8 @@ def _validate_signal_file(metadata: os.stat_result) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise RegimeShadowStoreError("shadow_signal_path_unsafe")
     if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise RegimeShadowStoreError("shadow_signal_path_unsafe")
+    if metadata.st_nlink != 1:
         raise RegimeShadowStoreError("shadow_signal_path_unsafe")
     if metadata.st_size > MAX_ENVELOPE_BYTES:
         raise RegimeShadowStoreError("shadow_signal_schema_invalid")
@@ -237,12 +248,13 @@ class RegimeShadowStore:
             raise RegimeShadowStoreError("shadow_signal_missing") from exc
         except OSError as exc:
             raise RegimeShadowStoreError("shadow_signal_unreadable") from exc
-        if stat.S_ISLNK(before.st_mode):
-            raise RegimeShadowStoreError("shadow_signal_path_unsafe")
+        _validate_signal_file(before)
         try:
             descriptor = os.open(
                 self.path.name,
-                _safe_open_flags(os.O_RDONLY),
+                _safe_open_flags(
+                    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                ),
                 dir_fd=parent_descriptor,
             )
         except OSError as exc:
@@ -263,6 +275,26 @@ class RegimeShadowStore:
                 chunks.append(chunk)
                 remaining -= len(chunk)
             raw = b"".join(chunks)
+            final = os.fstat(descriptor)
+            try:
+                path_after = os.stat(
+                    self.path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise RegimeShadowStoreError(
+                    "shadow_signal_path_unsafe"
+                ) from exc
+            _validate_signal_file(final)
+            _validate_signal_file(path_after)
+            if (
+                not _same_snapshot(before, after)
+                or not _same_snapshot(after, final)
+                or not _same_snapshot(final, path_after)
+                or len(raw) != final.st_size
+            ):
+                raise RegimeShadowStoreError("shadow_signal_path_unsafe")
             if len(raw) > MAX_ENVELOPE_BYTES:
                 raise RegimeShadowStoreError("shadow_signal_schema_invalid")
             return raw.decode("utf-8", errors="strict")
@@ -333,8 +365,27 @@ class RegimeShadowStore:
         }
 
 
+class RegimeShadowReader:
+    """Read-only capability projection for dashboard composition."""
+
+    __slots__ = ("path",)
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        if not self.path.name or self.path.name in {".", ".."}:
+            raise ValueError("path must identify a signal file")
+
+    def dashboard_payload(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        return RegimeShadowStore(self.path).dashboard_payload(now=now)
+
+
 __all__ = [
     "MAX_ENVELOPE_BYTES",
+    "RegimeShadowReader",
     "RegimeShadowStore",
     "RegimeShadowStoreError",
     "unavailable_dashboard_payload",

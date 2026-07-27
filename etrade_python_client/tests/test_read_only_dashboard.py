@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+from dataclasses import replace
+from email.message import Message
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Mapping
+
+import pytest
+
+from live_trading.read_only_dashboard import (
+    MAX_ARTIFACT_FUTURE_SKEW_SECONDS,
+    LOGIN_FAILURE_WINDOW_SECONDS,
+    MAX_LOGIN_FAILURES,
+    POSITIONS_READ_ONLY_MARKER,
+    ReadOnlyDashboardApplication,
+    ReadOnlyDashboardError,
+    create_server,
+    make_handler,
+)
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+
+
+def _write_application(tmp_path: Path) -> ReadOnlyDashboardApplication:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    root = private / "runtime"
+    for relative in (
+        "",
+        "state",
+        "cache",
+        "logs",
+        "artifacts",
+        "execution",
+        "data",
+        "model",
+    ):
+        directory = root / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    config = {
+        "schema_version": 1,
+        "mode": "paper",
+        "runtime_root": "runtime",
+        "strategy": {
+            "enabled": False,
+            "strategy_id": "disabled",
+            "symbols": [],
+        },
+        "data": {
+            "require_complete_snapshots": True,
+            "max_snapshot_age_seconds": 300,
+        },
+        "model": {
+            "enabled": False,
+            "required_for_entry": False,
+            "max_signal_age_seconds": 86_400,
+        },
+        "execution": {
+            "selected_account_id_key": None,
+            "account_allowlist": [],
+            "broker_mutations_enabled": False,
+        },
+        "risk": {
+            "max_order_contracts": 0,
+            "max_order_loss_cents": 0,
+            "max_account_open_risk_cents": 0,
+            "max_daily_loss_cents": 0,
+            "max_quote_age_seconds": 30,
+        },
+    }
+    config_path = private / "runtime-config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    os.chmod(config_path, 0o600)
+    return ReadOnlyDashboardApplication.from_config(
+        config_path,
+        environ={
+            "ETRADE_DASHBOARD_USER": "readonly-operator",
+            "ETRADE_DASHBOARD_PASSWORD": "correct-horse-battery-staple",
+            "ETRADE_DASHBOARD_PIN": "A9~strong",
+            "ETRADE_DASHBOARD_SESSION_SECRET": (
+                "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
+            ),
+        },
+    )
+
+
+def _request(
+    application: ReadOnlyDashboardApplication,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    headers: Mapping[str, str] | Message | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    handler_type = make_handler(application)
+    handler = object.__new__(handler_type)
+    handler.command = method
+    handler.path = path
+    handler.headers = headers if headers is not None else {}
+    handler.rfile = io.BytesIO(body or b"")
+    handler.wfile = io.BytesIO()
+    response_status: list[int] = []
+    response_headers: dict[str, str] = {}
+    handler.send_response = response_status.append
+    handler.send_header = (
+        lambda name, value: response_headers.__setitem__(
+            name.lower(),
+            value,
+        )
+    )
+    handler.end_headers = lambda: None
+    getattr(handler, f"do_{method}")()
+    return (
+        response_status[-1],
+        response_headers,
+        handler.wfile.getvalue(),
+    )
+
+
+def _raw_request(
+    application: ReadOnlyDashboardApplication,
+    method: str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | Message | None = None,
+) -> bytes:
+    handler_type = make_handler(application)
+    handler = object.__new__(handler_type)
+    handler.command = method
+    handler.path = path
+    handler.request_version = "HTTP/1.1"
+    handler.headers = headers if headers is not None else {}
+    handler.rfile = io.BytesIO()
+    handler.wfile = io.BytesIO()
+    getattr(handler, f"do_{method}")()
+    return handler.wfile.getvalue()
+
+
+def _login(application: ReadOnlyDashboardApplication) -> str:
+    payload = json.dumps(
+        {
+            "username": "readonly-operator",
+            "password": "correct-horse-battery-staple",
+        }
+    ).encode("utf-8")
+    status, headers, body = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    assert status == 200, body
+    return headers["set-cookie"].split(";", 1)[0]
+
+
+def test_login_status_positions_and_regime_are_broker_isolated(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    artifact = application.runtime.paths.positions_artifact_file
+    artifact.write_bytes(
+        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
+    )
+    os.chmod(artifact, 0o600)
+    assert "SPY Aug 21 650 Call" not in repr(
+        application.positions_snapshot()
+    )
+
+    health_status, health_headers, health_body = _request(
+        application,
+        "GET",
+        "/healthz",
+    )
+    assert health_status == 200
+    assert json.loads(health_body)["execution_enabled"] is False
+    assert "access-control-allow-origin" not in health_headers
+
+    unauthenticated, redirect_headers, _ = _request(
+        application,
+        "GET",
+        "/dashboard",
+    )
+    assert unauthenticated == 302
+    assert redirect_headers["location"] == "/login"
+    root_status, root_headers, _ = _request(application, "GET", "/")
+    assert root_status == 302
+    assert root_headers["location"] == "/login"
+
+    cookie = _login(application)
+    root_status, root_headers, _ = _request(
+        application,
+        "GET",
+        "/",
+        headers={"Cookie": cookie},
+    )
+    assert root_status == 302
+    assert root_headers["location"] == "/dashboard"
+    status, headers, template = _request(
+        application,
+        "GET",
+        "/dashboard",
+        headers={"Cookie": cookie},
+    )
+    assert status == 200
+    assert b"Broker-isolated operator view" in template
+    assert b"Execution" in template
+    assert b"V2 shadow advisory" in template
+    assert b"cannot authorize execution" in template
+    assert b'id="refresh-now"' in template
+    assert b'id="positions-frame" src="/api/positions" sandbox' in template
+    assert b"nextPositionsVersion !== positionsVersion" in template
+    assert b"/api/positions?v=" in template
+    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+    assert headers["permissions-policy"] == (
+        "camera=(), geolocation=(), microphone=(), payment=()"
+    )
+
+    status, _, body = _request(
+        application,
+        "GET",
+        "/api/status",
+        headers={"Cookie": cookie},
+    )
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["read_only"] is True
+    assert payload["execution_enabled"] is False
+    assert payload["positions"]["available"] is True
+    assert payload["regime"]["may_authorize_execution"] is False
+    assert set(payload["positions"]) == {
+        "available",
+        "modified_at",
+        "reason",
+        "sha256",
+        "size_bytes",
+        "stale",
+    }
+    assert "account" not in json.dumps(payload).lower()
+
+    status, headers, body = _request(
+        application,
+        "GET",
+        "/api/positions",
+        headers={"Cookie": cookie},
+    )
+    assert status == 200
+    assert b"SPY Aug 21 650 Call" in body
+    assert headers["x-frame-options"] == "SAMEORIGIN"
+    assert "connect-src 'none'" in headers["content-security-policy"]
+    raw = _raw_request(
+        application,
+        "GET",
+        "/api/positions",
+        headers={"Cookie": cookie},
+    )
+    raw_headers = raw.split(b"\r\n\r\n", 1)[0].lower()
+    assert raw_headers.count(b"\r\nx-frame-options:") == 1
+    assert b"\r\nx-frame-options: sameorigin" in raw_headers
+
+    status, _, body = _request(
+        application,
+        "GET",
+        "/api/regime_v2_shadow",
+        headers={"Cookie": cookie},
+    )
+    assert status == 503
+    regime = json.loads(body)
+    assert regime["available"] is False
+    assert regime["may_authorize_execution"] is False
+
+
+def test_disabled_route_rejects_before_reading_declared_body(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    cookie = _login(application)
+    status, _, body = _request(
+        application,
+        "POST",
+        "/api/execute_close_order",
+        headers={
+            "Cookie": cookie,
+            "Content-Length": "1048576",
+        },
+    )
+
+    assert status == 503
+    assert json.loads(body) == {
+        "code": "READ_ONLY_RUNTIME",
+        "error": "Trading actions are disabled.",
+        "execution_enabled": False,
+        "read_only": True,
+    }
+
+
+def test_login_rejects_wrong_duplicate_and_oversized_inputs(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    wrong = json.dumps(
+        {
+            "username": "readonly-operator",
+            "password": "wrong",
+        }
+    ).encode("utf-8")
+    status, headers, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=wrong,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(wrong)),
+        },
+    )
+    assert status == 403
+    assert "set-cookie" not in headers
+
+    duplicate = (
+        b'{"username":"readonly-operator","username":"other",'
+        b'"password":"correct-horse-battery-staple"}'
+    )
+    status, _, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=duplicate,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(duplicate)),
+        },
+    )
+    assert status == 400
+
+    status, _, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "8193",
+        },
+    )
+    assert status == 400
+
+    nested = b"[" * 1_100 + b"0" + b"]" * 1_100
+    status, _, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=nested,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(nested)),
+        },
+    )
+    assert status == 400
+
+
+def test_login_is_rate_limited_and_basic_auth_is_not_accepted(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    wrong = json.dumps(
+        {
+            "username": "readonly-operator",
+            "password": "wrong",
+        }
+    ).encode("utf-8")
+    for _ in range(MAX_LOGIN_FAILURES):
+        status, _, _ = _request(
+            application,
+            "POST",
+            "/api/login",
+            body=wrong,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(wrong)),
+            },
+        )
+        assert status == 403
+
+    status, headers, body = _request(
+        application,
+        "POST",
+        "/api/login",
+        headers={"Content-Length": "1048576"},
+    )
+    assert status == 429
+    assert headers["retry-after"] == str(LOGIN_FAILURE_WINDOW_SECONDS)
+    assert json.loads(body) == {"error": "Too many login attempts"}
+
+    basic_parent = tmp_path / "basic"
+    basic_parent.mkdir()
+    status, _, _ = _request(
+        _write_application(basic_parent),
+        "GET",
+        "/api/status",
+        headers={"Authorization": "Basic cmVhZG9ubHk6c2VjcmV0"},
+    )
+    assert status == 401
+
+
+def test_secure_cookie_requires_explicit_operator_configuration(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    payload = json.dumps(
+        {
+            "username": "readonly-operator",
+            "password": "correct-horse-battery-staple",
+        }
+    ).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(payload)),
+        "X-Forwarded-Proto": "https",
+    }
+
+    status, headers, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=payload,
+        headers=request_headers,
+    )
+    assert status == 200
+    assert "; Secure" not in headers["set-cookie"]
+    assert headers["set-cookie"].startswith(
+        f"{application.runtime.session_cookie_name}="
+    )
+
+    secure_application = replace(application, secure_cookie=True)
+    status, headers, _ = _request(
+        secure_application,
+        "POST",
+        "/api/login",
+        body=payload,
+        headers=request_headers,
+    )
+    assert status == 200
+    assert "; Secure" in headers["set-cookie"]
+
+
+def test_request_target_and_login_framing_are_strict(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    payload = json.dumps(
+        {
+            "username": "readonly-operator",
+            "password": "correct-horse-battery-staple",
+        }
+    ).encode("utf-8")
+
+    for target in ("http://[", "http://example.test/api/status"):
+        status, _, _ = _request(application, "GET", target)
+        assert status == 400
+
+    invalid_headers = (
+        {
+            "Content-Length": str(len(payload)),
+        },
+        {
+            "Content-Type": "text/plain",
+            "Content-Length": str(len(payload)),
+        },
+        {
+            "Content-Type": "application/json",
+            "Content-Length": f"0{len(payload)}",
+        },
+    )
+    for headers in invalid_headers:
+        status, _, _ = _request(
+            application,
+            "POST",
+            "/api/login",
+            body=payload,
+            headers=headers,
+        )
+        assert status == 400
+
+    duplicate_lengths = Message()
+    duplicate_lengths.add_header("Content-Type", "application/json")
+    duplicate_lengths.add_header("Content-Length", str(len(payload)))
+    duplicate_lengths.add_header("Content-Length", str(len(payload)))
+    status, _, _ = _request(
+        application,
+        "POST",
+        "/api/login",
+        body=payload,
+        headers=duplicate_lengths,
+    )
+    assert status == 400
+
+
+def test_positions_artifact_rejects_legacy_actions_and_symlinks(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    artifact = application.runtime.paths.positions_artifact_file
+    artifact.write_text(
+        f"{POSITIONS_READ_ONLY_MARKER}"
+        '<button data-close-position="legacy">Close</button>',
+        encoding="utf-8",
+    )
+    os.chmod(artifact, 0o600)
+    snapshot = application.positions_snapshot()
+    assert snapshot.available is False
+    assert snapshot.reason == "legacy_or_executable"
+
+    artifact.unlink()
+    target = tmp_path / "outside.html"
+    target.write_text(POSITIONS_READ_ONLY_MARKER, encoding="utf-8")
+    os.chmod(target, 0o600)
+    artifact.symlink_to(target)
+    snapshot = application.positions_snapshot()
+    assert snapshot.available is False
+    assert snapshot.reason == "unsafe_file"
+
+    artifact.unlink()
+    os.mkfifo(artifact, mode=0o600)
+    snapshot = application.positions_snapshot()
+    assert snapshot.available is False
+    assert snapshot.reason == "unsafe_file"
+
+
+def test_positions_artifact_open_is_nonblocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = _write_application(tmp_path)
+    artifact = application.runtime.paths.positions_artifact_file
+    artifact.write_bytes(
+        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
+    )
+    os.chmod(artifact, 0o600)
+    original_open = os.open
+    observed_flags: list[int] = []
+
+    def inspecting_open(path, flags, *args, **kwargs):
+        if path == artifact.name and kwargs.get("dir_fd") is not None:
+            observed_flags.append(flags)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "live_trading.read_only_dashboard.os.open",
+        inspecting_open,
+    )
+    assert application.positions_snapshot().available is True
+    assert observed_flags
+    assert all(
+        flags & getattr(os, "O_NONBLOCK", 0)
+        for flags in observed_flags
+    )
+
+
+def test_positions_artifact_rejects_stale_and_future_timestamps(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    artifact = application.runtime.paths.positions_artifact_file
+    artifact.write_bytes(
+        (FIXTURE_ROOT / "read_only_positions.html").read_bytes()
+    )
+    os.chmod(artifact, 0o600)
+    now = datetime.now(timezone.utc)
+
+    old = now - timedelta(
+        seconds=(
+            application.runtime.max_snapshot_age_seconds + 1
+        )
+    )
+    os.utime(artifact, (old.timestamp(), old.timestamp()))
+    stale = application.positions_snapshot(now=now)
+    assert stale.available is False
+    assert stale.stale is True
+    assert stale.reason == "stale"
+    assert stale.sha256 is not None
+    assert stale.modified_at == old.isoformat()
+
+    future = now + timedelta(
+        seconds=MAX_ARTIFACT_FUTURE_SKEW_SECONDS + 1
+    )
+    os.utime(artifact, (future.timestamp(), future.timestamp()))
+    future_snapshot = application.positions_snapshot(now=now)
+    assert future_snapshot.available is False
+    assert future_snapshot.stale is False
+    assert future_snapshot.reason == "future_timestamp"
+
+
+def test_application_and_server_reject_unsafe_capability_or_bind(
+    tmp_path: Path,
+) -> None:
+    application = _write_application(tmp_path)
+    rendered = repr(application)
+    assert "correct-horse-battery-staple" not in rendered
+    assert "A9~strong" not in rendered
+    with pytest.raises(ReadOnlyDashboardError, match="loopback"):
+        create_server(application, host="0.0.0.0")
+    with pytest.raises(ReadOnlyDashboardError, match="loopback"):
+        create_server(application, host="localhost")

@@ -47,6 +47,7 @@ EXPECTED_PACKAGE_DATA = frozenset(
         "backtesting/strategies/baseline_put_spread_catchup_refill.yaml",
         "backtesting/strategies/put_call_credit_spread.yaml",
         "live_trading/dashboard_template.html",
+        "live_trading/read_only_dashboard.html",
         "live_trading/runtime_config.example.json",
     }
 )
@@ -62,6 +63,7 @@ EXPECTED_WHEEL_METADATA = frozenset(
         "METADATA",
         "RECORD",
         "WHEEL",
+        "entry_points.txt",
         "top_level.txt",
     }
 )
@@ -70,6 +72,7 @@ EXPECTED_EGG_INFO = frozenset(
         "etrade_python_client/etrade_quant_trading.egg-info/PKG-INFO",
         "etrade_python_client/etrade_quant_trading.egg-info/SOURCES.txt",
         "etrade_python_client/etrade_quant_trading.egg-info/dependency_links.txt",
+        "etrade_python_client/etrade_quant_trading.egg-info/entry_points.txt",
         "etrade_python_client/etrade_quant_trading.egg-info/requires.txt",
         "etrade_python_client/etrade_quant_trading.egg-info/top_level.txt",
     }

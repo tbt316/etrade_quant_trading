@@ -139,10 +139,14 @@ def test_package_data_contract_is_explicit_and_complete() -> None:
         "backtesting": ["strategies/*.yaml"],
         "live_trading": [
             "dashboard_template.html",
+            "read_only_dashboard.html",
             "runtime_config.example.json",
         ],
     }
     assert (SOURCE_ROOT / "live_trading" / "dashboard_template.html").is_file()
+    assert (
+        SOURCE_ROOT / "live_trading" / "read_only_dashboard.html"
+    ).is_file()
     assert (
         SOURCE_ROOT
         / "live_trading"
@@ -156,6 +160,17 @@ def test_package_data_contract_is_explicit_and_complete() -> None:
         "baseline_put_spread_catchup_refill.yaml",
         "put_call_credit_spread.yaml",
     ]
+
+
+def test_operator_entry_points_are_explicit_and_broker_isolated() -> None:
+    scripts = _pyproject()["project"]["scripts"]
+
+    assert scripts == {
+        "etrade-read-only-dashboard": (
+            "live_trading.read_only_dashboard:main"
+        ),
+        "etrade-runtime-config": "live_trading.runtime_config:main",
+    }
 
 
 def test_local_packages_do_not_shadow_third_party_yfinance() -> None:

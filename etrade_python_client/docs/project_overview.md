@@ -149,6 +149,11 @@ flowchart LR
     ACCOUNT["Exact Account Selection<br/>and Refresh Revalidation"]
     DASHCFG["Strong Dashboard Credentials<br/>Owner-Only Settings and Logs"]
     DASH["Loopback-Only Read-Only Dashboard<br/>No Execution Controls or Mutation Queue"]
+    RCONFIG["runtime_config.py<br/>(Typed Paths, Disabled-by-Default Mode)"]
+    DSECRETS["Dashboard-Only Environment Secrets<br/>(No Broker Credentials or PIN)"]
+    RODASH["read_only_dashboard.py<br/>(Broker-Isolated Operator Plane)"]
+    POSITIONS[("Runtime Positions Artifact<br/>(Owner-Only, Static, Read-Only HTML)")]
+    SHADOW[("Runtime Regime V2 Signal<br/>(Owner-Only, Shadow-Only JSON)")]
     LEGACY["Legacy Mutation Surfaces<br/>(Unconditional Tombstones)"]
     STATIC["Tracked-Source Mutation Gate<br/>(CI + Local Checker)"]
     DEPLOY["Install / Restart<br/>(Suspended)"]
@@ -164,6 +169,10 @@ flowchart LR
     ARM --> SAFE
     SAFE --> OAUTH --> ACCOUNT
     DASHCFG --> DASH
+    RCONFIG --> RODASH
+    DSECRETS --> RODASH
+    POSITIONS --> RODASH
+    SHADOW --> RODASH
     ACCOUNT --> LEGACY
     DASH --> LEGACY
     STATIC --> LEGACY
@@ -204,6 +213,19 @@ account risk. Partial/replacement/assignment states, cancellation/closing
 protocols, the single live composition root, a pure full pre-trade risk policy,
 and operational migration remain mandatory before live wiring. The deployed
 service has not been restarted or inspected with R6 or R7.
+
+R8e-A adds a separate packaged operator process rather than composing unarmed
+production through the legacy agent. It validates typed configuration and all
+owner-only runtime directories before resolving three dashboard-only
+environment secrets, imports no broker/provider client, binds only
+`127.0.0.1`, and serves descriptor-verified static position and Regime V2
+artifacts. Login is rate-limited, sessions are bounded and HMAC-signed, legacy
+mutation routes remain fixed failures, and malformed, stale, future-dated,
+changing, linked, nonregular, oversized, or executable artifacts fail closed.
+No production publisher writes the new positions path yet; the legacy
+interactive renderer is not compatible with this static CSP. The operator
+plane therefore remains an isolated acceptance surface until the read-only
+publisher migration lands.
 
 ---
 
@@ -253,8 +275,10 @@ shadow/research-only and cannot affect E*TRADE order eligibility.
 *   **Durable E*TRADE Reader** ([`etrade_broker_reader.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_reader.py)): R7d performs only exact origin-pinned, no-retry GETs in bounded disposable processes. R7e adds exact per-leg fill quantities/timestamps and requests `lotsRequired=true`; position lots retain order and leg identity, signed quantities, and canonical provenance across both stability scans. Known-order reconciliation still uses only a direct lookup of the durable broker order ID; missing, incomplete, ambiguous, or mismatched evidence remains blocked.
 *   **Legacy Mutation Quarantine** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py), [`check_etrade_mutation_boundary.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scripts/check_etrade_mutation_boundary.py)): R7f makes every known legacy order, scheduler, close, repricing, and cancellation surface an exact unconditional tombstone. CI scans every tracked application Python file, including tracked scratch, for raw mutation I/O, request literals, forbidden transport access, reflection, and tombstone drift.
 *   **Read-Only Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py), [`dashboard_template.html`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/dashboard_template.html)): Serves the dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. The UI has no execute/close/neutralize controls, persisted auto-open is forced off, and five historical execution routes reject before body parsing or side effects. Current generated positions are frameable only by the same-origin dashboard and label every position read-only; missing, oversized, or pre-containment artifacts become a fixed `503` fallback whose CSP disables scripts, network connections, and form actions.
+*   **Typed Runtime Configuration** ([`runtime_config.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_config.py), [`runtime_configuration.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/runtime_configuration.md)): R8d defines one strict, credential-free startup document for mode, account allowlist, disabled-by-default strategy/execution, risk ceilings, and a single runtime root. Derived state paths are absolute and configuration-relative; directories are pre-provisioned owner-only. Full execution secrets and the narrower dashboard-only environment resolver are separate APIs.
+*   **Broker-Isolated Operator Plane** ([`runtime_composition.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_composition.py), [`read_only_dashboard.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/read_only_dashboard.py), [`read_only_dashboard.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/read_only_dashboard.md)): R8e-A is a standalone loopback service with an explicit console entry point. It reads no broker credentials or action PIN, imports no broker/provider capability, exposes only authenticated status/static-artifact reads, rate-limits login, and rejects every mutation surface. Descriptor-relative readers require one fresh owner-only regular inode and revalidate identity and metadata after bounded nonblocking reads. The new positions publisher is intentionally still pending.
 *   **Repository Index Hygiene** ([`check_repo_hygiene.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scripts/check_repo_hygiene.py)): R8a removes 1,531 generated/runtime paths from tracking while preserving their local files. A dependency-free pre-install CI gate reads NUL-delimited Git index paths and rejects ignored tracked content plus explicit virtual-environment, package-metadata, secret/state, cache/database, log, document, and backup artifacts.
-*   **Canonical Package and Dependency Locks** ([`pyproject.toml`](file:///Users/btian/EtradePythonClient/pyproject.toml), [`requirements/README.md`](file:///Users/btian/EtradePythonClient/requirements/README.md)): R8b makes `etrade_python_client/` the sole source root, explicitly allowlists ten flat compatibility packages, includes only the dashboard template and strategy YAML data, removes local `accounts`/`yfinance` collisions and legacy package inputs, pins CPython 3.10.20, and commits hash-locked runtime/test graphs. Polygon modules import without a credential or network call and fail only when a client is explicitly constructed without a key.
+*   **Canonical Package and Dependency Locks** ([`pyproject.toml`](file:///Users/btian/EtradePythonClient/pyproject.toml), [`requirements/README.md`](file:///Users/btian/EtradePythonClient/requirements/README.md)): R8b makes `etrade_python_client/` the sole source root, explicitly allowlists ten flat compatibility packages, removes local `accounts`/`yfinance` collisions and legacy package inputs, pins CPython 3.10.20, and commits hash-locked runtime/test graphs. Package data is explicit: strategy YAML, the legacy contained dashboard, the broker-isolated dashboard, and the credential-free runtime example. Polygon modules import without a credential or network call and fail only when a client is explicitly constructed without a key.
 *   **Artifact-First Offline CI** ([`ci.yml`](file:///Users/btian/EtradePythonClient/.github/workflows/ci.yml), [`check_release_artifacts.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scripts/check_release_artifacts.py)): R8c builds reproducible wheel and sdist artifacts on a fixed runner with immutable action SHAs, compares every distributed source/data byte with the committed Git tree, verifies wheel RECORD and distribution metadata, rejects archive links, unsafe paths, unreviewed package roots, tests, scratch, and local state, and rebuilds the same wheel from the inspected sdist. Clean-runtime smoke removes build-only installers and runs with a whitelisted environment; it and the functional tests execute from installed artifacts as the non-root runner in a loopback-only Linux network namespace. Repository-policy tests remain a separate source-aware gate.
 *   **Immutable Sync-Only Snapshot** ([`sync_to_pi.sh`](file:///Users/btian/EtradePythonClient/etrade_python_client/deploy/sync_to_pi.sh)): Remote restart remains disabled. Code-only synchronization rejects tracked changes and archives one resolved `HEAD` commit into an owner-only temporary directory before rsync, preventing ignored or untracked working-tree scripts from entering a transfer. Versioned atomic activation is still required before deployment can be re-enabled.
 *   **Credential Source Cleanup** ([`etrade_check_option.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_check_option.py), [`etrade_option_chains.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_option_chains.py)): Removes hardcoded OAuth credentials from the current source and requires local configuration or environment variables. Because the repository is currently public and those values remain in Git history, the affected keys must be treated as compromised until they are revoked and rotated externally; a coordinated history purge remains separate follow-up work.

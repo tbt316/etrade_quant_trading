@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Read-only position fixture</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      color: #e7eef8;
+      background: #0f172a;
+    }
+    body { margin: 0; padding: 18px; }
+    .notice {
+      margin-bottom: 16px;
+      padding: 11px 13px;
+      color: #b6f6df;
+      background: #0b322d;
+      border: 1px solid #2a6c5a;
+      border-radius: 10px;
+    }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      min-width: 720px;
+      border-collapse: collapse;
+      background: #111f32;
+      border: 1px solid #2b3e58;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 11px 13px;
+      text-align: right;
+      border-bottom: 1px solid #263951;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    th {
+      color: #9fb1c7;
+      background: #15263b;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .positive { color: #49d6a2; }
+    .negative { color: #fb7185; }
+  </style>
+</head>
+<body>
+  <div class="notice">
+    <strong>Read only — all E*TRADE order actions are disabled</strong>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Position</th>
+          <th>Quantity</th>
+          <th>Last</th>
+          <th>Market value</th>
+          <th>Day P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>SPY</td>
+          <td>100</td>
+          <td>$638.42</td>
+          <td>$63,842.00</td>
+          <td class="positive">+$284.00</td>
+        </tr>
+        <tr>
+          <td>SPY Aug 21 650 Call</td>
+          <td>-1</td>
+          <td>$3.16</td>
+          <td>-$316.00</td>
+          <td class="negative">-$22.00</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

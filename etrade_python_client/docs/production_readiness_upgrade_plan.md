@@ -568,6 +568,26 @@ state, arms, databases, and logs remain excluded from release artifacts. R8d
 does not compose the durable gateway and does not change the R7f mutation
 quarantine.
 
+R8e-A composes the first supported process from that contract: a standalone
+read-only operator plane that validates directories before secrets, reads only
+three dashboard environment variables, retains no broker credentials or
+action PIN, and imports no OAuth, broker, provider, or order client. It binds
+only numeric IPv4 loopback, rate-limits login, signs password-bound sessions,
+emits redacted structured request logs, and serves bounded
+descriptor-verified position and Regime V2 artifacts. Artifact reads are
+nonblocking and reject links, nonregular files, unsafe ownership/mode/link
+count, replacement races, concurrent writes, stale or future timestamps,
+oversized bytes, and legacy action markers. Release artifacts expose explicit
+operator entry points and verify the read-only import boundary from an empty
+working directory.
+
+R8e-A is not the complete dashboard migration. Current production code still
+writes the legacy CWD position artifact, and that renderer contains scripts
+which the static read-only frame correctly blocks. R8e-B must provide a pure
+static publisher targeting `RuntimePaths.positions_artifact_file`, with atomic
+owner-only writes and exact served-artifact visual verification. No order
+gateway or live service is composed by R8e-A.
+
 Deliver:
 
 1. Choose one package root and one `../pyproject.toml`; remove legacy

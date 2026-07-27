@@ -61,6 +61,10 @@ test = [
     "pytest==8.4.2",
 ]
 
+[project.scripts]
+etrade-read-only-dashboard = "live_trading.read_only_dashboard:main"
+etrade-runtime-config = "live_trading.runtime_config:main"
+
 [tool.setuptools]
 package-dir = {"" = "etrade_python_client"}
 packages = [
@@ -79,7 +83,11 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 backtesting = ["strategies/*.yaml"]
-live_trading = ["dashboard_template.html", "runtime_config.example.json"]
+live_trading = [
+  "dashboard_template.html",
+  "read_only_dashboard.html",
+  "runtime_config.example.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["etrade_python_client/tests"]

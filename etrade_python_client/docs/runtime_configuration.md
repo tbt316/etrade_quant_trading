@@ -200,12 +200,15 @@ mode has no broker:
   "etrade_password": null,
   "dashboard_username": "local-operator",
   "dashboard_password": "replace-with-a-long-random-value",
-  "dashboard_pin": "replace-with-8-to-64-random-digits",
-  "dashboard_session_secret": "replace-with-at-least-32-random-characters"
+  "dashboard_pin": "replace-with-8-to-64-random-characters",
+  "dashboard_session_secret": "replace-with-at-least-43-random-characters"
 }
 ```
 
 These strings are illustrative placeholders, not usable credentials.
+Generate the dashboard session key from a cryptographic random source, for
+example `secrets.token_urlsafe(32)`, and rotate it with the dashboard password
+so every existing stateless session is invalidated.
 
 `ETRADE_PRODUCTION_ARMING_SECRET` remains environment-only. It is never valid
 in the runtime configuration or local fallback, and it must not be supplied on
@@ -242,6 +245,35 @@ Use `--check-secrets` only in the service environment that supplies the
 credential variables. The command prints non-secret mode, path, schema, and
 source-hash evidence; it never prints account identifiers or secret values.
 
+The broker-isolated dashboard has a narrower check:
+
+```bash
+python -m live_trading.runtime_config validate \
+  --config /path/to/private/etrade/runtime_config.json \
+  --check-directories \
+  --check-dashboard-secrets
+```
+
+That path reads only `ETRADE_DASHBOARD_USER`,
+`ETRADE_DASHBOARD_PASSWORD`, and
+`ETRADE_DASHBOARD_SESSION_SECRET`. It never reads the combined fallback,
+broker credential variables, or `ETRADE_DASHBOARD_PIN`.
+
 The release gate verifies that the credential-free example is present in both
 the wheel and source distribution, matches the committed bytes, parses through
 the installed runtime module, and produces no working-directory state.
+
+## Read-only composition
+
+The supported operator-plane composition is
+[`read_only_dashboard.py`](../live_trading/read_only_dashboard.py). It validates
+configuration, directories, and dashboard-only secrets before opening a
+listening socket, and
+it constructs no OAuth, broker, market-data, model, or order collaborator.
+Dashboard credentials remain immutable and are not stored in or editable
+through legacy live settings. The operator process never reads or retains
+E*TRADE credentials or the unused action PIN.
+
+See [`read_only_dashboard.md`](read_only_dashboard.md) for provisioning,
+startup, endpoint, and artifact-integrity details. This read-only service does
+not make the isolated durable order stack live-ready.

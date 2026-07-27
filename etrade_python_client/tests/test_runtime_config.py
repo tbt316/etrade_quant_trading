@@ -21,6 +21,7 @@ from live_trading.runtime_config import (
     RuntimeConfigError,
     load_runtime_config,
     main as runtime_config_main,
+    resolve_dashboard_secrets,
     resolve_runtime_secrets,
     validate_runtime_directories,
 )
@@ -167,7 +168,7 @@ def _secret_document(**overrides: object) -> dict[str, object]:
         "etrade_password": "broker-password-value",
         "dashboard_username": "dashboard-operator",
         "dashboard_password": "correct-horse-battery-staple",
-        "dashboard_pin": "24681357",
+        "dashboard_pin": "A9~strong",
         "dashboard_session_secret": "session-secret-value-with-at-least-32-characters",
     }
     document.update(overrides)
@@ -181,7 +182,7 @@ def _environment_secrets(
     environment = {
         "ETRADE_DASHBOARD_USER": "environment-operator",
         "ETRADE_DASHBOARD_PASSWORD": "environment-password-value",
-        "ETRADE_DASHBOARD_PIN": "13572468",
+        "ETRADE_DASHBOARD_PIN": "B7!runtime",
         "ETRADE_DASHBOARD_SESSION_SECRET": (
             "environment-session-secret-with-at-least-32-characters"
         ),
@@ -954,6 +955,80 @@ class RuntimePathAndFilesystemTests(unittest.TestCase):
 
 
 class RuntimeSecretTests(unittest.TestCase):
+    def test_dashboard_secret_resolver_is_environment_only_and_least_privilege(
+        self,
+    ):
+        accessed: list[str] = []
+
+        class RecordingEnvironment(dict[str, str]):
+            def get(self, key, default=None):
+                accessed.append(key)
+                if key.startswith("ETRADE_LIVE_") or key in {
+                    "ETRADE_USER",
+                    "ETRADE_PASS",
+                    "ETRADE_DASHBOARD_PIN",
+                }:
+                    raise AssertionError(f"unexpected secret read: {key}")
+                return super().get(key, default)
+
+        environment = RecordingEnvironment(_environment_secrets())
+        secrets = resolve_dashboard_secrets(environ=environment)
+
+        self.assertEqual(secrets.username, "environment-operator")
+        self.assertEqual(
+            secrets.password,
+            "environment-password-value",
+        )
+        self.assertEqual(secrets.source, "environment")
+        self.assertEqual(
+            accessed,
+            [
+                "ETRADE_DASHBOARD_USER",
+                "ETRADE_DASHBOARD_PASSWORD",
+                "ETRADE_DASHBOARD_SESSION_SECRET",
+            ],
+        )
+        for value in (
+            secrets.username,
+            secrets.password,
+            secrets.session_secret,
+        ):
+            self.assertNotIn(value, repr(secrets))
+        with self.assertRaises(FrozenInstanceError):
+            secrets.password = "replacement-password"
+
+    def test_dashboard_secret_resolver_rejects_missing_or_weak_values(self):
+        invalid = (
+            {},
+            {
+                "ETRADE_DASHBOARD_USER": "admin",
+                "ETRADE_DASHBOARD_PASSWORD": (
+                    "environment-password-value"
+                ),
+                "ETRADE_DASHBOARD_SESSION_SECRET": (
+                    "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
+                ),
+            },
+            {
+                "ETRADE_DASHBOARD_USER": "environment-operator",
+                "ETRADE_DASHBOARD_PASSWORD": "short",
+                "ETRADE_DASHBOARD_SESSION_SECRET": (
+                    "test-session-secret-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R"
+                ),
+            },
+            {
+                "ETRADE_DASHBOARD_USER": "environment-operator",
+                "ETRADE_DASHBOARD_PASSWORD": (
+                    "environment-password-value"
+                ),
+                "ETRADE_DASHBOARD_SESSION_SECRET": "s" * 64,
+            },
+        )
+        for environment in invalid:
+            with self.subTest(environment=environment):
+                with self.assertRaises(RuntimeConfigError):
+                    resolve_dashboard_secrets(environ=environment)
+
     def test_complete_environment_is_authoritative_and_repr_is_redacted(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -1074,6 +1149,12 @@ class RuntimeSecretTests(unittest.TestCase):
         placeholder["ETRADE_DASHBOARD_PASSWORD"] = "changeme"
         invalid_environments.append(("placeholder secret", placeholder))
 
+        repeated_session_key = _environment_secrets()
+        repeated_session_key["ETRADE_DASHBOARD_SESSION_SECRET"] = "s" * 64
+        invalid_environments.append(
+            ("low-diversity dashboard session secret", repeated_session_key)
+        )
+
         with tempfile.TemporaryDirectory() as temporary:
             config = load_runtime_config(_write_config(Path(temporary)))
             for label, environment in invalid_environments:
@@ -1190,6 +1271,7 @@ class RuntimeConfigCliAndExampleTests(unittest.TestCase):
                 str(config_path),
                 "--check-directories",
                 "--check-secrets",
+                "--check-dashboard-secrets",
             ]
 
             missing_directories = subprocess.run(

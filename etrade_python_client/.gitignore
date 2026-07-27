@@ -27,6 +27,9 @@ dashboard_requests.log
 # Plots and HTML outputs
 *.html
 !live_trading/dashboard_template.html
+!live_trading/read_only_dashboard.html
+!tests/fixtures/read_only_positions.html
+!tests/fixtures/read_only_positions_updated.html
 *.png
 option_value_plot/
 

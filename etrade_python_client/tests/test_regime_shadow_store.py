@@ -163,6 +163,49 @@ class RegimeShadowStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RegimeShadowStoreError, "shadow_signal_path_unsafe"):
                 self.store.load(now=_utc("2025-04-03T20:16:00Z"))
 
+    def test_fifo_hardlink_and_blocking_open_fail_closed(self):
+        os.mkfifo(self.path, mode=0o600)
+        payload = self.store.dashboard_payload(
+            now=_utc("2025-04-03T20:16:00Z")
+        )
+        self.assertEqual(payload["reason_codes"], ["invalid"])
+
+        self.path.unlink()
+        target = self.path.parent / "hardlink-target.json"
+        target.write_text("{}", encoding="utf-8")
+        os.chmod(target, 0o600)
+        os.link(target, self.path)
+        with self.assertRaisesRegex(
+            RegimeShadowStoreError,
+            "shadow_signal_path_unsafe",
+        ):
+            self.store.load(now=_utc("2025-04-03T20:16:00Z"))
+
+        self.path.unlink()
+        target.unlink()
+        self.store.publish(_signal())
+        original_open = os.open
+        observed_flags = []
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            if path == self.path.name and dir_fd is not None:
+                observed_flags.append(flags)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with patch.object(
+            shadow_store_module.os,
+            "open",
+            side_effect=inspect_open,
+        ):
+            self.store.load(now=_utc("2025-04-03T20:16:00Z"))
+        self.assertTrue(observed_flags)
+        self.assertTrue(
+            all(
+                flags & getattr(os, "O_NONBLOCK", 0)
+                for flags in observed_flags
+            )
+        )
+
     def test_publish_rejects_non_signal_or_execution_capable_subclass(self):
         with self.assertRaises(TypeError):
             self.store.publish(object())

@@ -284,6 +284,19 @@ class RuntimeSecrets:
         return f"RuntimeSecrets(configured_fields={configured!r}, source={self.source!r})"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class DashboardSecrets:
+    """Least-privilege credentials for the read-only operator process."""
+
+    username: str
+    password: str
+    session_secret: str
+    source: str
+
+    def __repr__(self) -> str:
+        return f"DashboardSecrets(source={self.source!r}, values=[REDACTED])"
+
+
 def _reject_constant(value: str) -> None:
     raise RuntimeConfigError(f"non-finite JSON number is forbidden: {value}")
 
@@ -949,33 +962,23 @@ def _validate_secret_values(
         raise RuntimeConfigError(
             f"required runtime secrets are missing: {sorted(missing)}"
         )
-    for name in required:
-        value = values[name]
-        assert value is not None
-        _text(value, f"runtime secret {name}", maximum=4096)
-        if value.strip().lower() in _PLACEHOLDER_SECRETS:
-            raise RuntimeConfigError(f"runtime secret {name} is a placeholder")
-    username = values["dashboard_username"]
-    password = values["dashboard_password"]
+    _validate_secret_strings(values, required)
+    _validate_dashboard_credentials(values)
     pin = values["dashboard_pin"]
-    session_secret = values["dashboard_session_secret"]
-    assert username is not None
-    assert password is not None
     assert pin is not None
-    assert session_secret is not None
-    if username.lower() in {"admin", "etrade", "user"}:
-        raise RuntimeConfigError("dashboard username is a reserved default")
-    if len(password) < 16:
-        raise RuntimeConfigError("dashboard password is too short")
     if (
         not 8 <= len(pin) <= 64
-        or not pin.isdigit()
         or len(set(pin)) == 1
-        or pin in {"12345678", "87654321"}
+        or pin.lower()
+        in {
+            "00000000",
+            "12345678",
+            "87654321",
+            "changeme",
+            "password",
+        }
     ):
         raise RuntimeConfigError("dashboard PIN is weak")
-    if len(session_secret) < 32:
-        raise RuntimeConfigError("dashboard session secret is too short")
     if config.broker_environment is not None:
         for name in (
             "etrade_consumer_key",
@@ -987,6 +990,73 @@ def _validate_secret_values(
             assert value is not None
             if len(value) < 8:
                 raise RuntimeConfigError(f"runtime secret {name} is too short")
+
+
+def _validate_secret_strings(
+    values: Mapping[str, str | None],
+    names: tuple[str, ...],
+) -> None:
+    for name in names:
+        value = values[name]
+        assert value is not None
+        _text(value, f"runtime secret {name}", maximum=4096)
+        if value.strip().lower() in _PLACEHOLDER_SECRETS:
+            raise RuntimeConfigError(f"runtime secret {name} is a placeholder")
+
+
+def _validate_dashboard_credentials(
+    values: Mapping[str, str | None],
+) -> None:
+    username = values["dashboard_username"]
+    password = values["dashboard_password"]
+    session_secret = values["dashboard_session_secret"]
+    assert username is not None
+    assert password is not None
+    assert session_secret is not None
+    if username.lower() in {"admin", "etrade", "user"}:
+        raise RuntimeConfigError("dashboard username is a reserved default")
+    if len(password) < 16 or len(set(password)) < 8:
+        raise RuntimeConfigError("dashboard password is weak")
+    if len(session_secret) < 43 or len(set(session_secret)) < 12:
+        raise RuntimeConfigError("dashboard session secret is weak")
+
+
+def resolve_dashboard_secrets(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> DashboardSecrets:
+    """Resolve only credentials needed by the broker-isolated dashboard.
+
+    This intentionally has no owner-file fallback: the read-only process never
+    opens the combined broker secret document or reads broker environment keys.
+    """
+
+    environment = os.environ if environ is None else environ
+    values = {
+        "dashboard_username": environment.get("ETRADE_DASHBOARD_USER"),
+        "dashboard_password": environment.get("ETRADE_DASHBOARD_PASSWORD"),
+        "dashboard_session_secret": environment.get(
+            "ETRADE_DASHBOARD_SESSION_SECRET"
+        ),
+    }
+    required = (
+        "dashboard_username",
+        "dashboard_password",
+        "dashboard_session_secret",
+    )
+    missing = [name for name in required if not values.get(name)]
+    if missing:
+        raise RuntimeConfigError(
+            f"required dashboard secrets are missing: {sorted(missing)}"
+        )
+    _validate_secret_strings(values, required)
+    _validate_dashboard_credentials(values)
+    return DashboardSecrets(
+        username=values["dashboard_username"] or "",
+        password=values["dashboard_password"] or "",
+        session_secret=values["dashboard_session_secret"] or "",
+        source="environment",
+    )
 
 
 def resolve_runtime_secrets(
@@ -1046,6 +1116,7 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True, type=Path)
     validate.add_argument("--check-directories", action="store_true")
     validate.add_argument("--check-secrets", action="store_true")
+    validate.add_argument("--check-dashboard-secrets", action="store_true")
     return parser
 
 
@@ -1057,6 +1128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_runtime_directories(config.paths)
         if args.check_secrets:
             resolve_runtime_secrets(config)
+        if args.check_dashboard_secrets:
+            resolve_dashboard_secrets()
     except RuntimeConfigError as exc:
         print(f"runtime configuration invalid: {exc}", file=sys.stderr)
         return 2
@@ -1084,6 +1157,7 @@ if __name__ == "__main__":
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "AccountIdentity",
+    "DashboardSecrets",
     "DataConfig",
     "ExecutionConfig",
     "ModelConfig",
@@ -1095,6 +1169,7 @@ __all__ = [
     "StrategyConfig",
     "load_runtime_config",
     "main",
+    "resolve_dashboard_secrets",
     "resolve_runtime_secrets",
     "validate_runtime_directories",
 ]

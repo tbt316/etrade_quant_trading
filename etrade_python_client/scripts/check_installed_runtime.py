@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.resources
-import stat
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -23,6 +25,11 @@ PACKAGE_ROOTS = (
     "polygonio",
     "strategies",
 )
+READ_ONLY_MODULES = (
+    "live_trading.read_only_dashboard",
+    "live_trading.runtime_composition",
+    "live_trading.runtime_config",
+)
 SUPPORTED_MODULES = (
     "accounts.accounts_bo",
     "backtesting.backtest_runner",
@@ -31,12 +38,27 @@ SUPPORTED_MODULES = (
     "live_trading.etrade_cover_call_new",
     "live_trading.etrade_put_credit_spread",
     "live_trading.regime_detector_v2",
-    "live_trading.runtime_config",
     "live_trading.runtime_safety",
     "market.market_bo",
     "order.order_bo",
     "polygonio.poly_client",
     "strategies.strategies",
+)
+FORBIDDEN_READ_ONLY_IMPORT_PREFIXES = (
+    "accounts.accounts_bo",
+    "aiohttp",
+    "core_api.stock_trade_class",
+    "data_and_research.polygonio_config",
+    "live_trading.etrade_broker_transport",
+    "live_trading.etrade_cover_call_new",
+    "live_trading.etrade_order_gateway",
+    "live_trading.order_intent_ledger",
+    "order.order_bo",
+    "polygonio.poly_client",
+    "pyetrade",
+    "rauth",
+    "requests",
+    "yfinance",
 )
 FORBIDDEN_RUNTIME_DISTRIBUTIONS = (
     "pip",
@@ -72,7 +94,75 @@ def main() -> int:
         raise RuntimeSmokeError(
             "installed runtime smoke requires an empty working directory"
         )
-    for name in (*PACKAGE_ROOTS, *SUPPORTED_MODULES):
+    for name in (*PACKAGE_ROOTS, *READ_ONLY_MODULES):
+        _installed_module(name, source_root)
+    runtime_example = importlib.resources.files("live_trading").joinpath(
+        "runtime_config.example.json"
+    )
+    if not runtime_example.is_file():
+        raise RuntimeSmokeError(
+            "installed runtime-configuration example is missing"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix=".read-only-smoke-",
+        dir=working_directory,
+    ) as temporary:
+        private = Path(temporary)
+        config_path = private / "runtime-config.json"
+        shutil.copyfile(runtime_example, config_path)
+        os.chmod(config_path, 0o600)
+        runtime_root = private / "runtime"
+        for relative in (
+            "",
+            "state",
+            "cache",
+            "logs",
+            "artifacts",
+            "execution",
+            "data",
+            "model",
+        ):
+            directory = runtime_root / relative
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
+        from live_trading.read_only_dashboard import (
+            ReadOnlyDashboardApplication,
+        )
+
+        application = ReadOnlyDashboardApplication.from_config(
+            config_path,
+            environ={
+                "ETRADE_DASHBOARD_USER": "runtime-smoke-operator",
+                "ETRADE_DASHBOARD_PASSWORD": (
+                    "runtime-smoke-password-value"
+                ),
+                "ETRADE_DASHBOARD_SESSION_SECRET": (
+                    "runtime-smoke-4Vf7q2Zw9Lm5Nx3Bc6Hd0P8R7Ts1Qa"
+                ),
+            },
+        )
+        if (
+            application.runtime.broker_mutations_enabled
+            or hasattr(application.runtime, "config")
+            or hasattr(application.runtime.regime_shadow_reader, "publish")
+        ):
+            raise RuntimeSmokeError(
+                "read-only composition retained an unsafe capability"
+            )
+    forbidden_imports = sorted(
+        name
+        for name in sys.modules
+        if any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in FORBIDDEN_READ_ONLY_IMPORT_PREFIXES
+        )
+    )
+    if forbidden_imports:
+        raise RuntimeSmokeError(
+            "read-only runtime imported broker or provider capability: "
+            f"{forbidden_imports}"
+        )
+    for name in SUPPORTED_MODULES:
         _installed_module(name, source_root)
 
     distribution = importlib.metadata.distribution("etrade-quant-trading")
@@ -94,12 +184,12 @@ def main() -> int:
     )
     if not dashboard.is_file():
         raise RuntimeSmokeError("installed dashboard template is missing")
-    runtime_example = importlib.resources.files("live_trading").joinpath(
-        "runtime_config.example.json"
+    read_only_dashboard = importlib.resources.files("live_trading").joinpath(
+        "read_only_dashboard.html"
     )
-    if not runtime_example.is_file():
+    if not read_only_dashboard.is_file():
         raise RuntimeSmokeError(
-            "installed runtime-configuration example is missing"
+            "installed read-only dashboard template is missing"
         )
     from live_trading.runtime_config import (
         CONFIG_SCHEMA_VERSION,
@@ -135,28 +225,19 @@ def main() -> int:
             f"installed strategy payload differs: {strategies}"
         )
 
-    created_entries = set(working_directory.iterdir()) - initial_entries
-    allowed_logs = {"etrade_trader.log", "python_client.log"}
-    unexpected = sorted(
-        path.name for path in created_entries if path.name not in allowed_logs
+    created_entries = sorted(
+        path.name
+        for path in set(working_directory.iterdir()) - initial_entries
     )
-    if unexpected:
+    if created_entries:
         raise RuntimeSmokeError(
-            f"runtime imports created unexpected paths: {unexpected}"
+            f"runtime imports created paths: {created_entries}"
         )
-    for path in created_entries:
-        metadata = path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise RuntimeSmokeError(
-                f"runtime import log is not owner-only regular file: {path}"
-            )
 
     print(
         "installed runtime smoke passed: "
-        f"{len(PACKAGE_ROOTS)} roots, {len(SUPPORTED_MODULES)} modules"
+        f"{len(PACKAGE_ROOTS)} roots, "
+        f"{len(READ_ONLY_MODULES) + len(SUPPORTED_MODULES)} modules"
     )
     return 0
 
