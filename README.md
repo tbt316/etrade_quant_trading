@@ -42,15 +42,52 @@ The default suite is deterministic and must not call brokers or market-data
 providers:
 
 ```bash
+set -euo pipefail
+umask 022
 python etrade_python_client/scripts/check_repo_hygiene.py
 python etrade_python_client/scripts/check_etrade_mutation_boundary.py
-python -m pytest -q etrade_python_client/tests
-python -m build --sdist --wheel --no-isolation
+PYTHONPATH=etrade_python_client python -m pytest -q -m "not integration" \
+  etrade_python_client/tests/test_etrade_mutation_boundary.py \
+  etrade_python_client/tests/test_repo_hygiene.py
+
+release_source="$(mktemp -d)"
+release_dist="$(mktemp -d)"
+sdist_source="$(mktemp -d)"
+sdist_dist="$(mktemp -d)"
+git archive --format=tar HEAD | tar -xf - -C "$release_source"
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+python -m build --sdist --wheel --no-isolation \
+  --outdir "$release_dist" "$release_source"
+python etrade_python_client/scripts/normalize_sdist.py \
+  --sdist "$release_dist"/*.tar.gz \
+  --epoch "$SOURCE_DATE_EPOCH"
+python etrade_python_client/scripts/check_release_artifacts.py \
+  --dist-dir "$release_dist" \
+  --repository-root . \
+  --git-revision HEAD
+tar -xzf "$release_dist"/*.tar.gz \
+  --strip-components=1 \
+  -C "$sdist_source"
+python -m build --wheel --no-isolation \
+  --outdir "$sdist_dist" "$sdist_source"
+cmp "$release_dist"/*.whl "$sdist_dist"/*.whl
+python -m pip install --no-deps --no-build-isolation "$release_dist"/*.whl
+env -u PYTHONPATH ETRADE_TEST_ARTIFACT=1 ETRADE_TEST_NETWORK=deny \
+  python -m pytest -q -m "not integration" etrade_python_client/tests \
+  --ignore=etrade_python_client/tests/test_etrade_mutation_boundary.py \
+  --ignore=etrade_python_client/tests/test_repo_hygiene.py
 ```
 
-CI runs the same checks on CPython 3.10.20. Network, broker, and provider tests
-must be explicitly marked as integration tests and are never part of the
-default gate.
+CI runs the same artifact-first checks on CPython 3.10.20. It audits the wheel
+and sdist against the exact committed Git blobs, verifies wheel integrity and
+metadata, rebuilds the wheel from the inspected sdist, and proves runtime
+imports come from the installed artifact. CI runs the smoke and functional
+tests as the unprivileged runner inside a loopback-only Linux network
+namespace. The runtime smoke uses a whitelisted environment after removing
+build-only installers from its virtual environment. The
+`ETRADE_TEST_NETWORK=deny` command above is Python-level defense-in-depth when
+run outside that namespace. Network, broker, and provider tests must be
+explicitly marked as integration tests and are never part of the default gate.
 
 ## Source layout
 

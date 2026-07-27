@@ -343,7 +343,12 @@ def configure_owner_only_logger(name: str, filename: str = "python_client.log") 
     for existing in logger.handlers:
         if isinstance(existing, OwnerOnlyRotatingFileHandler) and existing.baseFilename == expected_filename:
             return logger
-    handler = OwnerOnlyRotatingFileHandler(filename, maxBytes=5 * 1024 * 1024, backupCount=3)
+    handler = OwnerOnlyRotatingFileHandler(
+        filename,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        delay=True,
+    )
     handler.setFormatter(logging.Formatter("%(asctime)-15s %(message)s", datefmt="%m/%d/%Y %I:%M:%S %p"))
     handler.addFilter(_SafeClientLogFilter())
     logger.addHandler(handler)

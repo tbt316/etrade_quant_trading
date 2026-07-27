@@ -533,9 +533,24 @@ pinned; every resolved distribution has an accepted hash. `pyetrade` and
 `rauth` are the only source-distribution exceptions and build under a separate
 hash-locked toolchain with isolation disabled. Runtime package installation is
 removed, Polygon import is credential-free, and Pi bootstrap joins service
-installation/restart in failing closed. R8c remains necessary to build from an
-exact clean archive and run every maintained test against the installed wheel
-without a source-tree `PYTHONPATH`.
+installation/restart in failing closed.
+
+R8c makes the release artifact the functional-test boundary. CI now runs on a
+fixed Ubuntu image with read-only repository permission and immutable action
+SHAs, builds one wheel and one sdist without build isolation, compares their
+payload bytes and metadata with the committed Git tree, verifies wheel RECORD
+hashes, proves byte-for-byte reproducible builds, rebuilds the same wheel from
+the inspected sdist, installs the wheel, and requires `pip check`.
+Repository-policy tests remain source-aware, while every other maintained test
+runs from the repository root with source imports unavailable. Runtime smoke
+and functional tests run as a non-root user inside a loopback-only Linux
+network namespace with an isolated home/temp area and a whitelisted child
+environment; the runtime virtual environment has no pip, setuptools, or wheel.
+A Python socket guard adds deterministic diagnostics.
+Canonical live imports are checked from an empty owner-only directory and may
+not create backtest/cache directories. Integration-marked tests are excluded
+explicitly. Remaining runtime-state paths move under typed configuration in
+R8d.
 
 Deliver:
 

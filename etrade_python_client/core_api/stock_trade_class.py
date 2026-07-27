@@ -34,20 +34,6 @@ from live_trading.runtime_safety import RuntimeSafetyBoundary, reject_legacy_exe
 from datetime import time
 import pickle
 
-pairs_trading_dir = '/Users/btian/pairs_trading'
-sys.path.append(pairs_trading_dir)
-
-# print('sys path: ', sys.path)
-# Now you can import the module without the .py extension
-try:
-    from pairs_trading_bo import Position,OpenPosition,InSamplePairs,HistoricalBacktest,CointData
-    import pairs_trading_bo
-    from pair_trade_backtrade import LookBackTest,LookForwardTest,TrainingDataSet
-    import pair_trade_backtrade
-except ModuleNotFoundError as e:
-    print("Error importing pairs_trading_bo:", e)
-
-
 def get_bid_ask_spread(ticker_symbol):
     # Fetch 1-minute interval data for the last 5 days
     ticker = yf.Ticker(ticker_symbol)
@@ -148,8 +134,12 @@ def extract_stock_info(data, get_history_spread: bool, source='etrade'):
         print(f"Value or Type error: {e}")
     return stock_info_list
 
-def import_ticker_from_csv(start_date_str, stock_universe='sp500'):
-    csv_directory = '/Users/btian/pairs_trading/price_csv/'
+def import_ticker_from_csv(
+    start_date_str,
+    stock_universe="sp500",
+    *,
+    csv_directory: str | os.PathLike[str],
+):
     filename_list = {
         'sp500': 'S&P 500 Historical Components & Changes(04-08-2024).csv',
         'oil-etf': 'oil-etf.csv',
@@ -168,7 +158,7 @@ def import_ticker_from_csv(start_date_str, stock_universe='sp500'):
     if stock_universe == 'sp500':
         sp500 = []
         title = 'List of S&P 500 companies'
-        filename = csv_directory + filename_list['sp500']
+        filename = os.path.join(csv_directory, filename_list['sp500'])
         if os.path.isfile(filename):
             df = pd.read_csv(filename)
             df['date'] = pd.to_datetime(df['date'])
@@ -182,7 +172,7 @@ def import_ticker_from_csv(start_date_str, stock_universe='sp500'):
     else:
         etf = []
         title = f'List of {stock_universe} companies'
-        filename = csv_directory + filename_list[stock_universe]
+        filename = os.path.join(csv_directory, filename_list[stock_universe])
         if os.path.isfile(filename):
             df = pd.read_csv(filename)
             df['date'] = pd.to_datetime(df['date'])
@@ -1444,7 +1434,10 @@ class LiveTradeAgent:
 
         return close_prices_df, full_prices_df
 
-    def generate_etrade_order(self, positions: list[Position], custom_order_ids: list) -> list:
+    def generate_etrade_order(self, positions: list[object], custom_order_ids: list) -> list:
+        reject_legacy_execution(
+            "core_api.stock_trade_class.LiveTradeAgent.generate_etrade_order"
+        )
         print(f"Generating etrade orders, {len(positions)} positions")
         etrade_orders = []
 
@@ -1706,6 +1699,9 @@ class BackEndAgent:
                 metric_selected: str,
                 dynamic_trade_setting: bool,
                 ) -> None:
+        reject_legacy_execution(
+            "core_api.stock_trade_class.BackEndAgent.__init__"
+        )
         if LiveTradeAgent_id is None:
             self.agent_id = LiveTradeAgent.generate_agent_id()
         else:
@@ -1842,8 +1838,11 @@ class BackEndAgent:
     def generate_trade_signal(self,
                             out_of_sample_df: pd.DataFrame(),
                             close_prices_df: pd.DataFrame(),
-                            selected_pairs: list[CointData],
+                            selected_pairs: list[object],
                             ):
+        reject_legacy_execution(
+            "core_api.stock_trade_class.BackEndAgent.generate_trade_signal"
+        )
         
         #load_coint_pair loads the cointegration parts at the start of each out_of_sample period
         self.selected_pairs,self.out_of_sample_df,self.in_sample_pair_buffer,self.kalman_spread_list = self.OutSamplePair.load_coint_pair(
