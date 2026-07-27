@@ -640,12 +640,20 @@ The existing monoliths should remain behind compatibility facades while these
 boundaries are extracted. Remove old paths only after golden tests and
 shadow-parity prove equivalent intended behavior.
 
-The current stacked delivery names this first source-level startup containment
-slice R6. It covers part of the planned live-containment and secret/log work,
-not the entire roadmap entries above. R7 is the next safety boundary:
-centralize every placement under one durable owner, preserve the arm/account
-check, persist stable intent identity and capacity reservations, and reconcile
-ambiguous broker outcomes before retry.
+The current stacked delivery names the source-level startup containment slice
+R6. R7a now implements the isolated durable order-intent foundation: strict
+vertical-spread validation, stable intent/client identity, capacity
+reservations, monotonic submission/amendment fences, exact immutable outbound
+authorization, and reconciliation-only ambiguous outcomes. Its schema 9 ledger
+performs no network I/O and no live caller instantiates it. New closing orders
+and terminal reservation absorption deliberately fail closed until R7b adds
+position-level evidence.
+
+R7b is therefore still the next production safety boundary: centralize every
+placement, amendment, and cancellation under one private E*TRADE gateway;
+preserve the arm/account check at the mutation boundary; derive broker evidence
+inside that gateway; reconcile all startup blockers; and statically prohibit
+direct legacy mutation calls. See `docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
 
@@ -696,9 +704,11 @@ R6 has not restarted or inspected the deployed dashboard, called E*TRADE, or
 exercised a live/sandbox mutation. Current-source credential removal also does
 not establish secret hygiene while the repository remains public and the old
 keys remain in Git history. External revoke/rotate, coordinated history purge,
-strong local credential reprovisioning, R7 durable gateway enforcement, and
-deployment verification remain required. The remaining actions belong to the
-staged acceptance gates above.
+strong local credential reprovisioning, R7b durable gateway enforcement, and
+deployment verification remain required. R7a's isolated ledger passed 32
+focused tests and independent causal/security review, but it has no production
+call site and is not live-execution evidence. The remaining actions belong to
+the staged acceptance gates above.
 
 The working tree was already heavily modified and contains important untracked
 runtime sources. This review intentionally adds only this plan and does not

@@ -149,7 +149,8 @@ flowchart LR
     DASHCFG["Strong Dashboard Credentials<br/>Owner-Only Settings and Logs"]
     DASH["Loopback-Only Dashboard<br/>No Automatic Tunnel / No Wildcard CORS"]
     DIRECT["Compatibility Order Client<br/>(Per-Call Arm + Account Guard)"]
-    GATE["R7 Central Order Gateway<br/>(Durable Single Mutation Owner)"]
+    LEDGER["R7a Order Intent Ledger<br/>(Implemented, Isolated)"]
+    GATE["R7b E*TRADE Gateway<br/>(Planned Single Mutation Owner)"]
     BROKER["E*TRADE"]
 
     CLI --> SAFE
@@ -159,15 +160,19 @@ flowchart LR
     DASHCFG --> DASH
     ACCOUNT --> DIRECT
     DIRECT -->|"current, guarded but non-durable"| BROKER
-    DIRECT -.->|"R7 migration"| GATE
-    GATE -.->|"planned replacement"| BROKER
+    DIRECT -.->|"R7b migration"| GATE
+    LEDGER --> GATE
+    GATE -.->|"not connected yet"| BROKER
 ```
 
 This is source-level containment, not a production-readiness claim. The
 compatibility order client now enforces the arm/account check for every order
-API call, but durable intent identity, reservations, ambiguous-outcome
-reconciliation, and a single broker-mutation owner remain R7 work. The deployed
-service has not been restarted or inspected with R6.
+API call. R7a adds an isolated durable ledger for intent identity, reservations,
+fencing, immutable outbound authorization, and ambiguous-outcome state. No live
+code instantiates it yet: R7b must make a private E*TRADE gateway the sole
+broker-mutation owner and construct reconciliation evidence from broker
+responses. The deployed service has not been restarted or inspected with R6 or
+R7a.
 
 ---
 
@@ -211,6 +216,7 @@ shadow/research-only and cannot affect E*TRADE order eligibility.
 
 *   **Runtime Safety Boundary** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py)): Resolves an explicit `sandbox` or `production` environment before OAuth construction. Production requires an exact account identity plus a versioned, signed arm file with a bounded lifetime; unsafe, missing, mismatched, future, or expired proof fails closed. The operator CLI writes the arm atomically as an owner-only file without accepting the signing secret as a command-line argument.
 *   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`order_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/order/order_bo.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh, and the compatibility order client repeats it immediately before every order API call. R7 must preserve the check inside the durable single mutation gateway.
+*   **Durable Order Intent Ledger** ([`order_intent_ledger.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/order_intent_ledger.py), [`order_intent_ledger.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/order_intent_ledger.md)): R7a provides strict vertical-spread validation, account capacity reservations, stable identifiers, monotonic submission/amendment fences, immutable outbound authorizations, and reconciliation-only handling after an ambiguous mutation. It is intentionally broker-agnostic and not yet called by the live agent; R7b remains the production integration gate.
 *   **Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py)): Serves the order-capable dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. Startup rejects default or weak dashboard credentials, while local settings and touched logs use owner-only file handling.
 *   **Credential Source Cleanup** ([`etrade_check_option.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_check_option.py), [`etrade_option_chains.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_option_chains.py)): Removes hardcoded OAuth credentials from the current source and requires local configuration or environment variables. Because the repository is currently public and those values remain in Git history, the affected keys must be treated as compromised until they are revoked and rotated externally; a coordinated history purge remains separate follow-up work.
 
