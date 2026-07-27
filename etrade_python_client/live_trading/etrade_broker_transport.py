@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree as ET
 
@@ -293,6 +293,7 @@ class ETradeBrokerTransport:
         ledger: OrderIntentLedger,
         runtime_safety: RuntimeSafetyBoundary,
         selected_account: SelectedBrokerAccount,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if type(session) is not OAuth1Session:
             raise ETradeBrokerTransportError(
@@ -319,8 +320,12 @@ class ETradeBrokerTransport:
             raise ETradeBrokerTransportError(
                 "order-capable runtime requires an explicitly armed account"
             )
-        runtime_safety.assert_current()
-        runtime_safety.verify_account(selected_account.runtime_mapping())
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        now = self._now()
+        runtime_safety.assert_current(now)
+        runtime_safety.verify_account(
+            selected_account.runtime_mapping(), now=now
+        )
         credentials = (
             session.consumer_key,
             session.consumer_secret,
@@ -353,6 +358,32 @@ class ETradeBrokerTransport:
         self._environment = runtime_safety.environment
         self._binding_secret = secrets.token_bytes(32)
         self._send_lock = threading.Lock()
+
+    def selected_account(self) -> SelectedBrokerAccount:
+        """Return a redacted immutable copy of the runtime-bound account."""
+
+        return SelectedBrokerAccount(
+            self._account_id,
+            self._account_id_key,
+            self._institution_type,
+        )
+
+    def assert_gateway_binding(
+        self,
+        ledger: OrderIntentLedger,
+        runtime_safety: RuntimeSafetyBoundary,
+    ) -> None:
+        """Prove the coordinator and transport share exact safety state."""
+
+        if ledger is not self._ledger or runtime_safety is not self._runtime_safety:
+            raise ETradeBrokerTransportError(
+                "gateway and transport must share exact ledger and runtime boundaries"
+            )
+        now = self._now()
+        runtime_safety.assert_current(now)
+        runtime_safety.verify_account(
+            self._selected_account.runtime_mapping(), now=now
+        )
 
     def preview(self, authorization: OutboundAuthorization) -> BrokerReply:
         request = self._build_request(
@@ -526,12 +557,18 @@ class ETradeBrokerTransport:
 
             runtime_safety = self._runtime_safety
             selected_account = self._selected_account
-            runtime_safety.assert_current()
-            runtime_safety.verify_account(selected_account.runtime_mapping())
+            now = self._now()
+            runtime_safety.assert_current(now)
+            runtime_safety.verify_account(
+                selected_account.runtime_mapping(), now=now
+            )
             evidence = _transport_evidence(trusted_request)
             self._ledger.claim_transport_send(evidence, authorization)
-            runtime_safety.assert_current()
-            runtime_safety.verify_account(selected_account.runtime_mapping())
+            now = self._now()
+            runtime_safety.assert_current(now)
+            runtime_safety.verify_account(
+                selected_account.runtime_mapping(), now=now
+            )
             _validate_prepared_request(prepared, trusted_request, url)
 
             try:
@@ -541,18 +578,29 @@ class ETradeBrokerTransport:
                 )
             except Exception:
                 reply = _unknown_reply(
-                    trusted_request, "TRANSPORT_ERROR"
+                    trusted_request,
+                    "TRANSPORT_ERROR",
+                    observed_at=self._now(),
                 )
             else:
+                observed_at = self._now()
                 if exchange.kind == "TIMEOUT":
-                    reply = _unknown_reply(trusted_request, "TIMEOUT")
+                    reply = _unknown_reply(
+                        trusted_request,
+                        "TIMEOUT",
+                        observed_at=observed_at,
+                    )
                 elif exchange.kind == "TRANSPORT_ERROR":
                     reply = _unknown_reply(
-                        trusted_request, "TRANSPORT_ERROR"
+                        trusted_request,
+                        "TRANSPORT_ERROR",
+                        observed_at=observed_at,
                     )
                 elif exchange.kind == "MALFORMED_RESPONSE":
                     reply = _unknown_reply(
-                        trusted_request, "MALFORMED_RESPONSE"
+                        trusted_request,
+                        "MALFORMED_RESPONSE",
+                        observed_at=observed_at,
                     )
                 else:
                     try:
@@ -560,10 +608,13 @@ class ETradeBrokerTransport:
                             trusted_request,
                             exchange.http_status,
                             exchange.raw_response,
+                            observed_at=observed_at,
                         )
                     except Exception:
                         reply = _unknown_reply(
-                            trusted_request, "MALFORMED_RESPONSE"
+                            trusted_request,
+                            "MALFORMED_RESPONSE",
+                            observed_at=observed_at,
                         )
             try:
                 self._ledger.record_transport_response(
@@ -574,6 +625,14 @@ class ETradeBrokerTransport:
                     "broker response could not be persisted durably"
                 ) from exc
             return reply
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if type(value) is not datetime or value.tzinfo is not timezone.utc:
+            raise ETradeBrokerTransportError(
+                "transport clock must use the exact UTC timezone"
+            )
+        return value
 
     def _verify_bound_request(self, request: BoundBrokerRequest) -> None:
         if type(request) is not BoundBrokerRequest:
@@ -1397,8 +1456,17 @@ def _parse_reply_bytes(
     request: BoundBrokerRequest,
     status: int | None,
     raw: bytes,
+    *,
+    observed_at: datetime | None = None,
 ) -> BrokerReply:
-    observed_at = datetime.now(timezone.utc)
+    observed_at = observed_at or datetime.now(timezone.utc)
+    if (
+        type(observed_at) is not datetime
+        or observed_at.tzinfo is not timezone.utc
+    ):
+        raise ETradeBrokerTransportError(
+            "response observation time must use the exact UTC timezone"
+        )
     if (
         type(status) is not int
         or not 100 <= status <= 599

@@ -1,14 +1,16 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7a isolated foundation
+**Delivery status:** R7a ledger + R7b transport + R7c coordinator, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
 
 `live_trading/order_intent_ledger.py` is the durable, broker-agnostic state
 machine for order identity, capacity reservation, fencing, and ambiguous broker
-outcomes. It performs no network I/O. R7a deliberately does not instantiate the
-ledger from the live agent, so it provides no protection to the current order
-paths until R7b makes one E*TRADE gateway the sole mutation owner.
+outcomes. It performs no network I/O. `etrade_broker_transport.py` now owns the
+reviewed no-retry mutation exchange, and `etrade_order_gateway.py` coordinates
+opening submissions, price-only amendments, and restart reconciliation. The
+live agent still instantiates none of them, so this stack does not yet protect
+the current legacy order paths.
 
 ## Supported scope
 
@@ -16,7 +18,7 @@ paths until R7b makes one E*TRADE gateway the sole mutation owner.
 - Two-leg vertical option spreads with one buy leg and one sell leg.
 - Opening credit and debit spreads whose price direction and maximum exposure
   can be derived from immutable order fields.
-- No new closing orders until R7b supplies typed position and open-order
+- No new closing orders until a later slice supplies typed position and open-order
   capacity evidence. Previously persisted closing orders remain readable and
   reconcilable after migration, but cannot be newly claimed or amended.
 - No equity orders, naked opening options, arbitrary multi-leg spreads, bulk
@@ -43,10 +45,14 @@ stateDiagram-v2
     SUBMITTED --> EXPIRED: broker query
 ```
 
-The gateway must persist `SUBMISSION_UNKNOWN` or an in-doubt amendment
-immediately before the corresponding broker mutation. A timeout, malformed
-response, process crash, or expired post-capable lease never returns the intent
-to a retryable state. A broker query must reconcile it first.
+The transport persists the exact send attempt and transitions to
+`SUBMISSION_UNKNOWN` or an in-doubt amendment immediately before the
+corresponding broker mutation. A timeout, malformed response, process crash, or
+expired post-capable lease never returns the intent to a retryable state. A
+broker query for a durably known broker order ID must prove the exact authorized
+economic payload before reconciliation. Because E*TRADE does not echo
+`clientOrderId`, an ambiguous placement without a durable broker order ID
+remains blocked rather than guessed or retried.
 
 ## Enforced invariants
 
@@ -71,49 +77,57 @@ to a retryable state. A broker query must reconcile it first.
   byte, and `Decimal` fields must use exact built-in types. Subclass overrides
   cannot replace validation or comparison behavior.
 - Preparation returns a frozen `OutboundAuthorization` containing immutable
-  serialized broker-schema bytes. `begin_submission` and `begin_amendment`
-  recompute the durable payload, client ID, operation, owner, and fence, then
-  persist the exact authorization in the same transaction that enters the
-  in-doubt state. R7b must deterministically derive the final E*TRADE XML from
-  these bytes and the broker preview ID.
-- Order events, broker-order history, amendment history, and outbound
-  authorizations are append-only.
+  serialized broker-schema bytes. The transport deterministically derives the
+  final E*TRADE XML from those bytes and a durably recorded preview ID. Every
+  preview/place send is uniquely claimed before I/O; every parsed response is
+  recorded before it can update or leave the durable state machine.
+- The coordinator requires one immutable account-level opening-risk ceiling.
+  Strategy commands cannot raise it. Reconciliation requires the reader's
+  normalized order payload to match the durable original, pending amendment, or
+  latest completed amendment hash.
+- Order events, broker-order history, amendment history, outbound
+  authorizations, transport attempts, preview receipts, and response receipts
+  are append-only.
 - The ledger database must live in an owner-only `0700` directory and remain an
   owner-only regular `0600` file. SQLite sidecars receive the same validation.
 
 ## Schema policy
 
-Schema 9 adds append-only outbound authorizations. The only supported migration
-is the additive schema 8 to 9 transition, which is restart-safe and tested.
-Unknown versions fail closed. Before any future production migration, the
-operator runbook must add an atomic backup, integrity check, rollback exercise,
-and an explicit version-by-version migration.
+Schema 10 adds append-only transport attempts, broker-preview receipts, and
+parsed transport-response receipts. Additive schema 8→9→10 migration is
+restart-safe and tested. Unknown versions fail closed. Before any production
+migration, the operator runbook must add an atomic backup, integrity check,
+rollback exercise, and an explicit version-by-version migration.
 
-## R7b release gates
+## Remaining production release gates
 
-R7a must not be used as evidence that live execution is production-ready. R7b
-must satisfy all of the following before any order-capable process is enabled:
+The isolated R7 stack must not be used as evidence that live execution is
+production-ready. The following remain required before any order-capable
+process is enabled:
 
-1. A private E*TRADE transport is the only module allowed to call order
-   `POST`, `PUT`, or `DELETE` endpoints.
-2. The transport derives the exact request body only from the immutable
-   authorization plus the broker preview ID; strategy code never receives a
-   mutable executable payload.
-3. Broker response parsing and `BrokerEvidence` construction are private to the
-   gateway. Application callers cannot assert their own reconciliation result.
-4. Startup reconciles every durable blocker before accepting a new mutation.
-5. Submission, closing-position capacity, terminal position absorption,
-   repricing, and per-intent cancellation have durable, crash-tested protocols.
-   Bulk cancellation remains disabled.
-6. The R6 production arm and exact account identity are revalidated immediately
-   before each broker mutation.
-7. Static enforcement rejects direct legacy order mutations outside the private
-   transport.
-8. Broker-fixture tests cover duplicate commands, crash-before/after-POST,
-   unknown responses, malformed replies, stale arm/account/capacity evidence,
-   amendment/cancel races, partial fills, and restart reconciliation.
+1. A concrete private reader must pin the exact E*TRADE origin, runtime
+   boundary, environment, and account; completely paginate account/order data;
+   persist origin-bound raw/parser receipts; and atomically bind durable read
+   evidence to reconciliation and capacity decisions.
+2. Position-level fill evidence must safely absorb terminal opening
+   reservations, including partial fills, replacements, assignment/exercise,
+   and zero-fill proof for cancelled/rejected/expired orders.
+3. Closing-position capacity and one-shot per-intent cancellation need durable,
+   crash-tested protocols. Bulk cancellation remains disabled.
+4. The live composition root must construct the exact ledger, reader,
+   transport, and coordinator, and static enforcement must reject direct legacy
+   order mutations outside that root.
+5. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
+   every nonterminal/terminal broker status, replacement chains, cancellation,
+   closing, and process death at each durable/I/O boundary.
+6. Operational migration needs a private database backup, integrity check,
+   rollback drill, credential rotation/history purge, deployment restart, and
+   observation of the exact served/live artifacts.
 
-The R7a focused suite contains 32 deterministic tests. Independent causal and
-security reviews found no remaining reproducible core path to double-submit,
-exceed the reservation cap, release opening exposure early, reuse an identifier,
-or substitute a different authorized economic payload.
+The current focused ledger/transport/coordinator suite contains 88 deterministic
+tests. Independent adversarial reviews found no remaining reproducible
+mutation-core path to double-submit, exceed the gateway-owned reservation
+ceiling, release opening exposure early, reuse an identifier, substitute a
+different authorized economic payload, or clear an amendment merely because
+the old broker order is still open. This is source verification only; the
+durable reader and live migration gates above remain open.

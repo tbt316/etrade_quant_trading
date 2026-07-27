@@ -150,7 +150,9 @@ flowchart LR
     DASH["Loopback-Only Dashboard<br/>No Automatic Tunnel / No Wildcard CORS"]
     DIRECT["Compatibility Order Client<br/>(Per-Call Arm + Account Guard)"]
     LEDGER["R7a Order Intent Ledger<br/>(Implemented, Isolated)"]
-    GATE["R7b E*TRADE Gateway<br/>(Planned Single Mutation Owner)"]
+    TRANSPORT["R7b Mutation Transport<br/>(Implemented, Isolated)"]
+    GATE["R7c Order Gateway<br/>(Implemented, Isolated)"]
+    READER["Durable E*TRADE Reader<br/>(Required Before Live Wiring)"]
     BROKER["E*TRADE"]
 
     CLI --> SAFE
@@ -160,19 +162,25 @@ flowchart LR
     DASHCFG --> DASH
     ACCOUNT --> DIRECT
     DIRECT -->|"current, guarded but non-durable"| BROKER
-    DIRECT -.->|"R7b migration"| GATE
+    DIRECT -.->|"future migration"| GATE
     LEDGER --> GATE
-    GATE -.->|"not connected yet"| BROKER
+    LEDGER --> TRANSPORT
+    READER -.->|"not implemented yet"| GATE
+    GATE --> TRANSPORT
+    TRANSPORT -.->|"not connected yet"| BROKER
 ```
 
 This is source-level containment, not a production-readiness claim. The
 compatibility order client now enforces the arm/account check for every order
-API call. R7a adds an isolated durable ledger for intent identity, reservations,
-fencing, immutable outbound authorization, and ambiguous-outcome state. No live
-code instantiates it yet: R7b must make a private E*TRADE gateway the sole
-broker-mutation owner and construct reconciliation evidence from broker
-responses. The deployed service has not been restarted or inspected with R6 or
-R7a.
+API call. R7a adds the durable intent ledger. R7b adds a private, no-retry
+mutation transport that claims every send before broker I/O and persists parsed
+responses. R7c composes those components into an opening/reprice coordinator
+with a gateway-owned risk ceiling, exact environment/account binding,
+restart reconciliation, and exact economic-term comparison. No live code
+instantiates this stack. A concrete origin-bound reader with durable raw and
+parsed receipts, position absorption, cancellation/closing protocols, and
+removal of legacy mutation paths remain mandatory before live wiring. The
+deployed service has not been restarted or inspected with R6 or R7.
 
 ---
 
@@ -216,7 +224,9 @@ shadow/research-only and cannot affect E*TRADE order eligibility.
 
 *   **Runtime Safety Boundary** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py)): Resolves an explicit `sandbox` or `production` environment before OAuth construction. Production requires an exact account identity plus a versioned, signed arm file with a bounded lifetime; unsafe, missing, mismatched, future, or expired proof fails closed. The operator CLI writes the arm atomically as an owner-only file without accepting the signing secret as a command-line argument.
 *   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`order_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/order/order_bo.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh, and the compatibility order client repeats it immediately before every order API call. R7 must preserve the check inside the durable single mutation gateway.
-*   **Durable Order Intent Ledger** ([`order_intent_ledger.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/order_intent_ledger.py), [`order_intent_ledger.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/order_intent_ledger.md)): R7a provides strict vertical-spread validation, account capacity reservations, stable identifiers, monotonic submission/amendment fences, immutable outbound authorizations, and reconciliation-only handling after an ambiguous mutation. It is intentionally broker-agnostic and not yet called by the live agent; R7b remains the production integration gate.
+*   **Durable Order Intent Ledger** ([`order_intent_ledger.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/order_intent_ledger.py), [`order_intent_ledger.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/order_intent_ledger.md)): R7a provides strict vertical-spread validation, account capacity reservations, stable identifiers, monotonic submission/amendment fences, immutable outbound authorizations, exact send/response receipts, and reconciliation-only handling after an ambiguous mutation.
+*   **Hardened Mutation Transport** ([`etrade_broker_transport.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_transport.py)): R7b is the only reviewed adapter permitted to derive E*TRADE mutation XML from a durable authorization. It disables ambient proxies, cookies, hooks, redirects, and retries; revalidates the armed account; claims the exact send before I/O; bounds the exchange in an isolated process; and records the parsed result before returning.
+*   **Order Gateway** ([`etrade_order_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_order_gateway.py)): R7c coordinates opening submissions and price-only amendments through the exact transport. Startup stays read-only until every known broker order is reconciled, unknown responses without a broker ID remain permanent blockers, returned order terms must hash to the durable authorization, and an immutable gateway policy—not a strategy command—sets the account risk ceiling. This component remains intentionally unreachable from the live agent until the durable broker reader and remaining execution protocols are delivered.
 *   **Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py)): Serves the order-capable dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. Startup rejects default or weak dashboard credentials, while local settings and touched logs use owner-only file handling.
 *   **Credential Source Cleanup** ([`etrade_check_option.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_check_option.py), [`etrade_option_chains.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_option_chains.py)): Removes hardcoded OAuth credentials from the current source and requires local configuration or environment variables. Because the repository is currently public and those values remain in Git history, the affected keys must be treated as compromised until they are revoked and rotated externally; a coordinated history purge remains separate follow-up work.
 
