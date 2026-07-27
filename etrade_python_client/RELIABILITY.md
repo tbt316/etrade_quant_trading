@@ -497,10 +497,16 @@ finding.
 
 This is containment in the current source, not production readiness. The
 compatibility order client now rejects calls without the current arm/account
-boundary, but placement has not yet been routed through one durable gateway.
-R7 must make that gateway the sole mutation owner while preserving the
-placement-time check, stable intent identity, capacity reservations, and
-unknown-POST reconciliation.
+boundary. R7a adds an isolated schema 9 order-intent ledger with stable
+identity, account capacity reservations, monotonic fences, immutable outbound
+authorization, and reconciliation-only ambiguous outcomes. It performs no
+network I/O and no live code instantiates it. New closing intents and terminal
+reservation release fail closed until position/open-order evidence exists.
+
+R7b must still make one private E*TRADE gateway the sole mutation owner,
+preserve the placement-time arm/account check, construct broker evidence from
+actual responses, reconcile durable blockers at startup, implement durable
+per-intent cancellation, and reject every direct legacy mutation path.
 
 The exposed OAuth keys still require external revocation and rotation. A later
 coordinated history purge must remove them from all refs and arrange cleanup of
@@ -522,6 +528,13 @@ deployed dashboard has not been reloaded or visually inspected with R6.
   files, guarded response/request logging, order calls without a boundary,
   placement-time arm expiry, dashboard credential rejection, and loopback/CORS
   behavior.
+- R7a includes 32 deterministic order-ledger tests for immutable identity,
+  stable identifiers, exact outbound authorization, capacity/reservation
+  arithmetic, exact evidence types, stale evidence, concurrency, fencing ABA,
+  ambiguous outcomes, restart reconciliation, terminal-risk retention,
+  append-only histories, legacy-closing reconciliation, and the additive schema
+  8 to 9 migration. Independent causal and security reviews found no remaining
+  reproducible P0 in the isolated core.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.
