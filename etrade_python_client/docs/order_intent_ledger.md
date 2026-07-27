@@ -1,7 +1,7 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7a ledger + R7b transport + R7c coordinator + R7d
-durable reader + R7e terminal-risk absorption + R7f legacy mutation
+**Delivery status:** R7 durable execution core plus crash-safe cancellation,
+exact closing-capacity reservations, terminal absorption, and legacy mutation
 quarantine, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
@@ -10,12 +10,14 @@ quarantine, isolated
 machine for order identity, capacity reservation, fencing, and ambiguous broker
 outcomes. It performs no network I/O. `etrade_broker_transport.py` owns the
 reviewed no-retry mutation exchange, `etrade_broker_reader.py` owns the exact
-origin-bound GET surface, and `etrade_order_gateway.py` coordinates opening
-submissions, price-only amendments, and restart reconciliation. R7f removes the
-gateway's public transport property and statically confines exact transport
-mutation calls to the gateway. The live agent still instantiates none of these
-components. Every known legacy mutation path is now an unconditional tombstone,
-so the current source is read-only rather than protected by the durable stack.
+origin-bound GET surface, and `etrade_order_gateway.py` coordinates opening and
+closing submissions, opening price-only amendments, per-order cancellation,
+and restart reconciliation. The gateway has no public transport property, and
+the static mutation boundary confines each exact transport call to one reviewed
+private gateway method. The live agent still instantiates none of these
+components. Every known legacy mutation path is an unconditional tombstone, so
+the current source remains read-only rather than silently falling back around
+the durable stack.
 
 ## Supported scope
 
@@ -23,15 +25,23 @@ so the current source is read-only rather than protected by the durable stack.
 - Two-leg vertical option spreads with one buy leg and one sell leg.
 - Opening credit and debit spreads whose price direction and maximum exposure
   can be derived from immutable order fields.
-- No new closing orders until a later slice supplies typed position and open-order
-  capacity evidence. Previously persisted closing orders remain readable and
-  reconcilable after migration, but cannot be newly claimed or amended.
+- Closing credit and debit verticals only when a complete schema-v3 capacity
+  read proves both exact OSI contracts, standard 100-share multipliers,
+  non-adjusted deliverables, directionally compatible positions, available
+  lots, and all active closing orders. An immutable position-capacity
+  reservation is created atomically with the intent before preview.
+- At most one unabsorbed durable close may touch an exact contract. This keeps a
+  later full-fill position delta attributable to one reservation rather than
+  guessing across simultaneous closes.
+- A one-shot cancellation is supported for known zero-fill opening and closing
+  orders. The broker's accepted-cancel warning is nonterminal; capacity remains
+  reserved until a later direct order read proves a terminal result.
 - Exact zero-fill cancellation/rejection/expiration and exact full-fill
-  position absorption are supported. Partial fills, replacement chains,
-  transformed lots, assignment/exercise, and ambiguous position evidence
-  remain blocked.
-- No equity orders, naked opening options, arbitrary multi-leg spreads, bulk
-  cancellation, or closing orders. Unsupported operations fail closed.
+  position absorption are supported for both exposure directions. Partial
+  fills, replacement chains, transformed lots, assignment/exercise, and
+  ambiguous position evidence remain blocked.
+- No equity orders, naked options, arbitrary multi-leg spreads, closing
+  amendments, or bulk cancellation. Unsupported operations fail closed.
 
 ## State and crash boundary
 
@@ -77,6 +87,12 @@ remains blocked rather than guessed or retried.
 - Opening reservations use fresh, typed quote, portfolio, and buying-power
   evidence. The caller's asserted maximum loss cannot be below the exposure
   derived from strike width, price, contract multiplier, and quantity.
+- Closing reservations are content-addressed and bind the intent payload to the
+  complete capacity evidence, exact contracts/lots, active broker closes, and
+  projected post-fill positions. A second process cannot reserve an overlapping
+  contract. A never-claimed reservation whose evidence expires can only become
+  an append-only `FAILED`/void outcome; the same idempotency key stays bound,
+  and a new attempt needs a fresh key and fresh evidence.
 - An opening terminal state retains its reservation as
   `FILLED_PENDING_ABSORPTION`. Schema 12 releases it only after a fresh,
   exact order re-query proves either zero filled quantity with complete cancel
@@ -84,6 +100,12 @@ remains blocked rather than guessed or retried.
   present in a newer stable portfolio snapshot. Full-fill margin remains in
   account risk utilization after release, so restart cannot recycle it into a
   new opening order.
+- A closing terminal state likewise retains its immutable claim. A complete
+  zero-fill terminal read releases it without a portfolio read. A full fill
+  requires a capacity-v3 request that began after the terminal evidence and
+  proves the exact before/after quantity change for both contracts. Release is
+  an immutable absorption receipt; partial, replacement-linked, or conflicting
+  evidence stays blocked.
 - Evidence dataclasses and their security-critical string, timestamp, integer,
   byte, and `Decimal` fields must use exact built-in types. Subclass overrides
   cannot replace validation or comparison behavior.
@@ -120,11 +142,13 @@ remains blocked rather than guessed or retried.
 
 ## Schema policy
 
-Schema 12 adds immutable terminal-reservation absorption receipts, their
-baseline/order/post-capacity evidence chain, and append-only transition guards.
-It retains schema 11 raw broker-read receipts, ordered semantic manifests,
-durable capacity decisions, and provenance foreign keys. Additive schema
-8→9→10→11→12 migration is one explicit SQLite transaction and verifies
+Schema 14 adds immutable closing reservations, pre-place void receipts, and
+terminal closing-absorption receipts, together with exact capacity provenance
+and append-only guards. It retains schema 13 cancellation records and
+send/response/resolution receipts, schema 12 opening terminal-absorption
+receipts, schema 11 raw broker-read receipts and semantic manifests, and the
+existing durable capacity decisions. Additive schema
+8→9→10→11→12→13→14 migration is one explicit SQLite transaction and verifies
 required columns, foreign keys, append-only triggers, journal mode, foreign-key
 integrity, and `quick_check` before version promotion. Unknown or malformed
 schemas fail closed. A production operator must still take an atomic private
@@ -145,8 +169,8 @@ process is enabled:
 1. Partial fills, replacements, transformed lots, and assignment/exercise
    remain unsupported and blocked; supervised recovery procedures are still
    required for those states.
-2. Closing-position capacity and one-shot per-intent cancellation need durable,
-   crash-tested protocols. Bulk cancellation remains disabled.
+2. Bulk cancellation and closing-order repricing remain disabled. Their absence
+   must be explicit in the operator UI and runbook.
 3. The live composition root must construct the exact ledger, reader,
    transport, and coordinator. R7f already rejects direct legacy mutation,
    transport bypass, reflection, and tombstone drift across all tracked
@@ -161,9 +185,8 @@ process is enabled:
 The focused ledger/reader/transport/coordinator suites exercise raw-parser
 binding, pagination and marker drift, lot-aware two-scan stability, schema
 rollback, exact payload/fill reconciliation, terminal absorption, retained
-filled risk, mutation fencing, and crash/timeout behavior. They contain 153
-deterministic tests. R7f adds mutation-boundary, dashboard,
+filled risk, closing-contract capacity, one-shot cancellation, mutation
+fencing, and crash/timeout behavior. R7f adds mutation-boundary, dashboard,
 legacy-tombstone, deployment-containment, and real local-handler visual
 verification. This is source verification only; partial/complex terminal
-states, cancellation/closing, live composition, and operational migration
-gates above remain open.
+states, live composition, and operational migration gates above remain open.

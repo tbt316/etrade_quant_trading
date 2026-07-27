@@ -28,10 +28,22 @@ from live_trading.etrade_order_protocol import (
     cancel_order_route as _cancel_order_route,
     cancel_order_xml as _cancel_order_xml,
 )
+from live_trading.order_domain import (
+    ActiveClosingOrder,
+    ClosingCapacity,
+    ClosingLeg,
+    ClosingRiskDecision,
+    DurableClosingReservation,
+    OptionContractId,
+    OrderDomainError,
+    PositionEffectProjection,
+    PositionLotCapacity,
+    evaluate_order as _evaluate_closing_order,
+)
 
 
-SCHEMA_VERSION = 13
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11, 12})
+SCHEMA_VERSION = 14
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11, 12, 13})
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
@@ -82,6 +94,17 @@ _CANCEL_AUTHORIZATION_HASH_DOMAIN = (
     b"etrade-cancel-authorization.v1\0"
 )
 _CANCEL_RESOLUTION_HASH_DOMAIN = b"etrade-cancel-resolution.v1\0"
+_CLOSING_DECISION_HASH_DOMAIN = b"etrade-closing-decision.v1\0"
+_CLOSING_RESERVATION_HASH_DOMAIN = (
+    b"etrade-closing-reservation.v1\0"
+)
+_CLOSING_VOID_HASH_DOMAIN = b"etrade-closing-void.v1\0"
+_CLOSING_ABSORPTION_HASH_DOMAIN = (
+    b"etrade-closing-absorption.v1\0"
+)
+_CLOSING_POSITION_PROOF_HASH_DOMAIN = (
+    b"etrade-closing-position-proof.v1\0"
+)
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
 _TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"})
@@ -332,6 +355,204 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON cancel_resolutions
         BEGIN
             SELECT RAISE(ABORT, 'cancel resolutions are append-only');
+        END
+    """,
+    "prevent_closing_reservation_update": """
+        CREATE TRIGGER prevent_closing_reservation_update
+        BEFORE UPDATE ON closing_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservations are append-only');
+        END
+    """,
+    "prevent_closing_reservation_delete": """
+        CREATE TRIGGER prevent_closing_reservation_delete
+        BEFORE DELETE ON closing_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservations are append-only');
+        END
+    """,
+    "prevent_closing_void_update": """
+        CREATE TRIGGER prevent_closing_void_update
+        BEFORE UPDATE ON closing_reservation_voids
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation voids are append-only');
+        END
+    """,
+    "prevent_closing_void_delete": """
+        CREATE TRIGGER prevent_closing_void_delete
+        BEFORE DELETE ON closing_reservation_voids
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation voids are append-only');
+        END
+    """,
+    "prevent_closing_absorption_update": """
+        CREATE TRIGGER prevent_closing_absorption_update
+        BEFORE UPDATE ON closing_reservation_absorptions
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation absorptions are append-only');
+        END
+    """,
+    "prevent_closing_absorption_delete": """
+        CREATE TRIGGER prevent_closing_absorption_delete
+        BEFORE DELETE ON closing_reservation_absorptions
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation absorptions are append-only');
+        END
+    """,
+    "validate_closing_reservation_insert": """
+        CREATE TRIGGER validate_closing_reservation_insert
+        BEFORE INSERT ON closing_reservations
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM order_intents AS intent
+            JOIN broker_read_manifests AS capacity
+              ON capacity.evidence_sha256 =
+                    NEW.capacity_evidence_sha256
+            WHERE intent.intent_id = NEW.intent_id
+              AND intent.intent_kind = 'CLOSING'
+              AND intent.state = 'INTENT'
+              AND intent.broker_order_id IS NULL
+              AND intent.account_id = NEW.account_id
+              AND intent.environment = NEW.environment
+              AND intent.payload_hash = NEW.order_payload_hash
+              AND intent.created_at = NEW.created_at
+              AND capacity.evidence_kind = 'CAPACITY'
+              AND capacity.completeness = 'COMPLETE'
+              AND capacity.account_id = NEW.account_id
+              AND capacity.environment = NEW.environment
+              AND capacity.target_broker_order_id IS NULL
+              AND capacity.observed_at <= NEW.created_at
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation lacks exact durable capacity provenance');
+        END
+    """,
+    "validate_closing_void_insert": """
+        CREATE TRIGGER validate_closing_void_insert
+        BEFORE INSERT ON closing_reservation_voids
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM closing_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            WHERE reservation.intent_id = NEW.intent_id
+              AND reservation.reservation_sha256 =
+                    NEW.reservation_sha256
+              AND intent.intent_kind = 'CLOSING'
+              AND intent.state = 'FAILED'
+              AND intent.broker_order_id IS NULL
+              AND intent.submission_fence = NEW.fencing_token
+              AND intent.updated_at = NEW.voided_at
+              AND NEW.reason_code = 'PRE_POST_ABORTED'
+              AND (
+                    (
+                        NEW.fencing_token = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM order_events AS claim
+                            WHERE claim.intent_id = NEW.intent_id
+                              AND claim.event_type =
+                                    'SUBMISSION_CLAIMED'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM transport_send_attempts AS attempt
+                            WHERE attempt.intent_id = NEW.intent_id
+                              AND attempt.authorization_operation =
+                                    'SUBMIT'
+                        )
+                    )
+                    OR
+                    (
+                        NEW.fencing_token > 0
+                        AND EXISTS (
+                            SELECT 1 FROM order_events AS claim
+                            WHERE claim.intent_id = NEW.intent_id
+                              AND claim.event_type =
+                                    'SUBMISSION_CLAIMED'
+                        )
+                    )
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM transport_send_attempts AS attempt
+                    WHERE attempt.intent_id = NEW.intent_id
+                      AND attempt.authorization_operation = 'SUBMIT'
+                      AND attempt.transport_operation = 'SUBMIT_PLACE'
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM closing_reservation_absorptions AS absorption
+                    WHERE absorption.intent_id = NEW.intent_id
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservation void lacks definitive pre-place proof');
+        END
+    """,
+    "validate_closing_absorption_insert": """
+        CREATE TRIGGER validate_closing_absorption_insert
+        BEFORE INSERT ON closing_reservation_absorptions
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM closing_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            JOIN broker_read_manifests AS terminal
+              ON terminal.evidence_sha256 =
+                    NEW.terminal_order_evidence_sha256
+            JOIN broker_read_manifests AS baseline
+              ON baseline.evidence_sha256 =
+                    NEW.baseline_capacity_evidence_sha256
+            WHERE reservation.intent_id = NEW.intent_id
+              AND reservation.capacity_evidence_sha256 =
+                    NEW.baseline_capacity_evidence_sha256
+              AND reservation.account_id = NEW.account_id
+              AND reservation.environment = NEW.environment
+              AND intent.intent_kind = 'CLOSING'
+              AND intent.account_id = NEW.account_id
+              AND intent.environment = NEW.environment
+              AND intent.broker_order_id = NEW.broker_order_id
+              AND intent.state = NEW.terminal_state
+              AND terminal.evidence_kind = 'ORDER_QUERY'
+              AND terminal.completeness = 'COMPLETE'
+              AND terminal.account_id = NEW.account_id
+              AND terminal.environment = NEW.environment
+              AND terminal.target_broker_order_id =
+                    NEW.broker_order_id
+              AND baseline.evidence_kind = 'CAPACITY'
+              AND baseline.completeness = 'COMPLETE'
+              AND baseline.account_id = NEW.account_id
+              AND baseline.environment = NEW.environment
+              AND baseline.target_broker_order_id IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM closing_reservation_voids AS void
+                    WHERE void.intent_id = NEW.intent_id
+              )
+              AND (
+                    (
+                        NEW.classification = 'ZERO_FILL'
+                        AND NEW.terminal_state IN (
+                            'CANCELLED','REJECTED','EXPIRED'
+                        )
+                        AND NEW.post_capacity_evidence_sha256 IS NULL
+                    )
+                    OR
+                    (
+                        NEW.classification = 'FULL_FILL'
+                        AND NEW.terminal_state = 'FILLED'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM broker_read_manifests AS post
+                            WHERE post.evidence_sha256 =
+                                    NEW.post_capacity_evidence_sha256
+                              AND post.evidence_kind = 'CAPACITY'
+                              AND post.completeness = 'COMPLETE'
+                              AND post.account_id = NEW.account_id
+                              AND post.environment = NEW.environment
+                              AND post.target_broker_order_id IS NULL
+                        )
+                    )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'closing absorption is not cross-bound to durable risk');
         END
     """,
     "prevent_broker_order_history_update": """
@@ -914,10 +1135,6 @@ class OrderIntent:
         derived_kind = _derive_intent_kind(json.loads(wire_payload))
         if intent_kind != derived_kind:
             raise OrderIntentValidationError("intent_kind must match the exposure derived from order actions")
-        if intent_kind == "CLOSING":
-            raise OrderIntentValidationError(
-                "closing orders require typed position and open-order capacity evidence"
-            )
         canonical_payload = canonical_order_payload(json.loads(wire_payload))
         payload_hash = _payload_hash(canonical_payload)
         return cls(
@@ -1144,6 +1361,67 @@ class CancellationObservation:
     ]
     evidence_sha256: str
     observed_at: datetime
+
+
+@dataclass(frozen=True)
+class ClosingReservation:
+    """Immutable position-capacity claim for one exact closing vertical."""
+
+    reservation_sha256: str
+    intent_id: str
+    account_id: str
+    environment: Literal["sandbox", "production"]
+    capacity_evidence_sha256: str
+    capacity_state_sha256: str
+    decision_sha256: str
+    order_payload_hash: str
+    quantity: int
+    canonical_legs_json: str
+    canonical_projections_json: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ClosingAbsorptionRequirement:
+    """Proof still required before one terminal close releases capacity."""
+
+    intent_id: str
+    classification: Literal["ZERO_FILL", "FULL_FILL"]
+    terminal_state: Literal[
+        "FILLED", "CANCELLED", "REJECTED", "EXPIRED"
+    ]
+    broker_order_id: str
+    terminal_order_evidence_sha256: str
+    baseline_capacity_evidence_sha256: str
+    ordered_quantity: int
+    filled_quantity: int
+    post_capacity_required: bool
+
+
+@dataclass(frozen=True)
+class ClosingAbsorptionReceipt:
+    """Append-only release proof for a terminal closing reservation."""
+
+    absorption_sha256: str
+    intent_id: str
+    account_id: str
+    environment: Literal["sandbox", "production"]
+    broker_order_id: str
+    terminal_state: Literal[
+        "FILLED", "CANCELLED", "REJECTED", "EXPIRED"
+    ]
+    classification: Literal["ZERO_FILL", "FULL_FILL"]
+    terminal_order_evidence_sha256: str
+    baseline_capacity_evidence_sha256: str
+    post_capacity_evidence_sha256: str | None
+    ordered_quantity: int
+    filled_quantity: int
+    placed_time_epoch_ms: str
+    executed_time_epoch_ms: str | None
+    canonical_position_proof_json: str
+    position_proof_sha256: str
+    observed_at: datetime
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, repr=False)
@@ -1684,11 +1962,486 @@ class OrderIntentLedger:
             )
             return CreateIntentResult(self._intent_from_row(self._require_intent(conn, requested_id)), True)
 
+    def create_closing_intent_from_read(
+        self,
+        envelope: OrderIntent,
+        capacity_evidence: BrokerReadEvidenceRef,
+        *,
+        intent_id: str | None = None,
+    ) -> CreateIntentResult:
+        """Atomically reserve exact position capacity for a closing vertical."""
+
+        if type(envelope) is not OrderIntent:
+            raise OrderIntentValidationError(
+                "closing creation requires an exact OrderIntent envelope"
+            )
+        _validate_envelope(envelope)
+        if envelope.intent_kind != "CLOSING":
+            raise OrderIntentValidationError(
+                "closing creation requires a CLOSING envelope"
+            )
+        if (
+            type(capacity_evidence) is not BrokerReadEvidenceRef
+            or capacity_evidence.evidence_kind != "CAPACITY"
+        ):
+            raise OrderIntentValidationError(
+                "closing creation requires exact CAPACITY evidence"
+            )
+        _validate_sha256(
+            "closing capacity evidence",
+            capacity_evidence.evidence_sha256,
+        )
+        requested_id = intent_id or uuid.uuid4().hex
+        _validate_identity("intent_id", requested_id)
+        client_order_id = stable_client_order_id(envelope)
+        now = self._now_us()
+        with self._transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE account_id = ? AND environment = ?
+                  AND idempotency_scope = ? AND idempotency_key = ?
+                """,
+                (
+                    envelope.account_id,
+                    envelope.environment,
+                    envelope.idempotency_scope,
+                    envelope.idempotency_key,
+                ),
+            ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM order_intents WHERE intent_id = ?
+                    """,
+                    (requested_id,),
+                ).fetchone()
+            if existing is not None:
+                record = self._intent_from_row(existing)
+                if record.envelope != envelope:
+                    raise OrderIntentIntegrityError(
+                        "closing idempotency identity is already bound to another envelope"
+                    )
+                reservation = conn.execute(
+                    """
+                    SELECT * FROM closing_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()
+                if reservation is None:
+                    raise OrderIntentIntegrityError(
+                        "durable closing intent lacks its atomic reservation"
+                    )
+                self._closing_reservation_from_row(conn, reservation)
+                return CreateIntentResult(record, created=False)
+            collision = conn.execute(
+                """
+                SELECT intent_id FROM order_intents
+                WHERE client_order_id = ?
+                """,
+                (client_order_id,),
+            ).fetchone()
+            if collision is not None:
+                raise OrderIntentIntegrityError(
+                    "stable client-order-id collision; do not create closing intent"
+                )
+            amendment_collision = conn.execute(
+                """
+                SELECT intent_id FROM amendment_leases
+                WHERE client_order_id = ?
+                UNION ALL
+                SELECT intent_id FROM amendment_history
+                WHERE client_order_id = ?
+                LIMIT 1
+                """,
+                (client_order_id, client_order_id),
+            ).fetchone()
+            if amendment_collision is not None:
+                raise OrderIntentIntegrityError(
+                    "stable client-order-id collision with an amendment"
+                )
+            self._expire_claimed_leases(
+                conn, envelope.account_id, envelope.environment, now
+            )
+            self._expire_amendment_leases(
+                conn, envelope.account_id, envelope.environment, now
+            )
+            if (
+                self._broker_blocker_rows_for_closing(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._amendment_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._cancellation_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+                or self._terminal_closing_blocker_rows(
+                    conn, envelope.account_id, envelope.environment
+                )
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "account/environment has unresolved broker work"
+                )
+            manifest, result = self._verified_broker_read_manifest(
+                conn, capacity_evidence.evidence_sha256
+            )
+            if (
+                manifest["evidence_kind"] != "CAPACITY"
+                or manifest["completeness"] != "COMPLETE"
+                or manifest["target_broker_order_id"] is not None
+                or manifest["account_id"] != envelope.account_id
+                or manifest["environment"] != envelope.environment
+                or result.get("schema") != "etrade-capacity.v3"
+            ):
+                raise OrderIntentReservationError(
+                    "closing capacity must be a complete account-bound schema-v3 read"
+                )
+            observed_at = int(manifest["observed_at"])
+            if (
+                observed_at > now + 5_000_000
+                or now - observed_at
+                > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentReservationError(
+                    "closing capacity evidence is stale or from the future"
+                )
+            self._require_latest_complete_manifest_head(
+                conn, manifest, recorded_at_boundary=now
+            )
+            decision, legs = self._evaluate_closing_capacity(
+                conn,
+                envelope,
+                result,
+                exclude_intent_id=None,
+            )
+            if not decision.allowed:
+                raise OrderIntentReservationError(
+                    f"closing capacity denied: {decision.reason_code}"
+                )
+            assert decision.requested_quantity is not None
+            quantity = _closing_exact_quantity(
+                decision.requested_quantity
+            )
+            canonical_legs_json = _canonical_read_json(
+                [_closing_leg_document(leg) for leg in legs]
+            )
+            canonical_projections_json = _canonical_read_json(
+                [
+                    _closing_projection_document(projection)
+                    for projection in decision.projections
+                ]
+            )
+            decision_sha256 = _domain_json_hash(
+                _CLOSING_DECISION_HASH_DOMAIN,
+                _closing_json_value(decision.canonical_material),
+            )
+            reservation_material = {
+                "intent_id": requested_id,
+                "account_id": envelope.account_id,
+                "environment": envelope.environment,
+                "capacity_evidence_sha256":
+                    capacity_evidence.evidence_sha256,
+                "capacity_state_sha256": result["state_sha256"],
+                "decision_sha256": decision_sha256,
+                "order_payload_hash": envelope.payload_hash,
+                "quantity": quantity,
+                "canonical_legs_json": canonical_legs_json,
+                "canonical_projections_json":
+                    canonical_projections_json,
+                "created_at": now,
+            }
+            reservation_sha256 = _domain_json_hash(
+                _CLOSING_RESERVATION_HASH_DOMAIN,
+                reservation_material,
+            )
+            conn.execute(
+                """
+                INSERT INTO order_intents (
+                    intent_id, account_id, environment, strategy_id,
+                    decision_id, idempotency_scope, idempotency_key,
+                    intent_kind, wire_payload, canonical_payload,
+                    payload_hash, client_order_id, state, broker_order_id,
+                    submission_fence, submission_lease_owner,
+                    submission_lease_expires_at, last_reconciled_run,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'CLOSING', ?, ?, ?, ?,
+                    'INTENT', NULL, 0, NULL, NULL, NULL, ?, ?
+                )
+                """,
+                (
+                    requested_id,
+                    envelope.account_id,
+                    envelope.environment,
+                    envelope.strategy_id,
+                    envelope.decision_id,
+                    envelope.idempotency_scope,
+                    envelope.idempotency_key,
+                    envelope.wire_payload,
+                    envelope.canonical_payload,
+                    envelope.payload_hash,
+                    client_order_id,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO closing_reservations (
+                    reservation_sha256, intent_id, account_id,
+                    environment, capacity_evidence_sha256,
+                    capacity_state_sha256, decision_sha256,
+                    order_payload_hash, quantity, canonical_legs_json,
+                    canonical_projections_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reservation_sha256,
+                    *reservation_material.values(),
+                ),
+            )
+            self._append_event(
+                conn,
+                requested_id,
+                "INTENT_CREATED",
+                None,
+                "INTENT",
+                "system",
+                "INTENT_CREATED",
+                now,
+            )
+            reservation = conn.execute(
+                """
+                SELECT * FROM closing_reservations WHERE intent_id = ?
+                """,
+                (requested_id,),
+            ).fetchone()
+            self._closing_reservation_from_row(conn, reservation)
+            return CreateIntentResult(
+                self._intent_from_row(
+                    self._require_intent(conn, requested_id)
+                ),
+                True,
+            )
+
+    def get_closing_reservation(
+        self, intent_id: str
+    ) -> ClosingReservation | None:
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM closing_reservations WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._closing_reservation_from_row(conn, row)
+
+    def abandon_stale_closing_intent(
+        self, intent_id: str
+    ) -> IntentRecord:
+        """Void a never-claimed close whose creation snapshot has expired.
+
+        The idempotency identity remains durably bound to the FAILED intent.
+        A later close therefore needs fresh capacity evidence and a new
+        idempotency key; stale evidence is never made sendable by recovery.
+        """
+
+        _validate_identity("intent_id", intent_id)
+        now = self._now_us()
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, intent_id)
+            reservation_row = conn.execute(
+                """
+                SELECT * FROM closing_reservations WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if reservation_row is None:
+                raise OrderIntentIntegrityError(
+                    "closing intent lacks its atomic position reservation"
+                )
+            reservation = self._closing_reservation_from_row(
+                conn, reservation_row
+            )
+            existing_void = conn.execute(
+                """
+                SELECT * FROM closing_reservation_voids
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing_void is not None:
+                if (
+                    intent["state"] == "FAILED"
+                    and int(existing_void["fencing_token"]) == 0
+                ):
+                    return self._intent_from_row(intent)
+                raise OrderIntentIntegrityError(
+                    "closing reservation was released by another lifecycle"
+                )
+            if (
+                intent["intent_kind"] != "CLOSING"
+                or intent["state"] != "INTENT"
+                or intent["broker_order_id"] is not None
+                or intent["pending_operation"] is not None
+                or int(intent["submission_fence"]) != 0
+                or conn.execute(
+                    """
+                    SELECT 1 FROM order_events
+                    WHERE intent_id = ?
+                      AND event_type = 'SUBMISSION_CLAIMED'
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    """
+                    SELECT 1 FROM transport_send_attempts
+                    WHERE intent_id = ?
+                      AND authorization_operation = 'SUBMIT'
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise OrderIntentTransitionError(
+                    "only a never-claimed closing intent can use stale recovery"
+                )
+            manifest, _result = self._verified_broker_read_manifest(
+                conn, reservation.capacity_evidence_sha256
+            )
+            observed_at = int(manifest["observed_at"])
+            if observed_at > now + 5_000_000:
+                raise OrderIntentIntegrityError(
+                    "closing capacity evidence is from the future"
+                )
+            if (
+                now - observed_at
+                <= _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentReservationError(
+                    "closing capacity evidence is still fresh"
+                )
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'FAILED', last_reconciled_run = ?,
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (self.run_id, now, intent_id),
+            )
+            self._void_closing_reservation(
+                conn,
+                intent_id,
+                fencing_token=0,
+                now=now,
+            )
+            self._append_event(
+                conn,
+                intent_id,
+                "PRE_POST_FAILED",
+                "INTENT",
+                "FAILED",
+                "system",
+                "PRE_POST_ABORTED",
+                now,
+            )
+            return self._intent_from_row(
+                self._require_intent(conn, intent_id)
+            )
+
+    def closing_reservation_blockers(
+        self, account_id: str, environment: str
+    ) -> tuple[IntentRecord, ...]:
+        """Return ambiguous or terminal-unabsorbed closing reservations."""
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        now = self._now_us()
+        with self._transaction() as conn:
+            self._expire_claimed_leases(
+                conn, account_id, environment, now
+            )
+            rows = (
+                self._closing_uncertainty_blocker_rows(
+                    conn, account_id, environment
+                )
+                + self._terminal_closing_blocker_rows(
+                    conn, account_id, environment
+                )
+            )
+            unique = {
+                row["intent_id"]: row
+                for row in rows
+            }
+            return tuple(
+                self._intent_from_row(unique[intent_id])
+                for intent_id in sorted(
+                    unique,
+                    key=lambda value: (
+                        int(unique[value]["created_at"]),
+                        value,
+                    ),
+                )
+            )
+
     def get_intent(self, intent_id: str) -> IntentRecord | None:
         _validate_identity("intent_id", intent_id)
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
         return self._intent_from_row(row) if row else None
+
+    def find_intent(
+        self, envelope: OrderIntent
+    ) -> IntentRecord | None:
+        """Return an exact idempotency replay without requiring fresh evidence."""
+
+        if type(envelope) is not OrderIntent:
+            raise OrderIntentValidationError(
+                "intent lookup requires an exact OrderIntent envelope"
+            )
+        _validate_envelope(envelope)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE account_id = ? AND environment = ?
+                  AND idempotency_scope = ? AND idempotency_key = ?
+                """,
+                (
+                    envelope.account_id,
+                    envelope.environment,
+                    envelope.idempotency_scope,
+                    envelope.idempotency_key,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._intent_from_row(row)
+            if record.envelope != envelope:
+                raise OrderIntentIntegrityError(
+                    "idempotency key is bound to a different immutable envelope"
+                )
+            if envelope.intent_kind == "CLOSING":
+                reservation = conn.execute(
+                    """
+                    SELECT * FROM closing_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()
+                if reservation is None:
+                    raise OrderIntentIntegrityError(
+                        "closing replay lacks its durable reservation"
+                    )
+                self._closing_reservation_from_row(conn, reservation)
+            return record
 
     def expected_order_payload_hash(self, intent_id: str) -> str:
         """Return the exact durable order terms a broker query must prove."""
@@ -2430,13 +3183,17 @@ class OrderIntentLedger:
         with self._transaction() as conn:
             intent = self._require_intent(conn, intent_id)
             if (
-                intent["intent_kind"] != "OPENING"
+                intent["intent_kind"] not in {"OPENING", "CLOSING"}
                 or intent["state"] != "SUBMITTED"
                 or intent["pending_operation"] is not None
                 or intent["broker_order_id"] is None
             ):
                 raise OrderIntentTransitionError(
-                    "only a known submitted opening order may be cancelled"
+                    "only a known submitted order may be cancelled"
+                )
+            if intent["intent_kind"] == "CLOSING":
+                self._require_active_closing_reservation(
+                    conn, intent, now, require_fresh=False
                 )
             existing = conn.execute(
                 """
@@ -2478,6 +3235,14 @@ class OrderIntentLedger:
                 intent["environment"],
                 exclude_intent_id=intent_id,
             ) or self._amendment_blocker_rows(
+                conn,
+                intent["account_id"],
+                intent["environment"],
+            ) or self._closing_uncertainty_blocker_rows(
+                conn,
+                intent["account_id"],
+                intent["environment"],
+            ) or self._terminal_closing_blocker_rows(
                 conn,
                 intent["account_id"],
                 intent["environment"],
@@ -2727,6 +3492,10 @@ class OrderIntentLedger:
                 raise OrderIntentReconciliationRequired(
                     "cancel authorization is stale or no longer sendable"
                 )
+            if intent["intent_kind"] == "CLOSING":
+                self._require_active_closing_reservation(
+                    conn, intent, now, require_fresh=False
+                )
             expected_route = _cancel_order_route(
                 request.account_id_key
             )
@@ -2971,13 +3740,9 @@ class OrderIntentLedger:
                 require_open=False,
             )
             outcome: str
-            if result["outcome"] in {
-                "FILLED",
-                "CANCELLED",
-                "REJECTED",
-                "EXPIRED",
-            }:
-                outcome = result["outcome"]
+            exact_terminal = _exact_cancellation_terminal_outcome(result)
+            if exact_terminal is not None:
+                outcome = exact_terminal
             elif (
                 result["outcome"] == "OPEN"
                 or _is_zero_fill_cancel_pending(result)
@@ -3039,15 +3804,12 @@ class OrderIntentLedger:
                 now=now,
                 require_open=False,
             )
-            terminal_outcome = result["outcome"]
-            if terminal_outcome not in {
-                "FILLED",
-                "CANCELLED",
-                "REJECTED",
-                "EXPIRED",
-            }:
+            terminal_outcome = _exact_cancellation_terminal_outcome(
+                result
+            )
+            if terminal_outcome is None:
                 raise OrderIntentReconciliationRequired(
-                    "cancellation is not terminal at the broker"
+                    "cancellation is not an exact terminal zero/full-fill order"
                 )
             observed_at = int(manifest["observed_at"])
             if intent["state"] != terminal_outcome:
@@ -3167,6 +3929,14 @@ class OrderIntentLedger:
             intent = self._require_intent(conn, intent_id)
             if intent["intent_kind"] != "OPENING" or intent["state"] != "INTENT":
                 raise OrderIntentTransitionError("only a new opening intent may reserve margin")
+            if self._closing_uncertainty_blocker_rows(
+                conn, intent["account_id"], intent["environment"]
+            ) or self._terminal_closing_blocker_rows(
+                conn, intent["account_id"], intent["environment"]
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "unresolved closing work blocks new opening risk"
+                )
             if evidence.decision_id != intent["decision_id"]:
                 raise OrderIntentIntegrityError("risk evidence decision id does not match intent")
             exposure_floor = _opening_exposure_floor(json.loads(intent["wire_payload"]))
@@ -3363,13 +4133,20 @@ class OrderIntentLedger:
                     )
                 else:
                     failure = OrderIntentTransitionError(f"cannot claim submission from {intent['state']}")
-            elif intent["intent_kind"] == "CLOSING":
-                failure = OrderIntentReservationError(
-                    "closing submission requires typed position and open-order capacity evidence"
-                )
             elif (
-                self._blocker_rows(
-                    conn, intent["account_id"], intent["environment"]
+                (
+                    self._broker_blocker_rows_for_closing(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=intent_id,
+                    )
+                    if intent["intent_kind"] == "CLOSING"
+                    else self._blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                    )
                 )
                 or self._amendment_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
@@ -3377,11 +4154,21 @@ class OrderIntentLedger:
                 or self._cancellation_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
                 )
+                or self._terminal_closing_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
+                )
             ):
                 failure = OrderIntentReconciliationRequired("account/environment has unresolved broker intents")
             else:
                 if intent["intent_kind"] == "OPENING":
                     self._require_active_opening_reservation(conn, intent, now)
+                else:
+                    self._require_active_closing_reservation(
+                        conn, intent, now, require_fresh=True
+                    )
                 fence = int(intent["submission_fence"]) + 1
                 conn.execute(
                     """
@@ -3411,10 +4198,6 @@ class OrderIntentLedger:
         expired = False
         with self._transaction() as conn:
             intent = self._require_intent(conn, intent_id)
-            if intent["intent_kind"] == "CLOSING":
-                raise OrderIntentReservationError(
-                    "closing submission renewal requires typed position and open-order capacity evidence"
-                )
             if self._claim_expired(intent, now):
                 self._mark_claim_in_doubt(conn, intent, now)
                 expired = True
@@ -3422,10 +4205,24 @@ class OrderIntentLedger:
                 self._require_submission_fence(intent, owner, fencing_token)
                 if intent["intent_kind"] == "OPENING":
                     self._require_active_opening_reservation(conn, intent, now)
+                else:
+                    self._require_active_closing_reservation(
+                        conn, intent, now, require_fresh=True
+                    )
                 if self._amendment_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
                 ) or self._cancellation_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
+                ) or self._closing_uncertainty_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
+                ) or self._terminal_closing_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
                 ):
                     raise OrderIntentReconciliationRequired(
                         "account/environment has unresolved broker work"
@@ -3451,15 +4248,19 @@ class OrderIntentLedger:
         expired = False
         with self._transaction() as conn:
             intent = self._require_intent(conn, intent_id)
-            if intent["intent_kind"] == "CLOSING":
-                raise OrderIntentReservationError(
-                    "closing payload preparation requires typed position and open-order capacity evidence"
-                )
             if self._claim_expired(intent, now):
                 self._mark_claim_in_doubt(conn, intent, now)
                 expired = True
             else:
                 self._require_submission_fence(intent, owner, fencing_token)
+                if intent["intent_kind"] == "OPENING":
+                    self._require_active_opening_reservation(
+                        conn, intent, now
+                    )
+                else:
+                    self._require_active_closing_reservation(
+                        conn, intent, now, require_fresh=True
+                    )
                 record = self._intent_from_row(intent)
                 payload = json.loads(record.envelope.wire_payload)
                 if not isinstance(payload, dict):
@@ -3555,11 +4356,33 @@ class OrderIntentLedger:
                         client_order_id=evidence.client_order_id,
                         payload=payload,
                     )
-                    self._require_active_opening_reservation(conn, intent, now)
+                    if intent["intent_kind"] == "OPENING":
+                        self._require_active_opening_reservation(
+                            conn, intent, now
+                        )
+                    else:
+                        self._require_active_closing_reservation(
+                            conn, intent, now, require_fresh=True
+                        )
                     if self._amendment_blocker_rows(
                         conn,
                         intent["account_id"],
                         intent["environment"],
+                    ) or self._cancellation_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ) or self._closing_uncertainty_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ) or self._terminal_closing_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
                     ):
                         raise OrderIntentReconciliationRequired(
                             "account/environment has an unresolved amendment"
@@ -3641,6 +4464,16 @@ class OrderIntentLedger:
                         intent["environment"],
                         exclude_intent_id=evidence.intent_id,
                     ) or self._amendment_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ) or self._closing_uncertainty_blocker_rows(
+                        conn,
+                        intent["account_id"],
+                        intent["environment"],
+                        exclude_intent_id=evidence.intent_id,
+                    ) or self._terminal_closing_blocker_rows(
                         conn,
                         intent["account_id"],
                         intent["environment"],
@@ -3869,10 +4702,6 @@ class OrderIntentLedger:
         expired = False
         with self._transaction() as conn:
             intent = self._require_intent(conn, intent_id)
-            if intent["intent_kind"] == "CLOSING":
-                raise OrderIntentReservationError(
-                    "closing submission requires typed position and open-order capacity evidence"
-                )
             if self._claim_expired(intent, now):
                 self._mark_claim_in_doubt(conn, intent, now)
                 expired = True
@@ -3894,10 +4723,24 @@ class OrderIntentLedger:
                 )
                 if intent["intent_kind"] == "OPENING":
                     self._require_active_opening_reservation(conn, intent, now)
+                else:
+                    self._require_active_closing_reservation(
+                        conn, intent, now, require_fresh=True
+                    )
                 if self._amendment_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
                 ) or self._cancellation_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
+                ) or self._closing_uncertainty_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
+                ) or self._terminal_closing_blocker_rows(
+                    conn,
+                    intent["account_id"],
+                    intent["environment"],
+                    exclude_intent_id=intent_id,
                 ):
                     raise OrderIntentReconciliationRequired(
                         "account/environment has unresolved broker work"
@@ -3989,7 +4832,17 @@ class OrderIntentLedger:
                     """,
                     (self.run_id, now, intent_id),
                 )
-                self._release_reservation(conn, intent_id, "PRE_POST_ABORTED", now)
+                if intent["intent_kind"] == "OPENING":
+                    self._release_reservation(
+                        conn, intent_id, "PRE_POST_ABORTED", now
+                    )
+                else:
+                    self._void_closing_reservation(
+                        conn,
+                        intent_id,
+                        fencing_token=fencing_token,
+                        now=now,
+                    )
                 self._append_event(conn, intent_id, "PRE_POST_FAILED", "CLAIMED", "FAILED", owner, reason_code, now)
                 record = self._intent_from_row(self._require_intent(conn, intent_id))
         if expired:
@@ -4071,7 +4924,9 @@ class OrderIntentLedger:
             if intent["intent_kind"] == "OPENING":
                 conn.execute("UPDATE margin_reservations SET state = 'FILLED_PENDING_ABSORPTION' WHERE intent_id = ? AND state = 'ACTIVE'", (intent_id,))
             else:
-                self._release_reservation(conn, intent_id, reason_code, now)
+                self._require_active_closing_reservation(
+                    conn, intent, now, require_fresh=False
+                )
             if intent["pending_operation"] == "AMEND":
                 if amendment is None:
                     raise OrderIntentIntegrityError("pending amendment is missing its durable operation")
@@ -4358,6 +5213,224 @@ class OrderIntentLedger:
             "use durable terminal-order and position-lot capacity evidence"
         )
 
+    def closing_absorption_requirement(
+        self,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+    ) -> ClosingAbsorptionRequirement:
+        """Classify exact terminal closing evidence without releasing capacity."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(terminal_order_evidence) is not BrokerReadEvidenceRef
+            or terminal_order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "closing absorption requires exact ORDER_QUERY evidence"
+            )
+        now = self._now_us()
+        with self._connection() as conn:
+            requirement, *_unused = (
+                self._closing_absorption_requirement_conn(
+                    conn,
+                    intent_id,
+                    terminal_order_evidence,
+                    now,
+                )
+            )
+        return requirement
+
+    def absorb_closing_reservation(
+        self,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+        *,
+        post_capacity_evidence: BrokerReadEvidenceRef | None = None,
+    ) -> ClosingAbsorptionReceipt:
+        """Append the only proof that releases a terminal closing claim."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(terminal_order_evidence) is not BrokerReadEvidenceRef
+            or terminal_order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "closing absorption requires exact ORDER_QUERY evidence"
+            )
+        if post_capacity_evidence is not None and (
+            type(post_capacity_evidence) is not BrokerReadEvidenceRef
+            or post_capacity_evidence.evidence_kind != "CAPACITY"
+        ):
+            raise OrderIntentValidationError(
+                "post-close evidence must be an exact CAPACITY reference"
+            )
+        now = self._now_us()
+        with self._transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM closing_reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                receipt = self._closing_absorption_from_row(
+                    conn, existing
+                )
+                requested_post = (
+                    None
+                    if post_capacity_evidence is None
+                    else post_capacity_evidence.evidence_sha256
+                )
+                if (
+                    receipt.terminal_order_evidence_sha256
+                    != terminal_order_evidence.evidence_sha256
+                    or receipt.post_capacity_evidence_sha256
+                    != requested_post
+                ):
+                    raise OrderIntentIntegrityError(
+                        "closing reservation already has a conflicting release proof"
+                    )
+                return receipt
+            (
+                requirement,
+                intent,
+                reservation,
+                terminal_manifest,
+                terminal_result,
+                baseline_manifest,
+                baseline_result,
+            ) = self._closing_absorption_requirement_conn(
+                conn,
+                intent_id,
+                terminal_order_evidence,
+                now,
+            )
+            post_evidence_sha256: str | None = None
+            position_proof: list[dict[str, Any]] = []
+            observed_at = int(terminal_manifest["observed_at"])
+            if requirement.classification == "ZERO_FILL":
+                if post_capacity_evidence is not None:
+                    raise OrderIntentIntegrityError(
+                        "zero-fill closing release cannot bind post-capacity evidence"
+                    )
+            else:
+                if post_capacity_evidence is None:
+                    raise OrderIntentReconciliationRequired(
+                        "full closing fill requires a newer capacity-v3 read"
+                    )
+                post_manifest, post_result = (
+                    self._verified_broker_read_manifest(
+                        conn, post_capacity_evidence.evidence_sha256
+                    )
+                )
+                if (
+                    post_manifest["evidence_kind"] != "CAPACITY"
+                    or post_manifest["completeness"] != "COMPLETE"
+                    or post_manifest["target_broker_order_id"] is not None
+                    or post_manifest["account_id"]
+                    != intent["account_id"]
+                    or post_manifest["environment"]
+                    != intent["environment"]
+                    or post_result.get("schema")
+                    != "etrade-capacity.v3"
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "post-close proof must be complete account-bound capacity-v3 evidence"
+                    )
+                post_observed_at = int(post_manifest["observed_at"])
+                if (
+                    post_observed_at <= int(terminal_manifest["observed_at"])
+                    or post_observed_at > now + 5_000_000
+                    or now - post_observed_at
+                    > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "post-close capacity evidence is stale or not newer than terminal proof"
+                    )
+                if self._manifest_request_started_at(
+                    conn, post_capacity_evidence.evidence_sha256
+                ) <= int(terminal_manifest["observed_at"]):
+                    raise OrderIntentReconciliationRequired(
+                        "post-close capacity read began before terminal evidence"
+                    )
+                self._require_latest_complete_manifest_head(
+                    conn, post_manifest, recorded_at_boundary=now
+                )
+                position_proof = _closing_position_absorption_proof(
+                    reservation=reservation,
+                    baseline_result=baseline_result,
+                    post_result=post_result,
+                    broker_order_id=requirement.broker_order_id,
+                    filled_quantity=requirement.filled_quantity,
+                )
+                post_evidence_sha256 = (
+                    post_capacity_evidence.evidence_sha256
+                )
+                observed_at = post_observed_at
+            canonical_position_proof_json = _canonical_read_json(
+                position_proof
+            )
+            position_proof_sha256 = _domain_bytes_hash(
+                _CLOSING_POSITION_PROOF_HASH_DOMAIN,
+                canonical_position_proof_json.encode("utf-8"),
+            )
+            fill_summary = terminal_result["fill_summary"]
+            material = {
+                "intent_id": intent_id,
+                "account_id": intent["account_id"],
+                "environment": intent["environment"],
+                "broker_order_id": requirement.broker_order_id,
+                "terminal_state": requirement.terminal_state,
+                "classification": requirement.classification,
+                "terminal_order_evidence_sha256":
+                    terminal_order_evidence.evidence_sha256,
+                "baseline_capacity_evidence_sha256":
+                    baseline_manifest["evidence_sha256"],
+                "post_capacity_evidence_sha256":
+                    post_evidence_sha256,
+                "ordered_quantity": requirement.ordered_quantity,
+                "filled_quantity": requirement.filled_quantity,
+                "placed_time_epoch_ms":
+                    fill_summary["placed_time_epoch_ms"],
+                "executed_time_epoch_ms":
+                    fill_summary["executed_time_epoch_ms"],
+                "canonical_position_proof_json":
+                    canonical_position_proof_json,
+                "position_proof_sha256": position_proof_sha256,
+                "observed_at": observed_at,
+                "recorded_at": now,
+            }
+            absorption_sha256 = _domain_json_hash(
+                _CLOSING_ABSORPTION_HASH_DOMAIN, material
+            )
+            conn.execute(
+                """
+                INSERT INTO closing_reservation_absorptions (
+                    absorption_sha256, intent_id, account_id,
+                    environment, broker_order_id, terminal_state,
+                    classification, terminal_order_evidence_sha256,
+                    baseline_capacity_evidence_sha256,
+                    post_capacity_evidence_sha256, ordered_quantity,
+                    filled_quantity, placed_time_epoch_ms,
+                    executed_time_epoch_ms,
+                    canonical_position_proof_json,
+                    position_proof_sha256, observed_at, recorded_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (absorption_sha256, *material.values()),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM closing_reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            return self._closing_absorption_from_row(conn, row)
+
     def reconciliation_blockers(self, account_id: str, environment: str) -> tuple[IntentRecord, ...]:
         _validate_identity("account_id", account_id)
         _validate_identity("environment", environment)
@@ -4365,8 +5438,23 @@ class OrderIntentLedger:
         with self._transaction() as conn:
             self._expire_claimed_leases(conn, account_id, environment, now)
             self._expire_amendment_leases(conn, account_id, environment, now)
-            rows = self._blocker_rows(conn, account_id, environment)
-            return tuple(self._intent_from_row(row) for row in rows)
+            rows = (
+                self._blocker_rows(conn, account_id, environment)
+                + self._terminal_closing_blocker_rows(
+                    conn, account_id, environment
+                )
+            )
+            unique = {row["intent_id"]: row for row in rows}
+            return tuple(
+                self._intent_from_row(unique[intent_id])
+                for intent_id in sorted(
+                    unique,
+                    key=lambda value: (
+                        int(unique[value]["created_at"]),
+                        value,
+                    ),
+                )
+            )
 
     def mark_reconciled(self, intent_id: str, evidence: BrokerEvidence) -> IntentRecord:
         """Acknowledge that a known submitted order was observed OPEN this run."""
@@ -4416,6 +5504,12 @@ class OrderIntentLedger:
                     exclude_intent_id=intent_id,
                 )
                 or self._cancellation_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+                or self._closing_uncertainty_blocker_rows(
+                    conn, intent["account_id"], intent["environment"]
+                )
+                or self._terminal_closing_blocker_rows(
                     conn, intent["account_id"], intent["environment"]
                 )
             ):
@@ -4549,6 +5643,12 @@ class OrderIntentLedger:
                         exclude_intent_id=intent_id,
                     )
                     or self._cancellation_blocker_rows(
+                        conn, intent["account_id"], intent["environment"]
+                    )
+                    or self._closing_uncertainty_blocker_rows(
+                        conn, intent["account_id"], intent["environment"]
+                    )
+                    or self._terminal_closing_blocker_rows(
                         conn, intent["account_id"], intent["environment"]
                     )
                 ):
@@ -4875,6 +5975,100 @@ class OrderIntentLedger:
                         )
                     )
                 );
+                CREATE TABLE IF NOT EXISTS closing_reservations (
+                    reservation_sha256 TEXT PRIMARY KEY
+                        CHECK (length(reservation_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES order_intents(intent_id),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    capacity_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    capacity_state_sha256 TEXT NOT NULL
+                        CHECK (length(capacity_state_sha256) = 64),
+                    decision_sha256 TEXT NOT NULL
+                        CHECK (length(decision_sha256) = 64),
+                    order_payload_hash TEXT NOT NULL
+                        CHECK (length(order_payload_hash) = 64),
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    canonical_legs_json TEXT NOT NULL,
+                    canonical_projections_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS closing_reservation_voids (
+                    void_sha256 TEXT PRIMARY KEY
+                        CHECK (length(void_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES closing_reservations(intent_id),
+                    reservation_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES closing_reservations(
+                            reservation_sha256
+                        ),
+                    fencing_token INTEGER NOT NULL
+                        CHECK (fencing_token >= 0),
+                    reason_code TEXT NOT NULL
+                        CHECK (reason_code = 'PRE_POST_ABORTED'),
+                    voided_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS closing_reservation_absorptions (
+                    absorption_sha256 TEXT PRIMARY KEY
+                        CHECK (length(absorption_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES closing_reservations(intent_id),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    broker_order_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL CHECK (
+                        terminal_state IN (
+                            'FILLED','CANCELLED','REJECTED','EXPIRED'
+                        )
+                    ),
+                    classification TEXT NOT NULL CHECK (
+                        classification IN ('ZERO_FILL','FULL_FILL')
+                    ),
+                    terminal_order_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    baseline_capacity_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    post_capacity_evidence_sha256 TEXT
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    ordered_quantity INTEGER NOT NULL
+                        CHECK (ordered_quantity > 0),
+                    filled_quantity INTEGER NOT NULL CHECK (
+                        filled_quantity >= 0
+                        AND filled_quantity <= ordered_quantity
+                    ),
+                    placed_time_epoch_ms TEXT NOT NULL,
+                    executed_time_epoch_ms TEXT,
+                    canonical_position_proof_json TEXT NOT NULL,
+                    position_proof_sha256 TEXT NOT NULL
+                        CHECK (length(position_proof_sha256) = 64),
+                    observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    CHECK (
+                        (
+                            classification = 'ZERO_FILL'
+                            AND terminal_state IN (
+                                'CANCELLED','REJECTED','EXPIRED'
+                            )
+                            AND filled_quantity = 0
+                            AND post_capacity_evidence_sha256 IS NULL
+                            AND executed_time_epoch_ms IS NULL
+                            AND canonical_position_proof_json = '[]'
+                        )
+                        OR
+                        (
+                            classification = 'FULL_FILL'
+                            AND terminal_state = 'FILLED'
+                            AND filled_quantity = ordered_quantity
+                            AND post_capacity_evidence_sha256 IS NOT NULL
+                            AND executed_time_epoch_ms IS NOT NULL
+                            AND canonical_position_proof_json != '[]'
+                        )
+                    )
+                );
                 CREATE TABLE IF NOT EXISTS amendment_leases (
                     intent_id TEXT PRIMARY KEY REFERENCES order_intents(intent_id),
                     broker_order_id TEXT NOT NULL,
@@ -5136,6 +6330,14 @@ class OrderIntentLedger:
                 CREATE INDEX IF NOT EXISTS idx_reservations_account_environment ON margin_reservations(account_id, environment, state);
                 CREATE INDEX IF NOT EXISTS idx_reservation_absorptions_account
                 ON reservation_absorptions(
+                    account_id, environment, classification
+                );
+                CREATE INDEX IF NOT EXISTS idx_closing_reservations_account
+                ON closing_reservations(
+                    account_id, environment, created_at
+                );
+                CREATE INDEX IF NOT EXISTS idx_closing_absorptions_account
+                ON closing_reservation_absorptions(
                     account_id, environment, classification
                 );
                 CREATE INDEX IF NOT EXISTS idx_order_cancellations_account
@@ -5571,6 +6773,48 @@ class OrderIntentLedger:
                 "observed_at",
                 "recorded_at",
             },
+            "closing_reservations": {
+                "reservation_sha256",
+                "intent_id",
+                "account_id",
+                "environment",
+                "capacity_evidence_sha256",
+                "capacity_state_sha256",
+                "decision_sha256",
+                "order_payload_hash",
+                "quantity",
+                "canonical_legs_json",
+                "canonical_projections_json",
+                "created_at",
+            },
+            "closing_reservation_voids": {
+                "void_sha256",
+                "intent_id",
+                "reservation_sha256",
+                "fencing_token",
+                "reason_code",
+                "voided_at",
+            },
+            "closing_reservation_absorptions": {
+                "absorption_sha256",
+                "intent_id",
+                "account_id",
+                "environment",
+                "broker_order_id",
+                "terminal_state",
+                "classification",
+                "terminal_order_evidence_sha256",
+                "baseline_capacity_evidence_sha256",
+                "post_capacity_evidence_sha256",
+                "ordered_quantity",
+                "filled_quantity",
+                "placed_time_epoch_ms",
+                "executed_time_epoch_ms",
+                "canonical_position_proof_json",
+                "position_proof_sha256",
+                "observed_at",
+                "recorded_at",
+            },
             "cancel_authorizations": {
                 "authorization_sha256",
                 "intent_id",
@@ -5712,6 +6956,17 @@ class OrderIntentLedger:
             ("reservation_absorptions", "order_intents"),
             ("reservation_absorptions", "broker_read_manifests"),
             ("reservation_absorptions", "capacity_decisions"),
+            ("closing_reservations", "order_intents"),
+            ("closing_reservations", "broker_read_manifests"),
+            ("closing_reservation_voids", "closing_reservations"),
+            (
+                "closing_reservation_absorptions",
+                "closing_reservations",
+            ),
+            (
+                "closing_reservation_absorptions",
+                "broker_read_manifests",
+            ),
             ("cancel_authorizations", "order_intents"),
             ("cancel_authorizations", "broker_read_manifests"),
             ("order_cancellations", "order_intents"),
@@ -5922,6 +7177,128 @@ class OrderIntentLedger:
             params,
         ).fetchall()
 
+    def _broker_blocker_rows_for_closing(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+        *,
+        exclude_intent_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Allow known submitted closes only when their reservation verifies."""
+
+        blocked: list[sqlite3.Row] = []
+        for row in self._blocker_rows(
+            conn,
+            account_id,
+            environment,
+            exclude_intent_id=exclude_intent_id,
+        ):
+            if (
+                row["intent_kind"] == "CLOSING"
+                and row["state"] == "SUBMITTED"
+                and row["broker_order_id"] is not None
+            ):
+                reservation = conn.execute(
+                    """
+                    SELECT * FROM closing_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                if reservation is not None:
+                    self._closing_reservation_from_row(
+                        conn, reservation
+                    )
+                    if (
+                        conn.execute(
+                            """
+                            SELECT 1 FROM closing_reservation_voids
+                            WHERE intent_id = ?
+                            """,
+                            (row["intent_id"],),
+                        ).fetchone()
+                        is None
+                        and conn.execute(
+                            """
+                            SELECT 1
+                            FROM closing_reservation_absorptions
+                            WHERE intent_id = ?
+                            """,
+                            (row["intent_id"],),
+                        ).fetchone()
+                        is None
+                    ):
+                        continue
+            blocked.append(row)
+        return blocked
+
+    @staticmethod
+    def _closing_uncertainty_blocker_rows(
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+        *,
+        exclude_intent_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [account_id, environment]
+        exclusion = ""
+        if exclude_intent_id is not None:
+            exclusion = " AND intent.intent_id != ?"
+            params.append(exclude_intent_id)
+        return conn.execute(
+            f"""
+            SELECT intent.*
+            FROM closing_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            LEFT JOIN closing_reservation_voids AS void
+              USING (intent_id)
+            LEFT JOIN closing_reservation_absorptions AS absorption
+              USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND intent.state IN ('CLAIMED','SUBMISSION_UNKNOWN')
+              AND void.intent_id IS NULL
+              AND absorption.intent_id IS NULL{exclusion}
+            ORDER BY intent.created_at, intent.intent_id
+            """,
+            params,
+        ).fetchall()
+
+    @staticmethod
+    def _terminal_closing_blocker_rows(
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+        *,
+        exclude_intent_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [account_id, environment]
+        exclusion = ""
+        if exclude_intent_id is not None:
+            exclusion = " AND intent.intent_id != ?"
+            params.append(exclude_intent_id)
+        return conn.execute(
+            f"""
+            SELECT intent.*
+            FROM closing_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            LEFT JOIN closing_reservation_voids AS void
+              USING (intent_id)
+            LEFT JOIN closing_reservation_absorptions AS absorption
+              USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND intent.state IN (
+                    'FILLED','CANCELLED','REJECTED','EXPIRED','FAILED'
+              )
+              AND void.intent_id IS NULL
+              AND absorption.intent_id IS NULL{exclusion}
+            ORDER BY intent.created_at, intent.intent_id
+            """,
+            params,
+        ).fetchall()
+
     @staticmethod
     def _cancellation_blocker_rows(
         conn: sqlite3.Connection,
@@ -6007,6 +7384,408 @@ class OrderIntentLedger:
             raise OrderIntentReservationError("filled risk reservation must be absorbed by a newer portfolio snapshot before new openings")
         if self._active_reservation_total(conn, intent["account_id"], intent["environment"]) > Decimal(cap["cap_amount"]):
             raise OrderIntentReservationError("active reservations exceed account/environment cap")
+
+    def _evaluate_closing_capacity(
+        self,
+        conn: sqlite3.Connection,
+        envelope: OrderIntent,
+        capacity_result: dict[str, Any],
+        *,
+        exclude_intent_id: str | None,
+    ) -> tuple[
+        ClosingRiskDecision, tuple[ClosingLeg, ClosingLeg]
+    ]:
+        legs = _closing_legs_from_payload(
+            json.loads(envelope.wire_payload), capacity_result
+        )
+        contracts = tuple(leg.contract for leg in legs)
+        active_by_contract = _active_closing_orders(
+            capacity_result, contracts
+        )
+        durable_by_contract: dict[
+            OptionContractId, list[DurableClosingReservation]
+        ] = {contract: [] for contract in contracts}
+        rows = conn.execute(
+            """
+            SELECT reservation.*, intent.state, intent.broker_order_id
+            FROM closing_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            LEFT JOIN closing_reservation_voids AS void
+              USING (intent_id)
+            LEFT JOIN closing_reservation_absorptions AS absorption
+              USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND void.intent_id IS NULL
+              AND absorption.intent_id IS NULL
+            ORDER BY reservation.created_at, reservation.intent_id
+            """,
+            (envelope.account_id, envelope.environment),
+        ).fetchall()
+        for row in rows:
+            if (
+                exclude_intent_id is not None
+                and row["intent_id"] == exclude_intent_id
+            ):
+                continue
+            self._closing_reservation_from_row(conn, row)
+            if row["state"] in {
+                "CLAIMED",
+                "SUBMISSION_UNKNOWN",
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+                "FAILED",
+            }:
+                raise OrderIntentReconciliationRequired(
+                    "unresolved closing reservation prevents a new capacity decision"
+                )
+            if row["state"] not in {"INTENT", "SUBMITTED"}:
+                raise OrderIntentIntegrityError(
+                    "closing reservation has an unsupported durable state"
+                )
+            broker_order_id = (
+                row["broker_order_id"]
+                if row["state"] == "SUBMITTED"
+                else None
+            )
+            documents = _load_closing_leg_documents(
+                row["canonical_legs_json"]
+            )
+            for ordinal, document in enumerate(documents):
+                contract = _closing_contract_from_document(
+                    document["contract"]
+                )
+                if contract not in durable_by_contract:
+                    continue
+                durable_by_contract[contract].append(
+                    DurableClosingReservation(
+                        contract=contract,
+                        reservation_id=(
+                            f"{row['reservation_sha256']}:{ordinal}"
+                        ),
+                        action=document["action"],
+                        quantity=Decimal(document["quantity"]),
+                        broker_order_id=broker_order_id,
+                    )
+                )
+        if any(durable_by_contract.values()):
+            raise OrderIntentReservationError(
+                "an active durable close already touches a requested contract"
+            )
+        capacities = _closing_capacities(
+            capacity_result,
+            contracts,
+            active_by_contract=active_by_contract,
+            durable_by_contract={
+                contract: tuple(values)
+                for contract, values in durable_by_contract.items()
+            },
+        )
+        return _evaluate_closing_order(legs, capacities), legs
+
+    def _require_active_closing_reservation(
+        self,
+        conn: sqlite3.Connection,
+        intent: sqlite3.Row,
+        now: int,
+        *,
+        require_fresh: bool,
+    ) -> ClosingReservation:
+        if intent["intent_kind"] != "CLOSING":
+            raise OrderIntentReservationError(
+                "closing reservation cannot bind an opening intent"
+            )
+        row = conn.execute(
+            """
+            SELECT * FROM closing_reservations WHERE intent_id = ?
+            """,
+            (intent["intent_id"],),
+        ).fetchone()
+        if row is None:
+            raise OrderIntentReservationError(
+                "closing submission requires a durable position reservation"
+            )
+        reservation = self._closing_reservation_from_row(conn, row)
+        if (
+            conn.execute(
+                """
+                SELECT 1 FROM closing_reservation_voids
+                WHERE intent_id = ?
+                """,
+                (intent["intent_id"],),
+            ).fetchone()
+            is not None
+            or conn.execute(
+                """
+                SELECT 1 FROM closing_reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent["intent_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise OrderIntentReservationError(
+                "closing position reservation has already been released"
+            )
+        if require_fresh:
+            manifest, _result = self._verified_broker_read_manifest(
+                conn, reservation.capacity_evidence_sha256
+            )
+            observed_at = int(manifest["observed_at"])
+            if (
+                observed_at > now + 5_000_000
+                or now - observed_at
+                > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentReservationError(
+                    "closing submission requires fresh capacity evidence"
+                )
+        return reservation
+
+    def _closing_reservation_from_row(
+        self, conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> ClosingReservation:
+        legs = _load_closing_leg_documents(
+            row["canonical_legs_json"]
+        )
+        projections = _load_canonical_json(
+            row["canonical_projections_json"],
+            "closing reservation projections",
+        )
+        if type(projections) is not list or len(projections) != 2:
+            raise OrderIntentIntegrityError(
+                "closing reservation projections are invalid"
+            )
+        quantity = int(row["quantity"])
+        decision_sha256 = _closing_decision_sha256(
+            legs, projections, quantity
+        )
+        material = {
+            "intent_id": row["intent_id"],
+            "account_id": row["account_id"],
+            "environment": row["environment"],
+            "capacity_evidence_sha256":
+                row["capacity_evidence_sha256"],
+            "capacity_state_sha256": row["capacity_state_sha256"],
+            "decision_sha256": row["decision_sha256"],
+            "order_payload_hash": row["order_payload_hash"],
+            "quantity": quantity,
+            "canonical_legs_json": row["canonical_legs_json"],
+            "canonical_projections_json":
+                row["canonical_projections_json"],
+            "created_at": int(row["created_at"]),
+        }
+        expected_reservation_sha256 = _domain_json_hash(
+            _CLOSING_RESERVATION_HASH_DOMAIN, material
+        )
+        intent = self._require_intent(conn, row["intent_id"])
+        manifest, result = self._verified_broker_read_manifest(
+            conn, row["capacity_evidence_sha256"]
+        )
+        if (
+            not hmac.compare_digest(
+                decision_sha256, row["decision_sha256"]
+            )
+            or not hmac.compare_digest(
+                expected_reservation_sha256,
+                row["reservation_sha256"],
+            )
+            or intent["intent_kind"] != "CLOSING"
+            or intent["account_id"] != row["account_id"]
+            or intent["environment"] != row["environment"]
+            or intent["payload_hash"] != row["order_payload_hash"]
+            or int(intent["created_at"]) != int(row["created_at"])
+            or manifest["evidence_kind"] != "CAPACITY"
+            or manifest["completeness"] != "COMPLETE"
+            or manifest["target_broker_order_id"] is not None
+            or manifest["account_id"] != row["account_id"]
+            or manifest["environment"] != row["environment"]
+            or result.get("schema") != "etrade-capacity.v3"
+            or result.get("state_sha256")
+            != row["capacity_state_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "closing reservation provenance does not verify"
+            )
+        expected_legs = _closing_legs_from_payload(
+            json.loads(intent["wire_payload"]), result
+        )
+        if [
+            _closing_leg_document(leg) for leg in expected_legs
+        ] != legs:
+            raise OrderIntentIntegrityError(
+                "closing reservation legs no longer match intent and capacity evidence"
+            )
+        if any(
+            document.get("requested_quantity") != str(quantity)
+            for document in projections
+        ):
+            raise OrderIntentIntegrityError(
+                "closing reservation projection quantity changed"
+            )
+        void = conn.execute(
+            """
+            SELECT * FROM closing_reservation_voids
+            WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        if void is not None:
+            void_material = {
+                "intent_id": void["intent_id"],
+                "reservation_sha256": void["reservation_sha256"],
+                "fencing_token": int(void["fencing_token"]),
+                "reason_code": void["reason_code"],
+                "voided_at": int(void["voided_at"]),
+            }
+            expected_void = _domain_json_hash(
+                _CLOSING_VOID_HASH_DOMAIN, void_material
+            )
+            void_fence = int(void["fencing_token"])
+            claim_exists = (
+                conn.execute(
+                    """
+                    SELECT 1 FROM order_events
+                    WHERE intent_id = ?
+                      AND event_type = 'SUBMISSION_CLAIMED'
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                is not None
+            )
+            submit_attempt_exists = (
+                conn.execute(
+                    """
+                    SELECT 1 FROM transport_send_attempts
+                    WHERE intent_id = ?
+                      AND authorization_operation = 'SUBMIT'
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                is not None
+            )
+            if (
+                expected_void != void["void_sha256"]
+                or void["reservation_sha256"]
+                != row["reservation_sha256"]
+                or intent["state"] != "FAILED"
+                or intent["broker_order_id"] is not None
+                or void_fence != int(intent["submission_fence"])
+                or void_fence < 0
+                or (
+                    void_fence == 0
+                    and (claim_exists or submit_attempt_exists)
+                )
+                or (void_fence > 0 and not claim_exists)
+                or conn.execute(
+                    """
+                    SELECT 1 FROM transport_send_attempts
+                    WHERE intent_id = ?
+                      AND authorization_operation = 'SUBMIT'
+                      AND transport_operation = 'SUBMIT_PLACE'
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                is not None
+            ):
+                raise OrderIntentIntegrityError(
+                    "closing reservation void does not verify"
+                )
+        return ClosingReservation(
+            reservation_sha256=row["reservation_sha256"],
+            intent_id=row["intent_id"],
+            account_id=row["account_id"],
+            environment=row["environment"],
+            capacity_evidence_sha256=(
+                row["capacity_evidence_sha256"]
+            ),
+            capacity_state_sha256=row["capacity_state_sha256"],
+            decision_sha256=row["decision_sha256"],
+            order_payload_hash=row["order_payload_hash"],
+            quantity=quantity,
+            canonical_legs_json=row["canonical_legs_json"],
+            canonical_projections_json=(
+                row["canonical_projections_json"]
+            ),
+            created_at=_from_us(row["created_at"]),
+        )
+
+    def _void_closing_reservation(
+        self,
+        conn: sqlite3.Connection,
+        intent_id: str,
+        *,
+        fencing_token: int,
+        now: int,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT * FROM closing_reservations WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise OrderIntentIntegrityError(
+                "failed closing intent lacks its durable reservation"
+            )
+        reservation = self._closing_reservation_from_row(conn, row)
+        if conn.execute(
+            """
+            SELECT 1 FROM closing_reservation_absorptions
+            WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone() is not None:
+            raise OrderIntentIntegrityError(
+                "absorbed closing reservation cannot be voided"
+            )
+        if conn.execute(
+            """
+            SELECT 1 FROM closing_reservation_voids
+            WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone() is not None:
+            raise OrderIntentIntegrityError(
+                "closing reservation is already void"
+            )
+        if conn.execute(
+            """
+            SELECT 1 FROM transport_send_attempts
+            WHERE intent_id = ?
+              AND authorization_operation = 'SUBMIT'
+              AND transport_operation = 'SUBMIT_PLACE'
+            """,
+            (intent_id,),
+        ).fetchone() is not None:
+            raise OrderIntentReconciliationRequired(
+                "closing reservation cannot be voided after a place claim"
+            )
+        material = {
+            "intent_id": intent_id,
+            "reservation_sha256": reservation.reservation_sha256,
+            "fencing_token": fencing_token,
+            "reason_code": "PRE_POST_ABORTED",
+            "voided_at": now,
+        }
+        void_sha256 = _domain_json_hash(
+            _CLOSING_VOID_HASH_DOMAIN, material
+        )
+        conn.execute(
+            """
+            INSERT INTO closing_reservation_voids (
+                void_sha256, intent_id, reservation_sha256,
+                fencing_token, reason_code, voided_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (void_sha256, *material.values()),
+        )
+        # Rebuild both immutable records inside the same transaction so a
+        # schema/trigger regression cannot commit a release receipt that the
+        # normal read path would later reject.
+        self._closing_reservation_from_row(conn, row)
 
     @staticmethod
     def _require_preview_receipt(
@@ -7490,6 +9269,433 @@ class OrderIntentLedger:
                     "later complete order evidence contradicts absorbed risk"
                 )
 
+    def _closing_absorption_requirement_conn(
+        self,
+        conn: sqlite3.Connection,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+        now: int,
+    ) -> tuple[
+        ClosingAbsorptionRequirement,
+        sqlite3.Row,
+        sqlite3.Row,
+        sqlite3.Row,
+        dict[str, Any],
+        sqlite3.Row,
+        dict[str, Any],
+    ]:
+        intent = self._require_intent(conn, intent_id)
+        reservation = conn.execute(
+            """
+            SELECT * FROM closing_reservations WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone()
+        if (
+            intent["intent_kind"] != "CLOSING"
+            or intent["state"]
+            not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+            or intent["broker_order_id"] is None
+            or reservation is None
+        ):
+            raise OrderIntentReconciliationRequired(
+                "only terminal closing risk can be absorbed"
+            )
+        self._closing_reservation_from_row(conn, reservation)
+        if (
+            conn.execute(
+                """
+                SELECT 1 FROM closing_reservation_voids
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise OrderIntentIntegrityError(
+                "terminal closing intent cannot have a pre-place void"
+            )
+        if (
+            conn.execute(
+                """
+                SELECT 1 FROM closing_reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise OrderIntentReconciliationRequired(
+                "closing reservation is already absorbed"
+            )
+        terminal_manifest, terminal_result = (
+            self._verified_broker_read_manifest(
+                conn, terminal_order_evidence.evidence_sha256
+            )
+        )
+        if (
+            terminal_manifest["evidence_kind"] != "ORDER_QUERY"
+            or terminal_manifest["completeness"] != "COMPLETE"
+            or terminal_manifest["account_id"] != intent["account_id"]
+            or terminal_manifest["environment"]
+            != intent["environment"]
+            or terminal_manifest["target_broker_order_id"]
+            != intent["broker_order_id"]
+            or terminal_result.get("schema")
+            != "etrade-order-query.v2"
+            or terminal_result.get("broker_order_id")
+            != intent["broker_order_id"]
+            or terminal_result.get("not_found") is not False
+            or terminal_result.get("outcome") != intent["state"]
+        ):
+            raise OrderIntentReconciliationRequired(
+                "closing terminal evidence is not an exact complete order read"
+            )
+        observed_at = int(terminal_manifest["observed_at"])
+        if (
+            observed_at > now + 5_000_000
+            or now - observed_at
+            > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentReconciliationRequired(
+                "closing terminal evidence is stale or from the future"
+            )
+        self._require_latest_complete_manifest_head(
+            conn, terminal_manifest, recorded_at_boundary=now
+        )
+        if terminal_result.get("replacement_links") != {
+            "replaces_order_id": None,
+            "replaced_by_order_id": None,
+        }:
+            raise OrderIntentReconciliationRequired(
+                "replacement-linked closing orders cannot release capacity"
+            )
+        expected_payload_hash = self._expected_order_payload_hash_conn(
+            conn, intent
+        )
+        if (
+            expected_payload_hash
+            not in terminal_result["order_payload_hashes"]
+        ):
+            raise OrderIntentBrokerTermsMismatch(
+                "closing terminal terms do not match the durable intent"
+            )
+        (
+            classification,
+            ordered_quantity,
+            filled_quantity,
+        ) = _terminal_closing_fill_classification(
+            intent,
+            terminal_result,
+            manifest_observed_at=observed_at,
+        )
+        baseline_manifest, baseline_result = (
+            self._verified_broker_read_manifest(
+                conn, reservation["capacity_evidence_sha256"]
+            )
+        )
+        if (
+            baseline_manifest["evidence_kind"] != "CAPACITY"
+            or baseline_manifest["completeness"] != "COMPLETE"
+            or baseline_manifest["account_id"] != intent["account_id"]
+            or baseline_manifest["environment"]
+            != intent["environment"]
+            or baseline_manifest["account_id_key"]
+            != terminal_manifest["account_id_key"]
+            or baseline_manifest["institution_type"]
+            != terminal_manifest["institution_type"]
+            or baseline_manifest["origin"]
+            != terminal_manifest["origin"]
+            or baseline_result.get("schema") != "etrade-capacity.v3"
+            or baseline_result.get("state_sha256")
+            != reservation["capacity_state_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "closing terminal evidence changed its reserved account binding"
+            )
+        return (
+            ClosingAbsorptionRequirement(
+                intent_id=intent_id,
+                classification=classification,
+                terminal_state=intent["state"],
+                broker_order_id=intent["broker_order_id"],
+                terminal_order_evidence_sha256=(
+                    terminal_order_evidence.evidence_sha256
+                ),
+                baseline_capacity_evidence_sha256=(
+                    reservation["capacity_evidence_sha256"]
+                ),
+                ordered_quantity=ordered_quantity,
+                filled_quantity=filled_quantity,
+                post_capacity_required=classification == "FULL_FILL",
+            ),
+            intent,
+            reservation,
+            terminal_manifest,
+            terminal_result,
+            baseline_manifest,
+            baseline_result,
+        )
+
+    def _closing_absorption_from_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> ClosingAbsorptionReceipt:
+        proof = _load_canonical_json(
+            row["canonical_position_proof_json"],
+            "closing position proof",
+        )
+        if type(proof) is not list:
+            raise OrderIntentIntegrityError(
+                "closing position proof must be an array"
+            )
+        expected_proof_sha256 = _domain_bytes_hash(
+            _CLOSING_POSITION_PROOF_HASH_DOMAIN,
+            row["canonical_position_proof_json"].encode("utf-8"),
+        )
+        material = {
+            "intent_id": row["intent_id"],
+            "account_id": row["account_id"],
+            "environment": row["environment"],
+            "broker_order_id": row["broker_order_id"],
+            "terminal_state": row["terminal_state"],
+            "classification": row["classification"],
+            "terminal_order_evidence_sha256":
+                row["terminal_order_evidence_sha256"],
+            "baseline_capacity_evidence_sha256":
+                row["baseline_capacity_evidence_sha256"],
+            "post_capacity_evidence_sha256":
+                row["post_capacity_evidence_sha256"],
+            "ordered_quantity": int(row["ordered_quantity"]),
+            "filled_quantity": int(row["filled_quantity"]),
+            "placed_time_epoch_ms": row["placed_time_epoch_ms"],
+            "executed_time_epoch_ms": row["executed_time_epoch_ms"],
+            "canonical_position_proof_json":
+                row["canonical_position_proof_json"],
+            "position_proof_sha256": row["position_proof_sha256"],
+            "observed_at": int(row["observed_at"]),
+            "recorded_at": int(row["recorded_at"]),
+        }
+        expected_absorption_sha256 = _domain_json_hash(
+            _CLOSING_ABSORPTION_HASH_DOMAIN, material
+        )
+        reservation = conn.execute(
+            """
+            SELECT * FROM closing_reservations WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        if reservation is None:
+            raise OrderIntentIntegrityError(
+                "closing absorption lost its reservation"
+            )
+        self._closing_reservation_from_row(conn, reservation)
+        intent = self._require_intent(conn, row["intent_id"])
+        terminal_manifest, terminal_result = (
+            self._verified_broker_read_manifest(
+                conn, row["terminal_order_evidence_sha256"]
+            )
+        )
+        baseline_manifest, baseline_result = (
+            self._verified_broker_read_manifest(
+                conn, row["baseline_capacity_evidence_sha256"]
+            )
+        )
+        if (
+            expected_proof_sha256 != row["position_proof_sha256"]
+            or expected_absorption_sha256 != row["absorption_sha256"]
+            or intent["intent_kind"] != "CLOSING"
+            or intent["account_id"] != row["account_id"]
+            or intent["environment"] != row["environment"]
+            or intent["broker_order_id"] != row["broker_order_id"]
+            or intent["state"] != row["terminal_state"]
+            or reservation["capacity_evidence_sha256"]
+            != row["baseline_capacity_evidence_sha256"]
+            or baseline_manifest["evidence_kind"] != "CAPACITY"
+            or baseline_manifest["completeness"] != "COMPLETE"
+            or baseline_manifest["target_broker_order_id"] is not None
+            or baseline_manifest["account_id"] != row["account_id"]
+            or baseline_manifest["environment"] != row["environment"]
+            or baseline_result.get("schema") != "etrade-capacity.v3"
+            or baseline_result.get("state_sha256")
+            != reservation["capacity_state_sha256"]
+            or terminal_manifest["evidence_kind"] != "ORDER_QUERY"
+            or terminal_manifest["completeness"] != "COMPLETE"
+            or terminal_manifest["account_id"] != row["account_id"]
+            or terminal_manifest["environment"] != row["environment"]
+            or terminal_manifest["target_broker_order_id"]
+            != row["broker_order_id"]
+            or terminal_result.get("broker_order_id")
+            != row["broker_order_id"]
+            or baseline_manifest["account_id_key"]
+            != terminal_manifest["account_id_key"]
+            or baseline_manifest["institution_type"]
+            != terminal_manifest["institution_type"]
+            or baseline_manifest["origin"]
+            != terminal_manifest["origin"]
+            or conn.execute(
+                """
+                SELECT 1 FROM closing_reservation_voids
+                WHERE intent_id = ?
+                """,
+                (row["intent_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise OrderIntentIntegrityError(
+                "closing absorption provenance does not verify"
+            )
+        try:
+            self._require_latest_complete_manifest_head(
+                conn,
+                terminal_manifest,
+                recorded_at_boundary=int(row["recorded_at"]),
+            )
+        except OrderIntentReconciliationRequired as exc:
+            raise OrderIntentIntegrityError(
+                "closing absorption did not use the terminal evidence head"
+            ) from exc
+        if (
+            terminal_result.get("schema")
+            != "etrade-order-query.v2"
+            or terminal_result.get("not_found") is not False
+            or terminal_result.get("outcome") != intent["state"]
+            or terminal_result.get("replacement_links")
+            != {
+                "replaces_order_id": None,
+                "replaced_by_order_id": None,
+            }
+            or self._expected_order_payload_hash_conn(conn, intent)
+            not in terminal_result.get("order_payload_hashes", [])
+        ):
+            raise OrderIntentIntegrityError(
+                "closing absorption terminal order proof changed"
+            )
+        try:
+            (
+                classification,
+                ordered_quantity,
+                filled_quantity,
+            ) = _terminal_closing_fill_classification(
+                intent,
+                terminal_result,
+                manifest_observed_at=int(
+                    terminal_manifest["observed_at"]
+                ),
+            )
+        except OrderIntentReconciliationRequired as exc:
+            raise OrderIntentIntegrityError(
+                "closing terminal classification no longer verifies"
+            ) from exc
+        summary = terminal_result["fill_summary"]
+        if (
+            classification != row["classification"]
+            or ordered_quantity != int(row["ordered_quantity"])
+            or filled_quantity != int(row["filled_quantity"])
+            or summary["placed_time_epoch_ms"]
+            != row["placed_time_epoch_ms"]
+            or summary["executed_time_epoch_ms"]
+            != row["executed_time_epoch_ms"]
+        ):
+            raise OrderIntentIntegrityError(
+                "closing absorption quantities or timestamps changed"
+            )
+        self._require_no_later_order_contradiction(
+            conn,
+            terminal_manifest,
+            terminal_result,
+            recorded_at_boundary=int(row["recorded_at"]),
+        )
+        if classification == "ZERO_FILL":
+            if (
+                proof
+                or row["post_capacity_evidence_sha256"] is not None
+                or int(row["observed_at"])
+                != int(terminal_manifest["observed_at"])
+            ):
+                raise OrderIntentIntegrityError(
+                    "zero-fill closing release contains unsupported position proof"
+                )
+        else:
+            post_manifest, post_result = (
+                self._verified_broker_read_manifest(
+                    conn, row["post_capacity_evidence_sha256"]
+                )
+            )
+            try:
+                self._require_latest_complete_manifest_head(
+                    conn,
+                    post_manifest,
+                    recorded_at_boundary=int(row["recorded_at"]),
+                )
+            except OrderIntentReconciliationRequired as exc:
+                raise OrderIntentIntegrityError(
+                    "closing absorption did not use the capacity evidence head"
+                ) from exc
+            if (
+                post_manifest["evidence_kind"] != "CAPACITY"
+                or post_manifest["completeness"] != "COMPLETE"
+                or post_manifest["account_id"] != row["account_id"]
+                or post_manifest["environment"] != row["environment"]
+                or post_result.get("schema") != "etrade-capacity.v3"
+                or post_manifest["account_id_key"]
+                != baseline_manifest["account_id_key"]
+                or post_manifest["institution_type"]
+                != baseline_manifest["institution_type"]
+                or post_manifest["origin"] != baseline_manifest["origin"]
+                or int(post_manifest["observed_at"])
+                <= int(terminal_manifest["observed_at"])
+                or int(post_manifest["observed_at"])
+                != int(row["observed_at"])
+                or self._manifest_request_started_at(
+                    conn, row["post_capacity_evidence_sha256"]
+                )
+                <= int(terminal_manifest["observed_at"])
+            ):
+                raise OrderIntentIntegrityError(
+                    "closing post-capacity proof changed"
+                )
+            rebuilt = _closing_position_absorption_proof(
+                reservation=reservation,
+                baseline_result=baseline_result,
+                post_result=post_result,
+                broker_order_id=row["broker_order_id"],
+                filled_quantity=int(row["filled_quantity"]),
+            )
+            if rebuilt != proof:
+                raise OrderIntentIntegrityError(
+                    "closing position absorption proof is not reproducible"
+                )
+        return ClosingAbsorptionReceipt(
+            absorption_sha256=row["absorption_sha256"],
+            intent_id=row["intent_id"],
+            account_id=row["account_id"],
+            environment=row["environment"],
+            broker_order_id=row["broker_order_id"],
+            terminal_state=row["terminal_state"],
+            classification=row["classification"],
+            terminal_order_evidence_sha256=(
+                row["terminal_order_evidence_sha256"]
+            ),
+            baseline_capacity_evidence_sha256=(
+                row["baseline_capacity_evidence_sha256"]
+            ),
+            post_capacity_evidence_sha256=(
+                row["post_capacity_evidence_sha256"]
+            ),
+            ordered_quantity=int(row["ordered_quantity"]),
+            filled_quantity=int(row["filled_quantity"]),
+            placed_time_epoch_ms=row["placed_time_epoch_ms"],
+            executed_time_epoch_ms=row["executed_time_epoch_ms"],
+            canonical_position_proof_json=(
+                row["canonical_position_proof_json"]
+            ),
+            position_proof_sha256=row["position_proof_sha256"],
+            observed_at=_from_us(row["observed_at"]),
+            recorded_at=_from_us(row["recorded_at"]),
+        )
+
     def _terminal_absorption_requirement_conn(
         self,
         conn: sqlite3.Connection,
@@ -8207,11 +10413,23 @@ class OrderIntentLedger:
         authorization = self._require_cancel_authorization(
             conn, row["authorization_sha256"]
         )
+        if intent["intent_kind"] == "CLOSING":
+            reservation = conn.execute(
+                """
+                SELECT * FROM closing_reservations WHERE intent_id = ?
+                """,
+                (row["intent_id"],),
+            ).fetchone()
+            if reservation is None:
+                raise OrderIntentIntegrityError(
+                    "closing cancellation lost its durable position reservation"
+                )
+            self._closing_reservation_from_row(conn, reservation)
         if (
             intent["account_id"] != row["account_id"]
             or intent["environment"] != row["environment"]
             or intent["broker_order_id"] != row["broker_order_id"]
-            or intent["intent_kind"] != "OPENING"
+            or intent["intent_kind"] not in {"OPENING", "CLOSING"}
             or authorization["intent_id"] != row["intent_id"]
             or authorization["account_id"] != row["account_id"]
             or authorization["environment"] != row["environment"]
@@ -8842,6 +11060,34 @@ def _is_zero_fill_cancel_pending(result: dict[str, Any]) -> bool:
         == 0
         for leg in summary["legs"]
     )
+
+
+def _exact_cancellation_terminal_outcome(
+    result: dict[str, Any],
+) -> Literal["FILLED", "CANCELLED", "REJECTED", "EXPIRED"] | None:
+    """Return only terminal states whose fill effect is unambiguous."""
+
+    outcome = result.get("outcome")
+    summary = result.get("fill_summary")
+    if (
+        result.get("not_found") is not False
+        or result.get("replacement_links")
+        != {
+            "replaces_order_id": None,
+            "replaced_by_order_id": None,
+        }
+        or type(summary) is not dict
+    ):
+        return None
+    classification = summary.get("classification")
+    if outcome == "FILLED" and classification == "FULL_FILL":
+        return "FILLED"
+    if (
+        outcome in {"CANCELLED", "REJECTED", "EXPIRED"}
+        and classification == "ZERO_FILL_TERMINAL"
+    ):
+        return outcome
+    return None
 
 
 def _validate_transport_request_evidence(
@@ -10238,6 +12484,7 @@ def _validate_fill_summary_shape(summary: Any) -> None:
             "fill summary must contain exactly two legs"
         )
     numbers: set[int] = set()
+    actions: set[str] = set()
     quantities: list[tuple[Decimal, Decimal, Decimal]] = []
     for leg in legs:
         if (
@@ -10256,12 +12503,15 @@ def _validate_fill_summary_shape(summary: Any) -> None:
             or leg["order_action"] not in {
                 "BUY_OPEN",
                 "SELL_OPEN",
+                "BUY_CLOSE",
+                "SELL_CLOSE",
             }
         ):
             raise OrderIntentIntegrityError(
                 "fill summary leg shape is invalid"
             )
         numbers.add(leg["leg_number"])
+        actions.add(leg["order_action"])
         _validate_normalized_product(
             leg["product"], "fill summary leg"
         )
@@ -10288,6 +12538,13 @@ def _validate_fill_summary_shape(summary: Any) -> None:
     if numbers != {1, 2}:
         raise OrderIntentIntegrityError(
             "fill summary leg numbers are ambiguous"
+        )
+    if actions not in (
+        {"BUY_OPEN", "SELL_OPEN"},
+        {"BUY_CLOSE", "SELL_CLOSE"},
+    ):
+        raise OrderIntentIntegrityError(
+            "fill summary mixes or duplicates exposure actions"
         )
     classification = summary["classification"]
     executed = summary["executed_time_epoch_ms"]
@@ -10517,6 +12774,729 @@ def _validate_capacity_positions(
         raise OrderIntentIntegrityError(
             "capacity position identities are ambiguous"
         )
+
+
+def _closing_json_value(value: Any) -> Any:
+    value_type = type(value)
+    if value is None or value_type in {str, bool, int}:
+        return value
+    if value_type is Decimal:
+        if not value.is_finite():
+            raise OrderIntentIntegrityError(
+                "closing decision contains a non-finite decimal"
+            )
+        normalized = format(value, "f")
+        if "." in normalized:
+            normalized = normalized.rstrip("0").rstrip(".")
+        return "0" if normalized in {"", "-0"} else normalized
+    if value_type in {tuple, list}:
+        return [_closing_json_value(item) for item in value]
+    if value_type is dict:
+        if any(type(key) is not str for key in value):
+            raise OrderIntentIntegrityError(
+                "closing decision keys must be exact strings"
+            )
+        return {
+            key: _closing_json_value(value[key])
+            for key in sorted(value)
+        }
+    raise OrderIntentIntegrityError(
+        "closing decision contains an unsupported value"
+    )
+
+
+def _closing_exact_quantity(value: Decimal) -> int:
+    if (
+        type(value) is not Decimal
+        or not value.is_finite()
+        or value <= 0
+        or value != value.to_integral_value()
+        or value > Decimal("2147483647")
+    ):
+        raise OrderIntentReservationError(
+            "closing quantity must be a positive signed-int32 integer"
+        )
+    return int(value)
+
+
+def _closing_contract_document(
+    contract: OptionContractId,
+) -> dict[str, Any]:
+    return {
+        "symbol": contract.symbol,
+        "expiry": contract.expiry.isoformat(),
+        "call_put": contract.call_put,
+        "strike": _closing_json_value(contract.strike),
+        "osi_key": contract.osi_key,
+        "multiplier": _closing_json_value(contract.multiplier),
+        "adjusted": contract.adjusted,
+        "deliverables": contract.deliverables,
+    }
+
+
+def _closing_contract_from_document(
+    document: Any,
+) -> OptionContractId:
+    if (
+        type(document) is not dict
+        or set(document)
+        != {
+            "symbol",
+            "expiry",
+            "call_put",
+            "strike",
+            "osi_key",
+            "multiplier",
+            "adjusted",
+            "deliverables",
+        }
+    ):
+        raise OrderIntentIntegrityError(
+            "closing contract document has an invalid shape"
+        )
+    try:
+        expiry = date.fromisoformat(document["expiry"])
+        strike = _canonical_signed_decimal_text(
+            document["strike"], "closing contract strike"
+        )
+        multiplier = _canonical_signed_decimal_text(
+            document["multiplier"], "closing contract multiplier"
+        )
+        return OptionContractId(
+            symbol=document["symbol"],
+            expiry=expiry,
+            call_put=document["call_put"],
+            strike=strike,
+            osi_key=document["osi_key"],
+            multiplier=multiplier,
+            adjusted=document["adjusted"],
+            deliverables=document["deliverables"],
+        )
+    except (TypeError, ValueError, OrderDomainError) as exc:
+        raise OrderIntentIntegrityError(
+            "closing contract document does not verify"
+        ) from exc
+
+
+def _closing_contract_from_position(
+    position: dict[str, Any],
+) -> OptionContractId:
+    if (
+        type(position) is not dict
+        or position.get("product", {}).get("security_type") != "OPTN"
+    ):
+        raise OrderIntentReservationError(
+            "closing capacity target is not an option position"
+        )
+    try:
+        return OptionContractId.from_normalized(
+            position["product"],
+            osi_key=position["osi_key"],
+            option_multiplier=position["option_multiplier"],
+            options_adjusted_flag=position["options_adjusted_flag"],
+            deliverables=position["deliverables"],
+        )
+    except (KeyError, TypeError, OrderDomainError) as exc:
+        raise OrderIntentReservationError(
+            "closing option identity is incomplete or inconsistent"
+        ) from exc
+
+
+def _normalized_product_matches_contract(
+    product: Any, contract: OptionContractId
+) -> bool:
+    if type(product) is not dict:
+        return False
+    return (
+        product.get("symbol") == contract.symbol
+        and product.get("security_type") == "OPTN"
+        and product.get("call_put") == contract.call_put
+        and product.get("expiry_year") == str(contract.expiry.year)
+        and product.get("expiry_month") == str(contract.expiry.month)
+        and product.get("expiry_day") == str(contract.expiry.day)
+        and product.get("strike_price")
+        == _closing_json_value(contract.strike)
+    )
+
+
+def _closing_leg_document(leg: ClosingLeg) -> dict[str, Any]:
+    return {
+        "contract": _closing_contract_document(leg.contract),
+        "action": leg.action,
+        "quantity": _closing_json_value(leg.quantity),
+    }
+
+
+def _load_closing_leg_documents(value: str) -> list[dict[str, Any]]:
+    documents = _load_canonical_json(
+        value, "closing reservation legs"
+    )
+    if type(documents) is not list or len(documents) != 2:
+        raise OrderIntentIntegrityError(
+            "closing reservation requires exactly two leg documents"
+        )
+    actions: set[str] = set()
+    quantities: set[Decimal] = set()
+    contracts: set[OptionContractId] = set()
+    for document in documents:
+        if (
+            type(document) is not dict
+            or set(document) != {"contract", "action", "quantity"}
+            or document["action"] not in {"BUY_CLOSE", "SELL_CLOSE"}
+        ):
+            raise OrderIntentIntegrityError(
+                "closing reservation leg shape is invalid"
+            )
+        contract = _closing_contract_from_document(
+            document["contract"]
+        )
+        quantity = _canonical_signed_decimal_text(
+            document["quantity"], "closing reservation quantity"
+        )
+        _closing_exact_quantity(quantity)
+        actions.add(document["action"])
+        quantities.add(quantity)
+        contracts.add(contract)
+    if (
+        actions != {"BUY_CLOSE", "SELL_CLOSE"}
+        or len(quantities) != 1
+        or len(contracts) != 2
+    ):
+        raise OrderIntentIntegrityError(
+            "closing reservation legs are not one exact vertical"
+        )
+    return documents
+
+
+def _closing_projection_document(
+    projection: PositionEffectProjection,
+) -> dict[str, Any]:
+    return {
+        "contract": _closing_contract_document(projection.contract),
+        "action": projection.action,
+        "requested_quantity": _closing_json_value(
+            projection.requested_quantity
+        ),
+        "position_before": _closing_json_value(
+            projection.position_before
+        ),
+        "position_after": _closing_json_value(
+            projection.position_after
+        ),
+        "position_capacity": _closing_json_value(
+            projection.position_capacity
+        ),
+        "lot_capacity": _closing_json_value(
+            projection.lot_capacity
+        ),
+        "active_close_quantity": _closing_json_value(
+            projection.active_close_quantity
+        ),
+        "unrepresented_reservation_quantity":
+            _closing_json_value(
+                projection.unrepresented_reservation_quantity
+            ),
+        "available_quantity": _closing_json_value(
+            projection.available_quantity
+        ),
+        "capacity_evidence_material": _closing_json_value(
+            projection.capacity_evidence_material
+        ),
+        "canonical_material": _closing_json_value(
+            projection.canonical_material
+        ),
+    }
+
+
+def _closing_decision_sha256(
+    legs: list[dict[str, Any]],
+    projections: list[Any],
+    quantity: int,
+) -> str:
+    if len(legs) != 2 or len(projections) != 2:
+        raise OrderIntentIntegrityError(
+            "closing decision requires two legs and projections"
+        )
+    leg_material = []
+    for document in legs:
+        contract = _closing_contract_from_document(
+            document["contract"]
+        )
+        leg_material.append(
+            [
+                list(contract.canonical_material),
+                document["action"],
+                document["quantity"],
+            ]
+        )
+    leg_material.sort(key=_canonical_read_json)
+    projection_material = []
+    expected_projection_keys = {
+        "contract",
+        "action",
+        "requested_quantity",
+        "position_before",
+        "position_after",
+        "position_capacity",
+        "lot_capacity",
+        "active_close_quantity",
+        "unrepresented_reservation_quantity",
+        "available_quantity",
+        "capacity_evidence_material",
+        "canonical_material",
+    }
+    for projection in projections:
+        if (
+            type(projection) is not dict
+            or set(projection) != expected_projection_keys
+            or projection["requested_quantity"] != str(quantity)
+        ):
+            raise OrderIntentIntegrityError(
+                "closing projection document is invalid"
+            )
+        contract = _closing_contract_from_document(
+            projection["contract"]
+        )
+        expected_material = [
+            list(contract.canonical_material),
+            projection["action"],
+            projection["requested_quantity"],
+            projection["position_before"],
+            projection["position_after"],
+            projection["position_capacity"],
+            projection["lot_capacity"],
+            projection["active_close_quantity"],
+            projection[
+                "unrepresented_reservation_quantity"
+            ],
+            projection["available_quantity"],
+            projection["capacity_evidence_material"],
+        ]
+        if projection["canonical_material"] != expected_material:
+            raise OrderIntentIntegrityError(
+                "closing projection canonical material changed"
+            )
+        projection_material.append(expected_material)
+    material = [
+        "etrade-closing-risk.v1",
+        "ALLOW",
+        "CLOSE_ALLOWED",
+        str(quantity),
+        leg_material,
+        projection_material,
+    ]
+    return _domain_json_hash(
+        _CLOSING_DECISION_HASH_DOMAIN, material
+    )
+
+
+def _closing_legs_from_payload(
+    payload: dict[str, Any],
+    capacity_result: dict[str, Any],
+) -> tuple[ClosingLeg, ClosingLeg]:
+    _validate_capacity_manifest_result(capacity_result)
+    if capacity_result["schema"] != "etrade-capacity.v3":
+        raise OrderIntentReservationError(
+            "closing requires exact capacity-v3 contract evidence"
+        )
+    if (
+        type(payload) is not dict
+        or _derive_intent_kind(payload) != "CLOSING"
+        or payload.get("orderAction") != "SPREAD"
+        or payload.get("spreadType") != "VERTICAL"
+        or type(payload.get("legs")) is not list
+        or len(payload["legs"]) != 2
+    ):
+        raise OrderIntentReservationError(
+            "closing reservation requires an exact two-leg vertical payload"
+        )
+    candidate_contracts: set[OptionContractId] = set()
+    for position in capacity_result["positions"]:
+        if position["product"]["security_type"] != "OPTN":
+            continue
+        candidate_contracts.add(
+            _closing_contract_from_position(position)
+        )
+    built: list[ClosingLeg] = []
+    for payload_leg in payload["legs"]:
+        matches = [
+            contract
+            for contract in candidate_contracts
+            if (
+                payload_leg["symbol"] == contract.symbol
+                and payload_leg["callPut"] == contract.call_put
+                and payload_leg["expiryYear"]
+                == contract.expiry.year
+                and payload_leg["expiryMonth"]
+                == contract.expiry.month
+                and payload_leg["expiryDay"]
+                == contract.expiry.day
+                and Decimal(str(payload_leg["strikePrice"]))
+                == contract.strike
+            )
+        ]
+        if len(matches) != 1:
+            raise OrderIntentReservationError(
+                "closing payload does not resolve to one exact option identity"
+            )
+        built.append(
+            ClosingLeg(
+                contract=matches[0],
+                action=payload_leg["orderAction"],
+                quantity=Decimal(payload_leg["quantity"]),
+            )
+        )
+    return built[0], built[1]
+
+
+def _active_closing_orders(
+    capacity_result: dict[str, Any],
+    contracts: tuple[OptionContractId, ...],
+) -> dict[OptionContractId, tuple[ActiveClosingOrder, ...]]:
+    active: dict[OptionContractId, list[ActiveClosingOrder]] = {
+        contract: [] for contract in contracts
+    }
+    seen: set[tuple[OptionContractId, str]] = set()
+    for order in capacity_result["open_orders"]:
+        if type(order) is not dict:
+            raise OrderIntentIntegrityError(
+                "active closing order is not an object"
+            )
+        order_id = order.get("order_id")
+        _validate_identity("active broker order id", order_id)
+        replacement_linked = any(
+            order.get(name) is not None
+            for name in (
+                "replaces_order_id",
+                "replaced_by_order_id",
+            )
+        )
+        details = order.get("details")
+        if type(details) is not list:
+            raise OrderIntentIntegrityError(
+                "active order details are invalid"
+            )
+        for detail in details:
+            if type(detail) is not dict:
+                raise OrderIntentIntegrityError(
+                    "active order detail is invalid"
+                )
+            if any(
+                detail.get(name) is not None
+                for name in (
+                    "replaces_order_id",
+                    "replaced_by_order_id",
+                )
+            ):
+                replacement_linked = True
+            instruments = detail.get("instruments")
+            if type(instruments) is not list:
+                raise OrderIntentIntegrityError(
+                    "active order instruments are invalid"
+                )
+            for instrument in instruments:
+                if type(instrument) is not dict:
+                    raise OrderIntentIntegrityError(
+                        "active order instrument is invalid"
+                    )
+                matches = [
+                    contract
+                    for contract in contracts
+                    if _normalized_product_matches_contract(
+                        instrument.get("product"), contract
+                    )
+                ]
+                if not matches:
+                    continue
+                if len(matches) != 1:
+                    raise OrderIntentReconciliationRequired(
+                        "active order product identity is ambiguous"
+                    )
+                action = instrument.get("order_action")
+                if action in {"BUY_OPEN", "SELL_OPEN"}:
+                    continue
+                if action not in {"BUY_CLOSE", "SELL_CLOSE"}:
+                    raise OrderIntentReconciliationRequired(
+                        "active target order has an unsupported position effect"
+                    )
+                if replacement_linked:
+                    raise OrderIntentReconciliationRequired(
+                        "replacement-linked active close is unsupported"
+                    )
+                ordered = _canonical_signed_decimal_text(
+                    instrument.get("ordered_quantity"),
+                    "active close ordered quantity",
+                )
+                filled = _canonical_signed_decimal_text(
+                    instrument.get("filled_quantity"),
+                    "active close filled quantity",
+                )
+                cancelled = _canonical_signed_decimal_text(
+                    instrument.get("cancel_quantity"),
+                    "active close cancel quantity",
+                )
+                remaining = ordered - filled - cancelled
+                if (
+                    ordered <= 0
+                    or remaining < 0
+                    or remaining != remaining.to_integral_value()
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "active close quantity is unresolved"
+                    )
+                if remaining == 0:
+                    continue
+                contract = matches[0]
+                identity = (contract, order_id)
+                if identity in seen:
+                    raise OrderIntentReconciliationRequired(
+                        "active close appears more than once for one contract"
+                    )
+                seen.add(identity)
+                active[contract].append(
+                    ActiveClosingOrder(
+                        contract=contract,
+                        broker_order_id=order_id,
+                        action=action,
+                        remaining_quantity=remaining,
+                    )
+                )
+    return {
+        contract: tuple(values)
+        for contract, values in active.items()
+    }
+
+
+def _closing_position_state(
+    capacity_result: dict[str, Any],
+    contract: OptionContractId,
+) -> tuple[Decimal, tuple[PositionLotCapacity, ...], list[dict[str, Any]]]:
+    quantity = Decimal("0")
+    position_is_positive: bool | None = None
+    lots: list[PositionLotCapacity] = []
+    lot_documents: list[dict[str, Any]] = []
+    for position in capacity_result["positions"]:
+        if position["product"]["security_type"] != "OPTN":
+            continue
+        candidate = _closing_contract_from_position(position)
+        if candidate != contract:
+            continue
+        position_quantity = _canonical_signed_decimal_text(
+            position["quantity"], "closing position quantity"
+        )
+        if (
+            position_quantity != position_quantity.to_integral_value()
+            or (
+                position_quantity > 0
+                and position["position_type"] != "LONG"
+            )
+            or (
+                position_quantity < 0
+                and position["position_type"] != "SHORT"
+            )
+        ):
+            raise OrderIntentReconciliationRequired(
+                "closing position sign/type is inconsistent"
+            )
+        if position_quantity != 0:
+            candidate_sign = position_quantity > 0
+            if (
+                position_is_positive is not None
+                and candidate_sign != position_is_positive
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "opposite-signed position records cannot be netted for closing capacity"
+                )
+            position_is_positive = candidate_sign
+        quantity += position_quantity
+        for lot in position["lots"]:
+            available = _canonical_signed_decimal_text(
+                lot["available_quantity"],
+                "closing lot available quantity",
+            )
+            if (
+                available != available.to_integral_value()
+                or (
+                    available != 0
+                    and position_quantity != 0
+                    and (available > 0) != (position_quantity > 0)
+                )
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "closing lot availability is inconsistent"
+                )
+            lots.append(
+                PositionLotCapacity(
+                    contract=contract,
+                    position_lot_id=lot["position_lot_id"],
+                    available_quantity=available,
+                )
+            )
+            lot_documents.append(
+                {
+                    "position_id": position["position_id"],
+                    "position_lot_id": lot["position_lot_id"],
+                    "available_quantity": lot["available_quantity"],
+                    "remaining_quantity": lot["remaining_quantity"],
+                }
+            )
+    lots.sort(key=lambda item: item.position_lot_id)
+    lot_documents.sort(key=_canonical_read_json)
+    return quantity, tuple(lots), lot_documents
+
+
+def _closing_capacities(
+    capacity_result: dict[str, Any],
+    contracts: tuple[OptionContractId, ...],
+    *,
+    active_by_contract: dict[
+        OptionContractId, tuple[ActiveClosingOrder, ...]
+    ],
+    durable_by_contract: dict[
+        OptionContractId, tuple[DurableClosingReservation, ...]
+    ],
+) -> tuple[ClosingCapacity, ClosingCapacity]:
+    capacities: list[ClosingCapacity] = []
+    for contract in contracts:
+        position_quantity, lots, _documents = (
+            _closing_position_state(capacity_result, contract)
+        )
+        capacities.append(
+            ClosingCapacity(
+                contract=contract,
+                position_quantity=position_quantity,
+                lots=lots,
+                active_closes=active_by_contract[contract],
+                durable_reservations=durable_by_contract[contract],
+            )
+        )
+    return capacities[0], capacities[1]
+
+
+def _terminal_closing_fill_classification(
+    intent: sqlite3.Row,
+    result: dict[str, Any],
+    *,
+    manifest_observed_at: int,
+) -> tuple[Literal["ZERO_FILL", "FULL_FILL"], int, int]:
+    if intent["intent_kind"] != "CLOSING":
+        raise OrderIntentIntegrityError(
+            "closing fill classification received an opening intent"
+        )
+    classification = _terminal_fill_classification(
+        intent,
+        result,
+        manifest_observed_at=manifest_observed_at,
+    )
+    actions = {
+        leg["order_action"] for leg in result["fill_summary"]["legs"]
+    }
+    if actions != {"BUY_CLOSE", "SELL_CLOSE"}:
+        raise OrderIntentReconciliationRequired(
+            "closing terminal evidence does not contain exact close actions"
+        )
+    return classification
+
+
+def _closing_position_absorption_proof(
+    *,
+    reservation: sqlite3.Row,
+    baseline_result: dict[str, Any],
+    post_result: dict[str, Any],
+    broker_order_id: str,
+    filled_quantity: int,
+) -> list[dict[str, Any]]:
+    _validate_capacity_manifest_result(baseline_result)
+    _validate_capacity_manifest_result(post_result)
+    if (
+        baseline_result["schema"] != "etrade-capacity.v3"
+        or post_result["schema"] != "etrade-capacity.v3"
+    ):
+        raise OrderIntentReconciliationRequired(
+            "closing absorption requires capacity-v3 before and after"
+        )
+    if any(
+        order.get("order_id") == broker_order_id
+        for order in post_result["open_orders"]
+        if type(order) is dict
+    ):
+        raise OrderIntentReconciliationRequired(
+            "terminal closing order remains active after fill"
+        )
+    projections = _load_canonical_json(
+        reservation["canonical_projections_json"],
+        "closing reservation projections",
+    )
+    if type(projections) is not list or len(projections) != 2:
+        raise OrderIntentIntegrityError(
+            "closing absorption lost its exact projections"
+        )
+    proof: list[dict[str, Any]] = []
+    for projection in projections:
+        contract = _closing_contract_from_document(
+            projection["contract"]
+        )
+        before_quantity, before_lots, before_documents = (
+            _closing_position_state(baseline_result, contract)
+        )
+        after_quantity, after_lots, after_documents = (
+            _closing_position_state(post_result, contract)
+        )
+        before_lot_capacity = sum(
+            (abs(lot.available_quantity) for lot in before_lots),
+            Decimal("0"),
+        )
+        after_lot_capacity = sum(
+            (abs(lot.available_quantity) for lot in after_lots),
+            Decimal("0"),
+        )
+        expected_after = _canonical_signed_decimal_text(
+            projection["position_after"],
+            "closing projected position after",
+        )
+        projected_before = _canonical_signed_decimal_text(
+            projection["position_before"],
+            "closing projected position before",
+        )
+        projected_lot_capacity = _canonical_signed_decimal_text(
+            projection["lot_capacity"],
+            "closing projected lot capacity",
+        )
+        expected_after_lots = (
+            projected_lot_capacity - Decimal(filled_quantity)
+        )
+        if (
+            before_quantity != projected_before
+            or before_lot_capacity != projected_lot_capacity
+            or after_quantity != expected_after
+            or expected_after_lots < 0
+            or after_lot_capacity != expected_after_lots
+        ):
+            raise OrderIntentReconciliationRequired(
+                "post-close positions do not absorb the exact filled quantity"
+            )
+        proof.append(
+            {
+                "contract": _closing_contract_document(contract),
+                "filled_quantity": str(filled_quantity),
+                "position_before": _closing_json_value(
+                    before_quantity
+                ),
+                "position_after": _closing_json_value(
+                    after_quantity
+                ),
+                "lot_capacity_before": _closing_json_value(
+                    before_lot_capacity
+                ),
+                "lot_capacity_after": _closing_json_value(
+                    after_lot_capacity
+                ),
+                "lots_before": before_documents,
+                "lots_after": after_documents,
+            }
+        )
+    proof.sort(key=_canonical_read_json)
+    return proof
 
 
 def _terminal_fill_classification(
@@ -11098,6 +14078,52 @@ def _validate_broker_order_shape(payload: Mapping[str, Any]) -> None:
                 raise OrderIntentValidationError("opening vertical credit must be non-negative and strictly less than strike width")
             if payload["priceType"] == "NET_DEBIT" and not (Decimal("0") < limit_price <= width):
                 raise OrderIntentValidationError("opening vertical debit must be positive and no greater than strike width")
+        else:
+            if payload["priceType"] not in {"NET_CREDIT", "NET_DEBIT"} or "limitPrice" not in payload:
+                raise OrderIntentValidationError(
+                    "closing verticals require bounded NET_CREDIT or NET_DEBIT pricing"
+                )
+            with localcontext() as decimal_context:
+                decimal_context.prec = _DECIMAL_PRECISION
+                width = abs(
+                    Decimal(str(legs[0]["strikePrice"]))
+                    - Decimal(str(legs[1]["strikePrice"]))
+                )
+                limit_price = Decimal(str(payload["limitPrice"]))
+            buy_leg = next(
+                leg for leg in legs if leg["orderAction"] == "BUY_CLOSE"
+            )
+            sell_leg = next(
+                leg for leg in legs if leg["orderAction"] == "SELL_CLOSE"
+            )
+            buy_closes_more_valuable_leg = (
+                buy_leg["callPut"] == "PUT"
+                and buy_leg["strikePrice"] > sell_leg["strikePrice"]
+            ) or (
+                buy_leg["callPut"] == "CALL"
+                and buy_leg["strikePrice"] < sell_leg["strikePrice"]
+            )
+            expected_price_type = (
+                "NET_DEBIT"
+                if buy_closes_more_valuable_leg
+                else "NET_CREDIT"
+            )
+            if payload["priceType"] != expected_price_type:
+                raise OrderIntentValidationError(
+                    "closing vertical price type does not match leg orientation"
+                )
+            if payload["priceType"] == "NET_CREDIT" and not (
+                Decimal("0") <= limit_price < width
+            ):
+                raise OrderIntentValidationError(
+                    "closing vertical credit must be non-negative and strictly less than strike width"
+                )
+            if payload["priceType"] == "NET_DEBIT" and not (
+                Decimal("0") < limit_price <= width
+            ):
+                raise OrderIntentValidationError(
+                    "closing vertical debit must be positive and no greater than strike width"
+                )
     else:
         required = {"symbol", "quantity", "orderAction", "callPut", "expiryYear", "expiryMonth", "expiryDay", "strikePrice", "priceType", "orderTerm"}
         if not required.issubset(payload) or payload.get("orderAction") not in {"BUY_OPEN", "SELL_OPEN", "BUY_CLOSE", "SELL_CLOSE"} or payload.get("callPut") not in {"PUT", "CALL"} or type(payload.get("symbol")) is not str or not payload["symbol"].strip() or "spreadType" in payload:

@@ -47,8 +47,8 @@ TRANSPORT_INTERNAL_CAPABILITIES = frozenset(
     }
 )
 GATEWAY_MUTATION_CALLERS = {
-    "preview": "live_trading.etrade_order_gateway.EtradeOrderGateway.submit_opening",
-    "place": "live_trading.etrade_order_gateway.EtradeOrderGateway.submit_opening",
+    "preview": "live_trading.etrade_order_gateway.EtradeOrderGateway._submit_intent",
+    "place": "live_trading.etrade_order_gateway.EtradeOrderGateway._submit_intent",
     "preview_change": (
         "live_trading.etrade_order_gateway.EtradeOrderGateway.reprice_opening"
     ),
@@ -56,7 +56,7 @@ GATEWAY_MUTATION_CALLERS = {
         "live_trading.etrade_order_gateway.EtradeOrderGateway.reprice_opening"
     ),
     "cancel": (
-        "live_trading.etrade_order_gateway.EtradeOrderGateway.cancel_opening"
+        "live_trading.etrade_order_gateway.EtradeOrderGateway._cancel_order"
     ),
 }
 HTTP_MUTATION_METHODS = frozenset(

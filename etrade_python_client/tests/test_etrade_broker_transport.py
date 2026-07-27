@@ -36,6 +36,7 @@ from live_trading.etrade_broker_transport import (
     _serialized_prepared_request,
     _transport_evidence,
     _transport_response_evidence,
+    _validate_vertical_payload,
     _write_exchange_result,
 )
 from live_trading.etrade_broker_reader import (
@@ -348,6 +349,14 @@ def vertical_payload(*, limit_price=1.25, symbol="SPY"):
             },
         ],
     }
+
+
+def closing_vertical_payload(*, limit_price=0.75):
+    payload = vertical_payload(limit_price=limit_price)
+    payload["priceType"] = "NET_DEBIT"
+    payload["legs"][0]["orderAction"] = "BUY_CLOSE"
+    payload["legs"][1]["orderAction"] = "SELL_CLOSE"
+    return payload
 
 
 class FakeResponse:
@@ -836,6 +845,36 @@ class ETradeBrokerTransportTests(unittest.TestCase):
         self.assertEqual(
             self.table_count(case, "transport_response_receipts"), 1
         )
+
+    def test_closing_vertical_validation_is_exact_and_price_oriented(
+        self,
+    ):
+        payload = closing_vertical_payload()
+
+        self.assertEqual(
+            _validate_vertical_payload(payload), "CLOSE"
+        )
+
+        mixed = json.loads(json.dumps(payload))
+        mixed["legs"][1]["orderAction"] = "BUY_OPEN"
+        with self.assertRaisesRegex(
+            ETradeBrokerTransportError, "uniform exposure"
+        ):
+            _validate_vertical_payload(mixed)
+
+        wrong_price = json.loads(json.dumps(payload))
+        wrong_price["priceType"] = "NET_CREDIT"
+        with self.assertRaisesRegex(
+            ETradeBrokerTransportError, "risk orientation"
+        ):
+            _validate_vertical_payload(wrong_price)
+
+        excessive_debit = json.loads(json.dumps(payload))
+        excessive_debit["limitPrice"] = 5.01
+        with self.assertRaisesRegex(
+            ETradeBrokerTransportError, "bounded width"
+        ):
+            _validate_vertical_payload(excessive_debit)
 
     def test_wrong_security_values_are_never_string_coerced(self):
         case = self.case([preview_response()])

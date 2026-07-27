@@ -1321,13 +1321,18 @@ class ETradeBrokerReader:
                 "known vertical leg identity is inconsistent"
             )
         balanced = len({leg["quantity"] for leg in legs}) == 1
+        actions = {leg["orderAction"] for leg in legs}
         if (
-            {leg["orderAction"] for leg in legs}
-            != {"BUY_OPEN", "SELL_OPEN"}
+            actions
+            not in (
+                {"BUY_OPEN", "SELL_OPEN"},
+                {"BUY_CLOSE", "SELL_CLOSE"},
+            )
             or len({leg["strikePrice"] for leg in legs}) != 2
         ):
             raise ETradeBrokerReaderIntegrityError(
-                "known vertical is not one buy-open and one sell-open"
+                "known vertical must have one buy and one sell "
+                "with uniform exposure"
             )
         payload_base = {
             "securityType": "OPTN",
@@ -2475,9 +2480,14 @@ def _normalize_known_leg(
     action = _ascii_text(
         instrument.get("orderAction"), "known order action"
     )
-    if action not in {"BUY_OPEN", "SELL_OPEN"}:
+    if action not in {
+        "BUY_OPEN",
+        "SELL_OPEN",
+        "BUY_CLOSE",
+        "SELL_CLOSE",
+    }:
         raise ETradeBrokerReaderIntegrityError(
-            "known vertical leg is not opening exposure"
+            "known vertical leg has unsupported exposure"
         )
     return {
         "legNumber": leg_number,

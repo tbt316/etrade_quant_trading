@@ -106,8 +106,9 @@ mount namespace.
 Adjusted or non-100-multiplier options are rejected from the display artifact;
 accepted options bind and show their exact standard-contract OSI identity.
 Standalone collection, hardened service activation, atomic release/rollback
-drills, cancellation, closing, full risk policy, and live gateway composition
-remain open.
+drills, full risk policy, and live gateway composition remain open. Exact
+closing and per-intent cancellation are implemented only inside the isolated
+durable stack; no live caller can reach them.
 
 ## What is worth preserving
 
@@ -435,13 +436,14 @@ intent, idempotency key, preview, broker IDs, price budget, every transition,
 actor, timestamps, retries, and reconciliation generation. Repricing has one
 owner and absolute slippage/debit/credit/time limits.
 
-Implementation status: schema 12 currently supports isolated opening and
-price-only reprice flows with `INTENT`, `CLAIMED`, `FAILED`,
+Implementation status: schema 14 supports isolated opening and closing
+verticals, opening price-only reprice, and one-shot cancellation flows with
+`INTENT`, `CLAIMED`, `FAILED`,
 `SUBMISSION_UNKNOWN`, `SUBMITTED`, and terminal states. Terminal-fill
 absorption is limited to exact zero fills or complete balanced fills with newer
-order-bound position lots; partial/replacement/assignment states stay blocked.
-New closing intents, cancellation, and live composition remain fail-closed
-release gates.
+order-bound position lots or exact closing position deltas;
+partial/replacement/assignment states stay blocked. Live composition remains a
+fail-closed release gate.
 
 ### Boundary 6: deterministic backtesting
 
@@ -532,10 +534,11 @@ credential checks, owner-only/redacted client logging, unconditional legacy
 mutation tombstones, read-only UI/routes, a tracked-source mutation gate, and
 deployment install/restart suspension are implemented in source. Phase 0
 remains open because no durable gateway is composed into a production process,
-the full pure pre-trade and failure policy is incomplete, closing/cancellation
-protocols are absent, exposed keys still require external revoke/rotate and
-coordinated history cleanup, the current local settings fail the new policy,
-and no deployed service has been restarted or verified.
+the full pure pre-trade and failure policy is incomplete, exposed keys still
+require external revoke/rotate and coordinated history cleanup, the current
+local settings fail the new policy, and no deployed service has been restarted
+or verified. Closing and cancellation now pass deterministic restart/crash
+contracts inside the isolated stack only.
 
 ### Phase 1 — reproducible repository baseline (week 1)
 
@@ -667,14 +670,16 @@ Exit gate:
 
 ### Phase 3 — durable live control plane (weeks 3–5)
 
-Status: partially delivered. R7a–R7f provide the schema-12 ledger, stable
-opening intent identity, outbox-style send claims, reconciliation, capacity
-reservations, a single isolated reprice owner, and exact zero/full terminal-risk
-absorption with retained filled-margin accounting. R7f also removes all current
-legacy mutation call sites and makes future bypasses fail CI. Partial/complex
-terminal states, closing/cancellation, the broader pure risk policy, process
-decomposition, a single reviewed composition root, dashboard command creation,
-and hardened live deployment remain open.
+Status: partially delivered. The R7 stack now provides the schema-14 ledger,
+stable opening and closing intent identity, outbox-style send claims,
+reconciliation, margin and exact-contract capacity reservations, one isolated
+opening reprice owner, one-shot opening/closing cancellation, and exact
+zero/full terminal-risk absorption. Filled opening margin remains counted, and
+filled closing capacity requires an exact post-position delta before release.
+R7f also removes all current legacy mutation call sites and makes future
+bypasses fail CI. Partial/complex terminal states, the broader pure risk policy,
+process decomposition, a single reviewed composition root, dashboard command
+creation, and hardened live deployment remain open.
 
 Deliver:
 
@@ -797,26 +802,25 @@ boundaries are extracted. Remove old paths only after golden tests and
 shadow-parity prove equivalent intended behavior.
 
 The current stacked delivery names the source-level startup containment slice
-R6. R7a–R7e implement an isolated schema-12 execution core: strict
-vertical-spread validation, stable intent/client identity, durable capacity
-reservations, monotonic submission/amendment fences, exact immutable outbound
-authorization, a no-retry mutation transport, an opening/reprice coordinator,
-an origin-bound durable E*TRADE reader, and order/lot-bound zero/full terminal
-absorption. The reader records bounded raw responses, the ledger independently
-replays their strict parser, and capacity or reconciliation can use only a
-semantically complete content-addressed manifest. Full fills retain their
-reserved margin in utilization after absorption. R7f quarantines the old
-execution system: 30 fixed mutation surfaces are reject-only tombstones, raw
-mutation I/O is statically confined to the transport, the gateway no longer
-exposes its transport, dashboard mutation routes and controls are inert, and
-install/restart tooling fails closed. No live caller instantiates the durable
-stack.
+R6. R7 implements an isolated schema-14 execution core: strict vertical-spread
+validation, stable intent/client identity, durable margin and exact-contract
+capacity reservations, monotonic submission/amendment/cancellation fences,
+exact immutable outbound authorization, a no-retry mutation transport,
+opening/closing coordination, an origin-bound durable E*TRADE reader, and
+order/lot/position-bound zero/full terminal absorption. The reader records
+bounded raw responses, the ledger independently replays its strict parser, and
+capacity or reconciliation can use only a semantically complete
+content-addressed manifest. R7f quarantines the old execution system: 30 fixed
+mutation surfaces are reject-only tombstones, raw mutation I/O is statically
+confined to the transport, the gateway exposes no transport, dashboard mutation
+routes and controls are inert, and install/restart tooling fails closed. No
+live caller instantiates the durable stack.
 
-The next R7 safety boundaries are closing-position capacity and one-shot
-per-intent cancellation. Only after those protocols pass restart/crash tests
-may a reviewed live composition root own the gateway. The direct-legacy
-mutation prohibition is already enforced and must remain green. See
-`docs/order_intent_ledger.md`.
+Closing-position capacity and per-intent cancellation now pass deterministic
+restart/crash tests. A reviewed live composition root still cannot be enabled
+until the pure risk policy, complex-state procedures, deployment, and staged
+sandbox gates pass. The direct-legacy mutation prohibition must remain green.
+See `docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
 
@@ -868,10 +872,10 @@ exercised a live/sandbox mutation. Current-source credential removal also does
 not establish secret hygiene while the repository remains public and the old
 keys remain in Git history. External revoke/rotate, coordinated history purge,
 strong local credential reprovisioning, the remaining R7
-partial/closing/cancellation protocols, durable-gateway composition, and
-deployment verification remain required. The isolated R7a–R7e stack has
-focused deterministic coverage and independent causal/security review,
-including exact zero/full terminal absorption, but it has no production call
+partial/complex-state protocols, durable-gateway composition, and deployment
+verification remain required. The isolated R7 stack has focused deterministic
+coverage and independent causal/security review, including exact closing,
+cancellation, and zero/full terminal absorption, but it has no production call
 site and is not live-execution evidence. R7f was rendered through an isolated
 real local handler and generated positions artifact at desktop and mobile
 widths, and its disabled endpoint returned the fixed `503` schema; this does

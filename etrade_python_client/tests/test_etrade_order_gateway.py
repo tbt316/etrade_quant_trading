@@ -32,11 +32,13 @@ from live_trading.etrade_broker_transport import (
     _ExchangeResult,
 )
 from live_trading.etrade_order_gateway import (
+    CancelClosingCommand,
     CancelOpeningCommand,
     EtradeOrderGateway,
     GatewayReconciliationRequired,
     GatewayValidationError,
     RepriceOpeningCommand,
+    SubmitClosingCommand,
     SubmitOpeningCommand,
 )
 from live_trading.order_intent_ledger import (
@@ -150,6 +152,22 @@ def vertical_payload(limit_price=1.25):
 def payload_bytes(limit_price=1.25):
     return json.dumps(
         vertical_payload(limit_price),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def closing_vertical_payload(limit_price=0.75):
+    payload = vertical_payload(limit_price)
+    payload["priceType"] = "NET_DEBIT"
+    payload["legs"][0]["orderAction"] = "BUY_CLOSE"
+    payload["legs"][1]["orderAction"] = "SELL_CLOSE"
+    return payload
+
+
+def closing_payload_bytes(limit_price=0.75):
+    return json.dumps(
+        closing_vertical_payload(limit_price),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -272,6 +290,8 @@ class FakeReader:
         self.capacity_digest = "a" * 64
         self.capacity_complete = True
         self.capacity_order_ids = ()
+        self.capacity_advance_seconds = 0
+        self.capacity_position_hook = None
         self.capacity_calls = []
         self.selected_hook = None
         self.query_behaviors = {}
@@ -333,12 +353,14 @@ class FakeReader:
                 ),
             )
 
-        if self.capacity_order_ids:
-            self.clock.advance(1)
+        if self.capacity_order_ids or self.capacity_advance_seconds:
+            self.clock.advance(max(1, self.capacity_advance_seconds))
         binding = self._binding()
         encoded_account = quote(self.account.account_id_key, safe="")
         as_of = str(int(self.clock.now.timestamp() * 1_000))
         positions = self._filled_positions()
+        if self.capacity_position_hook is not None:
+            positions = self.capacity_position_hook(positions)
         sources = [
             (
                 "binding.start",
@@ -496,7 +518,11 @@ class FakeReader:
                         "quantity": quantity,
                         "position_type": position_type,
                         "position_indicator": "TYPE1",
-                        "osi_key": None,
+                        "osi_key": (
+                            "SPY---270115P00620000"
+                            if strike == "620"
+                            else "SPY---270115P00615000"
+                        ),
                         "option_multiplier": "100",
                         "options_adjusted_flag": False,
                         "deliverables": "100 shares of SPY",
@@ -756,6 +782,9 @@ class FakeReader:
         executed_time = str(
             int((self.clock.now - timedelta(seconds=1)).timestamp() * 1_000)
         )
+        is_closing = canonical_order_payload_hash(
+            closing_vertical_payload()
+        ) in payload_hashes
         raw = (
             b""
             if not_found
@@ -781,12 +810,20 @@ class FakeReader:
                                             if outcome == "FILLED"
                                             else {}
                                         ),
-                                        "priceType": "NET_CREDIT",
+                                        "priceType": (
+                                            "NET_DEBIT"
+                                            if is_closing
+                                            else "NET_CREDIT"
+                                        ),
                                         "limitPrice": (
-                                            "1.50"
-                                            if order_payload_hash(1.50)
-                                            in payload_hashes
-                                            else "1.25"
+                                            "0.75"
+                                            if is_closing
+                                            else (
+                                                "1.50"
+                                                if order_payload_hash(1.50)
+                                                in payload_hashes
+                                                else "1.25"
+                                            )
                                         ),
                                         "orderTerm": "GOOD_FOR_DAY",
                                         "marketSession": "REGULAR",
@@ -794,7 +831,11 @@ class FakeReader:
                                         "stopPrice": "0",
                                         "Instrument": [
                                             self._known_leg(
-                                                "SELL_OPEN",
+                                                (
+                                                    "BUY_CLOSE"
+                                                    if is_closing
+                                                    else "SELL_OPEN"
+                                                ),
                                                 "620",
                                                 filled=outcome == "FILLED",
                                                 cancelled=(
@@ -803,7 +844,11 @@ class FakeReader:
                                                 ),
                                             ),
                                             self._known_leg(
-                                                "BUY_OPEN",
+                                                (
+                                                    "SELL_CLOSE"
+                                                    if is_closing
+                                                    else "BUY_OPEN"
+                                                ),
                                                 "615",
                                                 filled=outcome == "FILLED",
                                                 cancelled=(
@@ -990,6 +1035,23 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             lease_seconds=lease_seconds,
         )
 
+    def closing_command(
+        self,
+        *,
+        key="close-1",
+        decision="close-decision-1",
+        lease_seconds=30,
+    ):
+        return SubmitClosingCommand(
+            strategy_id="put-credit-spread-close",
+            decision_id=decision,
+            idempotency_scope="decision",
+            idempotency_key=key,
+            payload_bytes=closing_payload_bytes(),
+            owner=OWNER,
+            lease_seconds=lease_seconds,
+        )
+
     def restart(self, *, reader=None):
         ledger = OrderIntentLedger(
             self.path, clock=self.clock, run_id="gateway-run-b"
@@ -1009,6 +1071,14 @@ class EtradeOrderGatewayTests(unittest.TestCase):
     def submit_success(self):
         self.harness.add(preview_result(), place_result())
         return self.gateway.submit_opening(self.command())
+
+    def submit_closing_success(self, *, broker_order_id="94"):
+        self.reader.capacity_order_ids = ("93",)
+        self.harness.add(
+            preview_result(),
+            place_result(order_id=broker_order_id),
+        )
+        return self.gateway.submit_closing(self.closing_command())
 
     def make_pending_terminal(
         self,
@@ -1058,6 +1128,31 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         )
         self.reader.query_calls.clear()
 
+    def terminalize_closing(self, submitted, broker_order_id, outcome):
+        snapshot = BrokerOrderSnapshot(
+            account=self.account,
+            environment="sandbox",
+            broker_order_id=broker_order_id,
+            outcome=outcome,
+            observed_at=self.clock.now,
+            http_status=200,
+            raw_response_digest="4" * 64,
+            order_payload_hash=canonical_order_payload_hash(
+                closing_vertical_payload()
+            ),
+            complete=True,
+        )
+        self.reader.query_behaviors[broker_order_id] = snapshot
+        read = self.reader.query_order(self.account, broker_order_id)
+        terminal_evidence = self.ledger.broker_evidence_from_read(
+            submitted.intent_id, read, operation="ORDER_QUERY"
+        )
+        self.assertIsNotNone(terminal_evidence)
+        self.ledger.reconcile_terminal(
+            submitted.intent_id, outcome, terminal_evidence
+        )
+        self.reader.query_calls.clear()
+
     def test_real_transport_submission_is_idempotent_and_places_once(self):
         first = self.submit_success()
         replay = self.gateway.submit_opening(self.command())
@@ -1080,6 +1175,322 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         reservation = self.ledger.get_margin_reservation(first.intent_id)
         self.assertIsNotNone(reservation.capacity_decision_sha256)
         self.assertEqual(len(reservation.capacity_decision_sha256), 64)
+
+    def test_closing_vertical_is_reserved_and_placed_exactly_once(self):
+        first = self.submit_closing_success()
+        replay = self.gateway.submit_closing(self.closing_command())
+
+        self.assertEqual(first.state, "SUBMITTED")
+        self.assertEqual(replay.state, "SUBMITTED")
+        self.assertFalse(replay.created)
+        self.assertEqual(first.intent_id, replay.intent_id)
+        self.assertEqual(len(self.reader.capacity_calls), 1)
+        reservation = self.ledger.get_closing_reservation(first.intent_id)
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation.quantity, 1)
+        self.assertEqual(
+            self.ledger.get_intent(first.intent_id).envelope.intent_kind,
+            "CLOSING",
+        )
+        self.assertEqual(self.harness.count("/orders/preview"), 1)
+        self.assertEqual(self.harness.count("/orders/place"), 1)
+        for prepared, _timeout in self.harness.calls:
+            self.assertIn(
+                b"<orderAction>BUY_CLOSE</orderAction>",
+                prepared.body,
+            )
+            self.assertIn(
+                b"<orderAction>SELL_CLOSE</orderAction>",
+                prepared.body,
+            )
+
+    def test_overlapping_closing_reservation_is_denied_before_preview(self):
+        self.submit_closing_success()
+
+        with self.assertRaises(GatewayValidationError):
+            self.gateway.submit_closing(
+                self.closing_command(
+                    key="close-2", decision="close-decision-2"
+                )
+            )
+
+        self.assertEqual(self.harness.count("/orders/preview"), 1)
+        self.assertEqual(self.harness.count("/orders/place"), 1)
+
+    def test_failed_closing_preview_voids_capacity_for_a_new_intent(self):
+        self.reader.capacity_order_ids = ("93",)
+        self.harness.add(
+            preview_result(
+                messages={
+                    "description": "manual review required",
+                    "code": 1042,
+                    "type": "WARNING",
+                }
+            )
+        )
+
+        failed = self.gateway.submit_closing(self.closing_command())
+
+        self.assertEqual(failed.state, "FAILED")
+        self.assertEqual(self.harness.count("/orders/place"), 0)
+        self.clock.advance(1)
+        self.harness.add(
+            preview_result(preview_id="1020563280"),
+            place_result(order_id="95"),
+        )
+        submitted = self.gateway.submit_closing(
+            self.closing_command(
+                key="close-after-failure",
+                decision="close-after-failure-decision",
+            )
+        )
+        self.assertEqual(submitted.state, "SUBMITTED")
+        self.assertEqual(self.harness.count("/orders/place"), 1)
+
+    def test_stale_never_claimed_close_is_abandoned_without_broker_io(self):
+        self.reader.capacity_order_ids = ("93",)
+        with patch.object(
+            self.ledger,
+            "claim_submission",
+            side_effect=SystemExit("crash before claim"),
+        ):
+            with self.assertRaises(SystemExit):
+                self.gateway.submit_closing(self.closing_command())
+        self.clock.advance(301)
+
+        result = self.gateway.submit_closing(self.closing_command())
+
+        self.assertEqual(result.state, "FAILED")
+        self.assertEqual(result.reason_code, "STALE_CAPACITY_ABANDONED")
+        self.assertEqual(self.harness.calls, [])
+        self.assertEqual(
+            self.ledger.closing_reservation_blockers(
+                ACCOUNT_ID, "sandbox"
+            ),
+            (),
+        )
+        self.harness.add(preview_result(), place_result(order_id="95"))
+        fresh = self.gateway.submit_closing(
+            self.closing_command(
+                key="fresh-after-stale",
+                decision="fresh-after-stale-decision",
+            )
+        )
+        self.assertEqual(fresh.state, "SUBMITTED")
+
+    def test_unknown_closing_place_blocks_restart_without_retry(self):
+        self.reader.capacity_order_ids = ("93",)
+        self.harness.add(preview_result(), _ExchangeResult("TIMEOUT"))
+
+        result = self.gateway.submit_closing(self.closing_command())
+
+        self.assertEqual(result.state, "SUBMISSION_UNKNOWN")
+        with self.assertRaises(GatewayReconciliationRequired):
+            self.gateway.submit_closing(self.closing_command())
+        restarted, _, _ = self.restart()
+        with self.assertRaises(GatewayReconciliationRequired):
+            restarted.start()
+        self.assertEqual(self.harness.count("/orders/place"), 1)
+
+    def test_zero_fill_closing_terminal_releases_without_capacity_read(self):
+        submitted = self.submit_closing_success()
+        self.terminalize_closing(submitted, "94", "CANCELLED")
+        mutation_count = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "CANCELLED",
+            self.clock.now,
+            200,
+            "5" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(reader.capacity_calls, [])
+        self.assertEqual(
+            ledger.closing_reservation_blockers(ACCOUNT_ID, "sandbox"),
+            (),
+        )
+        self.assertEqual(len(self.harness.calls), mutation_count)
+
+    def test_closing_cancel_is_one_shot_and_releases_only_after_read(self):
+        submitted = self.submit_closing_success()
+        self.reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "OPEN",
+            self.clock.now,
+            200,
+            "5" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        self.harness.add(cancel_result())
+        command = CancelClosingCommand(
+            intent_id=submitted.intent_id,
+            idempotency_key="cancel-close-94",
+            owner=OWNER,
+        )
+
+        accepted = self.gateway.cancel_closing(command)
+        replay = self.gateway.cancel_closing(command)
+
+        self.assertEqual(accepted.state, "REQUEST_ACCEPTED")
+        self.assertEqual(replay.state, "REQUEST_ACCEPTED")
+        self.assertIsNotNone(
+            self.ledger.get_closing_reservation(submitted.intent_id)
+        )
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+
+        self.clock.advance(1)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "CANCELLED",
+            self.clock.now,
+            200,
+            "6" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        restarted, ledger, reader = self.restart(reader=reader)
+        restarted.start()
+
+        self.assertEqual(
+            ledger.closing_reservation_blockers(ACCOUNT_ID, "sandbox"),
+            (),
+        )
+        self.assertEqual(reader.capacity_calls, [])
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+
+    def test_closing_cancel_fill_race_requires_position_absorption(self):
+        submitted = self.submit_closing_success()
+        self.reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "OPEN",
+            self.clock.now,
+            200,
+            "5" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        self.harness.add(cancel_result())
+        self.gateway.cancel_closing(
+            CancelClosingCommand(
+                intent_id=submitted.intent_id,
+                idempotency_key="cancel-close-fill-race",
+                owner=OWNER,
+            )
+        )
+        self.clock.advance(1)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "FILLED",
+            self.clock.now,
+            200,
+            "6" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        reader.capacity_advance_seconds = 1
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        restarted.start()
+
+        self.assertEqual(
+            ledger.get_intent(submitted.intent_id).state, "FILLED"
+        )
+        self.assertEqual(
+            ledger.closing_reservation_blockers(ACCOUNT_ID, "sandbox"),
+            (),
+        )
+        self.assertEqual(reader.capacity_calls, [self.account])
+        self.assertEqual(self.harness.count("/orders/cancel"), 1)
+
+    def test_full_fill_closing_requires_a_newer_flat_position_read(self):
+        submitted = self.submit_closing_success()
+        self.terminalize_closing(submitted, "94", "FILLED")
+        mutation_count = len(self.harness.calls)
+        reader = FakeReader(self.clock, self.account)
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "FILLED",
+            self.clock.now,
+            200,
+            "6" * 64,
+            canonical_order_payload_hash(closing_vertical_payload()),
+            True,
+        )
+        restarted, ledger, reader = self.restart(reader=reader)
+
+        with self.assertRaises(GatewayReconciliationRequired):
+            restarted.start()
+        self.assertEqual(
+            len(
+                ledger.closing_reservation_blockers(
+                    ACCOUNT_ID, "sandbox"
+                )
+            ),
+            1,
+        )
+
+        reader.capacity_advance_seconds = 1
+        restarted.start()
+
+        self.assertEqual(
+            ledger.closing_reservation_blockers(ACCOUNT_ID, "sandbox"),
+            (),
+        )
+        self.assertEqual(len(reader.capacity_calls), 2)
+        self.assertEqual(len(self.harness.calls), mutation_count)
+
+    def test_ambiguous_closing_contract_evidence_denies_before_preview(self):
+        def wrong_osi(positions):
+            positions[0]["osi_key"] = "SPY---270115P00621000"
+            return positions
+
+        def adjusted(positions):
+            positions[0]["options_adjusted_flag"] = True
+            return positions
+
+        def wrong_multiplier(positions):
+            positions[0]["option_multiplier"] = "50"
+            return positions
+
+        def missing_lots(positions):
+            positions[0]["lots"] = []
+            return positions
+
+        for index, position_hook in enumerate(
+            (wrong_osi, adjusted, wrong_multiplier, missing_lots), start=1
+        ):
+            with self.subTest(position_hook=position_hook.__name__):
+                self.reader.capacity_order_ids = ("93",)
+                self.reader.capacity_position_hook = position_hook
+                with self.assertRaises(GatewayValidationError):
+                    self.gateway.submit_closing(
+                        self.closing_command(
+                            key=f"invalid-close-{index}",
+                            decision=f"invalid-close-decision-{index}",
+                        )
+                    )
+        self.assertEqual(self.harness.calls, [])
 
     def test_cancel_ack_stays_pending_and_restart_never_resends(
         self,

@@ -33,6 +33,9 @@ from live_trading.order_intent_ledger import (
     CancellationObservation,
     CancellationRecord,
     CapacityDecisionReceipt,
+    ClosingAbsorptionReceipt,
+    ClosingAbsorptionRequirement,
+    ClosingReservation,
     IntentRecord,
     MarginReservation,
     OrderIntent,
@@ -41,6 +44,7 @@ from live_trading.order_intent_ledger import (
     OrderIntentLedger,
     OrderIntentLedgerError,
     OrderIntentReconciliationRequired,
+    OrderIntentReservationError,
     OrderIntentTransitionError,
     ReservationAbsorptionReceipt,
     RiskEvidence,
@@ -83,6 +87,17 @@ class SubmitOpeningCommand:
 
 
 @dataclass(frozen=True)
+class SubmitClosingCommand:
+    strategy_id: str
+    decision_id: str
+    idempotency_scope: str
+    idempotency_key: str
+    payload_bytes: bytes = field(repr=False)
+    owner: str
+    lease_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class RepriceOpeningCommand:
     intent_id: str
     idempotency_key: str
@@ -93,6 +108,14 @@ class RepriceOpeningCommand:
 
 @dataclass(frozen=True)
 class CancelOpeningCommand:
+    intent_id: str
+    idempotency_key: str
+    owner: str
+    lease_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class CancelClosingCommand:
     intent_id: str
     idempotency_key: str
     owner: str
@@ -134,6 +157,13 @@ class _TerminalAbsorptionCandidate:
     record: IntentRecord
     terminal_read: BrokerReadEvidenceRef
     requirement: TerminalAbsorptionRequirement
+
+
+@dataclass(frozen=True)
+class _ClosingAbsorptionCandidate:
+    record: IntentRecord
+    terminal_read: BrokerReadEvidenceRef
+    requirement: ClosingAbsorptionRequirement
 
 
 class EtradeOrderGateway:
@@ -278,17 +308,58 @@ class EtradeOrderGateway:
                     else None
                 ),
             )
+        closing_candidates = []
+        for pending in self.ledger.closing_reservation_blockers(
+            account.account_id, self.runtime_safety.environment
+        ):
+            if pending.state not in {
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+            }:
+                continue
+            candidate = self._prepare_closing_absorption(
+                pending, account
+            )
+            if candidate is not None:
+                closing_candidates.append(candidate)
+        closing_post_capacity = None
+        if any(
+            candidate.requirement.classification == "FULL_FILL"
+            for candidate in closing_candidates
+        ):
+            try:
+                closing_post_capacity = self._read_capacity_evidence(
+                    account
+                )
+            except GatewayReconciliationRequired:
+                closing_post_capacity = None
+        for candidate in closing_candidates:
+            self._apply_closing_absorption(
+                candidate,
+                account,
+                post_capacity=(
+                    closing_post_capacity
+                    if candidate.requirement.classification == "FULL_FILL"
+                    else None
+                ),
+            )
         remaining = self.ledger.reconciliation_blockers(
             account.account_id, self.runtime_safety.environment
         )
         unabsorbed = self.ledger.pending_terminal_reservations(
             account.account_id, self.runtime_safety.environment
         )
-        if remaining or unabsorbed:
+        closing_unabsorbed = self.ledger.closing_reservation_blockers(
+            account.account_id, self.runtime_safety.environment
+        )
+        if remaining or unabsorbed or closing_unabsorbed:
             raise GatewayReconciliationRequired(
                 "gateway remains read-only: "
                 f"{len(remaining)} broker operation(s), "
-                f"{len(unabsorbed)} pending terminal reservation(s)"
+                f"{len(unabsorbed)} pending opening absorption(s), "
+                f"{len(closing_unabsorbed)} pending closing reservation(s)"
             )
         self._checked_account()
         self._started = True
@@ -336,30 +407,128 @@ class EtradeOrderGateway:
                     capacity_decision_sha256=capacity.decision_sha256,
                 ),
             )
-        lease = self.ledger.claim_submission(
-            record.intent_id,
-            command.owner,
+        return self._submit_intent(
+            record,
+            created=created.created,
+            owner=command.owner,
             lease_seconds=command.lease_seconds,
         )
-        authorization = self.ledger.prepare_submission_payload(
-            record.intent_id, command.owner, lease.fencing_token
+
+    def submit_closing(
+        self, command: SubmitClosingCommand
+    ) -> GatewayMutationResult:
+        """Reserve and submit one exact closing vertical."""
+
+        self._require_started()
+        command = _validate_closing_command(command)
+        account = self._checked_account()
+        envelope = OrderIntent.build(
+            account_id=account.account_id,
+            environment=self.runtime_safety.environment,
+            strategy_id=command.strategy_id,
+            decision_id=command.decision_id,
+            idempotency_scope=command.idempotency_scope,
+            idempotency_key=command.idempotency_key,
+            intent_kind="CLOSING",
+            order_payload=_decode_payload(command.payload_bytes),
         )
+        try:
+            record = self.ledger.find_intent(envelope)
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "closing idempotency lookup failed durable validation"
+            ) from exc
+        if record is not None:
+            existing = self._existing_submission_result(record, False)
+            if existing is not None:
+                return existing
+        self._require_no_blockers(account)
+        created = False
+        if record is None:
+            capacity_evidence = self._read_capacity_evidence(account)
+            try:
+                creation = self.ledger.create_closing_intent_from_read(
+                    envelope, capacity_evidence
+                )
+            except OrderIntentReconciliationRequired as exc:
+                raise GatewayReconciliationRequired(
+                    "closing capacity is blocked by unresolved broker work"
+                ) from exc
+            except OrderIntentLedgerError as exc:
+                raise GatewayValidationError(
+                    "closing capacity could not authorize an exact reservation"
+                ) from exc
+            record = creation.intent
+            created = creation.created
+            existing = self._existing_submission_result(record, created)
+            if existing is not None:
+                return existing
+        try:
+            return self._submit_intent(
+                record,
+                created=created,
+                owner=command.owner,
+                lease_seconds=command.lease_seconds,
+            )
+        except OrderIntentReservationError as exc:
+            current = self._require_intent(record.intent_id)
+            if current.state != "INTENT":
+                raise
+            try:
+                abandoned = self.ledger.abandon_stale_closing_intent(
+                    current.intent_id
+                )
+            except OrderIntentReservationError:
+                raise exc
+            return self._result(
+                abandoned,
+                created,
+                "FAILED",
+                None,
+                None,
+                "STALE_CAPACITY_ABANDONED",
+            )
+
+    def _submit_intent(
+        self,
+        record: IntentRecord,
+        *,
+        created: bool,
+        owner: str,
+        lease_seconds: int,
+    ) -> GatewayMutationResult:
+        """Run the one reviewed preview/place path for an already-reserved intent."""
+
+        lease = self.ledger.claim_submission(
+            record.intent_id,
+            owner,
+            lease_seconds=lease_seconds,
+        )
+        try:
+            authorization = self.ledger.prepare_submission_payload(
+                record.intent_id, owner, lease.fencing_token
+            )
+        except Exception:
+            self._fail_unplaced_submission(
+                record.intent_id, owner, lease.fencing_token
+            )
+            raise
         try:
             preview = self._transport.preview(authorization)
         except Exception:
             self._fail_unplaced_submission(
-                record.intent_id, command.owner, lease.fencing_token
+                record.intent_id, owner, lease.fencing_token
             )
             raise
         if preview.disposition == "UNKNOWN":
             failed = self.ledger.mark_pre_post_failed(
                 record.intent_id,
-                command.owner,
+                owner,
                 lease.fencing_token,
             )
             return self._result(
                 failed,
-                created.created,
+                created,
                 "FAILED",
                 preview.broker_order_id,
                 preview.preview_id,
@@ -369,7 +538,7 @@ class EtradeOrderGateway:
             self._checked_account()
         except Exception:
             self._fail_unplaced_submission(
-                record.intent_id, command.owner, lease.fencing_token
+                record.intent_id, owner, lease.fencing_token
             )
             raise
         try:
@@ -379,14 +548,19 @@ class EtradeOrderGateway:
             if current.state == "SUBMISSION_UNKNOWN":
                 return self._result(
                     current,
-                    created.created,
+                    created,
                     "SUBMISSION_UNKNOWN",
                     self._known_place_order_id(current, "SUBMIT_PLACE"),
                     preview.preview_id,
                     "TRANSPORT_RESPONSE_PERSISTENCE_ERROR",
                 )
             self._fail_unplaced_submission(
-                record.intent_id, command.owner, lease.fencing_token
+                record.intent_id, owner, lease.fencing_token
+            )
+            raise
+        except Exception:
+            self._fail_unplaced_submission(
+                record.intent_id, owner, lease.fencing_token
             )
             raise
         current = self._require_intent(record.intent_id)
@@ -400,7 +574,7 @@ class EtradeOrderGateway:
                 )
             return self._result(
                 current,
-                created.created,
+                created,
                 "SUBMITTED",
                 current.broker_order_id,
                 preview.preview_id,
@@ -412,7 +586,7 @@ class EtradeOrderGateway:
             )
         return self._result(
             current,
-            created.created,
+            created,
             "SUBMISSION_UNKNOWN",
             placed.broker_order_id,
             preview.preview_id,
@@ -558,13 +732,46 @@ class EtradeOrderGateway:
     def cancel_opening(
         self, command: CancelOpeningCommand
     ) -> GatewayCancellationResult:
-        """Request one cancel; only a later direct read may prove terminal."""
+        """Cancel one opening order through the durable one-shot protocol."""
 
         command = _validate_cancel_command(command)
-        existing = self.ledger.get_cancellation(command.intent_id)
+        return self._cancel_order(
+            intent_id=command.intent_id,
+            idempotency_key=command.idempotency_key,
+            owner=command.owner,
+            lease_seconds=command.lease_seconds,
+            expected_kind="OPENING",
+        )
+
+    def cancel_closing(
+        self, command: CancelClosingCommand
+    ) -> GatewayCancellationResult:
+        """Cancel one closing order without releasing its position claim."""
+
+        command = _validate_closing_cancel_command(command)
+        return self._cancel_order(
+            intent_id=command.intent_id,
+            idempotency_key=command.idempotency_key,
+            owner=command.owner,
+            lease_seconds=command.lease_seconds,
+            expected_kind="CLOSING",
+        )
+
+    def _cancel_order(
+        self,
+        *,
+        intent_id: str,
+        idempotency_key: str,
+        owner: str,
+        lease_seconds: int,
+        expected_kind: Literal["OPENING", "CLOSING"],
+    ) -> GatewayCancellationResult:
+        """Request once; only a later exact read may prove terminal."""
+
+        existing = self.ledger.get_cancellation(intent_id)
         if (
             existing is not None
-            and existing.idempotency_key != command.idempotency_key
+            and existing.idempotency_key != idempotency_key
         ):
             raise GatewayValidationError(
                 "cancellation idempotency key cannot be rebound"
@@ -572,18 +779,19 @@ class EtradeOrderGateway:
         if existing is not None and existing.state != "LEASED":
             return self._cancellation_result(
                 existing, "IDEMPOTENT_REPLAY"
-            )
+        )
         if existing is None:
             self._require_started()
-        record = self._require_intent(command.intent_id)
+        record = self._require_intent(intent_id)
         if (
-            record.envelope.intent_kind != "OPENING"
+            record.envelope.intent_kind != expected_kind
             or record.state != "SUBMITTED"
             or record.pending_operation is not None
             or record.broker_order_id is None
         ):
             raise GatewayValidationError(
-                "only a known submitted opening intent may be cancelled"
+                f"only a known submitted {expected_kind.lower()} "
+                "intent may be cancelled"
             )
         account = self._checked_account()
         if (
@@ -620,9 +828,9 @@ class EtradeOrderGateway:
                 )
         authorization = self.ledger.authorize_cancellation(
             record.intent_id,
-            command.idempotency_key,
-            command.owner,
-            command.lease_seconds,
+            idempotency_key,
+            owner,
+            lease_seconds,
             order_read,
         )
         self._checked_account()
@@ -840,6 +1048,23 @@ class EtradeOrderGateway:
         self,
         account: SelectedBrokerAccount,
     ) -> CapacityDecisionReceipt:
+        evidence = self._read_capacity_evidence(account)
+        try:
+            decision = self.ledger.set_reservation_cap_from_read(
+                evidence,
+                risk_budget=self._opening_risk_budget,
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "durable capacity evidence could not authorize a cap"
+            ) from exc
+        self._checked_account()
+        return decision
+
+    def _read_capacity_evidence(
+        self,
+        account: SelectedBrokerAccount,
+    ) -> BrokerReadEvidenceRef:
         checked = self._checked_account()
         _require_same_account(account, checked)
         try:
@@ -876,17 +1101,7 @@ class EtradeOrderGateway:
                 "capacity evidence reference failed durable verification"
             )
         self._checked_account()
-        try:
-            decision = self.ledger.set_reservation_cap_from_read(
-                evidence,
-                risk_budget=self._opening_risk_budget,
-            )
-        except OrderIntentLedgerError as exc:
-            raise GatewayValidationError(
-                "durable capacity evidence could not authorize a cap"
-            ) from exc
-        self._checked_account()
-        return decision
+        return evidence
 
     def _reconcile_once(
         self,
@@ -1112,6 +1327,153 @@ class EtradeOrderGateway:
         self._checked_account()
         return True
 
+    def _prepare_closing_absorption(
+        self,
+        record: IntentRecord,
+        account: SelectedBrokerAccount,
+    ) -> _ClosingAbsorptionCandidate | None:
+        """Collect exact terminal evidence for one durable closing claim."""
+
+        if (
+            record.envelope.intent_kind != "CLOSING"
+            or record.envelope.account_id != account.account_id
+            or record.envelope.environment
+            != self.runtime_safety.environment
+            or record.state
+            not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+            or record.broker_order_id is None
+        ):
+            raise GatewayValidationError(
+                "pending closing reservation has invalid durable identity"
+            )
+        checked = self._checked_account()
+        _require_same_account(account, checked)
+        try:
+            terminal_read = self.reader.query_order(
+                checked, record.broker_order_id
+            )
+        except ETradeBrokerReaderUnavailable:
+            return None
+        except ETradeBrokerReaderIntegrityError as exc:
+            raise GatewayValidationError(
+                "closing absorption order read violated the durable contract"
+            ) from exc
+        except ETradeBrokerReaderError:
+            return None
+        if (
+            type(terminal_read) is not BrokerReadEvidenceRef
+            or terminal_read.evidence_kind != "ORDER_QUERY"
+        ):
+            raise GatewayValidationError(
+                "closing absorption requires exact durable order evidence"
+            )
+        try:
+            requirement = self.ledger.closing_absorption_requirement(
+                record.intent_id, terminal_read
+            )
+            reservation = self.ledger.get_closing_reservation(
+                record.intent_id
+            )
+        except OrderIntentReconciliationRequired:
+            return None
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "closing absorption requirement failed durable validation"
+            ) from exc
+        if (
+            type(requirement) is not ClosingAbsorptionRequirement
+            or type(reservation) is not ClosingReservation
+            or requirement.intent_id != record.intent_id
+            or requirement.broker_order_id != record.broker_order_id
+            or requirement.terminal_state != record.state
+            or requirement.terminal_order_evidence_sha256
+            != terminal_read.evidence_sha256
+            or requirement.baseline_capacity_evidence_sha256
+            != reservation.capacity_evidence_sha256
+            or reservation.intent_id != record.intent_id
+            or reservation.account_id != account.account_id
+            or reservation.environment
+            != self.runtime_safety.environment
+            or requirement.post_capacity_required
+            != (requirement.classification == "FULL_FILL")
+            or requirement.classification not in {"ZERO_FILL", "FULL_FILL"}
+        ):
+            raise GatewayValidationError(
+                "closing absorption requirement is not bound to its reservation"
+            )
+        self._checked_account()
+        return _ClosingAbsorptionCandidate(
+            record=record,
+            terminal_read=terminal_read,
+            requirement=requirement,
+        )
+
+    def _apply_closing_absorption(
+        self,
+        candidate: _ClosingAbsorptionCandidate,
+        account: SelectedBrokerAccount,
+        *,
+        post_capacity: BrokerReadEvidenceRef | None,
+    ) -> bool:
+        """Release a terminal close only through its append-only proof."""
+
+        if type(candidate) is not _ClosingAbsorptionCandidate:
+            raise GatewayValidationError(
+                "closing absorption candidate has an invalid type"
+            )
+        requirement = candidate.requirement
+        if requirement.classification == "FULL_FILL":
+            if (
+                type(post_capacity) is not BrokerReadEvidenceRef
+                or post_capacity.evidence_kind != "CAPACITY"
+            ):
+                return False
+        elif post_capacity is not None:
+            raise GatewayValidationError(
+                "zero-fill closing absorption cannot use capacity evidence"
+            )
+        checked = self._checked_account()
+        _require_same_account(account, checked)
+        try:
+            receipt = self.ledger.absorb_closing_reservation(
+                candidate.record.intent_id,
+                candidate.terminal_read,
+                post_capacity_evidence=post_capacity,
+            )
+        except OrderIntentReconciliationRequired:
+            return False
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "closing reservation could not be absorbed atomically"
+            ) from exc
+        expected_post = (
+            None
+            if post_capacity is None
+            else post_capacity.evidence_sha256
+        )
+        if (
+            type(receipt) is not ClosingAbsorptionReceipt
+            or receipt.intent_id != candidate.record.intent_id
+            or receipt.account_id != account.account_id
+            or receipt.environment != self.runtime_safety.environment
+            or receipt.broker_order_id
+            != candidate.record.broker_order_id
+            or receipt.terminal_state != candidate.record.state
+            or receipt.classification != requirement.classification
+            or receipt.terminal_order_evidence_sha256
+            != candidate.terminal_read.evidence_sha256
+            or receipt.baseline_capacity_evidence_sha256
+            != requirement.baseline_capacity_evidence_sha256
+            or receipt.post_capacity_evidence_sha256 != expected_post
+            or receipt.ordered_quantity != requirement.ordered_quantity
+            or receipt.filled_quantity != requirement.filled_quantity
+        ):
+            raise GatewayValidationError(
+                "closing absorption receipt is not bound to the intent"
+            )
+        self._checked_account()
+        return True
+
     def _reconciliation_context(
         self, record: IntentRecord
     ) -> _ReconciliationContext | None:
@@ -1182,6 +1544,14 @@ class EtradeOrderGateway:
         if cancellations:
             raise GatewayReconciliationRequired(
                 f"{len(cancellations)} unresolved cancellation(s) "
+                "block mutation"
+            )
+        closing = self.ledger.closing_reservation_blockers(
+            account.account_id, self.runtime_safety.environment
+        )
+        if closing:
+            raise GatewayReconciliationRequired(
+                f"{len(closing)} unresolved closing reservation(s) "
                 "block mutation"
             )
         if self.ledger.unabsorbed_filled_reservation_count(
@@ -1343,6 +1713,26 @@ def _validate_submit_command(
     return command
 
 
+def _validate_closing_command(
+    command: SubmitClosingCommand,
+) -> SubmitClosingCommand:
+    if type(command) is not SubmitClosingCommand:
+        raise GatewayValidationError(
+            "closing command must use its exact immutable type"
+        )
+    for name in (
+        "strategy_id",
+        "decision_id",
+        "idempotency_scope",
+        "idempotency_key",
+        "owner",
+    ):
+        _exact_text(getattr(command, name), name)
+    _exact_payload_bytes(command.payload_bytes)
+    _lease_seconds(command.lease_seconds)
+    return command
+
+
 def _validate_reprice_command(
     command: RepriceOpeningCommand,
 ) -> RepriceOpeningCommand:
@@ -1364,6 +1754,20 @@ def _validate_cancel_command(
     if type(command) is not CancelOpeningCommand:
         raise GatewayValidationError(
             "cancel command must use its exact immutable type"
+        )
+    _exact_text(command.intent_id, "intent_id")
+    _exact_text(command.idempotency_key, "idempotency_key")
+    _exact_text(command.owner, "owner")
+    _lease_seconds(command.lease_seconds)
+    return command
+
+
+def _validate_closing_cancel_command(
+    command: CancelClosingCommand,
+) -> CancelClosingCommand:
+    if type(command) is not CancelClosingCommand:
+        raise GatewayValidationError(
+            "closing cancel command must use its exact immutable type"
         )
     _exact_text(command.intent_id, "intent_id")
     _exact_text(command.idempotency_key, "idempotency_key")

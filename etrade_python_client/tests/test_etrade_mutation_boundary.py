@@ -572,13 +572,13 @@ def test_only_exact_gateway_transport_invocations_are_allowed(
         {
             gateway: (
                 "class EtradeOrderGateway:\n"
-                "    def submit_opening(self):\n"
+                "    def _submit_intent(self):\n"
                 "        self._transport.preview(auth)\n"
                 "        self._transport.place(auth, preview)\n"
                 "    def reprice_opening(self):\n"
                 "        self._transport.preview_change(order_id, auth)\n"
                 "        self._transport.place_change(order_id, auth, preview)\n"
-                "    def cancel_opening(self):\n"
+                "    def _cancel_order(self):\n"
                 "        self._transport.cancel(auth)\n"
             )
         },
@@ -603,7 +603,7 @@ def test_gateway_transport_alias_calls_and_public_property_are_rejected(
                 "    @property\n"
                 "    def transport(self):\n"
                 "        return self._transport\n"
-                "    def submit_opening(self):\n"
+                "    def _submit_intent(self):\n"
                 "        self.transport.preview(auth)\n"
                 "    def helper(self):\n"
                 "        self._transport.place(auth, preview)\n"

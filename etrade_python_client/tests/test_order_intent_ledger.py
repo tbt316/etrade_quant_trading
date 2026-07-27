@@ -1056,17 +1056,19 @@ class OrderIntentLedgerTests(unittest.TestCase):
             OrderIntent.build(account_id="acct", environment="live", strategy_id="s", decision_id="d", idempotency_scope="scope", idempotency_key="key", intent_kind="OPENING", order_payload=raw_payload())
         with self.assertRaises(OrderIntentValidationError):
             OrderIntent.build(account_id="acct", environment="production", strategy_id="s", decision_id="d", idempotency_scope="scope", idempotency_key="key", intent_kind="CLOSING", order_payload=raw_payload())
+        closing = OrderIntent.build(
+            account_id="acct",
+            environment="production",
+            strategy_id="s",
+            decision_id="d",
+            idempotency_scope="scope",
+            idempotency_key="closing",
+            intent_kind="CLOSING",
+            order_payload=closing_payload(),
+        )
+        self.assertEqual(closing.intent_kind, "CLOSING")
         with self.assertRaises(OrderIntentValidationError):
-            OrderIntent.build(
-                account_id="acct",
-                environment="production",
-                strategy_id="s",
-                decision_id="d",
-                idempotency_scope="scope",
-                idempotency_key="closing",
-                intent_kind="CLOSING",
-                order_payload=closing_payload(),
-            )
+            self.ledger.create_intent(closing)
         malformed = raw_payload()
         malformed["legs"][0]["quantity"] = 0
         with self.assertRaises(OrderIntentValidationError):

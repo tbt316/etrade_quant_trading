@@ -1937,7 +1937,7 @@ def _authorized_vertical(
     client_order_id = payload.pop("client_order_id", None)
     if type(client_order_id) is not str or client_order_id != authorization.client_order_id:
         raise ETradeBrokerTransportError("authorization client order id is inconsistent")
-    _validate_opening_vertical_payload(payload)
+    exposure = _validate_vertical_payload(payload)
     try:
         wire_order_payload(payload)
     except Exception as exc:
@@ -1948,21 +1948,16 @@ def _authorized_vertical(
         or payload.get("spreadType") != "VERTICAL"
         or type(payload.get("legs")) is not list
         or len(payload["legs"]) != 2
-        or any(
-            type(leg) is not dict
-            or type(leg.get("orderAction")) is not str
-            or not leg["orderAction"].endswith("_OPEN")
-            for leg in payload["legs"]
-        )
+        or exposure not in {"OPEN", "CLOSE"}
     ):
         raise ETradeBrokerTransportError(
-            "transport currently supports opening vertical options only"
+            "transport supports exact two-leg vertical options only"
         )
     payload["client_order_id"] = client_order_id
     return payload
 
 
-def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
+def _validate_vertical_payload(payload: dict[str, Any]) -> str:
     required_top_level = {
         "securityType",
         "orderAction",
@@ -1974,7 +1969,7 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
     }
     if set(payload) != required_top_level:
         raise ETradeBrokerTransportError(
-            "transport requires an exact opening-vertical payload"
+            "transport requires an exact vertical payload"
         )
     exact_enums = (
         (payload["securityType"], {"OPTN"}),
@@ -1984,10 +1979,12 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
         (payload["spreadType"], {"VERTICAL"}),
     )
     if any(type(value) is not str or value not in allowed for value, allowed in exact_enums):
-        raise ETradeBrokerTransportError("opening-vertical enum is invalid")
+        raise ETradeBrokerTransportError("vertical enum is invalid")
     legs = payload["legs"]
     if type(legs) is not list or len(legs) != 2:
-        raise ETradeBrokerTransportError("opening vertical requires exactly two legs")
+        raise ETradeBrokerTransportError(
+            "vertical requires exactly two legs"
+        )
     required_leg = {
         "symbol",
         "callPut",
@@ -2003,7 +2000,9 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
     actions: set[str] = set()
     for leg in legs:
         if type(leg) is not dict or set(leg) != required_leg:
-            raise ETradeBrokerTransportError("opening-vertical leg shape is invalid")
+            raise ETradeBrokerTransportError(
+                "vertical leg shape is invalid"
+            )
         symbol = leg["symbol"]
         call_put = leg["callPut"]
         action = leg["orderAction"]
@@ -2015,19 +2014,25 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
             or type(call_put) is not str
             or call_put not in {"PUT", "CALL"}
             or type(action) is not str
-            or action not in {"BUY_OPEN", "SELL_OPEN"}
+            or action
+            not in {
+                "BUY_OPEN",
+                "SELL_OPEN",
+                "BUY_CLOSE",
+                "SELL_CLOSE",
+            }
             or any(type(value) is not int for value in expiry)
             or type(quantity) is not int
             or quantity <= 0
         ):
             raise ETradeBrokerTransportError(
-                "opening-vertical leg value is invalid"
+                "vertical leg value is invalid"
             )
         try:
             date(*expiry)
         except ValueError as exc:
             raise ETradeBrokerTransportError(
-                "opening-vertical expiry is invalid"
+                "vertical expiry is invalid"
             ) from exc
         strike = _finite_decimal(leg["strikePrice"], "strike price", positive=True)
         identities.append((symbol, call_put, *expiry, quantity))
@@ -2035,11 +2040,19 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
         actions.add(action)
     if identities[0] != identities[1]:
         raise ETradeBrokerTransportError(
-            "opening-vertical leg identities are inconsistent"
+            "vertical leg identities are inconsistent"
         )
-    if actions != {"BUY_OPEN", "SELL_OPEN"} or strikes[0] == strikes[1]:
+    if actions == {"BUY_OPEN", "SELL_OPEN"}:
+        exposure = "OPEN"
+    elif actions == {"BUY_CLOSE", "SELL_CLOSE"}:
+        exposure = "CLOSE"
+    else:
         raise ETradeBrokerTransportError(
-            "opening vertical requires one buy, one sell, and distinct strikes"
+            "vertical legs must be one buy and one sell with uniform exposure"
+        )
+    if strikes[0] == strikes[1]:
+        raise ETradeBrokerTransportError(
+            "vertical requires distinct strikes"
         )
     limit_price = _finite_decimal(
         payload["limitPrice"],
@@ -2048,7 +2061,9 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
     )
     width = abs(strikes[0] - strikes[1])
     sell_index = next(
-        index for index, leg in enumerate(legs) if leg["orderAction"] == "SELL_OPEN"
+        index
+        for index, leg in enumerate(legs)
+        if leg["orderAction"] == f"SELL_{exposure}"
     )
     buy_index = 1 - sell_index
     call_put = legs[0]["callPut"]
@@ -2060,7 +2075,7 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
     expected_price_type = "NET_CREDIT" if short_risk else "NET_DEBIT"
     if payload["priceType"] != expected_price_type:
         raise ETradeBrokerTransportError(
-            "opening-vertical price type does not match its risk orientation"
+            "vertical price type does not match its risk orientation"
         )
     if (
         payload["priceType"] == "NET_CREDIT"
@@ -2070,8 +2085,9 @@ def _validate_opening_vertical_payload(payload: dict[str, Any]) -> None:
         and not (Decimal("0") < limit_price <= width)
     ):
         raise ETradeBrokerTransportError(
-            "opening-vertical limit price is outside its bounded width"
+            "vertical limit price is outside its bounded width"
         )
+    return exposure
 
 
 def _finite_decimal(value: Any, label: str, *, positive: bool) -> Decimal:

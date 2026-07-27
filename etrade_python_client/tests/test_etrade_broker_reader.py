@@ -304,6 +304,7 @@ def option_leg(
 def known_order(
     status: str,
     *,
+    exposure: str = "OPEN",
     filled_quantity: str = "0",
     second_filled_quantity: str | None = None,
     cancel_quantity: str | None = None,
@@ -312,6 +313,8 @@ def known_order(
     replaces_order_id: str | None = None,
     replaced_by_order_id: str | None = None,
 ) -> Reply:
+    if exposure not in {"OPEN", "CLOSE"}:
+        raise AssertionError("unsupported known-order exposure fixture")
     second_filled = (
         filled_quantity
         if second_filled_quantity is None
@@ -333,21 +336,23 @@ def known_order(
         "orderNumber": order_id,
         "placedTime": "1785167000000",
         "status": status,
-        "priceType": "NET_CREDIT",
-        "limitPrice": "1.25",
+        "priceType": (
+            "NET_CREDIT" if exposure == "OPEN" else "NET_DEBIT"
+        ),
+        "limitPrice": "1.25" if exposure == "OPEN" else "0.75",
         "orderTerm": "GOOD_FOR_DAY",
         "marketSession": "REGULAR",
         "allOrNone": False,
         "stopPrice": "0",
         "Instrument": [
             option_leg(
-                "SELL_OPEN",
+                "SELL_OPEN" if exposure == "OPEN" else "BUY_CLOSE",
                 "620",
                 filled_quantity=filled_quantity,
                 cancel_quantity=first_cancel,
             ),
             option_leg(
-                "BUY_OPEN",
+                "BUY_OPEN" if exposure == "OPEN" else "SELL_CLOSE",
                 "615",
                 filled_quantity=second_filled,
                 cancel_quantity=second_cancel,
@@ -405,6 +410,39 @@ def expected_vertical_payload() -> dict:
                 "expiryDay": 21,
                 "strikePrice": Decimal("615"),
                 "orderAction": "BUY_OPEN",
+                "quantity": 1,
+            },
+        ],
+    }
+
+
+def expected_closing_vertical_payload() -> dict:
+    return {
+        "securityType": "OPTN",
+        "orderAction": "SPREAD",
+        "priceType": "NET_DEBIT",
+        "limitPrice": Decimal("0.75"),
+        "orderTerm": "GOOD_FOR_DAY",
+        "spreadType": "VERTICAL",
+        "legs": [
+            {
+                "symbol": "SPY",
+                "callPut": "PUT",
+                "expiryYear": 2026,
+                "expiryMonth": 8,
+                "expiryDay": 21,
+                "strikePrice": Decimal("620"),
+                "orderAction": "BUY_CLOSE",
+                "quantity": 1,
+            },
+            {
+                "symbol": "SPY",
+                "callPut": "PUT",
+                "expiryYear": 2026,
+                "expiryMonth": 8,
+                "expiryDay": 21,
+                "strikePrice": Decimal("615"),
+                "orderAction": "SELL_CLOSE",
                 "quantity": 1,
             },
         ],
@@ -1548,6 +1586,77 @@ class ETradeBrokerReaderTests(unittest.TestCase):
                         """,
                     )[0]["raw_response_sha256"],
                 )
+
+    def test_known_closing_vertical_has_exact_hash_and_terminal_evidence(
+        self,
+    ) -> None:
+        expected_hash = canonical_order_payload_hash(
+            expected_closing_vertical_payload()
+        )
+        for status, filled, outcome, classification in (
+            ("OPEN", "0", "OPEN", "OPEN"),
+            ("EXECUTED", "1", "FILLED", "FULL_FILL"),
+            (
+                "CANCELLED",
+                "0",
+                "CANCELLED",
+                "ZERO_FILL_TERMINAL",
+            ),
+        ):
+            with self.subTest(status=status):
+                case = self.case(
+                    [
+                        account_list(account()),
+                        known_order(
+                            status,
+                            exposure="CLOSE",
+                            filled_quantity=filled,
+                        ),
+                        account_list(account()),
+                    ]
+                )
+
+                evidence = case.reader.query_order(
+                    case.account, ORDER_ID
+                )
+                result = self.manifest_result(
+                    case, evidence.evidence_sha256
+                )
+
+                self.assertEqual(result["outcome"], outcome)
+                self.assertEqual(
+                    result["fill_summary"]["classification"],
+                    classification,
+                )
+                self.assertEqual(
+                    {
+                        leg["order_action"]
+                        for leg in result["fill_summary"]["legs"]
+                    },
+                    {"BUY_CLOSE", "SELL_CLOSE"},
+                )
+                self.assertIn(
+                    expected_hash, result["order_payload_hashes"]
+                )
+
+    def test_known_vertical_rejects_mixed_open_and_close_exposure(
+        self,
+    ) -> None:
+        document = reply_document(
+            known_order("OPEN", exposure="CLOSE")
+        )
+        document["OrdersResponse"]["Order"][0]["OrderDetail"][0][
+            "Instrument"
+        ][1]["orderAction"] = "BUY_OPEN"
+        case = self.case([])
+
+        with self.assertRaisesRegex(
+            ETradeBrokerReaderIntegrityError,
+            "uniform exposure",
+        ):
+            case.reader._parse_order_detail(
+                200, Reply.json(document).raw, ORDER_ID
+            )
 
     def test_partial_terminal_and_replacement_link_stay_unresolved(
         self,
