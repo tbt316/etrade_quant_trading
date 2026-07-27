@@ -17,6 +17,14 @@ Cboe's VIX history CSV because they provide a clear regular-session close and a
 first-party VIX source. The adapter is library-only: it is not scheduled, does
 not run at import time, and is not connected to E*TRADE orders.
 
+R5 adds `live_trading/regime_shadow_publish.py`, but does not resolve this gate.
+Both its CLI and its public publication function require an explicit approving
+entitlement capability before the first gateway refresh. A missing, false, or
+raising capability produces no provider request, evidence-channel read, or
+shadow-file mutation. The validator itself remains outside the repository and
+must bind the opaque ID to the records below; possession of an API key cannot
+serve as the capability.
+
 The current public terms do not establish the rights required for production
 use:
 
