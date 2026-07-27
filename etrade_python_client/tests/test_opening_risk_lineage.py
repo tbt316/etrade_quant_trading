@@ -307,6 +307,15 @@ def test_quote_and_lineage_tamper_are_detected_after_restart():
                     + capture.raw_response_bytes[1:],
                 ),
             )
+            connection.execute(
+                """
+                CREATE TRIGGER prevent_opening_quote_receipt_update
+                BEFORE UPDATE ON opening_quote_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'opening quote receipts are append-only');
+                END
+                """
+            )
             connection.commit()
         restarted = OrderIntentLedger(
             case.path, clock=case.clock, run_id="lineage-tamper"

@@ -1,6 +1,6 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7 durable execution core plus schema-16 non-authorizing
+**Delivery status:** R7 durable execution core plus schema-17 non-authorizing
 opening-risk evidence lineage, crash-safe cancellation, exact closing-capacity
 reservations, terminal absorption, and legacy mutation quarantine, isolated
 
@@ -180,26 +180,65 @@ remains blocked rather than guessed or retried.
   authorizations, transport attempts, preview receipts, mutation responses,
   broker-read responses, read manifests, and capacity decisions are
   append-only.
+- SQLite conflict resolution is part of that boundary. Every append-only row
+  has an exact `BEFORE INSERT` collision guard over its primary identity and
+  every declared alternate unique identity, so `REPLACE`, `INSERT OR REPLACE`,
+  and other colliding inserts cannot delete the old row before the
+  update/delete guards run.
 - The ledger database must live in an owner-only `0700` directory and remain an
   owner-only regular `0600` file. SQLite sidecars receive the same validation.
 
+### Durable-table inventory
+
+The complete append-only/immutable inventory is:
+
+- `order_events`, `broker_order_history`, and `amendment_history`;
+- `outbound_authorizations`, `transport_send_attempts`,
+  `broker_preview_receipts`, and `transport_response_receipts`;
+- `broker_read_receipts`, `broker_read_manifests`,
+  `broker_read_manifest_members`, and `capacity_decisions`;
+- `opening_risk_prerequisites`, `opening_quote_receipts`, and
+  `opening_risk_lineages`;
+- `reservation_absorptions`, `closing_reservations`,
+  `closing_reservation_voids`, and `closing_reservation_absorptions`; and
+- `cancel_authorizations`, `cancel_send_attempts`,
+  `cancel_response_receipts`, and `cancel_resolutions`.
+
+`order_intents`, `margin_reservations`, and `order_cancellations` are durable
+state-machine rows, not append-only evidence. Their reviewed transitions remain
+ordinary `UPDATE`s, while deletion and colliding reinsertion are forbidden so
+conflict resolution cannot reset the state machine or rebind its immutable
+identity. `reservation_caps` and `amendment_leases` are explicitly mutable
+operational projections; the former advances through a checked upsert and the
+latter is acquired, updated, and deleted through its lease protocol.
+`ledger_metadata` is mutable only inside an attested schema migration.
+
 ## Schema policy
 
-Schema 16 adds append-only `opening_quote_receipts` and
+Schema 16 added append-only `opening_quote_receipts` and
 `opening_risk_lineages`, while retaining schema 15
 `opening_risk_prerequisites` and exact intent,
 capacity-decision, and manifest cross-binding guards. These rows are
 persistence prerequisites, never placement authority or capacity claims.
-It retains schema 14 immutable closing reservations, pre-place void receipts,
+Schema 17 adds collision guards for the complete immutable/durable inventory
+and makes current-schema trigger loss a startup error. It retains schema 14
+immutable closing reservations, pre-place void receipts,
 and terminal closing-absorption receipts; schema 13 cancellation records;
 schema 12 opening terminal-absorption receipts; schema 11 raw broker-read
 receipts and semantic manifests; and the existing durable capacity decisions.
-Additive schema 8→9→10→11→12→13→14→15→16 migration is one explicit SQLite
+Additive schema 8→9→10→11→12→13→14→15→16→17 migration is one explicit SQLite
 transaction and verifies required columns, foreign keys, append-only triggers,
 journal mode, foreign-key integrity, and `quick_check` before version
 promotion. Unknown or malformed schemas fail closed. A production operator
 must still take an atomic private backup and complete a rollback drill before
 migration.
+
+Fresh schema 17 and genuine schema 8–16 migrations install the complete exact
+trigger set. This explicit version step lets a valid pre-change schema-16
+database acquire the additive guards without treating it as tampered. An
+already-versioned schema-17 database with a missing or altered required trigger
+is treated as tampered and refuses startup; initialization does not silently
+repair current-schema evidence guards.
 
 Schema 8/9 opening intents that predate durable reservations are migrated with
 a conservative reservation equal to their immutable maximum exposure. Live

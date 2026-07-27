@@ -1379,7 +1379,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 record.envelope.account_id,
                 record.envelope.environment,
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
@@ -1484,7 +1484,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 record.envelope.account_id,
                 record.envelope.environment,
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
@@ -1590,14 +1590,14 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 record.envelope.account_id,
                 record.envelope.environment,
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
                 run_id="post-started-release-forgery-restart",
             )
 
-    def test_order_event_delete_trigger_is_repaired_and_replacement_rejected(
+    def test_order_event_delete_trigger_missing_or_replaced_is_rejected(
         self,
     ):
         record = self.opening(key="post-started-delete-trigger")
@@ -1611,20 +1611,13 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 "DROP TRIGGER prevent_order_event_delete"
             )
 
-        OrderIntentLedger(
-            self.path,
-            clock=self.clock,
-            run_id="repair-order-event-delete-trigger",
-        )
+        with self.assertRaises(OrderIntentLedgerError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="missing-order-event-delete-trigger",
+            )
         with sqlite3.connect(self.path) as connection:
-            with self.assertRaises(sqlite3.DatabaseError):
-                connection.execute(
-                    """
-                    DELETE FROM order_events
-                    WHERE intent_id = ? AND event_type = 'POST_STARTED'
-                    """,
-                    (record.intent_id,),
-                )
             self.assertEqual(
                 connection.execute(
                     """
@@ -1637,9 +1630,8 @@ class OrderIntentLedgerTests(unittest.TestCase):
             )
 
         with sqlite3.connect(self.path) as connection:
-            connection.executescript(
+            connection.execute(
                 """
-                DROP TRIGGER prevent_order_event_delete;
                 CREATE TRIGGER prevent_order_event_delete
                 BEFORE DELETE ON order_events
                 WHEN 0

@@ -1070,7 +1070,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
             self.ledger.active_reserved_margin(
                 ACCOUNT_ID, ENVIRONMENT
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
@@ -1091,7 +1091,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
             self.ledger.active_reserved_margin(
                 ACCOUNT_ID, ENVIRONMENT
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
@@ -1699,7 +1699,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
             self.ledger.active_reserved_margin(
                 ACCOUNT_ID, ENVIRONMENT
             )
-        with self.assertRaises(OrderIntentIntegrityError):
+        with self.assertRaises(OrderIntentLedgerError):
             OrderIntentLedger(
                 self.path,
                 clock=self.clock,
@@ -2040,7 +2040,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 self.assertIn(expected_action, normalized)
                 self.assertIn("raise(abort", normalized)
 
-    def test_durable_legacy_triggers_are_repaired_or_rejected_exactly(
+    def test_current_schema_missing_or_replaced_triggers_are_rejected_exactly(
         self,
     ) -> None:
         triggers = (
@@ -2128,26 +2128,13 @@ class BrokerReadLedgerTests(unittest.TestCase):
                 with sqlite3.connect(path) as connection:
                     connection.execute(f'DROP TRIGGER "{name}"')
 
-                OrderIntentLedger(
-                    path,
-                    clock=self.clock,
-                    run_id=f"repair-{name}",
-                )
-                with sqlite3.connect(path) as connection:
-                    sql = connection.execute(
-                        """
-                        SELECT sql FROM sqlite_master
-                        WHERE type = 'trigger' AND name = ?
-                        """,
-                        (name,),
-                    ).fetchone()[0]
-                    normalized = " ".join(sql.lower().split())
-                    self.assertIn(
-                        f"before {operation.lower()} on {table}",
-                        normalized,
+                with self.assertRaises(OrderIntentLedgerError):
+                    OrderIntentLedger(
+                        path,
+                        clock=self.clock,
+                        run_id=f"reject-missing-{name}",
                     )
-                    self.assertIn("raise(abort", normalized)
-                    connection.execute(f'DROP TRIGGER "{name}"')
+                with sqlite3.connect(path) as connection:
                     connection.execute(
                         f"""
                         CREATE TRIGGER "{name}"

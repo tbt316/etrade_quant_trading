@@ -60,9 +60,9 @@ from live_trading.opening_risk_lineage import (
 )
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _MIGRATABLE_SCHEMA_VERSIONS = frozenset(
-    {8, 9, 10, 11, 12, 13, 14, 15}
+    {8, 9, 10, 11, 12, 13, 14, 15, 16}
 )
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
@@ -217,6 +217,17 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'order events are append-only');
         END
     """,
+    "prevent_order_event_replace": """
+        CREATE TRIGGER prevent_order_event_replace
+        BEFORE INSERT ON order_events
+        WHEN EXISTS (
+            SELECT 1 FROM order_events
+            WHERE sequence = NEW.sequence
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'order events are append-only');
+        END
+    """,
     "prevent_amendment_history_update": """
         CREATE TRIGGER prevent_amendment_history_update
         BEFORE UPDATE ON amendment_history
@@ -227,6 +238,21 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_amendment_history_delete": """
         CREATE TRIGGER prevent_amendment_history_delete
         BEFORE DELETE ON amendment_history
+        BEGIN
+            SELECT RAISE(ABORT, 'amendment history is immutable');
+        END
+    """,
+    "prevent_amendment_history_replace": """
+        CREATE TRIGGER prevent_amendment_history_replace
+        BEFORE INSERT ON amendment_history
+        WHEN EXISTS (
+            SELECT 1 FROM amendment_history
+            WHERE (
+                    intent_id = NEW.intent_id
+                    AND idempotency_key = NEW.idempotency_key
+                  )
+               OR client_order_id = NEW.client_order_id
+        )
         BEGIN
             SELECT RAISE(ABORT, 'amendment history is immutable');
         END
@@ -245,6 +271,19 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'outbound authorizations are immutable');
         END
     """,
+    "prevent_outbound_authorization_replace": """
+        CREATE TRIGGER prevent_outbound_authorization_replace
+        BEFORE INSERT ON outbound_authorizations
+        WHEN EXISTS (
+            SELECT 1 FROM outbound_authorizations
+            WHERE intent_id = NEW.intent_id
+              AND operation = NEW.operation
+              AND fencing_token = NEW.fencing_token
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'outbound authorizations are immutable');
+        END
+    """,
     "prevent_transport_send_attempt_update": """
         CREATE TRIGGER prevent_transport_send_attempt_update
         BEFORE UPDATE ON transport_send_attempts
@@ -255,6 +294,21 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_transport_send_attempt_delete": """
         CREATE TRIGGER prevent_transport_send_attempt_delete
         BEFORE DELETE ON transport_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'transport send attempts are immutable');
+        END
+    """,
+    "prevent_transport_send_attempt_replace": """
+        CREATE TRIGGER prevent_transport_send_attempt_replace
+        BEFORE INSERT ON transport_send_attempts
+        WHEN EXISTS (
+            SELECT 1 FROM transport_send_attempts
+            WHERE intent_id = NEW.intent_id
+              AND authorization_operation =
+                    NEW.authorization_operation
+              AND fencing_token = NEW.fencing_token
+              AND transport_operation = NEW.transport_operation
+        )
         BEGIN
             SELECT RAISE(ABORT, 'transport send attempts are immutable');
         END
@@ -273,6 +327,27 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'broker preview receipts are immutable');
         END
     """,
+    "prevent_broker_preview_receipt_replace": """
+        CREATE TRIGGER prevent_broker_preview_receipt_replace
+        BEFORE INSERT ON broker_preview_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM broker_preview_receipts
+            WHERE (
+                    intent_id = NEW.intent_id
+                    AND authorization_operation =
+                        NEW.authorization_operation
+                    AND fencing_token = NEW.fencing_token
+                  )
+               OR (
+                    account_id = NEW.account_id
+                    AND environment = NEW.environment
+                    AND preview_id = NEW.preview_id
+                  )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'broker preview receipts are immutable');
+        END
+    """,
     "prevent_transport_response_receipt_update": """
         CREATE TRIGGER prevent_transport_response_receipt_update
         BEFORE UPDATE ON transport_response_receipts
@@ -287,11 +362,40 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'transport response receipts are immutable');
         END
     """,
+    "prevent_transport_response_receipt_replace": """
+        CREATE TRIGGER prevent_transport_response_receipt_replace
+        BEFORE INSERT ON transport_response_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM transport_response_receipts
+            WHERE intent_id = NEW.intent_id
+              AND authorization_operation =
+                    NEW.authorization_operation
+              AND fencing_token = NEW.fencing_token
+              AND transport_operation = NEW.transport_operation
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'transport response receipts are immutable');
+        END
+    """,
     "prevent_order_cancellation_delete": """
         CREATE TRIGGER prevent_order_cancellation_delete
         BEFORE DELETE ON order_cancellations
         BEGIN
             SELECT RAISE(ABORT, 'order cancellations are durable');
+        END
+    """,
+    "prevent_order_cancellation_replace": """
+        CREATE TRIGGER prevent_order_cancellation_replace
+        BEFORE INSERT ON order_cancellations
+        WHEN EXISTS (
+            SELECT 1 FROM order_cancellations
+            WHERE intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'order cancellation state must be updated in place'
+            );
         END
     """,
     "prevent_order_cancellation_identity_update": """
@@ -344,6 +448,21 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'cancel authorizations are append-only');
         END
     """,
+    "prevent_cancel_authorization_replace": """
+        CREATE TRIGGER prevent_cancel_authorization_replace
+        BEFORE INSERT ON cancel_authorizations
+        WHEN EXISTS (
+            SELECT 1 FROM cancel_authorizations
+            WHERE authorization_sha256 = NEW.authorization_sha256
+               OR (
+                    intent_id = NEW.intent_id
+                    AND fencing_token = NEW.fencing_token
+                  )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel authorizations are append-only');
+        END
+    """,
     "prevent_cancel_send_attempt_update": """
         CREATE TRIGGER prevent_cancel_send_attempt_update
         BEFORE UPDATE ON cancel_send_attempts
@@ -354,6 +473,18 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_cancel_send_attempt_delete": """
         CREATE TRIGGER prevent_cancel_send_attempt_delete
         BEFORE DELETE ON cancel_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel send attempts are append-only');
+        END
+    """,
+    "prevent_cancel_send_attempt_replace": """
+        CREATE TRIGGER prevent_cancel_send_attempt_replace
+        BEFORE INSERT ON cancel_send_attempts
+        WHEN EXISTS (
+            SELECT 1 FROM cancel_send_attempts
+            WHERE intent_id = NEW.intent_id
+               OR authorization_sha256 = NEW.authorization_sha256
+        )
         BEGIN
             SELECT RAISE(ABORT, 'cancel send attempts are append-only');
         END
@@ -372,6 +503,17 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'cancel response receipts are append-only');
         END
     """,
+    "prevent_cancel_response_receipt_replace": """
+        CREATE TRIGGER prevent_cancel_response_receipt_replace
+        BEFORE INSERT ON cancel_response_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM cancel_response_receipts
+            WHERE intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel response receipts are append-only');
+        END
+    """,
     "prevent_cancel_resolution_update": """
         CREATE TRIGGER prevent_cancel_resolution_update
         BEFORE UPDATE ON cancel_resolutions
@@ -382,6 +524,18 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_cancel_resolution_delete": """
         CREATE TRIGGER prevent_cancel_resolution_delete
         BEFORE DELETE ON cancel_resolutions
+        BEGIN
+            SELECT RAISE(ABORT, 'cancel resolutions are append-only');
+        END
+    """,
+    "prevent_cancel_resolution_replace": """
+        CREATE TRIGGER prevent_cancel_resolution_replace
+        BEFORE INSERT ON cancel_resolutions
+        WHEN EXISTS (
+            SELECT 1 FROM cancel_resolutions
+            WHERE resolution_sha256 = NEW.resolution_sha256
+               OR intent_id = NEW.intent_id
+        )
         BEGIN
             SELECT RAISE(ABORT, 'cancel resolutions are append-only');
         END
@@ -400,6 +554,18 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'closing reservations are append-only');
         END
     """,
+    "prevent_closing_reservation_replace": """
+        CREATE TRIGGER prevent_closing_reservation_replace
+        BEFORE INSERT ON closing_reservations
+        WHEN EXISTS (
+            SELECT 1 FROM closing_reservations
+            WHERE reservation_sha256 = NEW.reservation_sha256
+               OR intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'closing reservations are append-only');
+        END
+    """,
     "prevent_closing_void_update": """
         CREATE TRIGGER prevent_closing_void_update
         BEFORE UPDATE ON closing_reservation_voids
@@ -414,6 +580,22 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'closing reservation voids are append-only');
         END
     """,
+    "prevent_closing_void_replace": """
+        CREATE TRIGGER prevent_closing_void_replace
+        BEFORE INSERT ON closing_reservation_voids
+        WHEN EXISTS (
+            SELECT 1 FROM closing_reservation_voids
+            WHERE void_sha256 = NEW.void_sha256
+               OR intent_id = NEW.intent_id
+               OR reservation_sha256 = NEW.reservation_sha256
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'closing reservation voids are append-only'
+            );
+        END
+    """,
     "prevent_closing_absorption_update": """
         CREATE TRIGGER prevent_closing_absorption_update
         BEFORE UPDATE ON closing_reservation_absorptions
@@ -426,6 +608,21 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON closing_reservation_absorptions
         BEGIN
             SELECT RAISE(ABORT, 'closing reservation absorptions are append-only');
+        END
+    """,
+    "prevent_closing_absorption_replace": """
+        CREATE TRIGGER prevent_closing_absorption_replace
+        BEFORE INSERT ON closing_reservation_absorptions
+        WHEN EXISTS (
+            SELECT 1 FROM closing_reservation_absorptions
+            WHERE absorption_sha256 = NEW.absorption_sha256
+               OR intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'closing reservation absorptions are append-only'
+            );
         END
     """,
     "validate_closing_reservation_insert": """
@@ -598,6 +795,49 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'broker order history is immutable');
         END
     """,
+    "prevent_broker_order_history_replace": """
+        CREATE TRIGGER prevent_broker_order_history_replace
+        BEFORE INSERT ON broker_order_history
+        WHEN EXISTS (
+            SELECT 1 FROM broker_order_history
+            WHERE broker_order_id = NEW.broker_order_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'broker order history is immutable');
+        END
+    """,
+    "prevent_order_intent_delete": """
+        CREATE TRIGGER prevent_order_intent_delete
+        BEFORE DELETE ON order_intents
+        BEGIN
+            SELECT RAISE(ABORT, 'order intents are durable');
+        END
+    """,
+    "prevent_order_intent_replace": """
+        CREATE TRIGGER prevent_order_intent_replace
+        BEFORE INSERT ON order_intents
+        WHEN EXISTS (
+            SELECT 1 FROM order_intents
+            WHERE intent_id = NEW.intent_id
+               OR client_order_id = NEW.client_order_id
+               OR (
+                    NEW.broker_order_id IS NOT NULL
+                    AND broker_order_id = NEW.broker_order_id
+                  )
+               OR (
+                    account_id = NEW.account_id
+                    AND environment = NEW.environment
+                    AND idempotency_scope = NEW.idempotency_scope
+                    AND idempotency_key = NEW.idempotency_key
+                  )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'order intent state must be updated in place'
+            );
+        END
+    """,
     "prevent_intent_identity_mutation": """
         CREATE TRIGGER prevent_intent_identity_mutation
         BEFORE UPDATE ON order_intents
@@ -641,6 +881,17 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'broker read receipts are append-only');
         END
     """,
+    "prevent_broker_read_receipt_replace": """
+        CREATE TRIGGER prevent_broker_read_receipt_replace
+        BEFORE INSERT ON broker_read_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM broker_read_receipts
+            WHERE receipt_sha256 = NEW.receipt_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read receipts are append-only');
+        END
+    """,
     "prevent_broker_read_manifest_update": """
         CREATE TRIGGER prevent_broker_read_manifest_update
         BEFORE UPDATE ON broker_read_manifests
@@ -651,6 +902,17 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_broker_read_manifest_delete": """
         CREATE TRIGGER prevent_broker_read_manifest_delete
         BEFORE DELETE ON broker_read_manifests
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read manifests are append-only');
+        END
+    """,
+    "prevent_broker_read_manifest_replace": """
+        CREATE TRIGGER prevent_broker_read_manifest_replace
+        BEFORE INSERT ON broker_read_manifests
+        WHEN EXISTS (
+            SELECT 1 FROM broker_read_manifests
+            WHERE evidence_sha256 = NEW.evidence_sha256
+        )
         BEGIN
             SELECT RAISE(ABORT, 'broker read manifests are append-only');
         END
@@ -669,6 +931,31 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'broker read manifest members are append-only');
         END
     """,
+    "prevent_broker_read_member_replace": """
+        CREATE TRIGGER prevent_broker_read_member_replace
+        BEFORE INSERT ON broker_read_manifest_members
+        WHEN EXISTS (
+            SELECT 1 FROM broker_read_manifest_members
+            WHERE (
+                    evidence_sha256 = NEW.evidence_sha256
+                    AND member_ordinal = NEW.member_ordinal
+                  )
+               OR (
+                    evidence_sha256 = NEW.evidence_sha256
+                    AND member_role = NEW.member_role
+                  )
+               OR (
+                    evidence_sha256 = NEW.evidence_sha256
+                    AND receipt_sha256 = NEW.receipt_sha256
+                  )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'broker read manifest members are append-only'
+            );
+        END
+    """,
     "prevent_capacity_decision_update": """
         CREATE TRIGGER prevent_capacity_decision_update
         BEFORE UPDATE ON capacity_decisions
@@ -679,6 +966,18 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
     "prevent_capacity_decision_delete": """
         CREATE TRIGGER prevent_capacity_decision_delete
         BEFORE DELETE ON capacity_decisions
+        BEGIN
+            SELECT RAISE(ABORT, 'capacity decisions are append-only');
+        END
+    """,
+    "prevent_capacity_decision_replace": """
+        CREATE TRIGGER prevent_capacity_decision_replace
+        BEFORE INSERT ON capacity_decisions
+        WHEN EXISTS (
+            SELECT 1 FROM capacity_decisions
+            WHERE capacity_decision_sha256 =
+                    NEW.capacity_decision_sha256
+        )
         BEGIN
             SELECT RAISE(ABORT, 'capacity decisions are append-only');
         END
@@ -695,6 +994,22 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE DELETE ON opening_risk_prerequisites
         BEGIN
             SELECT RAISE(ABORT, 'opening risk prerequisites are append-only');
+        END
+    """,
+    "prevent_opening_risk_prerequisite_replace": """
+        CREATE TRIGGER prevent_opening_risk_prerequisite_replace
+        BEFORE INSERT ON opening_risk_prerequisites
+        WHEN EXISTS (
+            SELECT 1 FROM opening_risk_prerequisites
+            WHERE binding_sha256 = NEW.binding_sha256
+               OR intent_id = NEW.intent_id
+               OR decision_sha256 = NEW.decision_sha256
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'opening risk prerequisites are append-only'
+            );
         END
     """,
     "prevent_opening_quote_receipt_update": """
@@ -828,11 +1143,37 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'reservation absorptions are append-only');
         END
     """,
+    "prevent_reservation_absorption_replace": """
+        CREATE TRIGGER prevent_reservation_absorption_replace
+        BEFORE INSERT ON reservation_absorptions
+        WHEN EXISTS (
+            SELECT 1 FROM reservation_absorptions
+            WHERE absorption_sha256 = NEW.absorption_sha256
+               OR intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation absorptions are append-only');
+        END
+    """,
     "prevent_margin_reservation_delete": """
         CREATE TRIGGER prevent_margin_reservation_delete
         BEFORE DELETE ON margin_reservations
         BEGIN
             SELECT RAISE(ABORT, 'margin reservations are durable');
+        END
+    """,
+    "prevent_margin_reservation_replace": """
+        CREATE TRIGGER prevent_margin_reservation_replace
+        BEFORE INSERT ON margin_reservations
+        WHEN EXISTS (
+            SELECT 1 FROM margin_reservations
+            WHERE intent_id = NEW.intent_id
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'margin reservation state must be updated in place'
+            );
         END
     """,
     "prevent_margin_reservation_identity_update": """
@@ -6757,6 +7098,7 @@ class OrderIntentLedger:
             metadata_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_metadata'"
             ).fetchone()
+            created_schema = metadata_table is None
             if metadata_table is None:
                 conn.execute("CREATE TABLE ledger_metadata (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)")
             conn.execute("INSERT OR IGNORE INTO ledger_metadata (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
@@ -7426,45 +7768,21 @@ class OrderIntentLedger:
                     intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
                     first_seen_at INTEGER NOT NULL
                 );
-                CREATE TRIGGER IF NOT EXISTS prevent_order_event_update BEFORE UPDATE ON order_events BEGIN SELECT RAISE(ABORT, 'order events are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_order_event_delete BEFORE DELETE ON order_events BEGIN SELECT RAISE(ABORT, 'order events are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_amendment_history_update BEFORE UPDATE ON amendment_history BEGIN SELECT RAISE(ABORT, 'amendment history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_amendment_history_delete BEFORE DELETE ON amendment_history BEGIN SELECT RAISE(ABORT, 'amendment history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_outbound_authorization_update BEFORE UPDATE ON outbound_authorizations BEGIN SELECT RAISE(ABORT, 'outbound authorizations are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_outbound_authorization_delete BEFORE DELETE ON outbound_authorizations BEGIN SELECT RAISE(ABORT, 'outbound authorizations are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_transport_send_attempt_update BEFORE UPDATE ON transport_send_attempts BEGIN SELECT RAISE(ABORT, 'transport send attempts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_transport_send_attempt_delete BEFORE DELETE ON transport_send_attempts BEGIN SELECT RAISE(ABORT, 'transport send attempts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_preview_receipt_update BEFORE UPDATE ON broker_preview_receipts BEGIN SELECT RAISE(ABORT, 'broker preview receipts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_preview_receipt_delete BEFORE DELETE ON broker_preview_receipts BEGIN SELECT RAISE(ABORT, 'broker preview receipts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_update BEFORE UPDATE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_delete BEFORE DELETE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_update BEFORE UPDATE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_delete BEFORE DELETE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_intent_identity_mutation BEFORE UPDATE ON order_intents
-                WHEN OLD.account_id != NEW.account_id OR OLD.environment != NEW.environment OR OLD.strategy_id != NEW.strategy_id
-                   OR OLD.decision_id != NEW.decision_id OR OLD.idempotency_scope != NEW.idempotency_scope
-                   OR OLD.idempotency_key != NEW.idempotency_key OR OLD.intent_kind != NEW.intent_kind
-                   OR OLD.wire_payload != NEW.wire_payload OR OLD.canonical_payload != NEW.canonical_payload OR OLD.payload_hash != NEW.payload_hash
-                   OR OLD.client_order_id != NEW.client_order_id
-                   OR OLD.opening_risk_prerequisite_sha256 IS NOT NEW.opening_risk_prerequisite_sha256
-                BEGIN SELECT RAISE(ABORT, 'order intent identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_terminal_rewrite BEFORE UPDATE ON order_intents
-                WHEN OLD.state IN ('FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'FAILED') AND NEW.state != OLD.state
-                BEGIN SELECT RAISE(ABORT, 'terminal order intent cannot transition'); END;
                 """
             )
             if current_schema_version != SCHEMA_VERSION:
                 conn.execute(
                     "DROP TRIGGER IF EXISTS prevent_intent_identity_mutation"
                 )
-            for definition in _REQUIRED_TRIGGER_DEFINITIONS.values():
-                conn.execute(
-                    definition.replace(
-                        "CREATE TRIGGER ",
-                        "CREATE TRIGGER IF NOT EXISTS ",
-                        1,
+            if created_schema or current_schema_version != SCHEMA_VERSION:
+                for definition in _REQUIRED_TRIGGER_DEFINITIONS.values():
+                    conn.execute(
+                        definition.replace(
+                            "CREATE TRIGGER ",
+                            "CREATE TRIGGER IF NOT EXISTS ",
+                            1,
+                        )
                     )
-                )
             self._migrate_legacy_opening_reservations(
                 conn, current_schema_version
             )
@@ -9351,15 +9669,28 @@ class OrderIntentLedger:
         return intent["state"] == "CLAIMED" and int(intent["submission_lease_expires_at"]) <= now
 
     @staticmethod
-    def _ensure_broker_order_is_unambiguous(conn: sqlite3.Connection, broker_order_id: str, intent_id: str) -> None:
-        existing = conn.execute("SELECT intent_id FROM broker_order_history WHERE broker_order_id = ?", (broker_order_id,)).fetchone()
-        if existing is not None and existing["intent_id"] != intent_id:
-            raise OrderIntentIntegrityError("broker order id is already bound to another durable intent")
-
-    @staticmethod
     def _bind_broker_order_history(conn: sqlite3.Connection, broker_order_id: str, intent_id: str, now: int) -> None:
-        OrderIntentLedger._ensure_broker_order_is_unambiguous(conn, broker_order_id, intent_id)
-        conn.execute("INSERT OR IGNORE INTO broker_order_history (broker_order_id, intent_id, first_seen_at) VALUES (?, ?, ?)", (broker_order_id, intent_id, now))
+        existing = conn.execute(
+            """
+            SELECT intent_id FROM broker_order_history
+            WHERE broker_order_id = ?
+            """,
+            (broker_order_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["intent_id"] != intent_id:
+                raise OrderIntentIntegrityError(
+                    "broker order id is already bound to another durable intent"
+                )
+            return
+        conn.execute(
+            """
+            INSERT INTO broker_order_history (
+                broker_order_id, intent_id, first_seen_at
+            ) VALUES (?, ?, ?)
+            """,
+            (broker_order_id, intent_id, now),
+        )
 
     @staticmethod
     def _archive_amendment(conn: sqlite3.Connection, amendment: sqlite3.Row, completion_state: str, now: int) -> None:
