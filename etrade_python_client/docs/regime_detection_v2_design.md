@@ -2,8 +2,8 @@
 
 **Review date:** 2026-07-26
 
-**Status:** R3 causally calibrated research profile with durable R2 evidence
-boundaries; not connected to order execution
+**Status:** R4 typed shadow contract with causal backtest/live semantics;
+not connected to order execution
 **Related roadmap:** `docs/production_readiness_upgrade_plan.md`
 
 ## Decision
@@ -568,6 +568,49 @@ has no retained raw/provider receipts, and is explicitly
 `promotion_status=research_only`, `Calibration_Abstain=true`, and
 `Execution_Eligible=false`.
 
+### R4 typed shadow parity
+
+`live_trading/regime_signal.py` is the only compatibility boundary for V2
+consumers. It converts detector rows into frozen, content-addressed
+`RegimeSignal` objects without collapsing the two axes into an HMM integer.
+Each object is keyed to its explicit effective session; consumers receive no
+forward fill and no state fallback.
+
+The adapter validates:
+
+- close-T is a real NYSE session and the effective date is exactly T+1;
+- signal availability is no earlier than joint SPY/VIX finalization and
+  strictly before the T+1 market open;
+- detector version, configuration, source-code identity, runtime fingerprint,
+  artifact/plan identity, and any snapshot/evidence hashes remain distinct;
+- calibrated traces retain immutable DataFrame attributes, match an externally
+  pinned artifact hash, explicitly abstain, and remain execution-ineligible;
+- canonical serialization reproduces the signal hash; and
+- all attempted action projections raise.
+
+The embedded causal record makes the mandatory audit fields explicit:
+
+| Field | R4 value |
+|---|---|
+| Training/calibration end | Last selection fold; 2024-12-31 for the committed artifact |
+| Test range | Retrospective 2025 range from the pinned plan |
+| Inference | `causal_prefix_filter` for the artifact; null and abstaining for raw research traces |
+| Regime lag | Exactly one NYSE session |
+| Return buckets | `not_used_shadow_annotation` |
+
+`backtesting/backtest_runner.py` accepts these objects only through
+`regime_v2_annotations`. It records their primitive, hash-verified envelope on
+the daily path and each new trade, but the signal is not consulted by expiration,
+strike, delta, quantity, probability, entry, exit, or roll logic. The legacy
+numeric HMM lane remains a separate compatibility path. R4 also removes
+backward filling of HMM probabilities, requires forward-return outcomes to
+resolve strictly before an EOD entry session.
+
+This is semantic parity, not a trading-policy promotion. A later phase must
+build verified provider history, finish the prospective holdout, define a
+separate monotonic risk policy, and pass paper/canary gates before V2 can veto
+or resize an opening order.
+
 ## Why not another single HMM
 
 A single latent state must choose among three bad behaviors:
@@ -786,6 +829,7 @@ and skipped-trade effects must be included.
 - Provider parser contract: `live_trading/regime_provider_evidence.py`
 - Provider gateway: `live_trading/regime_market_data_gateway.py`
 - Calibration engine: `live_trading/regime_calibration.py`
+- Typed shadow contract: `live_trading/regime_signal.py`
 - Frozen calibration plan: `docs/regime_v2_calibration_plan.json`
 - Research artifact:
   `research_reports/regime_v2_calibration_artifact.json`
@@ -794,7 +838,9 @@ and skipped-trade effects must be included.
   `tests/test_regime_market_data.py`, and
   `tests/test_regime_evidence_store.py`,
   `tests/test_regime_market_data_gateway.py`,
-  `tests/test_regime_calibration.py`
+  `tests/test_regime_calibration.py`,
+  `tests/test_regime_signal.py`, and
+  `tests/test_regime_backtest_parity.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
 - Deterministic calibration runner:
   `scratch/regime_detector_v2_calibrate.py`
@@ -816,6 +862,10 @@ The focused tests verify:
   parser receipts, and store-owned snapshot verification.
 - Stale-attempt rejection and channel-scoped, monotonic snapshot publication.
 - Unavailable first-return shock evidence.
+- Closed-enum, canonical V2 signals with no numeric HMM projection.
+- Exact T-to-T+1 backtest annotations with no fill or action effect.
+- Deployment artifact pins, immutable trace attributes, and strict
+  pre-entry return-outcome resolution.
 
 The read-only replay prints the causal record and reproduces the 2026 comparison
 without downloading or mutating data.

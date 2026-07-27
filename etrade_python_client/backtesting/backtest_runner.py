@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, asdict
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,10 @@ import pandas_market_calendars as mcal
 from backtesting.option_data_cache import OptionDataCache
 from backtesting.massive_api_client import MassiveAPIClient
 from backtesting.greeks_calculator import compute_chain_deltas, bs_put_delta, implied_volatility
+from live_trading.regime_signal import (
+    RegimeSignal,
+    annotation_for_session,
+)
 
 
 # ANSI Colors for terminal logging
@@ -45,6 +49,34 @@ CLR_RST = "\033[0m"
 
 
 NYSE = mcal.get_calendar("NYSE")
+
+
+def validate_regime_v2_annotations(
+    annotations: Optional[Mapping[str, RegimeSignal]],
+) -> Dict[str, RegimeSignal]:
+    """Validate the exact-date, shadow-only V2 annotation boundary.
+
+    V2 signals deliberately remain separate from legacy integer HMM regimes.
+    This function accepts no numeric states, performs no forward fill, and
+    returns no order-facing projection.
+    """
+
+    if annotations is None:
+        return {}
+    if not isinstance(annotations, Mapping):
+        raise TypeError("regime_v2_annotations must be a mapping")
+
+    validated: Dict[str, RegimeSignal] = {}
+    for key, value in annotations.items():
+        if not isinstance(key, str):
+            raise TypeError("regime_v2_annotations keys must be ISO date strings")
+        signal = annotation_for_session(annotations, key)
+        if signal is None or signal is not value:
+            raise ValueError("regime_v2_annotations contains an invalid entry")
+        if signal.may_authorize_execution:
+            raise ValueError("R4 V2 annotations cannot authorize execution")
+        validated[key] = signal
+    return validated
 
 
 def lag_daily_regime_map(regimes: Dict[str, int], trading_dates: List[str]) -> Dict[str, int]:
@@ -93,11 +125,16 @@ def _forward_return_assignment_strike(
 
     as_of_idx_full = all_date_index.get(as_of_date)
     if as_of_idx_full is None:
-        # Fallback if as_of_date not in full pricing series
-        as_of_idx_full = len(all_dates) - 1
+        return None, {
+            "reason": "as_of_date_missing_from_underlying_prices",
+            "as_of_date": as_of_date,
+        }
 
     trading_horizon = max(1, int(round(float(option_horizon_days) * 252.0 / 365.0)))
-    resolved_cutoff_full = as_of_idx_full - trading_horizon
+    # A sample is eligible only after its terminal close is strictly earlier
+    # than the entry session. A return resolving on the entry date is not
+    # decision-time evidence for that same EOD entry.
+    resolved_cutoff_full = as_of_idx_full - trading_horizon - 1
     if resolved_cutoff_full < 1:
         return None, {"reason": "insufficient_history", "trading_horizon": trading_horizon}
 
@@ -127,6 +164,10 @@ def _forward_return_assignment_strike(
         "reason": "empirical_forward_return_quantile",
         "n": int(len(sample)),
         "trading_horizon": int(trading_horizon),
+        "latest_resolution_session": pd.Timestamp(
+            all_dates[resolved_cutoff_full + trading_horizon]
+        ).date().isoformat(),
+        "outcomes_resolved_strictly_before_entry": True,
         "target_assignment_prob": target_prob,
         "target_return": target_return,
     }
@@ -207,6 +248,7 @@ class SpreadTrade:
     is_roll: bool = False # If opened from rollover
     entry_regime: int = -1
     entry_regime_name: str = ""
+    entry_regime_v2: Optional[Dict[str, Any]] = None
     profit_target: float = 0.70 # Default to early_profit_pct
     short_ticker: str = ""
     long_ticker: str = ""
@@ -274,6 +316,9 @@ class BacktestResult:
     risk_free_rates: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     regime_history: List[Tuple[str, int]] = field(default_factory=list)
     regime_labels: Dict[int, str] = field(default_factory=dict)
+    regime_v2_history: List[Tuple[str, Optional[Dict[str, Any]]]] = field(
+        default_factory=list
+    )
     daily_leg_premiums: List[Tuple[str, float, float]] = field(default_factory=list)
     daily_scatter_data: List[dict] = field(default_factory=list)
     daily_opened_dte: List[Tuple[str, int]] = field(default_factory=list)
@@ -307,6 +352,7 @@ class BacktestPathLogger:
         spot: float,
         regime: int,
         regime_name: str,
+        regime_v2: Optional[Dict[str, Any]],
         nlv: float,
         cash: float,
         margin: float,
@@ -321,6 +367,7 @@ class BacktestPathLogger:
             "spot_price": float(spot),
             "regime": int(regime),
             "regime_name": regime_name,
+            "regime_v2": regime_v2,
             "nlv": float(nlv),
             "cash": float(cash),
             "margin": float(margin),
@@ -845,6 +892,7 @@ async def run_put_credit_spread_backtest(
     slippage_model: str = "none",
     max_time_delta_minutes: float = 5.0,
     regime_probabilities: Optional[pd.DataFrame] = None,
+    regime_v2_annotations: Optional[Mapping[str, RegimeSignal]] = None,
     offline_only: bool = False,
 ) -> BacktestResult:
     """
@@ -862,6 +910,9 @@ async def run_put_credit_spread_backtest(
     result.margin_limit_pct = margin_limit_pct
     result.regime_labels = regime_labels if regime_labels else {}
     result.regime_probabilities = regime_probabilities
+    regime_v2_annotations = validate_regime_v2_annotations(
+        regime_v2_annotations
+    )
     
     # Extract strategy-level configurations
     entry_config = (strategy_config or {}).get("entry", {})
@@ -995,7 +1046,11 @@ async def run_put_credit_spread_backtest(
                     # Keep the daily probabilities for plotting
                     prob_cols = [f'prob_state_{i}' for i in range(k)]
                     if all(col in feature_df.columns for col in prob_cols):
-                        result.regime_probabilities = feature_df[prob_cols].reindex(trading_dates).ffill().bfill()
+                        result.regime_probabilities = (
+                            feature_df[prob_cols]
+                            .reindex(trading_dates)
+                            .ffill()
+                        )
                     print("  [Regime Timing] Using one-trading-day-lagged close_T overlay regimes for trade entry.")
                 else:
                     print("  WARNING: Could not build causal regime trace.")
@@ -1559,6 +1614,18 @@ async def run_put_credit_spread_backtest(
             current_regime = regimes.get(td, -1) if regimes else -1
             current_regime_name = result.regime_labels.get(current_regime, "")
             result.regime_history.append((td, current_regime))
+            current_regime_v2 = annotation_for_session(
+                regime_v2_annotations,
+                td,
+            )
+            current_regime_v2_payload = (
+                current_regime_v2.to_envelope()
+                if current_regime_v2 is not None
+                else None
+            )
+            result.regime_v2_history.append(
+                (td, current_regime_v2_payload)
+            )
             td_idx = trading_date_index.get(td, -1)
             prev_regime = regimes.get(trading_dates[td_idx - 1], -1) if regimes and td_idx > 0 else -1
             regime_switched_to_panic = (
@@ -2162,13 +2229,12 @@ async def run_put_credit_spread_backtest(
                     eff_short_delta = target_short_delta
 
             elif regime_dynamic_delta:
-                # Delta is at 0.1 during expansion regimes and cautious decline regime, 
-                # but doubled (0.2) during crisis/panic/turmoil regimes
-                is_crisis = current_regime_name and any(term in current_regime_name for term in ["Panic", "Crisis", "Turmoil"])
-                if is_crisis:
-                    eff_short_delta = -0.20
-                else:
-                    eff_short_delta = -0.10
+                # Legacy compatibility only. V2 never enters this path.
+                is_crisis = current_regime_name and any(
+                    term in current_regime_name
+                    for term in ["Panic", "Crisis", "Turmoil"]
+                )
+                eff_short_delta = -0.20 if is_crisis else -0.10
             eff_spread_width = spread_width
             if (
                 dynamic_delta_method == "vix_double_above_25"
@@ -2801,6 +2867,7 @@ async def run_put_credit_spread_backtest(
                                     status="open",
                                     entry_regime=current_regime,
                                     entry_regime_name=current_regime_name,
+                                    entry_regime_v2=current_regime_v2_payload,
                                     entry_dte=dte_days,
                                     short_entry_mid=short_mid,
                                     long_entry_mid=long_mid,
@@ -3010,6 +3077,7 @@ async def run_put_credit_spread_backtest(
                                                         status="open",
                                                         entry_regime=current_regime,
                                                         entry_regime_name=current_regime_name,
+                                                        entry_regime_v2=current_regime_v2_payload,
                                                         entry_dte=dte_days,
                                                         short_entry_mid=call_short_mid,
                                                         long_entry_mid=call_long_mid,
@@ -3083,6 +3151,7 @@ async def run_put_credit_spread_backtest(
                     spot=spot,
                     regime=current_regime,
                     regime_name="",
+                    regime_v2=current_regime_v2_payload,
                     nlv=current_nlv,
                     cash=current_cash,
                     margin=current_margin_usage,

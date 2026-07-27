@@ -163,11 +163,11 @@ the result is marked `VALID`.
 
 | Mandatory field | Current status | Upgrade requirement |
 |---|---|---|
-| Training/calibration end date | **Unverified.** Expanding refits occur in the canonical path but cutoffs are not persisted. Legacy scripts perform global fitting. | Store the cutoff for every model/refit and a calibration-policy hash. |
-| Test date range | **Partial.** Start/end dates are stored, but no OOS/holdout designation or model-selection history exists. | Store calibration, validation, and locked test ranges plus selection lineage. |
-| Inference method | **Mixed and unrecorded.** Canonical auto-training uses expanding inference; other entry points use non-expanding defaults. | Enumerate and store `walk_forward_filter`, prohibit smoothed/Viterbi history for backtest decisions. |
-| Regime lag | **Correct in the canonical helper, not proven per result.** Legacy scripts pass same-day states. | Persist `lag_trading_days >= 1` and assert it at trade-entry construction. |
-| Return-bucket causality | **Partially implemented, invalid end-to-end.** Resolved outcomes are censored, but raw and overlay taxonomies are mixed. | Store `as_of`, horizon convention, resolved cutoff, taxonomy/version, and assert only resolved outcomes enter the matching final-regime bucket. |
+| Training/calibration end date | **Implemented for R4 V2 annotations only.** The typed signal records the last selection-fold session from the pinned artifact. Legacy action paths remain unverified. | Store the cutoff for every model/refit and a calibration-policy hash. |
+| Test date range | **Implemented for R4 V2 annotations only.** The retrospective range is copied from the immutable plan; the prospective holdout is not complete. | Store calibration, validation, and locked test ranges plus selection lineage. |
+| Inference method | **Implemented for R4 V2 annotations only.** Calibrated signals record `causal_prefix_filter`; raw research signals leave it null and abstain. Legacy paths remain mixed. | Enumerate and store `walk_forward_filter`, prohibit smoothed/Viterbi history for backtest decisions. |
+| Regime lag | **Enforced for R4 V2 annotations.** The adapter proves close T maps to the exact next NYSE session and never fills a gap. Legacy scripts can still pass same-day states. | Persist `lag_trading_days >= 1` and assert it at trade-entry construction. |
+| Return-bucket causality | **Explicitly not used in R4.** Typed signals record `not_used_shadow_annotation`; the non-regime empirical helper now requires outcomes resolved strictly before entry. Legacy HMM/overlay buckets remain invalid end-to-end. | Store `as_of`, horizon convention, resolved cutoff, taxonomy/version, and assert only resolved outcomes enter the matching final-regime bucket. |
 
 If any field is absent, the run status is `UNVERIFIED`. If a gate is known to
 fail, the status is `INVALID`. Only `VALID` runs appear in performance
