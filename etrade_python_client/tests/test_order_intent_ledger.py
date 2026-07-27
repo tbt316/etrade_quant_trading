@@ -17,6 +17,8 @@ from live_trading.order_intent_ledger import (
     BrokerEvidence,
     AccountCapacityEvidence,
     OutboundAuthorization,
+    TransportRequestEvidence,
+    TransportResponseEvidence,
     OrderIntent,
     OrderIntentIntegrityError,
     OrderIntentLedger,
@@ -201,6 +203,53 @@ def evidence(record, clock, *, operation="ORDER_QUERY", outcome="OPEN", broker_o
     )
 
 
+def transport_request(
+    authorization,
+    *,
+    operation="SUBMIT_PREVIEW",
+    account_id="acct-1",
+    account_id_key="account-key",
+    institution_type="BROKERAGE",
+    target_broker_order_id=None,
+    preview_id=None,
+):
+    body = f"<{operation}/>".encode("ascii")
+    if operation.startswith("AMEND"):
+        route = (
+            f"/v1/accounts/{account_id_key}/orders/"
+            f"{target_broker_order_id}/change/"
+            f"{'place' if operation.endswith('PLACE') else 'preview'}"
+        )
+        method = "PUT"
+        authorization_operation = "AMEND"
+    else:
+        route = (
+            f"/v1/accounts/{account_id_key}/orders/"
+            f"{'place' if operation.endswith('PLACE') else 'preview'}"
+        )
+        method = "POST"
+        authorization_operation = "SUBMIT"
+    return TransportRequestEvidence(
+        account_id=account_id,
+        account_id_key=account_id_key,
+        institution_type=institution_type,
+        environment="production",
+        intent_id=authorization.intent_id,
+        owner=authorization.owner,
+        authorization_operation=authorization_operation,
+        fencing_token=authorization.fencing_token,
+        transport_operation=operation,
+        http_method=method,
+        route=route,
+        client_order_id=authorization.client_order_id,
+        target_broker_order_id=target_broker_order_id,
+        preview_id=preview_id,
+        authorization_payload_digest=authorization.payload_digest,
+        final_xml_bytes=body,
+        final_xml_sha256=hashlib.sha256(body).hexdigest(),
+    )
+
+
 class OrderIntentLedgerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -237,6 +286,62 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.assertEqual(payload["client_order_id"], record.client_order_id)
         self.assertNotIn("__number__", str(prepared))
         self.assertIn("__number__", record.envelope.canonical_payload)
+
+    def test_outbound_and_transport_evidence_repr_redacts_order_identity(self):
+        authorization = OutboundAuthorization(
+            intent_id="intent-safe",
+            operation="AMEND",
+            owner="worker-safe",
+            fencing_token=7,
+            client_order_id="client-secret",
+            payload_bytes=b'{"order":"payload-secret"}',
+            payload_digest="a" * 64,
+        )
+        request = TransportRequestEvidence(
+            account_id="account-secret",
+            account_id_key="account-key-secret",
+            institution_type="BROKERAGE",
+            environment="production",
+            intent_id="intent-safe",
+            owner="worker-safe",
+            authorization_operation="AMEND",
+            fencing_token=7,
+            transport_operation="AMEND_PLACE",
+            http_method="PUT",
+            route="/route/account-key-secret/target-secret",
+            client_order_id="client-secret",
+            target_broker_order_id="target-secret",
+            preview_id="preview-secret",
+            authorization_payload_digest="a" * 64,
+            final_xml_bytes=b"<payload-secret/>",
+            final_xml_sha256="b" * 64,
+        )
+        response = TransportResponseEvidence(
+            disposition="UNKNOWN",
+            http_status=200,
+            broker_status="EXECUTED",
+            broker_order_id="broker-secret",
+            preview_id="preview-secret",
+            message_codes=(),
+            message_types=(),
+            message_description_digests=(),
+            raw_response_digest="c" * 64,
+            observed_at=self.clock.now,
+            unknown_reason="RECONCILIATION_REQUIRED",
+        )
+
+        rendered = repr((authorization, request, response))
+
+        for secret in (
+            "client-secret",
+            "payload-secret",
+            "account-secret",
+            "account-key-secret",
+            "target-secret",
+            "preview-secret",
+            "broker-secret",
+        ):
+            self.assertNotIn(secret, rendered)
 
     def test_generated_vertical_payload_is_normalized_without_hashing_ignored_fields(self):
         generated = raw_payload()
@@ -520,15 +625,223 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with self.assertRaises(OrderIntentIntegrityError):
             self.ledger.reserve_margin(record.intent_id, risk(record, self.clock))
 
-    def test_expired_claim_is_durable_in_doubt_and_stale_worker_cannot_post_or_fail(self):
+    def test_expired_claim_without_place_attempt_returns_to_intent_with_new_fence(self):
         record = self.opening()
         lease = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=5)
         self.clock.advance(5)
         with self.assertRaises(OrderIntentReconciliationRequired):
             self.ledger.prepare_submission_payload(record.intent_id, "worker", lease.fencing_token)
-        self.assertEqual(self.ledger.get_intent(record.intent_id).state, "SUBMISSION_UNKNOWN")
-        with self.assertRaises(OrderIntentReconciliationRequired):
-            self.ledger.claim_submission(record.intent_id, "other", lease_seconds=5)
+        self.assertEqual(self.ledger.get_intent(record.intent_id).state, "INTENT")
+        replacement = self.ledger.claim_submission(
+            record.intent_id, "other", lease_seconds=5
+        )
+        self.assertGreater(replacement.fencing_token, lease.fencing_token)
+
+    def test_expired_preview_only_submission_returns_to_intent(self):
+        record = self.opening()
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=5
+        )
+        authorization = self.ledger.prepare_submission_payload(
+            record.intent_id, "worker", lease.fencing_token
+        )
+        self.ledger.claim_transport_send(
+            transport_request(authorization), authorization
+        )
+
+        self.clock.advance(6)
+
+        self.assertEqual(
+            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+        )
+        self.assertEqual(self.ledger.get_intent(record.intent_id).state, "INTENT")
+        replacement = self.ledger.claim_submission(
+            record.intent_id, "other", lease_seconds=5
+        )
+        self.assertGreater(replacement.fencing_token, lease.fencing_token)
+
+    def test_place_must_reuse_exact_preview_account_route_identity(self):
+        record = self.opening()
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        authorization = self.ledger.prepare_submission_payload(
+            record.intent_id, "worker", lease.fencing_token
+        )
+        preview = transport_request(authorization)
+        self.ledger.claim_transport_send(preview, authorization)
+        self.ledger.record_transport_response(
+            preview,
+            TransportResponseEvidence(
+                disposition="ACKNOWLEDGED",
+                http_status=200,
+                broker_status="OPEN",
+                broker_order_id=None,
+                preview_id="preview-1",
+                message_codes=(),
+                message_types=(),
+                message_description_digests=(),
+                raw_response_digest="c" * 64,
+                observed_at=self.clock.now,
+                unknown_reason=None,
+            ),
+        )
+        rebound_place = transport_request(
+            authorization,
+            operation="SUBMIT_PLACE",
+            account_id_key="other-account-key",
+            institution_type="OTHER_BROKER",
+            preview_id="preview-1",
+        )
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.claim_transport_send(
+                rebound_place, authorization
+            )
+
+        self.assertEqual(self.ledger.get_intent(record.intent_id).state, "CLAIMED")
+
+    def test_preview_receipt_requires_independently_validated_ack(self):
+        record = self.opening()
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        authorization = self.ledger.prepare_submission_payload(
+            record.intent_id, "worker", lease.fencing_token
+        )
+        preview = transport_request(authorization)
+        self.ledger.claim_transport_send(preview, authorization)
+        invalid_responses = (
+            TransportResponseEvidence(
+                disposition="ACKNOWLEDGED",
+                http_status=200,
+                broker_status="REJECTED",
+                broker_order_id=None,
+                preview_id="preview-1",
+                message_codes=(),
+                message_types=(),
+                message_description_digests=(),
+                raw_response_digest="c" * 64,
+                observed_at=self.clock.now,
+                unknown_reason=None,
+            ),
+            TransportResponseEvidence(
+                disposition="ACKNOWLEDGED",
+                http_status=200,
+                broker_status="OPEN",
+                broker_order_id=None,
+                preview_id="preview-1",
+                message_codes=(1042,),
+                message_types=("WARNING",),
+                message_description_digests=("d" * 64,),
+                raw_response_digest="c" * 64,
+                observed_at=self.clock.now,
+                unknown_reason=None,
+            ),
+        )
+
+        for invalid in invalid_responses:
+            with self.subTest(
+                status=invalid.broker_status,
+                messages=invalid.message_codes,
+            ):
+                with self.assertRaises(OrderIntentValidationError):
+                    self.ledger.record_transport_response(
+                        preview, invalid
+                    )
+
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM broker_preview_receipts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM transport_response_receipts"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_expired_unattempted_amendment_releases_lease(self):
+        record = self.opening()
+        submit = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", submit)
+        submitted = self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            submit.fencing_token,
+            evidence(record, self.clock, operation="SUBMIT_ACK"),
+        )
+        amendment = self.ledger.acquire_amendment_lease(
+            submitted.intent_id,
+            "nudger",
+            lease_seconds=5,
+            idempotency_key="amend-unattempted",
+            amendment_payload=raw_payload(),
+        )
+
+        self.clock.advance(6)
+
+        self.assertEqual(
+            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+        )
+        replacement = self.ledger.acquire_amendment_lease(
+            submitted.intent_id,
+            "other",
+            lease_seconds=5,
+            idempotency_key="amend-unattempted",
+            amendment_payload=raw_payload(),
+        )
+        self.assertGreater(replacement.fencing_token, amendment.fencing_token)
+
+    def test_expired_preview_only_amendment_releases_lease(self):
+        record = self.opening()
+        submit = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", submit)
+        submitted = self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            submit.fencing_token,
+            evidence(record, self.clock, operation="SUBMIT_ACK"),
+        )
+        amendment = self.ledger.acquire_amendment_lease(
+            submitted.intent_id,
+            "nudger",
+            lease_seconds=5,
+            idempotency_key="amend-preview",
+            amendment_payload=raw_payload(),
+        )
+        authorization = self.ledger.prepare_amendment_payload(
+            submitted.intent_id, "nudger", amendment.fencing_token
+        )
+        self.ledger.claim_transport_send(
+            transport_request(
+                authorization,
+                operation="AMEND_PREVIEW",
+                target_broker_order_id=submitted.broker_order_id,
+            ),
+            authorization,
+        )
+
+        self.clock.advance(6)
+
+        self.assertEqual(
+            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+        )
+        replacement = self.ledger.acquire_amendment_lease(
+            submitted.intent_id,
+            "other",
+            lease_seconds=5,
+            idempotency_key="amend-preview",
+            amendment_payload=raw_payload(),
+        )
+        self.assertGreater(replacement.fencing_token, amendment.fencing_token)
 
     def test_submission_begin_rejects_economic_or_client_id_authorization_tampering(self):
         record = self.opening()
@@ -1066,6 +1379,11 @@ class OrderIntentLedgerTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT schema_version FROM ledger_metadata").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbound_authorizations'").fetchone())
             self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_outbound_authorization_delete'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transport_send_attempts'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'broker_preview_receipts'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transport_response_receipts'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_transport_send_attempt_delete'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_transport_response_receipt_delete'").fetchone())
         legacy_record = migrated.get_intent("legacy-closing-intent")
         self.assertEqual(legacy_record.envelope.intent_kind, "CLOSING")
         claimed_record = migrated.get_intent("legacy-claimed-intent")
@@ -1169,6 +1487,55 @@ class OrderIntentLedgerTests(unittest.TestCase):
         os.chmod(self.path, 0o644)
         with self.assertRaises(OrderIntentValidationError):
             OrderIntentLedger(self.path, clock=self.clock, run_id="run-b")
+
+    def test_schema_9_adds_response_receipts_and_keeps_expiry_live(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "DROP TRIGGER prevent_transport_response_receipt_update"
+            )
+            conn.execute(
+                "DROP TRIGGER prevent_transport_response_receipt_delete"
+            )
+            conn.execute("DROP TABLE transport_response_receipts")
+            conn.execute(
+                "UPDATE ledger_metadata SET schema_version = 9 WHERE singleton = 1"
+            )
+
+        migrated = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="run-schema-9-migration"
+        )
+
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT schema_version FROM ledger_metadata"
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transport_response_receipts'"
+                ).fetchone()
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_transport_response_receipt_delete'"
+                ).fetchone()
+            )
+        record = migrated.create_intent(
+            make_intent(key="migration-live", decision="migration-live")
+        ).intent
+        migrated.set_reservation_cap(capacity(self.clock))
+        migrated.reserve_margin(record.intent_id, risk(record, self.clock))
+        lease = migrated.claim_submission(
+            record.intent_id, "worker", lease_seconds=5
+        )
+        self.clock.advance(6)
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            migrated.prepare_submission_payload(
+                record.intent_id, "worker", lease.fencing_token
+            )
+        self.assertEqual(migrated.get_intent(record.intent_id).state, "INTENT")
 
 
 if __name__ == "__main__":
