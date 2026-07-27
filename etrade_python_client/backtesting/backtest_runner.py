@@ -36,6 +36,12 @@ import pandas_market_calendars as mcal
 from backtesting.option_data_cache import OptionDataCache
 from backtesting.massive_api_client import MassiveAPIClient
 from backtesting.greeks_calculator import compute_chain_deltas, bs_put_delta, implied_volatility
+from backtesting.contract_universe import (
+    ContractUniverseSnapshot,
+    acquisition_union_by_expiration,
+    build_contract_universe_snapshot,
+    filter_chain_for_snapshot,
+)
 from live_trading.regime_signal import (
     RegimeSignal,
     annotation_for_session,
@@ -328,6 +334,19 @@ class BacktestResult:
     data_gap_count: int = 0
     critical_gap_count: int = 0
     abnormalities: List[Dict[str, Any]] = field(default_factory=list)
+    causal_validity: str = "UNVERIFIED"
+    causal_validity_reasons: List[str] = field(
+        default_factory=lambda: [
+            "contract_reference_available_at_is_modeled_not_provider_observed",
+            "contract_reference_pagination_completeness_unverified",
+            "fill_timestamp_causality_not_certified",
+        ]
+    )
+    contract_universe_manifest_sha256: Dict[str, str] = field(
+        default_factory=dict
+    )
+    contract_universe_snapshot_request_count: int = 0
+    contract_universe_request_amplification: float = 0.0
 
 
 class BacktestPathLogger:
@@ -410,6 +429,98 @@ def get_trading_dates(start: str, end: str) -> List[str]:
     """Get NYSE trading dates in range."""
     schedule = NYSE.schedule(start_date=start, end_date=end)
     return [d.strftime("%Y-%m-%d") for d in schedule.index]
+
+
+def _session_decision_times(trading_dates: List[str]) -> Dict[str, str]:
+    """Bind this EOD simulator to each session's exact NYSE close timestamp."""
+
+    if not trading_dates:
+        return {}
+    schedule = NYSE.schedule(
+        start_date=min(trading_dates),
+        end_date=max(trading_dates),
+    )
+    closes = {
+        index.strftime("%Y-%m-%d"): (
+            pd.Timestamp(row["market_close"])
+            .tz_convert("UTC")
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        for index, row in schedule.iterrows()
+    }
+    missing = sorted(set(trading_dates) - set(closes))
+    if missing:
+        raise ValueError(
+            f"missing NYSE decision timestamps for sessions: {missing[:3]}"
+        )
+    return {trade_date: closes[trade_date] for trade_date in trading_dates}
+
+
+async def _fetch_point_in_time_contract_universe(
+    client,
+    *,
+    underlying: str,
+    expiration: str,
+    contract_type: str,
+    trade_date: str,
+    decision_time: str,
+) -> Optional[ContractUniverseSnapshot]:
+    """Fetch and seal the reference universe as of the trade decision date."""
+
+    contracts = await client.fetch_contracts_list(
+        underlying,
+        expiration,
+        contract_type,
+        trade_date,
+    )
+    if not contracts:
+        return None
+    return build_contract_universe_snapshot(
+        underlying=underlying,
+        expiration=expiration,
+        contract_type=contract_type,
+        as_of_date=trade_date,
+        # Massive documents a date-granular point-in-time `as_of` view, not an
+        # observed intraday available_at. Close T is therefore a conservative
+        # modeling boundary, not provider evidence; the run remains UNVERIFIED.
+        available_at=decision_time,
+        decision_time=decision_time,
+        contracts=contracts,
+    )
+
+
+def _point_in_time_chain(
+    cache,
+    contract_universes: Mapping[
+        Tuple[str, str, str],
+        ContractUniverseSnapshot,
+    ],
+    *,
+    underlying: str,
+    expiration: str,
+    contract_type: str,
+    trade_date: str,
+    decision_time: str,
+) -> list:
+    """Filter cached price rows through the exact decision-time universe."""
+
+    snapshot = contract_universes.get(
+        (trade_date, expiration, contract_type)
+    )
+    if snapshot is None:
+        return []
+    raw_chain = cache.get_chain_for_date(
+        underlying,
+        expiration,
+        contract_type,
+        trade_date,
+    )
+    return filter_chain_for_snapshot(
+        raw_chain,
+        snapshot,
+        decision_time,
+    )
 
 
 def find_target_expiration_friday(trade_date: str, target_dte: int = 42) -> List[str]:
@@ -640,19 +751,26 @@ def _roll_setup_requires_deviation(
 
 def _pick_monthly_alternative(
     possible_exps: list,
-    contracts_by_exp: dict,
+    contract_universes: Mapping[
+        Tuple[str, str, str],
+        ContractUniverseSnapshot,
+    ],
     daily_chain_cache: dict,
     precomputed_chain_data: dict,
     cache,
     underlying: str,
     trade_date: str,
+    decision_time: str,
     min_chain_strikes: int,
 ) -> Tuple[Optional[str], Optional[list]]:
     """
     Return the first monthly expiration in candidate order that has usable chain data.
     """
     for exp in possible_exps:
-        if not _is_third_friday(exp) or exp not in contracts_by_exp:
+        if (
+            not _is_third_friday(exp)
+            or (trade_date, exp, "put") not in contract_universes
+        ):
             continue
         if exp in daily_chain_cache:
             chain_data = daily_chain_cache[exp]
@@ -661,7 +779,15 @@ def _pick_monthly_alternative(
             if precomputed_key in precomputed_chain_data:
                 chain_data = precomputed_chain_data[precomputed_key]
             else:
-                chain_data = cache.get_chain_for_date(underlying, exp, "put", trade_date)
+                chain_data = _point_in_time_chain(
+                    cache,
+                    contract_universes,
+                    underlying=underlying,
+                    expiration=exp,
+                    contract_type="put",
+                    trade_date=trade_date,
+                    decision_time=decision_time,
+                )
                 daily_chain_cache[exp] = chain_data
         if not chain_data:
             continue
@@ -1022,6 +1148,7 @@ async def run_put_credit_spread_backtest(
 
     trading_dates = get_trading_dates(start_date, end_date)
     trading_date_index = {date: idx for idx, date in enumerate(trading_dates)}
+    decision_times = _session_decision_times(trading_dates)
     print(f"\n  Trading days: {len(trading_dates)}")
     
     # If the strategy is regime-aware and no regimes are provided, auto-train walk-forward HMM
@@ -1128,7 +1255,7 @@ async def run_put_credit_spread_backtest(
         # ── Phase 1: Identify all needed expirations ────────────
         print("\n─── Phase 1: Identifying target expirations ───")
         trade_plan = []  # (trade_date, candidates)
-        first_targeted_date = {} # exp -> earliest td
+        universe_requests = set()  # (trade_date, expiration, contract_type)
 
         for td in trading_dates:
             current_regime = regimes.get(td, -1) if regimes else -1
@@ -1143,70 +1270,92 @@ async def run_put_credit_spread_backtest(
             trade_plan.append((td, candidates))
 
             for exp in candidates[:8]:
-                if exp not in first_targeted_date or td < first_targeted_date[exp]:
-                    first_targeted_date[exp] = td
+                universe_requests.add((td, exp, "put"))
+                if call_side_enabled:
+                    universe_requests.add((td, exp, "call"))
 
             if rolling_enabled and roll_dte_multiplier != 1.0:
                 roll_candidates = find_target_expiration_friday(td, int(eff_target_dte * roll_dte_multiplier))
                 for exp in roll_candidates[:8]:
-                    if exp not in first_targeted_date or td < first_targeted_date[exp]:
-                        first_targeted_date[exp] = td
+                    universe_requests.add((td, exp, "put"))
+                    if call_side_enabled:
+                        universe_requests.add((td, exp, "call"))
 
-        # ── Phase 2: Fetch contracts lists (batch async) ────────
-        print(f"\n─── Phase 2: Fetching contracts lists (batch async) ── {len(first_targeted_date)} expirations")
-        
-        sorted_exps = sorted(first_targeted_date.keys())
-        tasks = []
-        task_meta = []
-        for exp in sorted_exps:
-            # FIX: Use the expiration date itself as the 'as_of' date.
-            # Premature polling (e.g. 50+ days out) often fails for weeklies.
-            # Look-ahead bias is prevented because Phase 3 (pricing) uses the actual trade date.
-            as_of = exp
-            tasks.append(client.fetch_contracts_list(underlying, exp, "put", as_of))
-            task_meta.append((exp, "put"))
-            if call_side_enabled:
-                tasks.append(client.fetch_contracts_list(underlying, exp, "call", as_of))
-                task_meta.append((exp, "call"))
-            
-        results = await asyncio.gather(*tasks)
-        
-        contracts_by_exp = {}
-        call_contracts_by_exp = {}
-        for (exp, contract_type), contracts in zip(task_meta, results):
-            if contracts:
-                if contract_type == "call":
-                    call_contracts_by_exp[exp] = contracts
-                else:
-                    contracts_by_exp[exp] = contracts
-            else:
-                print(f"  WARNING: No {contract_type} contracts found for expiration {exp}")
+        # ── Phase 2: Fetch exact decision-time contract universes ────────
+        print(
+            "\n─── Phase 2: Fetching point-in-time contract universes "
+            f"(batch async) ── {len(universe_requests)} snapshots"
+        )
+
+        task_meta = sorted(universe_requests)
+        expiration_request_keys = {
+            (expiration, contract_type)
+            for _, expiration, contract_type in task_meta
+        }
+        result.contract_universe_snapshot_request_count = len(task_meta)
+        result.contract_universe_request_amplification = (
+            len(task_meta) / len(expiration_request_keys)
+            if expiration_request_keys
+            else 0.0
+        )
+        tasks = [
+            _fetch_point_in_time_contract_universe(
+                client,
+                underlying=underlying,
+                expiration=exp,
+                contract_type=contract_type,
+                trade_date=td,
+                decision_time=decision_times[td],
+            )
+            for td, exp, contract_type in task_meta
+        ]
+        snapshots = await asyncio.gather(*tasks)
+
+        contract_universes: Dict[
+            Tuple[str, str, str],
+            ContractUniverseSnapshot,
+        ] = {}
+        for key, snapshot in zip(task_meta, snapshots):
+            if snapshot is not None:
+                contract_universes[key] = snapshot
+        result.contract_universe_manifest_sha256 = {
+            "|".join(key): snapshot.snapshot_sha256
+            for key, snapshot in sorted(contract_universes.items())
+        }
+
+        missing_snapshot_count = len(task_meta) - len(contract_universes)
+        if missing_snapshot_count:
+            print(
+                "  WARNING: "
+                f"{missing_snapshot_count} point-in-time contract snapshots "
+                "were unavailable and cannot authorize eligibility"
+            )
+
+        # These unions are acquisition-only over-fetch plans. Eligibility is
+        # always re-applied from contract_universes for the exact trade date.
+        contracts_by_exp = acquisition_union_by_expiration(
+            contract_universes.values(),
+            "put",
+        )
+        call_contracts_by_exp = acquisition_union_by_expiration(
+            contract_universes.values(),
+            "call",
+        )
 
         # ── Phase 3: Batch fetch OHLCV for all contracts (global batch) ────────
         print(f"\n─── Phase 3: Fetching OHLCV bars (global batch async) ── {len(contracts_by_exp)} expirations")
         
         tasks = []
         for exp, contracts in contracts_by_exp.items():
-            if exp in first_targeted_date:
-                fetch_from = first_targeted_date[exp]
-            else:
-                relevant_dates = [td for td, cands in trade_plan if exp in cands[:3]]
-                if not relevant_dates: continue
-                fetch_from = min(relevant_dates)
-            fetch_to = exp
-
-            # Strike Filtering Optimization
-            # Only fetch strikes within a reasonable buffer of the spot price range during this window.
-            # This significantly reduces API calls for deep OTM/ITM strikes we will never trade.
-            spot_window = underlying_prices[(underlying_prices.index >= fetch_from) & (underlying_prices.index <= fetch_to)]
-            if not spot_window.empty:
-                min_s = spot_window.min()
-                max_s = spot_window.max()
-                # Buffer: 17% below min spot to 5% above max spot
-                # (Optimized to significantly reduce strike count while safely covering -0.12 delta puts and ATM rolls)
-                filtered = [c for c in contracts if (min_s * 0.83) <= c["strike"] <= (max_s * 1.05)]
-                print(f"  [FILTER] {exp}: {len(contracts)} -> {len(filtered)} strikes")
-                contracts = filtered
+            relevant_dates = [
+                td
+                for td, candidate_exp, contract_type in contract_universes
+                if candidate_exp == exp and contract_type == "put"
+            ]
+            if not relevant_dates:
+                continue
+            fetch_from = min(relevant_dates)
+            fetch_to = min(exp, end_date)
 
             tasks.append(client.fetch_chain_ohlcv_batch(
                 contracts, fetch_from, fetch_to,
@@ -1215,21 +1364,15 @@ async def run_put_credit_spread_backtest(
 
         if call_side_enabled:
             for exp, contracts in call_contracts_by_exp.items():
-                if exp in first_targeted_date:
-                    fetch_from = first_targeted_date[exp]
-                else:
-                    relevant_dates = [td for td, cands in trade_plan if exp in cands[:3]]
-                    if not relevant_dates:
-                        continue
-                    fetch_from = min(relevant_dates)
-                fetch_to = exp
-                spot_window = underlying_prices[(underlying_prices.index >= fetch_from) & (underlying_prices.index <= fetch_to)]
-                if not spot_window.empty:
-                    min_s = spot_window.min()
-                    max_s = spot_window.max()
-                    filtered = [c for c in contracts if (min_s * 0.83) <= c["strike"] <= (max_s * 1.05)]
-                    print(f"  [FILTER CALL] {exp}: {len(contracts)} -> {len(filtered)} strikes")
-                    contracts = filtered
+                relevant_dates = [
+                    td
+                    for td, candidate_exp, contract_type in contract_universes
+                    if candidate_exp == exp and contract_type == "call"
+                ]
+                if not relevant_dates:
+                    continue
+                fetch_from = min(relevant_dates)
+                fetch_to = min(exp, end_date)
                 tasks.append(client.fetch_chain_ohlcv_batch(
                     contracts, fetch_from, fetch_to,
                     underlying=underlying, contract_type="call", expiration=exp,
@@ -1261,10 +1404,18 @@ async def run_put_credit_spread_backtest(
             selected_exp = None
             selected_chain = None
             for exp in possible_exps:
-                if exp not in contracts_by_exp:
+                if (td, exp, "put") not in contract_universes:
                     continue
                 cache_key = (td, exp)
-                chain_data = cache.get_chain_for_date(underlying, exp, "put", td)
+                chain_data = _point_in_time_chain(
+                    cache,
+                    contract_universes,
+                    underlying=underlying,
+                    expiration=exp,
+                    contract_type="put",
+                    trade_date=td,
+                    decision_time=decision_times[td],
+                )
                 precomputed_chain_data[cache_key] = chain_data
 
                 if chain_data and len(chain_data) >= 10:
@@ -1275,17 +1426,33 @@ async def run_put_credit_spread_backtest(
             if rolling_enabled and roll_dte_multiplier != 1.0:
                 roll_exps = find_target_expiration_friday(td, int(eff_target_dte * roll_dte_multiplier))
                 for rexp in roll_exps:
-                    if rexp in contracts_by_exp:
+                    if (td, rexp, "put") in contract_universes:
                         r_cache_key = (td, rexp)
                         if r_cache_key not in precomputed_chain_data:
-                            precomputed_chain_data[r_cache_key] = cache.get_chain_for_date(underlying, rexp, "put", td)
+                            precomputed_chain_data[r_cache_key] = _point_in_time_chain(
+                                cache,
+                                contract_universes,
+                                underlying=underlying,
+                                expiration=rexp,
+                                contract_type="put",
+                                trade_date=td,
+                                decision_time=decision_times[td],
+                            )
             if call_side_enabled and rolling_enabled and roll_dte_multiplier != 1.0:
                 roll_exps = find_target_expiration_friday(td, int(eff_target_dte * roll_dte_multiplier))
                 for rexp in roll_exps:
-                    if rexp in call_contracts_by_exp:
+                    if (td, rexp, "call") in contract_universes:
                         r_cache_key = (td, rexp)
                         if r_cache_key not in precomputed_call_chain_data:
-                            precomputed_call_chain_data[r_cache_key] = cache.get_chain_for_date(underlying, rexp, "call", td)
+                            precomputed_call_chain_data[r_cache_key] = _point_in_time_chain(
+                                cache,
+                                contract_universes,
+                                underlying=underlying,
+                                expiration=rexp,
+                                contract_type="call",
+                                trade_date=td,
+                                decision_time=decision_times[td],
+                            )
 
             if not selected_exp or not selected_chain:
                 continue
@@ -1314,8 +1481,19 @@ async def run_put_credit_spread_backtest(
                 "option_type": "put",
             })
 
-            if call_side_enabled and selected_exp in call_contracts_by_exp:
-                call_chain_data = cache.get_chain_for_date(underlying, selected_exp, "call", td)
+            if (
+                call_side_enabled
+                and (td, selected_exp, "call") in contract_universes
+            ):
+                call_chain_data = _point_in_time_chain(
+                    cache,
+                    contract_universes,
+                    underlying=underlying,
+                    expiration=selected_exp,
+                    contract_type="call",
+                    trade_date=td,
+                    decision_time=decision_times[td],
+                )
                 precomputed_call_chain_data[(td, selected_exp)] = call_chain_data
                 if call_chain_data and len(call_chain_data) >= 10:
                     call_strikes = [r["strike"] for r in call_chain_data]
@@ -2287,7 +2465,7 @@ async def run_put_credit_spread_backtest(
                 
                 possible_exps = find_target_expiration_friday(td, eff_target_dte)
                 for exp in possible_exps:
-                    if exp in contracts_by_exp:
+                    if (td, exp, "put") in contract_universes:
                         if exp in daily_chain_cache:
                             chain_data = daily_chain_cache[exp]
                         else:
@@ -2295,7 +2473,15 @@ async def run_put_credit_spread_backtest(
                             if precomputed_key in precomputed_chain_data:
                                 chain_data = precomputed_chain_data[precomputed_key]
                             else:
-                                chain_data = cache.get_chain_for_date(underlying, exp, "put", td)
+                                chain_data = _point_in_time_chain(
+                                    cache,
+                                    contract_universes,
+                                    underlying=underlying,
+                                    expiration=exp,
+                                    contract_type="put",
+                                    trade_date=td,
+                                    decision_time=decision_times[td],
+                                )
                             daily_chain_cache[exp] = chain_data
                         if not chain_data:
                             print(f"  {td}: Skipping {exp} (empty)")
@@ -2348,14 +2534,15 @@ async def run_put_credit_spread_backtest(
                     if roll_needs_deviation:
                         alt_exp, alt_chain = _pick_monthly_alternative(
                             possible_exps,
-                            contracts_by_exp,
+                            contract_universes,
                             daily_chain_cache,
                             precomputed_chain_data,
-                                cache,
-                                underlying,
-                                td,
-                                min_chain_strikes,
-                            )
+                            cache,
+                            underlying,
+                            td,
+                            decision_times[td],
+                            min_chain_strikes,
+                        )
                         if alt_exp and alt_chain:
                             print(
                                 f"  {td}: [MONTHLY PREFERENCE] Weekly expiration {selected_exp} would require strike/pricing fallback; "
@@ -2525,12 +2712,13 @@ async def run_put_credit_spread_backtest(
                             if delta_deviation_pct > delta_tolerance_pct or width_deviation_pct > 1e-9:
                                 alt_exp, alt_chain = _pick_monthly_alternative(
                                     possible_exps,
-                                    contracts_by_exp,
+                                    contract_universes,
                                     daily_chain_cache,
                                     precomputed_chain_data,
                                     cache,
                                     underlying,
                                     td,
+                                    decision_times[td],
                                     min_chain_strikes,
                                 )
                                 if alt_exp and alt_chain:
@@ -2941,7 +3129,15 @@ async def run_put_credit_spread_backtest(
                                         if call_key in precomputed_call_chain_data:
                                             call_chain = precomputed_call_chain_data[call_key]
                                         else:
-                                            call_chain = cache.get_chain_for_date(underlying, selected_exp, "call", td)
+                                            call_chain = _point_in_time_chain(
+                                                cache,
+                                                contract_universes,
+                                                underlying=underlying,
+                                                expiration=selected_exp,
+                                                contract_type="call",
+                                                trade_date=td,
+                                                decision_time=decision_times[td],
+                                            )
                                         daily_call_chain_cache[selected_exp] = call_chain
 
                                     if not call_chain or len(call_chain) < min_chain_strikes:
@@ -3175,7 +3371,18 @@ async def run_put_credit_spread_backtest(
                 "loss_count": int(result.loss_count),
                 "total_trades": int(result.total_trades),
                 "max_drawdown": float(result.max_drawdown),
-                "abnormalities": result.abnormalities
+                "abnormalities": result.abnormalities,
+                "causal_validity": result.causal_validity,
+                "causal_validity_reasons": result.causal_validity_reasons,
+                "contract_universe_manifest_sha256": (
+                    result.contract_universe_manifest_sha256
+                ),
+                "contract_universe_snapshot_request_count": (
+                    result.contract_universe_snapshot_request_count
+                ),
+                "contract_universe_request_amplification": (
+                    result.contract_universe_request_amplification
+                ),
             }
             path_logger.save(final_results=summary)
         

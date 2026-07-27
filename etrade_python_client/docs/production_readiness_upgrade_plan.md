@@ -239,6 +239,27 @@ yet a durable, centralized mutation gateway; affected OAuth keys have not been r
 public history has not been purged; and no deployed process has been verified.
 P0-L3 through P0-L6 and P0-L8 remain stop-ship issues.
 
+P0-B1/P0-B2 now have an executable containment slice. The backtest requests
+Massive reference contracts by exact trade date, expiration, and option type;
+seals each non-empty response into a content-addressed immutable snapshot; and
+filters every entry-chain read through that exact snapshot. A later snapshot or
+an acquisition union can therefore add tickers without changing an earlier
+eligible universe. The old underlying-price min/max filter through expiration
+is removed, and price acquisition stops at the test end date rather than
+expiration when expiration lies later.
+
+This is not causal certification. Massive documents date-granular `as_of`
+behavior but not an observed intraday `available_at`, and the current adapter
+does not retain complete-page/request evidence. Snapshot manifests and
+`BacktestResult` therefore state that availability and completeness are
+`UNVERIFIED`; fills remain separately uncertified under P0-B4. Exact daily
+snapshots also amplify reference requests: the default put-only plan produces
+2,000 snapshot requests versus 112 expiration-level requests for calendar 2025
+(17.86x), and 12,848 versus 674 for 2020-01-01 through 2026-05-23 (19.06x).
+The follow-on is an entitlement-approved immutable daily catalog with durable
+pagination evidence and batch/offline replay, not a return to future-dated
+universe discovery.
+
 ## Required regime-aware causal record
 
 Every regime-aware run must persist the following fields and pass them before

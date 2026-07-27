@@ -263,6 +263,11 @@ class MassiveAPIClient:
         """
         Get list of option contracts for an underlying/expiration.
         Returns list of {"option_ticker": str, "strike": float}.
+
+        ``as_of`` is only a date-granular provider query parameter. This raw
+        adapter does not prove an intraday ``available_at`` and its return value
+        must not be used directly as a backtest eligibility universe. The
+        runner seals and checks an exact decision-date snapshot separately.
         """
         # Check cache
         cached = self.cache.get_cached_contracts(
