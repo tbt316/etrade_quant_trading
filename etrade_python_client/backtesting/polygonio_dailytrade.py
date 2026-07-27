@@ -102,8 +102,6 @@ stored_option_chain = {}
 
 # Directory where we store monthly backtest results
 MONTHLY_BACKTEST_DIR = "monthly_backtest_data"
-if not os.path.exists(MONTHLY_BACKTEST_DIR):
-    os.makedirs(MONTHLY_BACKTEST_DIR)
 
 # ---------------------------------------------------------
 # 2. DIRECTORY + FILENAME HELPERS
@@ -140,6 +138,12 @@ def get_monthly_backtest_file(ticker: str, global_start_date: str, global_end_da
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"monthly_{ticker}_{global_start_date}_to_{global_end_date}_{timestamp_str}.pkl"
     return os.path.join(MONTHLY_BACKTEST_DIR, filename)
+
+
+def ensure_monthly_backtest_dir() -> None:
+    """Create the monthly result directory only at an explicit write boundary."""
+    os.makedirs(MONTHLY_BACKTEST_DIR, exist_ok=True)
+
 
 # ---------------------------------------------------------
 # 3. LOADING & SAVING DATA
@@ -3648,6 +3652,7 @@ async def monthly_recursive_backtest(
 
     save_file = False
     if save_file:
+        ensure_monthly_backtest_dir()
         filename = get_monthly_backtest_file(ticker, global_start_date, global_end_date)
         data_to_save = {
             "parameters": current_parameters,

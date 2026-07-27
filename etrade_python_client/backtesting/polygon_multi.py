@@ -169,8 +169,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 df = {}
 log_dir = "./option_test_log"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
 
 def process_ticker_with_data(ticker):
     try:

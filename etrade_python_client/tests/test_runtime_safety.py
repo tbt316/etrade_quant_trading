@@ -81,6 +81,15 @@ def _arm_document(*, issued_at=None, expires_at=None, extra=None):
     return document
 
 
+def _child_environment(repository: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    if os.environ.get("ETRADE_TEST_ARTIFACT") == "1":
+        environment.pop("PYTHONPATH", None)
+    else:
+        environment["PYTHONPATH"] = str(repository)
+    return environment
+
+
 class RuntimeSafetyTests(unittest.TestCase):
     def test_missing_environment_never_defaults_to_production(self):
         with self.assertRaisesRegex(RuntimeSafetyError, "explicit"):
@@ -535,19 +544,18 @@ class RuntimeSafetyTests(unittest.TestCase):
                 self.assertEqual(legacy.get_etrade_oauth(use_sandbox=False), token)
             self.assertEqual(os.stat(cache_path).st_mode & 0o777, 0o600)
 
-    def test_quarantined_spread_import_uses_owner_only_log_and_cannot_authenticate(self):
+    def test_quarantined_spread_import_is_clean_and_cannot_authenticate(self):
         repository = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            environment = os.environ.copy()
-            environment["PYTHONPATH"] = str(repository)
+            environment = _child_environment(repository)
             result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
-                    "import os, stat; "
+                    "import os; "
                     "from live_trading import etrade_put_credit_spread as legacy; "
                     "from live_trading.runtime_safety import RuntimeSafetyError; "
-                    "assert stat.S_IMODE(os.stat('etrade_trader.log').st_mode) == 0o600; "
+                    "assert not os.path.exists('etrade_trader.log'); "
                     "\ntry:\n legacy.get_etrade_session(False)\n"
                     "except RuntimeSafetyError:\n pass\n"
                     "else:\n raise AssertionError('legacy authentication was not quarantined')",
@@ -658,8 +666,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             lock_path = Path(directory) / "lock"
             handle = secure_lock_file(lock_path)
             try:
-                environment = os.environ.copy()
-                environment["PYTHONPATH"] = str(repository)
+                environment = _child_environment(repository)
                 result = subprocess.run(
                     [
                         sys.executable,
@@ -677,17 +684,16 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("already running", result.stderr)
 
-    def test_clean_cwd_import_creates_a_protected_client_log(self):
+    def test_clean_cwd_import_does_not_create_a_client_log(self):
         repository = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
             command = [
                 sys.executable,
                 "-c",
-                "import live_trading.etrade_cover_call_new; import os, stat; "
-                "assert stat.S_IMODE(os.stat('python_client.log').st_mode) == 0o600",
+                "import live_trading.etrade_cover_call_new; import os; "
+                "assert not os.path.exists('python_client.log')",
             ]
-            environment = os.environ.copy()
-            environment["PYTHONPATH"] = str(repository)
+            environment = _child_environment(repository)
             result = subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
