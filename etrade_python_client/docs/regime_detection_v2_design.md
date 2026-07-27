@@ -2,7 +2,7 @@
 
 **Review date:** 2026-07-26
 
-**Status:** shadow-mode detector plus evidence contract; not connected to order execution
+**Status:** shadow-mode detector with R2 durable provider evidence; not connected to order execution
 **Related roadmap:** `docs/production_readiness_upgrade_plan.md`
 
 ## Decision
@@ -342,8 +342,12 @@ Each row contains:
   "Calendar_Policy_Version": "nyse+cboe_index_options.v1",
   "Source_Policy_Version": "regime_source_identity.v1",
   "Source_Policy_SHA256": "<sha256>",
-  "Input_Provenance_Status": "unverified",
-  "Input_Provenance_Evidence": "complete_but_not_durably_verified",
+  "Input_Provenance_Status": "verified | unverified",
+  "Input_Provenance_Evidence": "durable_raw_payload_and_parser_receipts_verified | complete_but_not_durably_verified | incomplete",
+  "Evidence_Manifest_SHA256": "<sha256> | null",
+  "Evidence_Verification_Kind": "decision_time | verified_replay | null",
+  "Evidence_Verified_At": "<UTC timestamp> | null",
+  "Evidence_Decision_Time_Eligible": true,
   "Detector_Stage": "shadow",
   "Execution_Eligible": false,
   "Reason_Codes": "vix_daily_change_extreme",
@@ -360,6 +364,21 @@ frozen source-policy verdict. The snapshot binds the version and hash of that
 policy, verifies exact contiguous NYSE sessions, one independent SPY and VIX
 observation per session, recognized identities, deterministic input and
 calendar hashes, and timezone-aware clock ordering.
+
+R2 does not let the snapshot or caller certify provenance. The
+`detect_regimes_from_verified_snapshot(snapshot, evidence_store)` boundary
+calls `evidence_store.verify_snapshot(snapshot)` itself, binds the resulting
+manifest to that exact snapshot hash, and rejects incomplete evidence. It does
+not accept a caller-provided Boolean or report. Only this retained-byte reparse
+path can emit the `verified` variant above. The ordinary snapshot, loose-array,
+and legacy-cache paths emit `unverified` and remain execution-ineligible.
+
+`decision_time` means the evidence was parsed no later than the snapshot's
+recorded decision time. `verified_replay` proves byte/parser lineage but does
+not prove that lineage existed at the historical decision time; it sets
+`Evidence_Decision_Time_Eligible=false`, adds a data-quality warning, and must
+be rejected by future backtest or live promotion gates. Both variants remain
+execution-ineligible in R2.
 
 SPY event time comes from the versioned NYSE schedule. VIX event time comes
 from the versioned `CBOE_Index_Options` schedule, including shortened sessions;
@@ -385,32 +404,69 @@ Insufficient calibration history returns `unavailable`, and the first row's
 shock state is `unavailable` because a daily change cannot yet be observed.
 None of these cases silently produces `calm` or `none`.
 
-R1 intentionally does **not** call a checksum “verified provenance.” The
-current snapshot retains a digest but not the provider response bytes or a
-trusted parser receipt, so even structurally complete source metadata is
-labeled `complete_but_not_durably_verified`. No current R1 path emits
-`Input_Provenance_Status=verified`. A later provider-adapter release must store
-content-addressed raw responses, link each chosen observation revision to the
-fetch attempt and parser version, and re-derive the parsed close before this
-gate can be promoted.
+### R2 provider evidence gateway
 
-### R1 evidence persistence
+R2 closes the durable-lineage gap for the provider-backed shadow path.
+`live_trading/regime_market_data_gateway.py` is a library, not a scheduler: it
+does not fetch at import time, read a secret configuration, start a worker, or
+connect to E*TRADE execution. An explicit caller supplies a transport, clock,
+sleep function, and bounded requested range. The production transport requests
+one Massive Daily Ticker Summary per NYSE session for SPY (`adjusted=false`) and
+one official Cboe `VIX_History.csv` response for the same session range.
 
-`live_trading/regime_evidence_store.py` provides the first durable manifest
-boundary. It stores source attempts, source health, append-only observation
-revisions, and channel-scoped, content-addressed input snapshots in SQLite with WAL,
-`synchronous=FULL`, foreign keys, restrictive file permissions, and immediate
-write transactions. Failed or time-inconsistent attempts roll back without
-advancing last-success state. A successful range must include exactly one
-currently ingested observation for every requested NYSE session. Snapshot
-reload verifies its canonical hash before returning data, and an older
-backfill cannot replace a newer-as-of snapshot in the same channel.
+For every complete HTTP response, including retryable and non-2xx responses,
+the gateway captures the exact **decoded parser-input bytes** before deciding
+whether to retry. SQLite stores those content-addressed bytes separately from a
+credential-free fetch receipt. A registered strict parser then produces the
+chosen observation(s), a parser receipt bound to parser source/configuration,
+and stable source locators. The store re-reads the retained bytes and reparses
+them when creating the snapshot-evidence manifest; a snapshot is verified only
+when every selected SPY and VIX observation links to that manifest. A checksum
+alone remains unverified.
 
-This store is not yet wired into the live collection worker. That adapter and
-the raw-payload/parser receipts and two-leg retry/publication scheduler belong
-to the later live-shadow phase.
-The legacy JSON and Parquet caches remain research/display artifacts and cannot
-be promoted into verified evidence.
+SPY and VIX have independent source attempts and outcomes. The gateway never
+holds a store transaction over HTTP. It records each captured response, closes
+each attempt as success or failure, and can publish only after both legs cover
+the same exact contiguous NYSE sessions, satisfy their exchange clocks, and
+pass store-owned verification. A one-leg failure retains the prior verified
+`shadow` channel head; it must not partially publish or erase confirmed history.
+
+Incremental collection is a **snapshot-start history assembly** process. The
+first collection requests a bounded calibration/bootstrap range. Later runs
+extend the explicitly recorded `snapshot_start` through the latest jointly
+eligible session and assemble a new complete contiguous candidate from the
+previous verified history plus new independent observations. A one-session
+refresh is therefore not a substitute for the detector's required trailing
+history. The resulting publication is still a full immutable snapshot, never a
+mutable in-place append.
+
+`available_at` means this collector observed a completed response after the
+versioned NYSE/Cboe exchange-close clock. It is not a claim that Massive or
+Cboe has supplied a contractual per-row finality guarantee. Provider
+corrections are retained as append-only observation revisions; a correction is
+eligible only through a newly verified snapshot and cannot rewrite an existing
+publication.
+
+The [provider-entitlement gate](regime_data_provider_entitlements.md) remains
+unresolved. Until it is satisfied, raw provider bytes stay local, are not
+redistributed or rendered, and every provider-backed result remains
+shadow/research-only with `Execution_Eligible=false`.
+
+`live_trading/regime_evidence_store.py` is the durable manifest boundary. It
+stores source attempts and health, raw BLOBs, fetch and parser receipts,
+append-only observation revisions, evidence manifests, and channel-scoped
+content-addressed snapshots in SQLite with WAL, `synchronous=FULL`, foreign
+keys, restrictive file permissions, and immediate write transactions. Snapshot
+reload and verification recheck canonical hashes and stored parser lineage. The
+legacy JSON and Parquet caches remain research/display artifacts and cannot be
+promoted into verified evidence.
+
+The database must live in a dedicated current-user-owned `0700` directory;
+database and SQLite companion files are preflighted without following links and
+forced to `0600`. This protects the service boundary from shared-directory and
+pre-existing link/special-file attacks. It does not claim isolation from a
+malicious process already running as the same OS user, so production deployment
+must use a dedicated service identity.
 
 ## Why not another single HMM
 
@@ -625,9 +681,13 @@ and skipped-trade effects must be included.
 - Detector: `live_trading/regime_detector_v2.py`
 - Evidence contract: `live_trading/regime_market_data.py`
 - Evidence store: `live_trading/regime_evidence_store.py`
+- Provider parser contract: `live_trading/regime_provider_evidence.py`
+- Provider gateway: `live_trading/regime_market_data_gateway.py`
+- Release gate: `docs/regime_data_provider_entitlements.md`
 - Focused tests: `tests/test_regime_detector_v2.py`,
   `tests/test_regime_market_data.py`, and
-  `tests/test_regime_evidence_store.py`
+  `tests/test_regime_evidence_store.py`,
+  `tests/test_regime_market_data_gateway.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
 
 The focused tests verify:
@@ -643,6 +703,8 @@ The focused tests verify:
 - Actual NYSE/Cboe regular and shortened-session clocks.
 - Deterministic snapshot, calendar, and source-policy hashes.
 - Exact requested-range coverage and transactional failure rollback.
+- Exact retained provider bytes, credential-free fetch receipts, deterministic
+  parser receipts, and store-owned snapshot verification.
 - Stale-attempt rejection and channel-scoped, monotonic snapshot publication.
 - Unavailable first-return shock evidence.
 

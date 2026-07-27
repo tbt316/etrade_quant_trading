@@ -50,15 +50,19 @@ flowchart TD
 The Market Regime Detection (MRD) stack retains the existing causal HMM/GMM
 research path and adds a separate V2 shadow path. V2 validates immutable
 SPY/VIX evidence and separates persistent background stress from fast event
-shocks. It is not connected to order execution.
+shocks. It is not connected to order execution. The provider-backed path is a
+library-only, entitlement-gated shadow collector; it does not schedule itself
+or read credentials at import time.
 
 ```mermaid
 flowchart TD
     subgraph Data & Feature Layer
         DI["live_trading/data_ingestion.py<br/>(Fractional-Diff & Stationarity Checks)"]
         YF[("yfinance Cache / Flat Files<br/>(SPY, SPX, VIX, IRX Close Prices)")]
+        MPG["regime_market_data_gateway.py<br/>(Bounded Massive/Cboe acquisition)"]
+        RPE["regime_provider_evidence.py<br/>(Strict retained-byte parsers)"]
         RMD["live_trading/regime_market_data.py<br/>(Immutable SPY/VIX Evidence Contract)"]
-        RES[("regime_evidence_store.py<br/>(Attempts, Revisions, Snapshots)")]
+        RES[("regime_evidence_store.py<br/>(Bytes, Receipts, Revisions, Verified Snapshots)")]
     end
 
     subgraph Dimensionality Reduction
@@ -84,9 +88,14 @@ flowchart TD
         CSVS["audit_plots/*.csv<br/>(Causal Audit Trace Tables)"]
     end
 
+    Massive["Massive SPY daily summary"] --> MPG
+    Cboe["Cboe VIX history CSV"] --> MPG
+    MPG -->|"exact decoded parser-input bytes"| RES
+    MPG --> RPE
+    RPE -->|"parser receipts + observations"| RES
+    RES -->|"verified immutable snapshot"| RMD
     YF --> DI
     YF --> RMD
-    RMD -.->|"adapter persistence pending"| RES
     RMD --> RD2
     RD2 --> RVA
     DI --> PF
@@ -118,12 +127,22 @@ flowchart TD
 *   **Data Ingestion** ([`data_ingestion.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/data_ingestion.py)): Ingests raw market series (SPY, SPX, VIX, IRX) and transforms them to stationary inputs (log returns, fractional differencing) while running ADF (Augmented Dickey-Fuller) stationarity assertions.
 *   **PCA Fusion** ([`pca_fusion.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/pca_fusion.py)): Projects scaled stationary features into mathematically orthogonal components using rolling/expanding window PCA, enforcing eigenvector sign alignment over consecutive steps.
 *   **Core Engine** ([`ev_engine.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/ev_engine.py)): Implements walk-forward Hidden Markov Model (HMM) fits, deterministic state mapping (by variance/VIX to prevent label switching), and GMM (Gaussian Mixture Model) conditional forward return density estimates to calculate quantitative Expected Values (EV) for OTM puts.
-*   **V2 Evidence Contract** ([`regime_market_data.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_market_data.py)): Defines exact NYSE/Cboe clocks, immutable source observations, deterministic input hashes, and policy-bound provenance metadata. It refuses to call checksums verified until raw provider bytes and parser receipts are durably linked.
-*   **V2 Evidence Store** ([`regime_evidence_store.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_evidence_store.py)): Persists source attempts, last-confirmed health, append-only corrections, and channel-scoped detector snapshots in SQLite. Raw-response and live adapter wiring are still pending.
+*   **V2 Evidence Contract** ([`regime_market_data.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_market_data.py)): Defines exact NYSE/Cboe clocks, immutable source observations, deterministic input hashes, and policy-bound provenance metadata.
+*   **V2 Provider Gateway and Parsers** ([`regime_market_data_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_market_data_gateway.py), [`regime_provider_evidence.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_provider_evidence.py)): A caller-invoked, bounded Massive SPY/Cboe VIX acquisition library. It captures exact decoded parser-input bytes before retry decisions, retains credential-free fetch receipts, and derives strict parser receipts. It has no scheduler, import-time network call, or execution link.
+*   **V2 Evidence Store** ([`regime_evidence_store.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_evidence_store.py)): Persists raw BLOBs, source attempts/health, fetch and parser receipts, append-only corrections, and channel-scoped verified snapshots in SQLite. It replays retained bytes before a `shadow` publication; one-leg failures preserve the previously verified head.
 *   **V2 Shadow Detector** ([`regime_detector_v2.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/regime_detector_v2.py)): Produces independent background and shock states from causal daily SPY/VIX inputs. Every current output is execution-ineligible.
 *   **Plotting & Diagnostics** ([`ev_plots.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/ev_plots.py)): Orchestrates visualizations of regime timelines, HMM state returns, GMM distribution fits, and Expected Value curves. It is also equipped to trigger out-of-sample calibration backtests.
 *   **Regime Audit** ([`regime_probability_audit.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scratch/regime_probability_audit.py)): A rigorous statistical audit script that merges SPY/SPX data, fits a causal walk-forward HMM, checks for statistical equivalence via Kolmogorov-Smirnov (KS) tests, audits options assignment frequencies against BS/Skew probabilities, and compiles a comprehensive audit report.
 *   **V2 Legacy Replay Audit** ([`regime_detector_v2_audit.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/scratch/regime_detector_v2_audit.py)): Wraps legacy cache values in an explicitly unverified snapshot, surfaces conflicts/quarantined rows, and compares the two-timescale shadow result with the old overlay.
+
+The provider-backed route begins with an explicit `snapshot_start` bootstrap or
+incremental history assembly: each candidate must cover the complete contiguous
+NYSE range through its new endpoint, not merely the newest session. Observing a
+response after the NYSE/Cboe close is the availability policy, not a provider
+finality promise; later provider corrections append a revision and require a
+new verified snapshot. The [provider entitlement gate](regime_data_provider_entitlements.md)
+is unresolved, so retained provider data and all derived V2 outputs remain
+shadow/research-only and cannot affect E*TRADE order eligibility.
 
 ---
 
