@@ -222,13 +222,14 @@ def test_ci_builds_and_tests_an_immutable_offline_artifact() -> None:
     assert "runs-on: ubuntu-24.04" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert (
-        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
         in workflow
     )
     assert (
-        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+        "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
         in workflow
     )
+    assert "cache: pip" not in workflow
     assert "python -m build --sdist --wheel --no-isolation" in workflow
     assert workflow.count("git archive --format=tar HEAD") == 2
     assert workflow.count("umask 022") == 2
