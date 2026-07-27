@@ -329,15 +329,25 @@ decision-time receipts, so it cannot establish production provenance.
     beginning 2026-07-27.
 - `research_reports/regime_v2_calibration_artifact.json`
   - Records the deterministic legacy-data evaluation and selected baseline.
+- `live_trading/regime_signal.py`
+  - Defines an immutable two-axis signal with canonical hashing, exact
+    close-T-to-next-session timing, artifact/evidence lineage, the mandatory
+    causal record, and a hard-coded non-authoritative action boundary.
+- `backtesting/backtest_runner.py`
+  - Accepts V2 only as an exact-date audit annotation and persists it without
+    consulting it for trade behavior.
+  - No longer backfills later HMM probabilities into earlier dates.
+  - Requires empirical forward-return outcomes to resolve strictly before the
+    entry session.
 
 ### Remaining risk
 
 The selected profile is not approved for E*TRADE orders. Its calibration data
 are explicitly `legacy_normalized_unverified`; the provider entitlement gate is
-unresolved; the prospective window has not accumulated; backtest/live taxonomy
-parity is still an R4 task; and no centralized fail-closed risk engine consumes
-the signal. The correct operational result remains `Calibration_Abstain=true`
-and `Execution_Eligible=false`.
+unresolved; the prospective window has not accumulated; the live dashboard has
+not yet published the R4 typed lane; and no centralized fail-closed risk engine
+consumes the signal. The correct operational result remains
+`Calibration_Abstain=true` and `Execution_Eligible=false`.
 
 ### Verification record
 
@@ -354,6 +364,10 @@ and `Execution_Eligible=false`.
 - Unit coverage includes canonical/tamper checks, strict purging, exact
   post-lag outcomes, prefix invariance, stale build/data/pin rejection, and
   binding coverage/chatter/false-persistence guards.
+- R4 coverage verifies closed two-axis types, canonical signal hashes,
+  artifact pins, stripped-attribute rejection, exact Friday-to-Monday mapping,
+  no-fill lookup, numeric-HMM separation, audit serialization, and strictly
+  prior return-bucket resolution.
 
 ### CI portability incident
 
