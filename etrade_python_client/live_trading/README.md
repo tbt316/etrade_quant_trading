@@ -4,48 +4,50 @@ This module contains the live trading agent and its associated web-based managem
 
 ## 🚀 Quick Start
 
-1. **Start the Trading Bot**:
-   Run the main script with the `--trade` flag. This will automatically start the background HTTP server on port `8765`.
+1. **Provision safety inputs**:
+   Configure client credentials outside Git using local `config.ini` or environment variables, and create an owner-only `live_trading_settings.json` with a non-default dashboard username, a 16+ character password, and an 8+ digit action PIN. Production also requires `ETRADE_PRODUCTION_ARMING_SECRET` and an owner-only, signed, unexpired production-arm document.
+
+2. **Start the trading bot with an explicit environment and account identity**:
+
    ```zsh
-   python3 -m live_trading.etrade_cover_call_new --no-sandbox --trade
+   python3 -m live_trading.etrade_cover_call_new \
+     --environment sandbox \
+     --expected-account-id '<display-id>' \
+     --expected-account-id-key '<account-key>' \
+     --expected-institution-type '<institution-type>' \
+     --trade
    ```
 
-2. **Access the Dashboard**:
-   * **Local**: Open `http://localhost:8765/dashboard` in your browser.
-   * **PIN**: Default PIN is `1234` (configurable in `live_trading_settings.json`).
+   For production, issue a fresh arm document immediately before startup. The secret is read only from the environment; do not put it in the command, settings file, or Git.
+
+   ```zsh
+   export ETRADE_PRODUCTION_ARMING_SECRET='<32+-character secret>'
+   python3 -m live_trading.runtime_safety issue-production-arm \
+     --output .production-arm.json \
+     --expected-account-id '<display-id>' \
+     --expected-account-id-key '<account-key>' \
+     --expected-institution-type '<institution-type>' \
+     --ttl-seconds 300
+
+   python3 -m live_trading.etrade_cover_call_new \
+     --environment production \
+     --production-arm-file .production-arm.json \
+     --expected-account-id '<display-id>' \
+     --expected-account-id-key '<account-key>' \
+     --expected-institution-type '<institution-type>' \
+     --trade
+   ```
+
+   The generated document is owner-only (`0600`), binds the exact account identity, and is valid for at most 15 minutes. A missing or ambiguous environment never defaults to production.
+
+3. **Access the dashboard locally**:
+   Open `http://localhost:8765/dashboard` in your browser. The server binds to loopback only; it does not create a public tunnel.
 
 ---
 
-## 🌐 Public Access Setup (ngrok)
+## 🔒 Remote access
 
-To access your dashboard from your phone while away from home, use **ngrok** to create a secure tunnel.
-
-### 1. Installation
-```zsh
-brew install ngrok/ngrok/ngrok
-```
-
-1. Open `config.ini` in the root directory.
-2. Add your token to the `[NGROK]` section:
-   ```ini
-   [NGROK]
-   AUTH_TOKEN = your_token_here
-   STATIC_DOMAIN = your-name.ngrok-free.app
-   ```
-3. Run the authentication command once:
-   ```zsh
-   ngrok config add-authtoken <YOUR_AUTH_TOKEN>
-   ```
-
-### 3. Claim a Static Domain
-In your ngrok dashboard, go to **Cloud Edge -> Domains** and claim your free static domain (e.g., `your-name.ngrok-free.app`).
-
-### 4. Run the Tunnel
-```zsh
-ngrok http --url=your-name.ngrok-free.app 8765
-```
-
----
+The order-capable dashboard deliberately has no automatic public tunnel. If remote access is later approved, place it behind a separately managed TLS reverse proxy with strong authentication, request-rate controls, and network allowlisting. Do not expose the local HTTP listener directly.
 
 ## 📊 Dashboard Features
 
@@ -59,7 +61,8 @@ ngrok http --url=your-name.ngrok-free.app 8765
 
 ## ⚙️ Configuration
 
-*   **Settings**: `live_trading_settings.json` stores all dynamic parameters.
+*   **Settings**: `live_trading_settings.json` stores dynamic parameters and must be owner-only (`0600`). It is not a place for E*TRADE OAuth credentials.
+*   **E*TRADE credentials**: configure sandbox values through `ETRADE_SANDBOX_CONSUMER_KEY` / `ETRADE_SANDBOX_CONSUMER_SECRET` and production values through `ETRADE_LIVE_CONSUMER_KEY` / `ETRADE_LIVE_CONSUMER_SECRET`, or matching local `config.ini` entries. Never commit values.
 *   **Refresh Frequency**: 
     *   Main Loop Evaluation: Every 60 seconds.
     *   Stale Order Monitoring: Every 120 seconds.

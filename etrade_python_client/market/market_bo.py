@@ -1,32 +1,28 @@
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import xmltodict
 import xml.etree.ElementTree as ET
 import configparser
+from live_trading.runtime_safety import configure_owner_only_logger, redact_http_headers, resolve_etrade_consumer_key
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 # loading configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 class Market:
-    def __init__(self, session, base_url,use_sandbox=False):
+    def __init__(self, session, base_url,use_sandbox=False, consumer_key=None):
         self.session = session
         self.base_url = base_url
         self.use_sandbox = use_sandbox
-        if self.use_sandbox:
-            self.consumer_key = config["DEFAULT"]["SANDBOX_CONSUMER_KEY"]
-        else: 
-            self.consumer_key = config["DEFAULT"]["PROD_CONSUMER_KEY"]
+        config_key = "SANDBOX_CONSUMER_KEY" if self.use_sandbox else "PROD_CONSUMER_KEY"
+        self.consumer_key = resolve_etrade_consumer_key(
+            self.use_sandbox,
+            consumer_key=consumer_key,
+            config_value=config["DEFAULT"].get(config_key),
+        )
 
     def lookup(self, symbol):
         """
@@ -44,7 +40,7 @@ class Market:
         # Parameters for the API call
         # params = {"search": symbol}
         response = self.session.get(url, auth=self.session.auth)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         # Make the API call
         # response = self.session.get(url, params=params)
@@ -103,7 +99,7 @@ class Market:
         # Make API call for GET request
         response = self.session.get(url)
 
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         if response is not None and response.status_code == 200:
 
@@ -230,10 +226,10 @@ class Market:
             api_url += ".json"
         if len(args):
             api_url += "?" + "&".join(args)
-        logger.debug(api_url)
+        logger.debug("Market request issued")
 
         req = self.session.get(api_url)
         req.raise_for_status()
-        logger.debug(req.text)
+        logger.debug("Response Body: %s", req.text)
 
         return xmltodict.parse(req.text) if resp_format.lower() == "xml" else req.json()

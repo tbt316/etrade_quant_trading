@@ -22,6 +22,7 @@ import pyetrade
 import pyperclip
 import random
 import sys
+import tempfile
 from copy import deepcopy
 import csv
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, SessionNotCreatedException
@@ -29,6 +30,7 @@ from itertools import product
 from accounts.accounts_bo import Accounts
 from market.market_bo import Market
 from order.order_bo import Order
+from live_trading.runtime_safety import RuntimeSafetyBoundary
 from datetime import time
 import pickle
 
@@ -1117,7 +1119,7 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 )
                 if js_token and str(js_token).strip() and len(str(js_token).strip()) > 3:
                     token = str(js_token).strip()
-                    print(f"Token obtained via JS: {token}")
+                    print("OAuth verifier obtained via browser automation.")
                     return token
             except:
                 pass
@@ -1142,7 +1144,7 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 val = token_element.get_attribute("value") or token_element.text
                 if val and len(val.strip()) > 3:
                     token = val.strip()
-                    print(f"Token obtained via element: {token}")
+                    print("OAuth verifier obtained via browser automation.")
                     return token
 
             # 4. Check for Accept/Authorize Button
@@ -1233,7 +1235,7 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 token_candidates = parsed_query.get('oauth_verifier') or parsed_query.get('verifier')
                 if token_candidates:
                     token = unquote(token_candidates[0]).strip()
-                    print(f"Token found in URL fallback: {token}")
+                    print("OAuth verifier obtained from the authorization redirect.")
                     return token
             except:
                 pass
@@ -1243,19 +1245,28 @@ def get_token_automated(oauth_url, username=None, password=None, headless=True, 
                 page_text = driver.execute_script("return document.body ? document.body.innerText : '';")
                 token = _extract_token_from_text(page_text)
                 if token:
-                    print(f"Token found in body text fallback: {token}")
+                    print("OAuth verifier obtained from the authorization page.")
                     return token
             except:
                 pass
 
             # Only now save failure info
-            debug_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            screenshot_path = os.path.abspath(f"login_failure_{debug_timestamp}.png")
+            descriptor, screenshot_path = tempfile.mkstemp(
+                prefix="login_failure_",
+                suffix=".png",
+                dir=os.getcwd(),
+            )
+            os.close(descriptor)
             try:
                 driver.save_screenshot(screenshot_path)
+                os.chmod(screenshot_path, 0o600)
                 print(f"Extraction failed. Saved failure screenshot to: {screenshot_path}")
-            except:
-                pass
+            except Exception:
+                try:
+                    os.unlink(screenshot_path)
+                except OSError:
+                    pass
+                screenshot_path = None
             
             raise LoginFailureException("Unable to retrieve OAuth verifier token automatically.", screenshot_path=screenshot_path)
 
@@ -1273,8 +1284,13 @@ class LiveTradeAgent:
                 agent_id = None,
                 authenticated_session = None,
                 base_url = None,
-                selected_account = 1,
-                use_sandbox = False,
+                selected_account = None,
+                use_sandbox = None,
+                expected_account_id_key = None,
+                expected_account_id = None,
+                expected_institution_type = None,
+                consumer_key = None,
+                runtime_safety: RuntimeSafetyBoundary | None = None,
                 ):
         if agent_id is None:
             self.agent_id = self.generate_agent_id()
@@ -1282,25 +1298,70 @@ class LiveTradeAgent:
         else:
             self.agent_id = agent_id
 
-        self.use_sandbox = use_sandbox
-        self.selected_account = selected_account
-
         if authenticated_session is not None and base_url is not None:
+            if runtime_safety is None:
+                raise RuntimeError(
+                    "Authenticated LiveTradeAgent construction requires a RuntimeSafetyBoundary"
+                )
+            selected = runtime_safety.account_selection_kwargs["selected_account_id"]
+            expected = (
+                runtime_safety.expected_account_id_key,
+                runtime_safety.expected_account_id,
+                runtime_safety.expected_institution_type,
+            )
+            supplied = (expected_account_id_key, expected_account_id, expected_institution_type)
+            if (
+                use_sandbox is not None and use_sandbox != runtime_safety.use_sandbox
+            ) or (selected_account is not None and selected_account != selected) or any(
+                provided is not None and provided != armed
+                for provided, armed in zip(supplied, expected)
+            ):
+                raise RuntimeError("LiveTradeAgent arguments conflict with the RuntimeSafetyBoundary")
+            self.use_sandbox = runtime_safety.use_sandbox
+            self.selected_account = selected
+            self.expected_account_id_key = runtime_safety.expected_account_id_key
+            self.expected_account_id = runtime_safety.expected_account_id
+            self.expected_institution_type = runtime_safety.expected_institution_type
+            self.runtime_safety = runtime_safety
+            self.consumer_key = consumer_key
             self._initialize_components(authenticated_session, base_url)
+            self.runtime_safety.verify_account(self.account.account)
+        else:
+            self.use_sandbox = bool(use_sandbox)
+            self.selected_account = selected_account
+            self.expected_account_id_key = expected_account_id_key
+            self.expected_account_id = expected_account_id
+            self.expected_institution_type = expected_institution_type
+            self.runtime_safety = None
+            self.consumer_key = consumer_key
         self.today_stock_price = []
         self.today_stock_spread = []
 
     def _initialize_components(self, authenticated_session, base_url):
         """Initialize or refresh dependent services with a new authenticated session."""
-        self.market = Market(authenticated_session, base_url)
-        self.account = Accounts(authenticated_session, base_url)
-        self.account.account_list(self.selected_account)
+        self.market = Market(
+            authenticated_session, base_url, use_sandbox=self.use_sandbox, consumer_key=self.consumer_key
+        )
+        self.account = Accounts(
+            authenticated_session,
+            base_url,
+            use_sandbox=self.use_sandbox,
+            consumer_key=self.consumer_key,
+        )
+        self.account.account_list(
+            self.selected_account,
+            expected_account_id_key=self.expected_account_id_key,
+            expected_account_id=self.expected_account_id,
+            expected_institution_type=self.expected_institution_type,
+        )
         account_selected = self.account.account
         self.order = Order(
             authenticated_session,
             account_selected,
             base_url,
-            use_sandbox=self.use_sandbox
+            use_sandbox=self.use_sandbox,
+            consumer_key=self.consumer_key,
+            runtime_safety=self.runtime_safety,
         )
 
     def refresh_session(self, authenticated_session, base_url):
@@ -1309,6 +1370,9 @@ class LiveTradeAgent:
         Keeps agent/account IDs but rebuilds market/account/order clients.
         """
         self._initialize_components(authenticated_session, base_url)
+        if self.runtime_safety is None:
+            raise RuntimeError("Authenticated LiveTradeAgent refresh requires a RuntimeSafetyBoundary")
+        self.runtime_safety.verify_account(self.account.account)
 
     @staticmethod
     def generate_agent_id():

@@ -34,7 +34,6 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl
 
@@ -50,6 +49,12 @@ from data_and_research.option_assign_probability import calculate_probability
 from backtesting.polygonio_dailytrade import fetch_yfinance_data
 from data_and_research.polygonio_improvequery import get_earnings_dates
 from backtesting.polygon_multi import load_latest_parameters
+from live_trading.runtime_safety import (
+    RuntimeSafetyError,
+    configure_owner_only_logger,
+    read_owner_only_json,
+    write_owner_only_json,
+)
 
 # Constants
 ETRADE_OAUTH_FILE = ".etrade_oauth"
@@ -60,25 +65,17 @@ config.read('config.ini')
 
 OAUTH_KEYS = {
     "sandbox": {
-        "consumer_key": config.get('DEFAULT', 'SANDBOX_CONSUMER_KEY', fallback=os.getenv("ETRADE_SANDBOX_CONSUMER_KEY", "default_sandbox_key")),
-        "consumer_secret": config.get('DEFAULT', 'SANDBOX_CONSUMER_SECRET', fallback=os.getenv("ETRADE_SANDBOX_CONSUMER_SECRET", "default_sandbox_secret")),
+        "consumer_key": os.getenv("ETRADE_SANDBOX_CONSUMER_KEY") or config.get('DEFAULT', 'SANDBOX_CONSUMER_KEY', fallback=None),
+        "consumer_secret": os.getenv("ETRADE_SANDBOX_CONSUMER_SECRET") or config.get('DEFAULT', 'SANDBOX_CONSUMER_SECRET', fallback=None),
     },
     "live": {
-        "consumer_key": config.get('DEFAULT', 'PROD_CONSUMER_KEY', fallback=os.getenv("ETRADE_LIVE_CONSUMER_KEY", "default_live_key")),
-        "consumer_secret": config.get('DEFAULT', 'PROD_CONSUMER_SECRET', fallback=os.getenv("ETRADE_LIVE_CONSUMER_SECRET", "default_live_secret")),
+        "consumer_key": os.getenv("ETRADE_LIVE_CONSUMER_KEY") or config.get('DEFAULT', 'PROD_CONSUMER_KEY', fallback=None),
+        "consumer_secret": os.getenv("ETRADE_LIVE_CONSUMER_SECRET") or config.get('DEFAULT', 'PROD_CONSUMER_SECRET', fallback=None),
     }
 }
 
 # Setup logging
-logger = logging.getLogger('etrade_trader')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("etrade_trader.log", maxBytes=5*1024*1024, backupCount=3)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+logger = configure_owner_only_logger('etrade_trader', "etrade_trader.log")
 
 def environment_key(use_sandbox: bool) -> str:
     """Determine the environment key based on sandbox flag."""
@@ -87,31 +84,33 @@ def environment_key(use_sandbox: bool) -> str:
 def load_oauth_tokens(use_sandbox: bool) -> Optional[Dict[str, str]]:
     """Load cached OAuth tokens from file."""
     try:
-        with open(ETRADE_OAUTH_FILE, 'r') as f:
-            tokens = json.load(f)
+        tokens = read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache")
         return tokens.get(environment_key(use_sandbox))
-    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+    except (RuntimeSafetyError, KeyError, TypeError) as e:
         logger.warning(f"Failed to load OAuth tokens: {e}")
         return None
 
 def save_oauth_tokens(tokens: Dict[str, str], use_sandbox: bool) -> None:
     """Save OAuth tokens to file securely."""
     try:
-        existing_tokens = {}
-        if os.path.exists(ETRADE_OAUTH_FILE):
-            with open(ETRADE_OAUTH_FILE, 'r') as f:
-                existing_tokens = json.load(f)
+        existing_tokens = (
+            read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache")
+            if os.path.lexists(ETRADE_OAUTH_FILE)
+            else {}
+        )
         existing_tokens[environment_key(use_sandbox)] = tokens
-        with open(ETRADE_OAUTH_FILE, 'w', encoding='utf-8') as f:
-            json.dump(existing_tokens, f, ensure_ascii=False, indent=4)
-        os.chmod(ETRADE_OAUTH_FILE, 0o600)
+        write_owner_only_json(ETRADE_OAUTH_FILE, existing_tokens)
         logger.info("OAuth tokens saved successfully.")
-    except (IOError, json.JSONDecodeError) as e:
+    except (RuntimeSafetyError, KeyError, TypeError) as e:
         logger.error(f"Failed to save OAuth tokens: {e}")
-        sys.exit(1)
+        raise RuntimeSafetyError("could not persist OAuth cache safely") from e
 
 def get_etrade_session(use_sandbox: bool, auto_login: bool = True, username: Optional[str] = None, password: Optional[str] = None) -> Tuple[Optional[OAuth1Service], str]:
     """Authenticate and get E*TRADE OAuth session with renewal support."""
+    raise RuntimeSafetyError(
+        "etrade_put_credit_spread is quarantined; use etrade_cover_call_new "
+        "with an explicit RuntimeSafetyBoundary"
+    )
     keys = OAUTH_KEYS[environment_key(use_sandbox)]
     base_url = config.get('DEFAULT', 'SANDBOX_BASE_URL') if use_sandbox else config.get('DEFAULT', 'PROD_BASE_URL')
 
@@ -253,6 +252,7 @@ def release_margin(
 
 def main():
     parser = argparse.ArgumentParser(description="E*TRADE Options Trading Application")
+    parser.error("etrade_put_credit_spread is quarantined; use etrade_cover_call_new with explicit runtime safety")
     parser.add_argument('--sandbox', action='store_true', help='Use sandbox environment')
     parser.add_argument('--trade', action='store_true', help='Enable live trading')
     parser.add_argument('--use_existing_file', action='store_true', help='Reuse backtest results')

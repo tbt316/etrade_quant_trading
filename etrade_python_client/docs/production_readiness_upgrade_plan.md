@@ -37,6 +37,40 @@ Until Phase 0 exits, automatic live execution should remain disabled. Until the
 backtest validity gates exit, regime-aware reports should be labeled
 `UNVERIFIED` rather than ranked beside valid experiments.
 
+## Delivery status as of 2026-07-26
+
+R5 / PR #28 established a clean dependency/import baseline and passed 134 tests
+in clean CI. R6 now implements the first live-startup containment slice in the
+current source:
+
+- `sandbox` or `production` must be selected explicitly; missing or conflicting
+  mode input fails before OAuth construction.
+- Production requires an exact account ID, account key, and institution type
+  plus an owner-only, HMAC-signed, versioned arm document bound to that identity.
+  Its maximum lifetime is 15 minutes.
+- The selected identity and unexpired arm are checked at startup, on account
+  refresh, and immediately before every compatibility-client order API call.
+- The order-capable dashboard binds to loopback, does not launch ngrok
+  automatically, and does not grant wildcard CORS. Startup rejects weak
+  dashboard credentials, and touched settings/log files use owner-only handling.
+- Hardcoded OAuth credentials were removed from the current versions of two
+  legacy utilities in favor of local configuration or environment variables.
+- Shared client logs use owner-only files and retain only redacted headers plus
+  fingerprints for order payloads, account/order bodies, and account-bearing
+  URLs. The older interactive order client and spread executable are
+  quarantined.
+
+These changes do **not** satisfy Phase 0 or make the repository production
+ready. The existing order paths are guarded but not yet centralized, so R7 must
+preserve the arm/account check in a sole mutation owner and add durable
+idempotency, capacity reservations, and reconciliation. The current local dashboard settings
+are intentionally rejected until stronger credentials are provisioned. The
+repository is public, and OAuth keys retained in public Git history must be
+treated as compromised: external revoke/rotate is required, followed by a
+coordinated history purge and downstream cleanup. No live service restart,
+deployment, E*TRADE mutation, or exact served-dashboard verification has been
+performed for R6.
+
 ## What is worth preserving
 
 This is not a rewrite-from-zero recommendation. The following foundations are
@@ -156,6 +190,12 @@ broker timeouts, complete pagination, durable state, web hardening,
 observability, atomic publication, schema validation, dependency locking,
 deployment rollback, and decomposition of the three monoliths.
 
+R6 partially mitigates P0-L1, P0-L2, and P0-L7 in the current source. Their
+release conditions remain open: the placement-time compatibility guard is not
+yet a durable, centralized mutation gateway; affected OAuth keys have not been revoked or rotated;
+public history has not been purged; and no deployed process has been verified.
+P0-L3 through P0-L6 and P0-L8 remain stop-ship issues.
+
 ## Required regime-aware causal record
 
 Every regime-aware run must persist the following fields and pass them before
@@ -244,6 +284,15 @@ flowchart TB
   `0600`, never logged, and validated at startup.
 - Strategy, data, model, execution, and risk policies are separate typed
   sections; unknown keys and invalid ranges are errors.
+
+R6 implements a narrow compatibility boundary around the existing monolith:
+explicit environment selection; exact production account identity; a
+versioned, signed arm document with a maximum 15-minute lifetime; refresh-time
+and order-call revalidation; strong dashboard credential validation; and
+owner-only local files. It does not yet provide the complete typed
+configuration model or an OS secret-store integration. Its compatibility
+order guard does not replace the R7 requirement for a durable single placement
+gateway with stable intent identity and reconciliation.
 
 ### Boundary 2: E*TRADE gateway
 
@@ -412,6 +461,15 @@ Exit gate:
 - Each required dependency failure yields zero submissions.
 - Secret scans of history, working tree, build output, and logs are clean.
 - Existing 11 focused reliability tests remain green.
+
+R6 status: the explicit mode, exact identity, short-lived signed arm,
+refresh-time and order-call revalidation, loopback dashboard, restrictive CORS,
+strong local credential checks, and owner-only/redacted client logging are
+implemented in source. Phase 0 remains open because placement is not centralized or durably
+idempotent, the remaining pre-trade and failure gates are incomplete, exposed
+keys still require external revoke/rotate and coordinated history cleanup, the
+current local settings fail the new policy, and no deployed service has been
+restarted or verified.
 
 ### Phase 1 — reproducible repository baseline (week 1)
 
@@ -582,6 +640,13 @@ The existing monoliths should remain behind compatibility facades while these
 boundaries are extracted. Remove old paths only after golden tests and
 shadow-parity prove equivalent intended behavior.
 
+The current stacked delivery names this first source-level startup containment
+slice R6. It covers part of the planned live-containment and secret/log work,
+not the entire roadmap entries above. R7 is the next safety boundary:
+centralize every placement under one durable owner, preserve the arm/account
+check, persist stable intent identity and capacity reservations, and reconcile
+ambiguous broker outcomes before retry.
+
 ## Test and verification matrix
 
 | Layer | Required tests |
@@ -625,7 +690,15 @@ inspect the deployed Pi; and did not restart the user's deployed dashboard.
 R5 later added an isolated browser verification of the actual dashboard handler
 and source template for both a sealed synthetic advisory and the missing-signal
 failure state. That proves the code/HTML path, not deployment or live provider
-operation. The remaining actions belong to the staged acceptance gates above.
+operation. Its PR #28 clean CI job passed 134 tests.
+
+R6 has not restarted or inspected the deployed dashboard, called E*TRADE, or
+exercised a live/sandbox mutation. Current-source credential removal also does
+not establish secret hygiene while the repository remains public and the old
+keys remain in Git history. External revoke/rotate, coordinated history purge,
+strong local credential reprovisioning, R7 durable gateway enforcement, and
+deployment verification remain required. The remaining actions belong to the
+staged acceptance gates above.
 
 The working tree was already heavily modified and contains important untracked
 runtime sources. This review intentionally adds only this plan and does not

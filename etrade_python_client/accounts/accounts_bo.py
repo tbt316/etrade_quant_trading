@@ -1,7 +1,6 @@
 import json
 import logging
 import configparser
-from logging.handlers import RotatingFileHandler
 from turtle import position
 # from order.order_bo import Order
 import xml.etree.ElementTree as ET
@@ -24,6 +23,11 @@ from pandas.tseries.offsets import CustomBusinessDay
 import re
 from backtesting import option_limit_backtest
 from data_and_research.polygonio_improvequery import load_stored_option_data  # Ensure this is importable
+from live_trading.runtime_safety import (
+    configure_owner_only_logger,
+    redact_http_headers,
+    resolve_etrade_consumer_key,
+)
 
 ROLL_IN_GL_THRESHOLD = 60
 ROLL_OUT_GL_THRESHOLD = -1
@@ -44,18 +48,17 @@ CORRELATED_STOCKS={
 
 EXEMPTED_STOCKS=['SQQQ','VIX']
 
+
+def _redact_account_identifier(value):
+    text = str(value or "")
+    return f"***{text[-4:]}" if text else "[unavailable]"
+
 # loading configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 
 ETRADE_TICKER=["VIXW","VIX","BRKB","BRK.B","SPX"]
 YFINANCE_TICKER=["^VIX","^VIX","BRK-B","BRK-B","^SPX"]
@@ -1089,10 +1092,11 @@ class Accounts:
         self.base_url = base_url
         self.use_sandbox = use_sandbox
         config_key = "SANDBOX_CONSUMER_KEY" if self.use_sandbox else "PROD_CONSUMER_KEY"
-        self.consumer_key = (
-            consumer_key
-            if consumer_key is not None
-            else config["DEFAULT"].get(config_key)
+        self.consumer_key = resolve_etrade_consumer_key(
+            self.use_sandbox,
+            consumer_key=consumer_key,
+            config_value=config["DEFAULT"].get(config_key),
+            required=False,
         )
 
     def _consumer_key_headers(self):
@@ -1115,7 +1119,14 @@ class Accounts:
         self.session, self.base_url = refreshed
         return True
 
-    def account_list(self, selected_account_id=1):
+    def account_list(
+        self,
+        selected_account_id=1,
+        *,
+        expected_account_id_key=None,
+        expected_account_id=None,
+        expected_institution_type=None,
+    ):
         """
         Calls account list API to retrieve a list of the user's E*TRADE accounts
 
@@ -1128,7 +1139,7 @@ class Accounts:
 
         # Make API call for GET request
         response = self.session.get(url, header_auth=True)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         # List to store account information
         account_info = []
@@ -1137,7 +1148,7 @@ class Accounts:
         # Handle and parse response
         if response is not None and response.status_code == 200:
             parsed = json.loads(response.text)
-            logger.debug("Response Body: %s", json.dumps(parsed, indent=4, sort_keys=True))
+            logger.debug("Account list response received")
 
             data = response.json()
             if data is not None and "AccountListResponse" in data and "Accounts" in data["AccountListResponse"] \
@@ -1150,17 +1161,33 @@ class Accounts:
                 for account in accounts:
                     account_id = account.get("accountId", "")
                     account_id_key = account.get("accountIdKey", "")
-                    account_desc = account.get("accountDesc", "").strip() if account.get("accountDesc") else ""
                     institution_type = account.get("institutionType", "")                    
-                    # Add account details to the list
-                    account_info.append((account_id, account_desc, institution_type, account_id_key))
+                    account_info.append((account_id, "", institution_type, account_id_key))
                     
-                    print_str = f"{count-1})\t{account_id}, {account_desc}, {institution_type}"
+                    print_str = f"{count-1})\t{_redact_account_identifier(account_id)}, {institution_type}"
                     print(print_str)
                     count += 1
-                self.account = accounts[selected_account_id] 
-                # 0: IRA account
-                # 1: Individual brokerage account
+                if expected_account_id_key is not None:
+                    matches = [
+                        account for account in accounts
+                        if account.get("accountIdKey") == expected_account_id_key
+                    ]
+                    if len(matches) != 1:
+                        raise RuntimeError(
+                            "Expected E*TRADE account key did not resolve to exactly one open account"
+                        )
+                    selected = matches[0]
+                    if (
+                        selected.get("accountId") != expected_account_id
+                        or selected.get("institutionType") != expected_institution_type
+                    ):
+                        raise RuntimeError("Expected E*TRADE account identity did not match")
+                    self.account = selected
+                elif selected_account_id is not None:
+                    self.account = accounts[selected_account_id]
+                else:
+                    raise RuntimeError("An exact E*TRADE account identity is required")
+                # Index selection is retained only for legacy sandbox callers.
                 return account_info
             else:
                 # Handle errors
@@ -1901,7 +1928,7 @@ class Accounts:
             if is_etrade_token_expired_response(response) and self._refresh_auth_session_if_possible("portfolio fetch"):
                 url = f"{self.base_url}/v1/accounts/{self.account['accountIdKey']}/portfolio.json"
                 response = self.session.get(url, params=params, header_auth=True)
-            logger.debug("Request Header: %s", response.request.headers)
+            logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
             
             # Check if API call was successful
             if response.status_code != 200:
@@ -4788,8 +4815,8 @@ class Accounts:
         # Make API call for GET request
         # response = self.session.get(url, header_auth=True, params=params, headers=headers)
         response = self.session.get(url, header_auth=True, params=params)
-        logger.debug("Request url: %s", url)
-        logger.debug("Request Header: %s", response.request.headers)
+        logger.debug("Account balance request issued")
+        logger.debug("Request Header: %s", redact_http_headers(response.request.headers))
 
         # Handle and parse response
         if response is not None and response.status_code == 200:
@@ -4799,12 +4826,12 @@ class Accounts:
             if data is not None and "BalanceResponse" in data:
                 balance_data = data["BalanceResponse"]
                 if balance_data is not None and "accountId" in balance_data:
-                    print("\n\nBalance for " + balance_data["accountId"] + ":")
+                    print("\n\nBalance for " + _redact_account_identifier(balance_data["accountId"]) + ":")
                 else:
                     print("\n\nBalance:")
                 # Display balance information
                 if balance_data is not None and "accountDescription" in balance_data:
-                    print("Account Nickname: " + balance_data["accountDescription"])
+                    print("Account description withheld")
                 if balance_data is not None and "Computed" in balance_data \
                         and "RealTimeValues" in balance_data["Computed"] \
                         and "totalAccountValue" in balance_data["Computed"]["RealTimeValues"]:

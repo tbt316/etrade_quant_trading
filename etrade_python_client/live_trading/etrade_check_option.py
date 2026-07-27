@@ -30,6 +30,7 @@ from rauth import OAuth1Service
 from logging.handlers import RotatingFileHandler
 from accounts.accounts_bo import Accounts, calculate_std_dev
 from market.market_bo import Market
+from live_trading.runtime_safety import configure_owner_only_logger, read_owner_only_json, write_owner_only_json
 import configparser
 import multiprocessing
 from typing import List
@@ -46,31 +47,31 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 # logger settings
-logger = logging.getLogger('my_logger')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler("python_client.log", maxBytes=5*1024*1024, backupCount=3)
-FORMAT = "%(asctime)-15s %(message)s"
-fmt = logging.Formatter(FORMAT, datefmt='%m/%d/%Y %I:%M:%S %p')
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+logger = configure_owner_only_logger('my_logger')
 '''
     Grab the option expire dates and option chains for the specified symbol.
     Save as a JSON file
 
 '''
 
-# FILL THESE IN WITH YOUR OAUTH KEYS AND SECRETS
-# See https://developer.etrade.com/getting-started
+# OAuth credentials are supplied by local config.ini or environment variables.
 OAUTH_KEYS = {
     "sandbox": {
-        "consumer_key": "79a22325849d55ab995c67d9b5df9684",
-        "consumer_secret": "b9711c32ff7e1ec28a609317e0bdcf149fa6f944e59f3c89348e5aa85fd1b32f",
+        "consumer_key": os.getenv("ETRADE_SANDBOX_CONSUMER_KEY") or config['DEFAULT'].get('SANDBOX_CONSUMER_KEY'),
+        "consumer_secret": os.getenv("ETRADE_SANDBOX_CONSUMER_SECRET") or config['DEFAULT'].get('SANDBOX_CONSUMER_SECRET'),
     },
     "live": {
-        "consumer_key": "73ae73ac0315a6520f31b9d081d7849a",
-        "consumer_secret": "3058031dfb6e2a44b5d0ef0055ed46c74f333c08fafdfb6ead39d6637249b34f",
+        "consumer_key": os.getenv("ETRADE_LIVE_CONSUMER_KEY") or config['DEFAULT'].get('PROD_CONSUMER_KEY'),
+        "consumer_secret": os.getenv("ETRADE_LIVE_CONSUMER_SECRET") or config['DEFAULT'].get('PROD_CONSUMER_SECRET'),
     }
 }
+
+
+def configured_oauth_keys(use_sandbox):
+    keys = OAUTH_KEYS[environment_key(use_sandbox)]
+    if not all(isinstance(keys.get(name), str) and keys[name].strip() for name in ("consumer_key", "consumer_secret")):
+        raise RuntimeError("E*TRADE client credentials are not configured")
+    return {name: keys[name].strip() for name in ("consumer_key", "consumer_secret")}
 
 # File to cache OAuth tokens so you don't have to re-authenticate each time
 ETRADE_OAUTH_FILE = ".etrade_oauth"
@@ -95,31 +96,25 @@ def environment_key(use_sandbox) -> str:
 
 def get_etrade_oauth(use_sandbox) -> dict:
     try:
-        with open(ETRADE_OAUTH_FILE) as f:
-            tokens = json.load(f)
-            return tokens[environment_key(use_sandbox)]
-    except (KeyError, TypeError, FileNotFoundError, JSONDecodeError) as err:
-        print("Couldn't find/parse cached OAuth in {} ({}: {})".format(ETRADE_OAUTH_FILE, err))
+        return read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache")[environment_key(use_sandbox)]
+    except (KeyError, TypeError, RuntimeError):
+        print("Couldn't load cached OAuth safely.")
         return None
 
 # Save the token, merging in with existing tokens
 def save_etrade_oauth(token, use_sandbox) -> bool:
     try:
-        try:
-            with open(ETRADE_OAUTH_FILE) as f:
-                tokens = json.load(f)
-        except FileNotFoundError:
-            tokens = {}
+        tokens = read_owner_only_json(ETRADE_OAUTH_FILE, label="OAuth cache") if os.path.lexists(ETRADE_OAUTH_FILE) else {}
         tokens[environment_key(use_sandbox)] = token
-        with open(os.open(ETRADE_OAUTH_FILE, os.O_CREAT | os.O_WRONLY, 0o600), "w") as f:
-            f.write(json.dumps(tokens))
-    except (KeyError, JSONDecodeError) as err:
-        print("Couldn't write cached OAuth in {} ({})".format(ETRADE_OAUTH_FILE, err))
-        sys.exit(1)
+        write_owner_only_json(ETRADE_OAUTH_FILE, tokens)
+        return True
+    except (KeyError, TypeError, RuntimeError):
+        print("Couldn't save cached OAuth safely.")
+        return False
 
 def oauth(use_sandbox, auto_login = True):
     """Allows user authorization for the sample application with OAuth 1"""
-    keys = OAUTH_KEYS[environment_key(use_sandbox)]
+    keys = configured_oauth_keys(use_sandbox)
     consumer_key = keys["consumer_key"]
     consumer_secret = keys["consumer_secret"]
     if use_sandbox:
@@ -137,12 +132,8 @@ def oauth(use_sandbox, auto_login = True):
         base_url=base_url
     )
 
-    token_file = ".etrade_oauth"
-
-    if os.path.exists(token_file):
-        with open(token_file, 'r') as f:
-            tokens = json.load(f)
-        
+    tokens = get_etrade_oauth(use_sandbox)
+    if isinstance(tokens, dict) and {"access_token", "access_token_secret"} <= set(tokens):
         session = etrade.get_session((tokens['access_token'], tokens['access_token_secret']))
         
         renew_url = f"{base_url}/oauth/renew_access_token"
@@ -183,8 +174,8 @@ def oauth(use_sandbox, auto_login = True):
         'access_token': session.access_token,
         'access_token_secret': session.access_token_secret
     }
-    with open(token_file, 'w') as f:
-        json.dump(tokens, f)
+    if not save_etrade_oauth(tokens, use_sandbox):
+        raise RuntimeError("could not persist OAuth cache safely")
 
     print("New session created and tokens saved.")
     return session, base_url
@@ -300,7 +291,7 @@ if __name__ == "__main__":
     
     if start_trade:
         if not bypass_etrade: 
-            etrade_instance = LiveTradeAgent(None,session,base_url)
+            raise RuntimeError("Legacy live execution is disabled; use etrade_cover_call_new with a RuntimeSafetyBoundary")
         else:
             etrade_instance = LiveTradeAgent()
         print('Live trade agent id: ', etrade_instance.agent_id)
@@ -338,4 +329,3 @@ if __name__ == "__main__":
             else:
                 print("Trading hours are over.")
                 t.sleep(60)
-  

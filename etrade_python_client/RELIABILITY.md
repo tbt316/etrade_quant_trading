@@ -63,6 +63,27 @@ For every reliability incident:
   with the raw executions, the cached daily net flow, and the prior cumulative
   value.
 
+### Live startup and local security
+
+- Every order-capable process must require an explicit `sandbox` or `production`
+  environment. Missing or contradictory mode input must never fall through to
+  production.
+- Production startup requires an exact account ID, account key, and institution
+  type plus an owner-only, signed, short-lived arm document bound to the same
+  identity. The arm and identity must be revalidated after account refresh and
+  immediately before every order API call. R7 must preserve that invariant
+  while replacing the compatibility guard with one durable mutation gateway.
+- An order-capable dashboard binds to loopback by default. Public tunneling is a
+  separately supervised operator action, and wildcard CORS is forbidden.
+- Dashboard credentials must reject defaults and weak values. Settings, arm
+  documents, OAuth state, and touched local logs must be owner-only regular
+  files and must not expose credentials, OAuth verifiers, full account
+  responses, order payloads, or account-bearing URLs.
+- Removing a credential from the current source does not remediate a public Git
+  history. Any published key must be treated as compromised, revoked and
+  rotated at its issuer, then removed from history through a coordinated rewrite
+  and downstream clone/cache cleanup.
+
 ### Delivery and verification
 
 - The live service must be restarted or reloaded after backend changes.
@@ -98,6 +119,7 @@ truth. A source patch is not live until this whole path has been exercised.
 | INC-2026-07-17-03 | Resolved | Mobile view fragmented each SPX position into separate cards, making portfolio-level action thresholds hard to scan. | Layout was organized around individual position cards instead of decision-making by underlying. | One responsive table per ticker, pair-level gain/loss, DTE, strikes, and action emphasis. |
 | INC-2026-07-18-01 | Resolved | A weekend Refresh Data request changed the live portfolio value and margin budget to zero. | The E*TRADE portfolio request returned 401 after OAuth expiry. `portfolio()` silently converted the failed response to an empty list, and the dashboard writer treated it as a confirmed empty portfolio and overwrote the production HTML. | Retry an expired-token portfolio request through the shared auth callback, and require every dashboard-producing portfolio fetch to succeed before replacing the served artifact. |
 | INC-2026-07-24-01 | Resolved | The orange VIX line in the one-month benchmark chart stopped after July 6 while SPY and option-value data continued through July 24. | Market-history refresh checked only SPY and SPX for missing cached dates, so a VIX-only gap never triggered a download. Yahoo also returned malformed responses when the corrected refresh attempted the backfill. | Include VIX in independent missing-date detection and fall back to Cboe's official daily VIX history when Yahoo does not return the requested closes. |
+| INC-2026-07-26-02 | Open | The live process could enter production without an explicit environment, bind a mutable account-list position, and expose an order-capable dashboard beyond loopback; OAuth credentials were also embedded in tracked source. | Environment, arming, account identity, dashboard exposure, local file permissions, and credential sourcing were independent conventions rather than one fail-closed startup boundary. The repository is public, so removing values from the current source cannot revoke copies retained in Git history. | R6 adds explicit environment resolution, exact production identity, a signed short-lived arm, placement-time revalidation, loopback-only dashboard service, strong local credentials, owner-only files, and guarded client logs. Keep this incident open until external keys are revoked/rotated, history is purged, R7 replaces compatibility paths with a durable single mutation owner, and the deployed service is verified. |
 
 ## INC-2026-07-17-01 — Recent cash-flow history regressed
 
@@ -412,6 +434,97 @@ pandas, and calendar versions remain recorded in a separate runtime
 fingerprint. A future promotion gate must validate both a reviewed source hash
 and an approved runtime/lockfile identity, but a patch release cannot rewrite
 the research protocol identity.
+
+## INC-2026-07-26-02 — Live startup could fail open and source exposed OAuth credentials
+
+### Evidence
+
+Before R6, omitted mode input could resolve to the production E*TRADE endpoint,
+the selected brokerage account depended on mutable list position `1`, and there
+was no independently signed, expiring production arm. The same process could
+bind its order-capable dashboard to all interfaces, start ngrok automatically,
+and emit wildcard CORS. Local settings and request logs were not consistently
+created with owner-only protections, and the existing local dashboard
+credentials do not meet the new minimum-strength policy.
+
+Two tracked legacy E*TRADE utilities also contained hardcoded OAuth credentials.
+Those literals have been removed from the current source, but the repository is
+currently public. The affected keys must therefore be treated as compromised;
+their presence in Git history is security evidence, not a resolved source-only
+finding.
+
+### Implementation
+
+- `live_trading/runtime_safety.py`
+  - Requires an explicit `sandbox` or `production` environment before OAuth
+    construction.
+  - Requires production to name the exact account ID, account key, and
+    institution type.
+  - Validates an owner-only, HMAC-signed, versioned arm document bound to that
+    identity, with issued/expiry timestamps and a maximum 15-minute lifetime.
+  - Provides an operator CLI that creates the arm atomically with mode `0600`
+    and reads the signing secret only from
+    `ETRADE_PRODUCTION_ARMING_SECRET`.
+  - Rejects default dashboard usernames, passwords shorter than 16 characters,
+    and action PINs shorter than eight digits.
+- `accounts/accounts_bo.py` and
+  `live_trading/etrade_cover_call_new.py`
+  - Select production accounts by exact identity rather than list position.
+  - Revalidate the account identity and current arm at startup and account
+    refresh.
+  - Bind the dashboard to loopback, do not launch ngrok automatically, and do
+    not return wildcard CORS.
+  - Use owner-only handling for local settings and touched logs and redact
+    dashboard request records.
+- `order/order_bo.py`, `order/order.py`, and
+  `core_api/stock_trade_class.py`
+  - Pass the immutable runtime boundary into the reusable order client.
+  - Revalidate the current arm, environment, and exact account immediately
+    before every order API POST/PUT.
+  - Reject order API access without that boundary and quarantine the older
+    interactive order client.
+- Shared E*TRADE client logging
+  - Uses owner-only files, does not propagate to unfiltered root handlers,
+    redacts authorization-bearing headers, and records only SHA-256/size
+    metadata for order payloads, account/order response bodies, and
+    account-bearing URLs.
+- `live_trading/etrade_check_option.py` and
+  `live_trading/etrade_option_chains.py`
+  - Remove hardcoded OAuth credentials from the current source and require
+    local configuration or environment variables.
+
+### Remaining risk
+
+This is containment in the current source, not production readiness. The
+compatibility order client now rejects calls without the current arm/account
+boundary, but placement has not yet been routed through one durable gateway.
+R7 must make that gateway the sole mutation owner while preserving the
+placement-time check, stable intent identity, capacity reservations, and
+unknown-POST reconciliation.
+
+The exposed OAuth keys still require external revocation and rotation. A later
+coordinated history purge must remove them from all refs and arrange cleanup of
+downstream clones, forks, caches, and build artifacts; making the repository
+private now would not undo prior exposure. The repository remains public.
+
+The current local dashboard settings intentionally fail the new credential
+policy and must be reprovisioned before startup. No live service has been
+restarted, no E*TRADE session or order path has been exercised, and the exact
+deployed dashboard has not been reloaded or visually inspected with R6.
+
+### Verification record
+
+- R5 / PR #28 passed its clean CI job with 134 tests. This establishes the
+  clean dependency/import baseline for the preceding shadow-dashboard change;
+  it is not deployment evidence for R6.
+- R6 includes focused runtime-safety coverage for explicit environments,
+  production-arm schema/signature/lifetime, exact account matching, owner-only
+  files, guarded response/request logging, order calls without a boundary,
+  placement-time arm expiry, dashboard credential rejection, and loopback/CORS
+  behavior.
+- Deployment verification is deliberately recorded as incomplete. This
+  incident remains open until the remaining-risk conditions above are
+  satisfied.
 
 ## Checklist for future dashboard incidents
 
