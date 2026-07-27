@@ -292,6 +292,69 @@ uses confirmed daily closes; it must not fabricate a value for that point.
   SPY and VIX null, as expected for an intraday live point without confirmed
   closes.
 
+## INC-2026-07-26-01 — Regime output could not distinguish climate from shocks
+
+### Evidence
+
+The legacy HMM trace emitted the same raw state on every saved row, while its
+final overlay ignored the HMM and used fixed absolute thresholds. The active
+dashboard could also fall back to a stale trace when regime computation was
+disabled. This made a persistent late-March/early-April stress climate and a
+quieter June/July period with isolated VIX jumps appear operationally similar.
+
+The local normalized replay contains two VIX-only non-NYSE rows and one
+conflicting overlapping cached value. It has no retained provider bytes or
+decision-time receipts, so it cannot establish production provenance.
+
+### Implementation
+
+- `live_trading/regime_detector_v2.py`
+  - Separates `calm/elevated/persistent_stress` background state from
+    `none/active/aftershock` event state.
+  - Uses causal prior-only percentiles, explicit next-session availability,
+    immutable configuration hashes, and a detector/build hash covering the
+    calendar implementation and runtime dependency versions.
+- `live_trading/regime_calibration.py`
+  - Freezes a small candidate grid and rejects shock-lane tuning.
+  - Uses purged 2016–2024 folds and only fully resolved post-lag future-risk
+    labels.
+  - Makes coverage, switching, aggregate occupancy, state diversity, and
+    isolated-shock false-persistence checks binding selection guardrails.
+  - Requires exact plan, price-prefix, calendar, source-policy, build, and
+    deployment-pinned artifact hashes.
+  - Rejects provider-provenance claims from loose DataFrames and keeps every R3
+    artifact research-only and execution-ineligible.
+- `docs/regime_v2_calibration_plan.json`
+  - Commits the canonical protocol before the prospective observation window
+    beginning 2026-07-27.
+- `research_reports/regime_v2_calibration_artifact.json`
+  - Records the deterministic legacy-data evaluation and selected baseline.
+
+### Remaining risk
+
+The selected profile is not approved for E*TRADE orders. Its calibration data
+are explicitly `legacy_normalized_unverified`; the provider entitlement gate is
+unresolved; the prospective window has not accumulated; backtest/live taxonomy
+parity is still an R4 task; and no centralized fail-closed risk engine consumes
+the signal. The correct operational result remains `Calibration_Abstain=true`
+and `Execution_Eligible=false`.
+
+### Verification record
+
+- Plan SHA-256:
+  `f4373e6e3049fd289a8e27f319644cc4c2194fe3c89f8a77e68ae5699f5f6b7b`.
+- Artifact SHA-256:
+  `a010fea66633bb1b75b83b95c0f57364a44288d60c7cfe24c7f6bf13fab24230`.
+- Selection retained `b0_baseline`: score 0.3810, 100% evaluation coverage,
+  6.01 switches per 252 sessions, maximum aggregate occupancy 0.516, and two
+  false persistent transitions across 60 qualifying isolated shocks.
+- The baseline led the 2025 retrospective candidates with tail F1 0.4898.
+- March 20–April 7 produced 12/12 `persistent_stress` sessions. June 15–July
+  24 produced 22 `elevated`, six `calm`, and five independently active shocks.
+- Unit coverage includes canonical/tamper checks, strict purging, exact
+  post-lag outcomes, prefix invariance, stale build/data/pin rejection, and
+  binding coverage/chatter/false-persistence guards.
+
 ## Checklist for future dashboard incidents
 
 - [ ] Capture the exact URL, selected time span, viewport, and screenshot.

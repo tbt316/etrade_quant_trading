@@ -2,7 +2,8 @@
 
 **Review date:** 2026-07-26
 
-**Status:** shadow-mode detector with R2 durable provider evidence; not connected to order execution
+**Status:** R3 causally calibrated research profile with durable R2 evidence
+boundaries; not connected to order execution
 **Related roadmap:** `docs/production_readiness_upgrade_plan.md`
 
 ## Decision
@@ -335,7 +336,7 @@ Each row contains:
   "VIX_Finalization_At": "2026-07-23T20:15:00+00:00",
   "Signal_Available_At": "2026-07-23T20:16:00+00:00",
   "Tradable_Session": "2026-07-24",
-  "Detector_Version": "regime_v2_shadow_0.2.0",
+  "Detector_Version": "regime_v2_shadow_0.3.0",
   "Config_Hash": "<sha256>",
   "Input_Snapshot_SHA256": "<sha256>",
   "Input_Schema_Version": "regime_market_data.v2",
@@ -468,6 +469,98 @@ pre-existing link/special-file attacks. It does not claim isolation from a
 malicious process already running as the same OS user, so production deployment
 must use a dedicated service identity.
 
+### R3 causal calibration and validation
+
+R3 keeps the transparent two-lane detector and rejects a more complex model
+unless it produces a material improvement. The immutable protocol is
+`docs/regime_v2_calibration_plan.json`; the deterministic result is
+`research_reports/regime_v2_calibration_artifact.json`. Both documents use
+canonical strict-schema JSON and content hashes. Runtime research inference
+also requires an externally supplied expected artifact hash and verifies the
+exact historical price prefix, detector/build hash, calibration-engine hash,
+exchange schedule, calendar policy, and source policy.
+
+The predeclared candidate set is deliberately small:
+
+| ID | Difference from control |
+|---|---|
+| `b0_baseline` | 10-session slow VIX and realized-volatility windows; existing thresholds |
+| `c1_slow_15d` | 15-session slow VIX and realized-volatility windows |
+| `c3_stress_entry_080` | persistent-stress entry score raised from 0.75 to 0.80 |
+| `c4_stress_confirm_4d` | persistent-stress confirmation raised from three to four sessions |
+
+All candidates use the same raw-shock thresholds and aftershock duration. The
+calibration plan rejects a candidate grid that tunes the shock lane while
+selecting the background model.
+
+The statistical target is future market risk, not an invented “regime truth”
+label or probability. A close-T signal is first tradable during T+1. Because
+the legacy dataset contains only closes, R3 conservatively excludes the
+close-T to close-T+1 move and measures:
+
+```text
+annualized RMS log-return volatility over close T+1 through close T+h+1
+maximum peak-to-trough drawdown over close T+1 through close T+h+1
+h in {5, 20}
+```
+
+Each measure is converted to an empirical percentile using only the fold's
+reference outcomes. A tail event occurs when any measure reaches its
+training-only 95th percentile. Reference outcomes must resolve strictly before
+the evaluation fold begins; unresolved labels are rejected, never silently
+dropped.
+
+Candidate selection uses annual evaluation folds from 2016 through 2024. Each
+reference end is purged through the 21-session maximum outcome resolution.
+The score is:
+
+```text
+tail F1 + 0.25 * max(mean background-risk Spearman, 0)
+```
+
+A challenger must improve that score by at least 0.01. Binding guardrails
+require at least 120 rows per fold, at least 99% detector availability, no more
+than 24 background switches per 252 sessions, aggregate occupancy below 95%,
+at least two observed background states, and at least 50 qualifying isolated
+shock episodes. Across those episodes, no more than 10% may cause a
+`persistent_stress` state during the next five sessions. This last check
+measures the behavior the user identified: a discrete news spike must not
+silently turn into a persistent background classification.
+
+The 2025 calendar year is a retrospective validation window and is never used
+for candidate selection. The March–April and June–July 2026 windows are
+retrospective case studies only. The committed prospective observation window
+starts on 2026-07-27; it cannot authorize trading and must accumulate before a
+later paper-promotion review.
+
+Selection-fold results on the unverified legacy cache are:
+
+| Candidate | Tail F1 | Recall | Precision | Mean Spearman | Selection score | False persistence | Result |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `b0_baseline` | 0.3488 | 0.6500 | 0.2384 | 0.1286 | **0.3810** | 2/60 | selected |
+| `c1_slow_15d` | 0.3514 | 0.6615 | 0.2392 | 0.1146 | 0.3800 | 3/61 | rejected |
+| `c3_stress_entry_080` | 0.3438 | 0.6308 | 0.2363 | 0.1215 | 0.3742 | 2/60 | rejected |
+| `c4_stress_confirm_4d` | 0.3472 | 0.6423 | 0.2379 | 0.1250 | 0.3784 | 2/60 | rejected |
+
+The control also had the strongest 2025 tail F1: 0.4898 versus 0.4242,
+0.4583, and 0.4742 for C1, C3, and C4. C1 is especially undesirable for the
+stated use case: it labels all 28 sessions from June 15 through July 24, 2026
+as `elevated`, eliminating the six `calm` sessions while leaving the same five
+active shocks.
+
+The chosen profile reproduces the requested distinction:
+
+- March 20–April 7: 12/12 `persistent_stress`, with three active shocks.
+- June 15–July 24: 22 `elevated`, six `calm`, and five independently active
+  shocks.
+
+These results establish detector behavior, not investment edge. The source
+cache has two quarantined non-NYSE rows and one conflicting overlapping value,
+has no retained raw/provider receipts, and is explicitly
+`legacy_normalized_unverified`. The artifact therefore has
+`promotion_status=research_only`, `Calibration_Abstain=true`, and
+`Execution_Eligible=false`.
+
 ## Why not another single HMM
 
 A single latent state must choose among three bad behaviors:
@@ -564,11 +657,11 @@ Every regime experiment must persist:
 
 | Field | V2 prototype status | Production requirement |
 |---|---|---|
-| Training/calibration end date | Thresholds are currently illustrative; no locked selection cutoff | Freeze configuration inside each walk-forward fold and store cutoff plus config hash |
-| Test date range | 2011-05-03 through 2026-07-24 is a diagnostic replay, not a locked OOS test | Pre-register validation and untouched test windows |
-| Inference method | Prefix-causal score and state machine | Store `causal_prefix_filter` per run |
-| Regime lag | Output explicitly says `after_spy_vix_finalization_T_for_next_session` | Assert at least one trading-session lag at every trade entry |
-| Return-bucket causality | Not used by V2 detector | If later used, include only outcomes resolved before T and use the exact same taxonomy/version |
+| Training/calibration end date | Selection folds end 2024-12-31; retrospective outcomes resolve through 2026-02-02; exact folds and hashes are stored | Rebuild on verified provider evidence before paper promotion |
+| Test date range | 2025 is retrospective validation; 2026 examples are retrospective case studies; prospective observation starts 2026-07-27 | Accumulate and review the untouched prospective window without changing the frozen plan |
+| Inference method | `causal_prefix_filter`, bound in the plan and artifact | Preserve the same method in backtest, shadow, and live consumers |
+| Regime lag | Exactly one session; close-T labels begin post-lag outcomes at close T+1 | Assert the same exact trade-entry mapping in R4 |
+| Return-bucket causality | Fold reference outcomes resolve strictly before evaluation; post-lag labels resolve at T+h+1 | R4 must use the same resolved-only convention and taxonomy |
 
 The current prototype is therefore **UNVERIFIED for investment claims** even
 though its inference mechanics are causal.
@@ -660,6 +753,8 @@ and skipped-trade effects must be included.
 - Audit 2008, 2011, 2018, 2020, 2022, and 2026 without choosing thresholds from
   the final test windows.
 - Publish an experiment manifest and prefix-invariance proof for every run.
+- Keep the committed R3 plan unchanged while the prospective window
+  accumulates.
 
 ### Phase 3 — unify research, backtest, and dashboard semantics
 
@@ -683,12 +778,19 @@ and skipped-trade effects must be included.
 - Evidence store: `live_trading/regime_evidence_store.py`
 - Provider parser contract: `live_trading/regime_provider_evidence.py`
 - Provider gateway: `live_trading/regime_market_data_gateway.py`
+- Calibration engine: `live_trading/regime_calibration.py`
+- Frozen calibration plan: `docs/regime_v2_calibration_plan.json`
+- Research artifact:
+  `research_reports/regime_v2_calibration_artifact.json`
 - Release gate: `docs/regime_data_provider_entitlements.md`
 - Focused tests: `tests/test_regime_detector_v2.py`,
   `tests/test_regime_market_data.py`, and
   `tests/test_regime_evidence_store.py`,
-  `tests/test_regime_market_data_gateway.py`
+  `tests/test_regime_market_data_gateway.py`,
+  `tests/test_regime_calibration.py`
 - Read-only replay: `scratch/regime_detector_v2_audit.py`
+- Deterministic calibration runner:
+  `scratch/regime_detector_v2_calibrate.py`
 
 The focused tests verify:
 
