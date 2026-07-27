@@ -1,13 +1,10 @@
-#Note to Codex: run test by "PYTHONPATH=. POLYGON_API_KEY=dummy pytest -q"
+# Required PR gate: deterministic offline tests only.
 name: ci
 
 on:
   pull_request:
   push:
     branches: [ main ]
-
-env:
-  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
 jobs:
   integration:
@@ -27,5 +24,8 @@ jobs:
           # pip install pytest pandas numpy matplotlib requests python-dateutil pytz pandas_market_calendars aiohttp
           pip install -r requirements.txt
           
-      - name: Run integration tests
-        run: pytest -q -m "integration"
+      - name: Run deterministic tests
+        working-directory: etrade_python_client
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests

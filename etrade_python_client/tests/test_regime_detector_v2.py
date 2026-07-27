@@ -64,7 +64,7 @@ def _context(prices):
         "spy_available_at": spy_available_at,
         "vix_available_at": vix_available_at,
         "as_of": signal_available_at + pd.Timedelta(minutes=1),
-        "source_provenance_verified": True,
+        "source_provenance_verified": False,
     }
 
 
@@ -143,7 +143,7 @@ class RegimeDetectorV2Tests(unittest.TestCase):
                 as_of=pd.Timestamp("2025-01-03T22:00:00Z"),
                 spy_available_at=pd.Series(dtype="object"),
                 vix_available_at=pd.Series(dtype="object"),
-                source_provenance_verified=True,
+                source_provenance_verified=False,
             )
 
         prices = _calm_prices()
@@ -167,7 +167,7 @@ class RegimeDetectorV2Tests(unittest.TestCase):
                 as_of=weekend_date.tz_localize("UTC") + pd.Timedelta(days=2),
                 spy_available_at=weekend_date.tz_localize("UTC"),
                 vix_available_at=weekend_date.tz_localize("UTC"),
-                source_provenance_verified=True,
+                source_provenance_verified=False,
             )
 
     def test_missing_interior_nyse_session_fails_closed(self):
@@ -185,7 +185,8 @@ class RegimeDetectorV2Tests(unittest.TestCase):
         self.assertEqual(result.attrs["regime_signal_timestamp"], SIGNAL_TIMESTAMP)
         self.assertEqual(result.attrs["detector_version"], DETECTOR_VERSION)
         self.assertEqual(len(result.attrs["config_hash"]), 64)
-        self.assertTrue(result.attrs["freshness_assessed"])
+        self.assertFalse(result.attrs["freshness_assessed"])
+        self.assertFalse(result.attrs["execution_eligible"])
         self.assertEqual(
             result.attrs["latest_jointly_finalized_session"],
             prices.index.max().date().isoformat(),
@@ -236,19 +237,19 @@ class RegimeDetectorV2Tests(unittest.TestCase):
                 as_of=context["as_of"],
                 spy_available_at=premature_spy,
                 vix_available_at=context["vix_available_at"],
-                source_provenance_verified=True,
+                source_provenance_verified=False,
             )
 
         premature_vix = context["vix_available_at"].copy()
         premature_vix.iloc[-1] -= pd.Timedelta(minutes=2)
-        with self.assertRaisesRegex(ValueError, "before the Cboe 4:15 p.m. ET cutoff"):
+        with self.assertRaisesRegex(ValueError, "before the official Cboe close"):
             detect_regimes(
                 prices,
                 _config(),
                 as_of=context["as_of"],
                 spy_available_at=context["spy_available_at"],
                 vix_available_at=premature_vix,
-                source_provenance_verified=True,
+                source_provenance_verified=False,
             )
 
     def test_latest_session_is_not_available_at_401_pm_eastern(self):
@@ -270,7 +271,7 @@ class RegimeDetectorV2Tests(unittest.TestCase):
                 as_of=as_of,
                 spy_available_at=spy_available_at,
                 vix_available_at=vix_available_at,
-                source_provenance_verified=True,
+                source_provenance_verified=False,
             )
 
     def test_unverified_source_provenance_is_explicit(self):
@@ -307,7 +308,7 @@ class RegimeDetectorV2Tests(unittest.TestCase):
             as_of=delayed_arrival + pd.Timedelta(minutes=1),
             spy_available_at=spy_available_at,
             vix_available_at=vix_available_at,
-            source_provenance_verified=True,
+            source_provenance_verified=False,
         )
 
         expected = pd.Timestamp(following.index[1]).tz_localize(None).normalize()
@@ -335,7 +336,7 @@ class RegimeDetectorV2Tests(unittest.TestCase):
             as_of=delayed_arrival + pd.Timedelta(minutes=1),
             spy_available_at=spy_available_at,
             vix_available_at=vix_available_at,
-            source_provenance_verified=True,
+            source_provenance_verified=False,
         )
 
         expected = pd.Timestamp(following.index[1]).tz_localize(None).normalize()
@@ -355,6 +356,17 @@ class RegimeDetectorV2Tests(unittest.TestCase):
         self.assertEqual(result.iloc[-1]["Tradable_Session"], expected)
         self.assertIsNotNone(pd.Timestamp(result.iloc[-1]["Market_Close_At"]).tzinfo)
         self.assertIsNotNone(pd.Timestamp(result.iloc[-1]["VIX_Finalization_At"]).tzinfo)
+
+    def test_loose_arrays_cannot_claim_verified_provenance(self):
+        prices = _calm_prices()
+        context = _context(prices)
+        context["source_provenance_verified"] = True
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Verified provenance requires RegimeMarketDataSnapshot",
+        ):
+            detect_regimes(prices, _config(), **context)
 
 
 if __name__ == "__main__":

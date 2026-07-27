@@ -6,8 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "etrade-quant-trading"
 version = "0.0.0"
 description = "Backtesting and daily trading utilities"
+readme = "README.md"
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["polygonio*", "strategies*", "yfinance*", "accounts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["etrade_python_client/tests"]
+markers = [
+    "integration: tests that require live external services",
+]

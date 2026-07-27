@@ -1078,7 +1078,7 @@ class StockPosition:
 
 
 class Accounts:
-    def __init__(self, session, base_url, use_sandbox=False):
+    def __init__(self, session, base_url, use_sandbox=False, consumer_key=None):
         """
         Initialize Accounts object with session and account information
 
@@ -1088,10 +1088,22 @@ class Accounts:
         self.account = {}
         self.base_url = base_url
         self.use_sandbox = use_sandbox
-        if self.use_sandbox:
-            self.consumer_key = config["DEFAULT"]["SANDBOX_CONSUMER_KEY"]
-        else: 
-            self.consumer_key = config["DEFAULT"]["PROD_CONSUMER_KEY"]
+        config_key = "SANDBOX_CONSUMER_KEY" if self.use_sandbox else "PROD_CONSUMER_KEY"
+        self.consumer_key = (
+            consumer_key
+            if consumer_key is not None
+            else config["DEFAULT"].get(config_key)
+        )
+
+    def _consumer_key_headers(self):
+        if not self.consumer_key:
+            environment = "sandbox" if self.use_sandbox else "production"
+            config_key = "SANDBOX_CONSUMER_KEY" if self.use_sandbox else "PROD_CONSUMER_KEY"
+            raise RuntimeError(
+                f"Missing E*TRADE {environment} consumer key; pass consumer_key "
+                f"to Accounts or configure {config_key}."
+            )
+        return {"consumerKey": self.consumer_key}
 
     def _refresh_auth_session_if_possible(self, reason):
         callback = getattr(self, "auth_refresh_callback", None)
@@ -5563,7 +5575,7 @@ class Accounts:
         """
         # Base URL for the API
         base_url = f"{self.base_url}/v1/market/quote"
-        headers = {"consumerKey": self.consumer_key}
+        headers = self._consumer_key_headers()
 
         # Prepare the symbol
         symbol = "NVDA:2024:12:20:PUT:139"
@@ -5607,7 +5619,7 @@ class Accounts:
         """
         # Base URL for the API
         base_url = f"{self.base_url}/v1/market/quote"
-        headers = {"consumerKey": self.consumer_key}
+        headers = self._consumer_key_headers()
 
         # Prepare the symbol
         symbol = stock_option.symbol

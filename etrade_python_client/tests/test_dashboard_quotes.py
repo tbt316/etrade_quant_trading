@@ -49,7 +49,7 @@ class DashboardQuoteTests(unittest.TestCase):
                 }]
             }
         })
-        accounts = Accounts(session, "https://api.etrade.com")
+        accounts = Accounts(session, "https://api.etrade.com", consumer_key="")
 
         prices, metadata = accounts.get_stock_prices(["SPX"], include_metadata=True)
 
@@ -132,7 +132,7 @@ class DashboardQuoteTests(unittest.TestCase):
                 "AccountPortfolio": [],
             }
         })
-        accounts = Accounts(expired_session, "https://api.etrade.test")
+        accounts = Accounts(expired_session, "https://api.etrade.test", consumer_key="")
         accounts.account = {"accountIdKey": "account-key"}
         accounts.auth_refresh_callback = lambda reason: (
             refreshed_session,
@@ -149,11 +149,24 @@ class DashboardQuoteTests(unittest.TestCase):
         session = _Session(responses=[
             _Response({}, status_code=401, text="oauth_problem=token_rejected"),
         ])
-        accounts = Accounts(session, "https://api.etrade.test")
+        accounts = Accounts(session, "https://api.etrade.test", consumer_key="")
         accounts.account = {"accountIdKey": "account-key"}
 
         with self.assertRaisesRegex(RuntimeError, "status code 401"):
             accounts.portfolio(require_success=True)
+
+    def test_consumer_key_is_required_only_for_calls_that_use_its_header(self):
+        session = _Session({})
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Missing E\\*TRADE production consumer key"):
+            accounts.check_earning_date(SimpleNamespace(symbol="SPY"))
+
+        self.assertEqual(session.calls, [])
 
 
 if __name__ == "__main__":
