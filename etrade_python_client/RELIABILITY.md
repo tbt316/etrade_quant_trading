@@ -514,10 +514,14 @@ finding.
     state, and persist the raw response before any normalized result can leave
     the reader.
   - Independently replay the installed strict parser over each retained
-    response, then accept capacity only from a content-addressed schema-11
-    manifest containing two complete economically identical account scans.
+    response, then accept capacity only from a content-addressed manifest
+    containing two complete economically identical account scans.
     Reconciliation uses only a direct query for the already durable broker
     order ID.
+  - Schema 12 releases terminal opening reservations only for an exact
+    zero-fill terminal or a complete balanced fill proven by newer position
+    lots carrying the same broker order and leg identities. Absorbed full-fill
+    margin remains counted in account utilization.
   - Remain intentionally disconnected from the live agent until the remaining
     position, closing, cancellation, composition, and operational migration
     gates below are complete.
@@ -529,12 +533,12 @@ finding.
 ### Remaining risk
 
 This is containment in the current source, not production readiness. The
-compatibility order client still owns current live calls. The isolated R7a–R7d
-stack now provides a schema-11 intent ledger, hardened mutation transport,
-origin-bound durable reader, and opening/reprice coordinator, but no live code
-instantiates it.
+compatibility order client still owns current live calls. The isolated R7a–R7e
+stack now provides a schema-12 intent ledger, hardened mutation transport,
+origin-bound durable reader, opening/reprice coordinator, and exact zero/full
+terminal-risk absorption, but no live code instantiates it.
 
-Position-bound fill absorption, closing capacity, durable per-intent
+Partial/replacement/assignment recovery, closing capacity, durable per-intent
 cancellation, a single production composition root, and a static ban on every
 direct legacy mutation path remain required.
 
@@ -558,19 +562,20 @@ deployed dashboard has not been reloaded or visually inspected with R6.
   files, guarded response/request logging, order calls without a boundary,
   placement-time arm expiry, dashboard credential rejection, and loopback/CORS
   behavior.
-- The current R7 ledger/reader/transport/coordinator focused suite includes
-  112 deterministic tests for immutable identity, exact authorization/XML,
+- The current R7 ledger/reader/transport/coordinator focused suite includes 153
+  deterministic tests for immutable identity, exact authorization/XML,
   transport deadlines, send fencing, parsed receipts, crash/timeout recovery,
   capacity arithmetic, gateway-owned risk ceilings, environment/account
   binding, strict raw-response replay, pagination/marker completeness,
-  two-scan stability, exact order-term reconciliation, amendment replay,
-  terminal-risk retention, and additive schema 8→9→10→11 migration.
+  lot-aware two-scan stability, exact order/fill reconciliation, amendment
+  replay, terminal absorption, retained filled risk, and additive schema
+  8→9→10→11→12 migration.
   Independent adversarial review found and closed fail-open handling for
   replacement-linked and partially filled terminal orders; both now remain
   unresolved. The review explicitly retains a no-go on live wiring until the
-  remaining position, closing, cancellation, and composition protocols are
-  delivered.
-- The maintained `tests/` suite passes 277 tests in the clean Python 3.10
+  remaining partial/complex terminal, closing, cancellation, and composition
+  protocols are delivered.
+- The maintained `tests/` suite passes 318 tests in the clean Python 3.10
   environment. An unscoped repository-root pytest invocation still
   mis-collects two legacy `scratch/test_delta_*` research scripts and triggers
   import-time market-data behavior; the reproducible-build/CI gate must

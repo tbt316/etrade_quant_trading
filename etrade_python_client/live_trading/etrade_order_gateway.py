@@ -31,6 +31,7 @@ from live_trading.order_intent_ledger import (
     BrokerEvidence,
     CapacityDecisionReceipt,
     IntentRecord,
+    MarginReservation,
     OrderIntent,
     OrderIntentBrokerTermsMismatch,
     OrderIntentIntegrityError,
@@ -38,7 +39,9 @@ from live_trading.order_intent_ledger import (
     OrderIntentLedgerError,
     OrderIntentReconciliationRequired,
     OrderIntentTransitionError,
+    ReservationAbsorptionReceipt,
     RiskEvidence,
+    TerminalAbsorptionRequirement,
     TransportResponseReceipt,
     canonical_order_payload_hash,
 )
@@ -103,6 +106,13 @@ class _ReconciliationContext:
     operation: Literal["ORDER_QUERY", "AMEND_QUERY"]
     client_order_id: str = field(repr=False)
     broker_order_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _TerminalAbsorptionCandidate:
+    record: IntentRecord
+    terminal_read: BrokerReadEvidenceRef
+    requirement: TerminalAbsorptionRequirement
 
 
 class EtradeOrderGateway:
@@ -208,17 +218,46 @@ class EtradeOrderGateway:
         )
         for blocker in blockers:
             self._reconcile_once(blocker, account)
+        pending_absorptions = self.ledger.pending_terminal_reservations(
+            account.account_id, self.runtime_safety.environment
+        )
+        absorption_candidates = []
+        for pending in pending_absorptions:
+            candidate = self._prepare_terminal_absorption(
+                pending, account
+            )
+            if candidate is not None:
+                absorption_candidates.append(candidate)
+        post_capacity = None
+        if any(
+            candidate.requirement.classification == "FULL_FILL"
+            for candidate in absorption_candidates
+        ):
+            try:
+                post_capacity = self._read_capacity(account)
+            except GatewayReconciliationRequired:
+                post_capacity = None
+        for candidate in absorption_candidates:
+            self._apply_terminal_absorption(
+                candidate,
+                account,
+                post_capacity=(
+                    post_capacity
+                    if candidate.requirement.classification == "FULL_FILL"
+                    else None
+                ),
+            )
         remaining = self.ledger.reconciliation_blockers(
             account.account_id, self.runtime_safety.environment
         )
-        unabsorbed = self.ledger.unabsorbed_filled_reservation_count(
+        unabsorbed = self.ledger.pending_terminal_reservations(
             account.account_id, self.runtime_safety.environment
         )
         if remaining or unabsorbed:
             raise GatewayReconciliationRequired(
                 "gateway remains read-only: "
                 f"{len(remaining)} broker operation(s), "
-                f"{unabsorbed} unabsorbed fill reservation(s)"
+                f"{len(unabsorbed)} pending terminal reservation(s)"
             )
         self._checked_account()
         self._started = True
@@ -629,6 +668,170 @@ class EtradeOrderGateway:
                 "broker evidence could not be applied atomically"
             ) from exc
 
+    def _prepare_terminal_absorption(
+        self,
+        record: IntentRecord,
+        account: SelectedBrokerAccount,
+    ) -> _TerminalAbsorptionCandidate | None:
+        """Collect one exact terminal read before any shared capacity scan."""
+
+        if (
+            record.envelope.account_id != account.account_id
+            or record.envelope.environment
+            != self.runtime_safety.environment
+            or record.broker_order_id is None
+        ):
+            raise GatewayValidationError(
+                "pending terminal reservation has invalid durable identity"
+            )
+        checked = self._checked_account()
+        _require_same_account(account, checked)
+        try:
+            terminal_read = self.reader.query_order(
+                checked, record.broker_order_id
+            )
+        except ETradeBrokerReaderUnavailable:
+            return None
+        except ETradeBrokerReaderIntegrityError as exc:
+            raise GatewayValidationError(
+                "terminal absorption order read violated the durable contract"
+            ) from exc
+        except ETradeBrokerReaderError:
+            return None
+        if (
+            type(terminal_read) is not BrokerReadEvidenceRef
+            or terminal_read.evidence_kind != "ORDER_QUERY"
+        ):
+            raise GatewayValidationError(
+                "terminal absorption requires exact durable order evidence"
+            )
+        try:
+            requirement = self.ledger.terminal_absorption_requirement(
+                record.intent_id, terminal_read
+            )
+        except OrderIntentReconciliationRequired:
+            return None
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal absorption requirement failed durable validation"
+            ) from exc
+        if (
+            type(requirement) is not TerminalAbsorptionRequirement
+            or requirement.intent_id != record.intent_id
+            or requirement.broker_order_id != record.broker_order_id
+            or requirement.terminal_state != record.state
+            or requirement.terminal_order_evidence_sha256
+            != terminal_read.evidence_sha256
+        ):
+            raise GatewayValidationError(
+                "terminal absorption requirement is not bound to the intent"
+            )
+        try:
+            reservation = self.ledger.get_margin_reservation(
+                record.intent_id
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal absorption reservation failed durable validation"
+            ) from exc
+        if (
+            type(reservation) is not MarginReservation
+            or reservation.intent_id != record.intent_id
+            or reservation.account_id != account.account_id
+            or reservation.environment
+            != self.runtime_safety.environment
+            or reservation.state != "FILLED_PENDING_ABSORPTION"
+            or reservation.capacity_decision_sha256
+            != requirement.baseline_capacity_decision_sha256
+        ):
+            raise GatewayValidationError(
+                "terminal absorption requirement is disconnected from risk"
+            )
+        if requirement.post_capacity_required != (
+            requirement.classification == "FULL_FILL"
+        ):
+            raise GatewayValidationError(
+                "terminal absorption requirement has inconsistent capacity needs"
+            )
+        if requirement.classification not in {"ZERO_FILL", "FULL_FILL"}:
+            raise GatewayValidationError(
+                "terminal absorption classification is unsupported"
+            )
+        self._checked_account()
+        return _TerminalAbsorptionCandidate(
+            record=record,
+            terminal_read=terminal_read,
+            requirement=requirement,
+        )
+
+    def _apply_terminal_absorption(
+        self,
+        candidate: _TerminalAbsorptionCandidate,
+        account: SelectedBrokerAccount,
+        *,
+        post_capacity: CapacityDecisionReceipt | None,
+    ) -> bool:
+        """Apply one candidate using a capacity snapshot newer than the batch."""
+
+        if type(candidate) is not _TerminalAbsorptionCandidate:
+            raise GatewayValidationError(
+                "terminal absorption candidate has an invalid type"
+            )
+        record = candidate.record
+        terminal_read = candidate.terminal_read
+        requirement = candidate.requirement
+        if requirement.classification == "FULL_FILL":
+            if post_capacity is None:
+                return False
+            if type(post_capacity) is not CapacityDecisionReceipt:
+                raise GatewayValidationError(
+                    "full-fill absorption requires exact capacity evidence"
+                )
+        elif (
+            requirement.classification == "ZERO_FILL"
+            and post_capacity is not None
+        ):
+            raise GatewayValidationError(
+                "zero-fill absorption cannot use capacity evidence"
+            )
+        checked = self._checked_account()
+        _require_same_account(account, checked)
+        try:
+            receipt = self.ledger.absorb_terminal_reservation(
+                record.intent_id,
+                terminal_read,
+                post_capacity_decision=post_capacity,
+            )
+        except OrderIntentReconciliationRequired:
+            return False
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "terminal reservation could not be absorbed atomically"
+            ) from exc
+        if (
+            type(receipt) is not ReservationAbsorptionReceipt
+            or receipt.intent_id != record.intent_id
+            or receipt.broker_order_id != record.broker_order_id
+            or receipt.terminal_state != record.state
+            or receipt.classification != requirement.classification
+            or receipt.terminal_order_evidence_sha256
+            != terminal_read.evidence_sha256
+            or (
+                post_capacity is None
+                and receipt.post_capacity_decision_sha256 is not None
+            )
+            or (
+                post_capacity is not None
+                and receipt.post_capacity_decision_sha256
+                != post_capacity.decision_sha256
+            )
+        ):
+            raise GatewayValidationError(
+                "terminal absorption receipt is not bound to the intent"
+            )
+        self._checked_account()
+        return True
+
     def _reconciliation_context(
         self, record: IntentRecord
     ) -> _ReconciliationContext | None:
@@ -697,7 +900,7 @@ class EtradeOrderGateway:
             account.account_id, self.runtime_safety.environment
         ):
             raise GatewayReconciliationRequired(
-                "unabsorbed filled risk blocks mutation"
+                "unabsorbed terminal risk blocks mutation"
             )
 
     def _require_started(self) -> None:

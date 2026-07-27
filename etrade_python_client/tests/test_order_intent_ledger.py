@@ -25,6 +25,7 @@ from live_trading.etrade_broker_reader import (
 from live_trading.order_intent_ledger import (
     SCHEMA_VERSION,
     BrokerEvidence,
+    BrokerReadEvidenceRef,
     BrokerReadManifestEvidence,
     BrokerReadManifestMember,
     BrokerReadResponseEvidence,
@@ -35,6 +36,7 @@ from live_trading.order_intent_ledger import (
     OrderIntent,
     OrderIntentIntegrityError,
     OrderIntentLedger,
+    OrderIntentLedgerError,
     OrderIntentLeaseConflict,
     OrderIntentReconciliationRequired,
     OrderIntentReservationError,
@@ -764,6 +766,12 @@ class OrderIntentLedgerTests(unittest.TestCase):
         ).encode("ascii")
         wire_payload = json.loads(record.envelope.wire_payload)
         raw_status = "EXECUTED" if outcome == "FILLED" else outcome
+        placed_time = str(
+            int((observed_at - timedelta(minutes=1)).timestamp() * 1_000)
+        )
+        executed_time = str(
+            int((observed_at - timedelta(seconds=30)).timestamp() * 1_000)
+        )
         raw = canonical_json(
             {
                 "OrdersResponse": {
@@ -776,6 +784,12 @@ class OrderIntentLedgerTests(unittest.TestCase):
                                     "accountId": account,
                                     "orderNumber": broker_order_id,
                                     "status": raw_status,
+                                    "placedTime": placed_time,
+                                    **(
+                                        {"executedTime": executed_time}
+                                        if outcome == "FILLED"
+                                        else {}
+                                    ),
                                     "priceType": wire_payload[
                                         "priceType"
                                     ],
@@ -812,6 +826,16 @@ class OrderIntentLedgerTests(unittest.TestCase):
                                             "filledQuantity": (
                                                 leg["quantity"]
                                                 if outcome == "FILLED"
+                                                else 0
+                                            ),
+                                            "cancelQuantity": (
+                                                leg["quantity"]
+                                                if outcome
+                                                in {
+                                                    "CANCELLED",
+                                                    "REJECTED",
+                                                    "EXPIRED",
+                                                }
                                                 else 0
                                             ),
                                             "orderAction": leg[
@@ -867,10 +891,11 @@ class OrderIntentLedgerTests(unittest.TestCase):
             final_response=True,
         )
         result = {
-            "schema": "etrade-order-query.v1",
+            "schema": "etrade-order-query.v2",
             "broker_order_id": broker_order_id,
             "raw_status": detail_parsed["raw_status"],
             "outcome": detail_parsed["outcome"],
+            "fill_summary": detail_parsed["fill_summary"],
             "order_payload_hashes": detail_parsed[
                 "order_payload_hashes"
             ],
@@ -1303,6 +1328,343 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 ),
             )
 
+    def test_direct_sql_cannot_forge_an_understated_reservation(self):
+        record = self.ledger.create_intent(
+            make_intent(key="tiny-direct-reservation")
+        ).intent
+        decision = self.set_capacity()
+        now = int(self.clock.now.timestamp() * 1_000_000)
+        values = (
+            record.intent_id,
+            record.envelope.account_id,
+            record.envelope.environment,
+            "1",
+            record.envelope.decision_id,
+            "1",
+            now,
+            "a" * 64,
+            int(decision.observed_at.timestamp() * 1_000_000),
+            decision.portfolio_snapshot_digest,
+            decision.decision_sha256,
+            now,
+        )
+        statement = """
+            INSERT INTO margin_reservations (
+                intent_id, account_id, environment, amount,
+                risk_decision_id, max_loss_amount,
+                quote_observed_at, quote_digest,
+                portfolio_observed_at, portfolio_snapshot_digest,
+                capacity_decision_sha256, state,
+                released_reason_code, created_at, released_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
+                NULL, ?, NULL
+            )
+        """
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(statement, values)
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER validate_margin_reservation_insert"
+            )
+            connection.execute(statement, values)
+
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="tiny-direct-reservation-restart",
+            )
+
+    def test_valid_pre_post_failure_releases_reserved_margin(self):
+        record = self.opening(key="valid-pre-post-release")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        failed = self.ledger.mark_pre_post_failed(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+        )
+        reservation = self.ledger.get_margin_reservation(
+            record.intent_id
+        )
+        self.assertEqual(failed.state, "FAILED")
+        self.assertEqual(reservation.state, "RELEASED")
+        self.assertEqual(
+            reservation.released_reason_code, "PRE_POST_ABORTED"
+        )
+        self.assertEqual(
+            [
+                (event.event_type, event.reason_code)
+                for event in self.ledger.events(record.intent_id)[-2:]
+            ],
+            [
+                ("RESERVATION_RELEASED", "RESERVATION_RELEASED"),
+                ("PRE_POST_FAILED", "PRE_POST_ABORTED"),
+            ],
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            ),
+            Decimal("0"),
+        )
+        reopened = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="valid-pre-post-release-restart",
+        )
+        self.assertEqual(
+            reopened.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            ),
+            Decimal("0"),
+        )
+
+    def test_submitted_opening_cannot_forge_active_reservation_release(
+        self,
+    ):
+        record = self.opening(key="forged-active-release")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+            evidence(record, self.clock, operation="SUBMIT_ACK"),
+        )
+        released_at = int(self.clock.now.timestamp() * 1_000_000)
+        statement = """
+            UPDATE margin_reservations
+            SET state = 'RELEASED',
+                released_reason_code = 'RESERVATION_RELEASED',
+                released_at = ?
+            WHERE intent_id = ?
+        """
+        with sqlite3.connect(self.path) as connection:
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    statement, (released_at, record.intent_id)
+                )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            ),
+            Decimal("500"),
+        )
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                DROP TRIGGER
+                validate_margin_reservation_pre_post_release
+                """
+            )
+            connection.execute(
+                statement, (released_at, record.intent_id)
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="forged-active-release-restart",
+            )
+
+    def test_post_started_evidence_blocks_forged_pre_post_release(
+        self,
+    ):
+        record = self.opening(key="post-started-release-forgery")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        released_at = int(self.clock.now.timestamp() * 1_000_000)
+        fail_intent = """
+            UPDATE order_intents
+            SET state = 'FAILED', pending_operation = NULL,
+                pending_owner = NULL, pending_fence = NULL,
+                last_reconciled_run = 'forged',
+                updated_at = ?
+            WHERE intent_id = ?
+        """
+        release = """
+            UPDATE margin_reservations
+            SET state = 'RELEASED',
+                released_reason_code = 'PRE_POST_ABORTED',
+                released_at = ?
+            WHERE intent_id = ?
+        """
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                fail_intent, (released_at, record.intent_id)
+            )
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    release, (released_at, record.intent_id)
+                )
+            connection.rollback()
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                DROP TRIGGER
+                validate_margin_reservation_pre_post_release
+                """
+            )
+            connection.execute(
+                fail_intent, (released_at, record.intent_id)
+            )
+            connection.execute(
+                release, (released_at, record.intent_id)
+            )
+            for event_type, from_state, to_state, actor, reason in (
+                (
+                    "RESERVATION_RELEASED",
+                    "FAILED",
+                    "FAILED",
+                    "system",
+                    "RESERVATION_RELEASED",
+                ),
+                (
+                    "PRE_POST_FAILED",
+                    "CLAIMED",
+                    "FAILED",
+                    "worker",
+                    "PRE_POST_ABORTED",
+                ),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO order_events (
+                        intent_id, account_id, environment,
+                        client_order_id, event_type, from_state,
+                        to_state, actor, reason_code, broker_status,
+                        broker_order_id, observed_at,
+                        evidence_operation, http_status,
+                        raw_response_digest,
+                        broker_read_evidence_sha256, created_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?
+                    )
+                    """,
+                    (
+                        record.intent_id,
+                        record.envelope.account_id,
+                        record.envelope.environment,
+                        record.client_order_id,
+                        event_type,
+                        from_state,
+                        to_state,
+                        actor,
+                        reason,
+                        released_at,
+                    ),
+                )
+
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError, "durable POST evidence"
+        ):
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            )
+        with self.assertRaises(OrderIntentIntegrityError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="post-started-release-forgery-restart",
+            )
+
+    def test_order_event_delete_trigger_is_repaired_and_replacement_rejected(
+        self,
+    ):
+        record = self.opening(key="post-started-delete-trigger")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER prevent_order_event_delete"
+            )
+
+        OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="repair-order-event-delete-trigger",
+        )
+        with sqlite3.connect(self.path) as connection:
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """
+                    DELETE FROM order_events
+                    WHERE intent_id = ? AND event_type = 'POST_STARTED'
+                    """,
+                    (record.intent_id,),
+                )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM order_events
+                    WHERE intent_id = ? AND event_type = 'POST_STARTED'
+                    """,
+                    (record.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+        with sqlite3.connect(self.path) as connection:
+            connection.executescript(
+                """
+                DROP TRIGGER prevent_order_event_delete;
+                CREATE TRIGGER prevent_order_event_delete
+                BEFORE DELETE ON order_events
+                WHEN 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'never runs');
+                END;
+                """
+            )
+
+        with self.assertRaises(OrderIntentLedgerError):
+            OrderIntentLedger(
+                self.path,
+                clock=self.clock,
+                run_id="reject-replaced-order-event-delete-trigger",
+            )
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM order_events
+                    WHERE intent_id = ? AND event_type = 'POST_STARTED'
+                    """,
+                    (record.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+
     def test_expired_claim_without_place_attempt_returns_to_intent_with_new_fence(self):
         record = self.opening()
         lease = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=5)
@@ -1715,7 +2077,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         ack = self.ledger.record_post_acknowledgement(record.intent_id, "worker", lease.fencing_token, evidence(record, self.clock, operation="SUBMIT_ACK"))
         self.assertEqual(ack.state, "SUBMITTED")
 
-    def test_restart_reconciliation_keeps_terminal_reservation_until_r7b_position_evidence(self):
+    def test_restart_keeps_terminal_risk_until_exact_absorption_evidence(self):
         record = self.opening()
         lease = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=30)
         self.begin_submission(record, "worker", lease)
@@ -1914,7 +2276,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
             self.begin_submission(record, "worker", submit)
         self.assertEqual(self.ledger.get_intent(record.intent_id).state, "CLAIMED")
 
-    def test_cancelled_and_expired_openings_hold_reservation_without_position_evidence(self):
+    def test_zero_fill_terminals_hold_risk_without_fresh_order_evidence(self):
         for terminal in ("CANCELLED", "EXPIRED"):
             with self.subTest(terminal=terminal):
                 self.clock.advance(1)
@@ -1962,6 +2324,231 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 with self.assertRaises(OrderIntentReservationError):
                     self.ledger.claim_submission(blocked.intent_id, "still-blocked", lease_seconds=30)
 
+    def test_zero_fill_terminal_absorption_is_atomic_and_idempotent(self):
+        record = self.opening(key="zero-fill-absorption")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        submitted = self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+            evidence(
+                record,
+                self.clock,
+                operation="SUBMIT_ACK",
+                broker_order_id="2000000088",
+            ),
+        )
+        terminal = self.query_evidence(
+            submitted,
+            outcome="CANCELLED",
+            broker_order_id="2000000088",
+        )
+        self.ledger.reconcile_terminal(
+            record.intent_id, "CANCELLED", terminal
+        )
+        with sqlite3.connect(self.path) as connection:
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """
+                    UPDATE margin_reservations
+                    SET state = 'RELEASED',
+                        released_reason_code = 'ZERO_FILL_CONFIRMED',
+                        released_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        int(self.clock.now.timestamp() * 1_000_000),
+                        record.intent_id,
+                    ),
+                )
+        self.clock.advance(1)
+        fresh_terminal = self.query_evidence(
+            submitted,
+            outcome="CANCELLED",
+            broker_order_id="2000000088",
+        )
+        reference = BrokerReadEvidenceRef(
+            fresh_terminal.broker_read_evidence_sha256,
+            "ORDER_QUERY",
+        )
+        self.clock.advance(1)
+        newest_terminal = self.query_evidence(
+            submitted,
+            outcome="CANCELLED",
+            broker_order_id="2000000088",
+        )
+        newest_reference = BrokerReadEvidenceRef(
+            newest_terminal.broker_read_evidence_sha256,
+            "ORDER_QUERY",
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            self.ledger.terminal_absorption_requirement(
+                record.intent_id, reference
+            )
+        reference = newest_reference
+
+        requirement = self.ledger.terminal_absorption_requirement(
+            record.intent_id, reference
+        )
+        self.assertEqual(requirement.classification, "ZERO_FILL")
+        self.assertFalse(requirement.post_capacity_required)
+        self.assertEqual(
+            requirement.baseline_capacity_decision_sha256,
+            self.ledger.get_margin_reservation(
+                record.intent_id
+            ).capacity_decision_sha256,
+        )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER abort_zero_absorption_event
+                BEFORE INSERT ON order_events
+                WHEN NEW.event_type = 'RESERVATION_RELEASED'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated post-receipt failure');
+                END
+                """
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id, reference
+            )
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM reservation_absorptions
+                    WHERE intent_id = ?
+                    """,
+                    (record.intent_id,),
+                ).fetchone()[0],
+                0,
+            )
+            connection.execute("DROP TRIGGER abort_zero_absorption_event")
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        receipt = self.ledger.absorb_terminal_reservation(
+            record.intent_id, reference
+        )
+        replay = self.ledger.absorb_terminal_reservation(
+            record.intent_id, reference
+        )
+        self.assertEqual(replay, receipt)
+        self.assertEqual(receipt.absorbed_margin_amount, Decimal("0"))
+        self.assertEqual(
+            self.ledger.get_intent(record.intent_id).state,
+            "CANCELLED",
+        )
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "RELEASED",
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            ),
+            Decimal("0"),
+        )
+        final_event = self.ledger.events(record.intent_id)[-1]
+        self.assertEqual(
+            final_event.event_type, "RESERVATION_RELEASED"
+        )
+        self.assertEqual(
+            final_event.reason_code, "RESERVATION_RELEASED"
+        )
+        conflicting = BrokerReadEvidenceRef(
+            terminal.broker_read_evidence_sha256,
+            "ORDER_QUERY",
+        )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.absorb_terminal_reservation(
+                record.intent_id, conflicting
+            )
+
+    def test_absorption_insert_trigger_rejects_zero_fill_for_filled_intent(
+        self,
+    ):
+        record = self.opening(key="forged-zero-fill")
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        submitted = self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+            evidence(
+                record,
+                self.clock,
+                operation="SUBMIT_ACK",
+                broker_order_id="2000000089",
+            ),
+        )
+        terminal = self.query_evidence(
+            submitted,
+            outcome="FILLED",
+            broker_order_id="2000000089",
+        )
+        self.ledger.reconcile_terminal(
+            record.intent_id, "FILLED", terminal
+        )
+        reservation = self.ledger.get_margin_reservation(record.intent_id)
+        now = int(self.clock.now.timestamp() * 1_000_000)
+
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """
+                    INSERT INTO reservation_absorptions (
+                        absorption_sha256, intent_id, account_id,
+                        environment, broker_order_id, terminal_state,
+                        classification, terminal_order_evidence_sha256,
+                        baseline_capacity_decision_sha256,
+                        post_capacity_decision_sha256,
+                        post_capacity_evidence_sha256, ordered_quantity,
+                        filled_quantity, placed_time_epoch_ms,
+                        executed_time_epoch_ms, canonical_lot_proof_json,
+                        lot_proof_sha256, absorbed_margin_amount,
+                        observed_at, recorded_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, 'CANCELLED', 'ZERO_FILL', ?, ?,
+                        NULL, NULL, 1, 0, ?, NULL, '[]', ?, '0', ?, ?
+                    )
+                    """,
+                    (
+                        "f" * 64,
+                        record.intent_id,
+                        record.envelope.account_id,
+                        record.envelope.environment,
+                        "2000000089",
+                        terminal.broker_read_evidence_sha256,
+                        reservation.capacity_decision_sha256,
+                        str(int(self.clock.now.timestamp() * 1_000)),
+                        "e" * 64,
+                        now,
+                        now,
+                    ),
+                )
+
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "FILLED_PENDING_ABSORPTION",
+        )
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                record.envelope.account_id,
+                record.envelope.environment,
+            ),
+            Decimal("500"),
+        )
+
     def test_concurrent_amendment_race_has_one_winner(self):
         record = self.opening()
         submit = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=30)
@@ -1977,6 +2564,32 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             outcomes = list(pool.map(acquire, ("nudger-a", "nudger-b")))
         self.assertEqual(sum(value is not None for value in outcomes), 1)
+
+    def test_concurrent_first_initialization_rechecks_metadata_under_lock(self):
+        parent = Path(self.tmp.name) / "parallel-initialize"
+        parent.mkdir(mode=0o700)
+        path = parent / "orders.sqlite3"
+        barrier = threading.Barrier(2)
+
+        def initialize(index):
+            barrier.wait()
+            return OrderIntentLedger(
+                path,
+                clock=self.clock,
+                run_id=f"parallel-initialize-{index}",
+            ).path
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            paths = list(pool.map(initialize, (1, 2)))
+
+        self.assertEqual(paths, [path, path])
+        with sqlite3.connect(path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT schema_version FROM ledger_metadata"
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
 
     def test_schema_8_migrates_without_losing_the_ledger(self):
         legacy_wire = wire_order_payload(closing_payload())
@@ -2165,6 +2778,50 @@ class OrderIntentLedgerTests(unittest.TestCase):
             self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transport_response_receipts'").fetchone())
             self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_transport_send_attempt_delete'").fetchone())
             self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'prevent_transport_response_receipt_delete'").fetchone())
+            legacy_reservation = conn.execute(
+                """
+                SELECT amount, max_loss_amount, risk_decision_id, state,
+                       capacity_decision_sha256, quote_digest,
+                       portfolio_snapshot_digest
+                FROM margin_reservations
+                WHERE intent_id = 'legacy-query-intent'
+                """
+            ).fetchone()
+            self.assertEqual(
+                legacy_reservation[:5],
+                (
+                    "375",
+                    "375",
+                    "legacy-opening-migration",
+                    "ACTIVE",
+                    None,
+                ),
+            )
+            self.assertEqual(len(legacy_reservation[5]), 64)
+            self.assertEqual(len(legacy_reservation[6]), 64)
+            legacy_creation = conn.execute(
+                """
+                SELECT from_state, to_state, actor, reason_code
+                FROM order_events
+                WHERE intent_id = 'legacy-query-intent'
+                  AND event_type = 'RESERVATION_CREATED'
+                """
+            ).fetchone()
+            self.assertEqual(
+                legacy_creation,
+                (
+                    "SUBMITTED",
+                    "SUBMITTED",
+                    "schema-migration",
+                    "RESERVATION_CREATED",
+                ),
+            )
+        self.assertEqual(
+            migrated.active_reserved_margin(
+                query_legacy.account_id, query_legacy.environment
+            ),
+            Decimal("375"),
+        )
         legacy_record = migrated.get_intent("legacy-closing-intent")
         self.assertEqual(legacy_record.envelope.intent_kind, "CLOSING")
         claimed_record = migrated.get_intent("legacy-claimed-intent")

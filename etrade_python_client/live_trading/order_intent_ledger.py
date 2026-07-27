@@ -25,8 +25,8 @@ from typing import Any, Callable, Iterator, Literal, Mapping
 from urllib.parse import quote
 
 
-SCHEMA_VERSION = 11
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10})
+SCHEMA_VERSION = 12
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10, 11})
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
@@ -69,6 +69,10 @@ _READ_PARSED_HASH_DOMAIN = b"etrade-read-parsed.v1\0"
 _READ_RECEIPT_HASH_DOMAIN = b"etrade-read-receipt.v1\0"
 _READ_MANIFEST_HASH_DOMAIN = b"etrade-read-manifest.v1\0"
 _CAPACITY_DECISION_HASH_DOMAIN = b"etrade-capacity-decision.v1\0"
+_RESERVATION_ABSORPTION_HASH_DOMAIN = (
+    b"etrade-reservation-absorption.v1\0"
+)
+_LOT_PROOF_HASH_DOMAIN = b"etrade-reservation-lot-proof.v1\0"
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
 _TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"})
@@ -136,6 +140,590 @@ _LEG_FIELDS = frozenset(
         "quantity",
     }
 )
+
+_REQUIRED_TRIGGER_DEFINITIONS = {
+    "prevent_order_event_update": """
+        CREATE TRIGGER prevent_order_event_update
+        BEFORE UPDATE ON order_events
+        BEGIN
+            SELECT RAISE(ABORT, 'order events are append-only');
+        END
+    """,
+    "prevent_order_event_delete": """
+        CREATE TRIGGER prevent_order_event_delete
+        BEFORE DELETE ON order_events
+        BEGIN
+            SELECT RAISE(ABORT, 'order events are append-only');
+        END
+    """,
+    "prevent_amendment_history_update": """
+        CREATE TRIGGER prevent_amendment_history_update
+        BEFORE UPDATE ON amendment_history
+        BEGIN
+            SELECT RAISE(ABORT, 'amendment history is immutable');
+        END
+    """,
+    "prevent_amendment_history_delete": """
+        CREATE TRIGGER prevent_amendment_history_delete
+        BEFORE DELETE ON amendment_history
+        BEGIN
+            SELECT RAISE(ABORT, 'amendment history is immutable');
+        END
+    """,
+    "prevent_outbound_authorization_update": """
+        CREATE TRIGGER prevent_outbound_authorization_update
+        BEFORE UPDATE ON outbound_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'outbound authorizations are immutable');
+        END
+    """,
+    "prevent_outbound_authorization_delete": """
+        CREATE TRIGGER prevent_outbound_authorization_delete
+        BEFORE DELETE ON outbound_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'outbound authorizations are immutable');
+        END
+    """,
+    "prevent_transport_send_attempt_update": """
+        CREATE TRIGGER prevent_transport_send_attempt_update
+        BEFORE UPDATE ON transport_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'transport send attempts are immutable');
+        END
+    """,
+    "prevent_transport_send_attempt_delete": """
+        CREATE TRIGGER prevent_transport_send_attempt_delete
+        BEFORE DELETE ON transport_send_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'transport send attempts are immutable');
+        END
+    """,
+    "prevent_broker_preview_receipt_update": """
+        CREATE TRIGGER prevent_broker_preview_receipt_update
+        BEFORE UPDATE ON broker_preview_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'broker preview receipts are immutable');
+        END
+    """,
+    "prevent_broker_preview_receipt_delete": """
+        CREATE TRIGGER prevent_broker_preview_receipt_delete
+        BEFORE DELETE ON broker_preview_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'broker preview receipts are immutable');
+        END
+    """,
+    "prevent_transport_response_receipt_update": """
+        CREATE TRIGGER prevent_transport_response_receipt_update
+        BEFORE UPDATE ON transport_response_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'transport response receipts are immutable');
+        END
+    """,
+    "prevent_transport_response_receipt_delete": """
+        CREATE TRIGGER prevent_transport_response_receipt_delete
+        BEFORE DELETE ON transport_response_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'transport response receipts are immutable');
+        END
+    """,
+    "prevent_broker_order_history_update": """
+        CREATE TRIGGER prevent_broker_order_history_update
+        BEFORE UPDATE ON broker_order_history
+        BEGIN
+            SELECT RAISE(ABORT, 'broker order history is immutable');
+        END
+    """,
+    "prevent_broker_order_history_delete": """
+        CREATE TRIGGER prevent_broker_order_history_delete
+        BEFORE DELETE ON broker_order_history
+        BEGIN
+            SELECT RAISE(ABORT, 'broker order history is immutable');
+        END
+    """,
+    "prevent_intent_identity_mutation": """
+        CREATE TRIGGER prevent_intent_identity_mutation
+        BEFORE UPDATE ON order_intents
+        WHEN OLD.account_id != NEW.account_id
+          OR OLD.environment != NEW.environment
+          OR OLD.strategy_id != NEW.strategy_id
+          OR OLD.decision_id != NEW.decision_id
+          OR OLD.idempotency_scope != NEW.idempotency_scope
+          OR OLD.idempotency_key != NEW.idempotency_key
+          OR OLD.intent_kind != NEW.intent_kind
+          OR OLD.wire_payload != NEW.wire_payload
+          OR OLD.canonical_payload != NEW.canonical_payload
+          OR OLD.payload_hash != NEW.payload_hash
+          OR OLD.client_order_id != NEW.client_order_id
+        BEGIN
+            SELECT RAISE(ABORT, 'order intent identity is immutable');
+        END
+    """,
+    "prevent_terminal_rewrite": """
+        CREATE TRIGGER prevent_terminal_rewrite
+        BEFORE UPDATE ON order_intents
+        WHEN OLD.state IN ('FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'FAILED')
+          AND NEW.state != OLD.state
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal order intent cannot transition');
+        END
+    """,
+    "prevent_broker_read_receipt_update": """
+        CREATE TRIGGER prevent_broker_read_receipt_update
+        BEFORE UPDATE ON broker_read_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read receipts are append-only');
+        END
+    """,
+    "prevent_broker_read_receipt_delete": """
+        CREATE TRIGGER prevent_broker_read_receipt_delete
+        BEFORE DELETE ON broker_read_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read receipts are append-only');
+        END
+    """,
+    "prevent_broker_read_manifest_update": """
+        CREATE TRIGGER prevent_broker_read_manifest_update
+        BEFORE UPDATE ON broker_read_manifests
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read manifests are append-only');
+        END
+    """,
+    "prevent_broker_read_manifest_delete": """
+        CREATE TRIGGER prevent_broker_read_manifest_delete
+        BEFORE DELETE ON broker_read_manifests
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read manifests are append-only');
+        END
+    """,
+    "prevent_broker_read_member_update": """
+        CREATE TRIGGER prevent_broker_read_member_update
+        BEFORE UPDATE ON broker_read_manifest_members
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read manifest members are append-only');
+        END
+    """,
+    "prevent_broker_read_member_delete": """
+        CREATE TRIGGER prevent_broker_read_member_delete
+        BEFORE DELETE ON broker_read_manifest_members
+        BEGIN
+            SELECT RAISE(ABORT, 'broker read manifest members are append-only');
+        END
+    """,
+    "prevent_capacity_decision_update": """
+        CREATE TRIGGER prevent_capacity_decision_update
+        BEFORE UPDATE ON capacity_decisions
+        BEGIN
+            SELECT RAISE(ABORT, 'capacity decisions are append-only');
+        END
+    """,
+    "prevent_capacity_decision_delete": """
+        CREATE TRIGGER prevent_capacity_decision_delete
+        BEFORE DELETE ON capacity_decisions
+        BEGIN
+            SELECT RAISE(ABORT, 'capacity decisions are append-only');
+        END
+    """,
+    "prevent_reservation_absorption_update": """
+        CREATE TRIGGER prevent_reservation_absorption_update
+        BEFORE UPDATE ON reservation_absorptions
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation absorptions are append-only');
+        END
+    """,
+    "prevent_reservation_absorption_delete": """
+        CREATE TRIGGER prevent_reservation_absorption_delete
+        BEFORE DELETE ON reservation_absorptions
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation absorptions are append-only');
+        END
+    """,
+    "prevent_margin_reservation_delete": """
+        CREATE TRIGGER prevent_margin_reservation_delete
+        BEFORE DELETE ON margin_reservations
+        BEGIN
+            SELECT RAISE(ABORT, 'margin reservations are durable');
+        END
+    """,
+    "prevent_margin_reservation_identity_update": """
+        CREATE TRIGGER prevent_margin_reservation_identity_update
+        BEFORE UPDATE ON margin_reservations
+        WHEN OLD.intent_id IS NOT NEW.intent_id
+           OR OLD.account_id IS NOT NEW.account_id
+           OR OLD.environment IS NOT NEW.environment
+           OR OLD.amount IS NOT NEW.amount
+           OR OLD.risk_decision_id IS NOT NEW.risk_decision_id
+           OR OLD.max_loss_amount IS NOT NEW.max_loss_amount
+           OR OLD.quote_observed_at IS NOT NEW.quote_observed_at
+           OR OLD.quote_digest IS NOT NEW.quote_digest
+           OR OLD.portfolio_observed_at IS NOT NEW.portfolio_observed_at
+           OR OLD.portfolio_snapshot_digest IS NOT NEW.portfolio_snapshot_digest
+           OR OLD.capacity_decision_sha256 IS NOT NEW.capacity_decision_sha256
+           OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'margin reservation identity is immutable');
+        END
+    """,
+    "prevent_margin_reservation_invalid_transition": """
+        CREATE TRIGGER prevent_margin_reservation_invalid_transition
+        BEFORE UPDATE ON margin_reservations
+        WHEN NOT (
+            OLD.state = NEW.state
+            OR (
+                OLD.state = 'ACTIVE'
+                AND NEW.state IN ('FILLED_PENDING_ABSORPTION','RELEASED')
+            )
+            OR (
+                OLD.state = 'FILLED_PENDING_ABSORPTION'
+                AND NEW.state = 'RELEASED'
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid margin reservation transition');
+        END
+    """,
+    "prevent_margin_reservation_release_rewrite": """
+        CREATE TRIGGER prevent_margin_reservation_release_rewrite
+        BEFORE UPDATE ON margin_reservations
+        WHEN OLD.state = NEW.state
+         AND (
+            OLD.released_reason_code IS NOT NEW.released_reason_code
+            OR OLD.released_at IS NOT NEW.released_at
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'margin reservation release metadata is immutable');
+        END
+    """,
+    "validate_margin_reservation_insert": """
+        CREATE TRIGGER validate_margin_reservation_insert
+        BEFORE INSERT ON margin_reservations
+        WHEN NOT (
+            EXISTS (
+                SELECT 1
+                FROM order_intents AS intent
+                JOIN reservation_caps AS cap
+                  ON cap.account_id = intent.account_id
+                 AND cap.environment = intent.environment
+                JOIN capacity_decisions AS decision
+                  ON decision.capacity_decision_sha256 =
+                        NEW.capacity_decision_sha256
+                WHERE intent.intent_id = NEW.intent_id
+                  AND intent.intent_kind = 'OPENING'
+                  AND intent.state = 'INTENT'
+                  AND intent.broker_order_id IS NULL
+                  AND NEW.account_id = intent.account_id
+                  AND NEW.environment = intent.environment
+                  AND NEW.risk_decision_id = intent.decision_id
+                  AND NEW.state = 'ACTIVE'
+                  AND NEW.released_reason_code IS NULL
+                  AND NEW.released_at IS NULL
+                  AND NEW.created_at >= intent.created_at
+                  AND cap.capacity_decision_sha256 =
+                        NEW.capacity_decision_sha256
+                  AND cap.cap_amount = decision.cap_amount
+                  AND cap.broker_buying_power =
+                        decision.broker_buying_power
+                  AND cap.risk_budget = decision.risk_budget
+                  AND cap.observed_at = decision.observed_at
+                  AND cap.portfolio_snapshot_digest =
+                        decision.capacity_snapshot_sha256
+                  AND decision.account_id = NEW.account_id
+                  AND decision.environment = NEW.environment
+                  AND NEW.portfolio_observed_at =
+                        decision.observed_at
+                  AND NEW.portfolio_snapshot_digest =
+                        decision.capacity_snapshot_sha256
+                  AND etrade_decimal_gte(
+                        NEW.amount,
+                        etrade_opening_exposure_floor(
+                            intent.wire_payload
+                        )
+                  ) = 1
+                  AND etrade_decimal_gte(
+                        NEW.max_loss_amount,
+                        etrade_opening_exposure_floor(
+                            intent.wire_payload
+                        )
+                  ) = 1
+                  AND etrade_decimal_gte(
+                        decision.cap_amount,
+                        NEW.amount
+                  ) = 1
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM order_intents AS intent
+                JOIN ledger_metadata AS metadata
+                  ON metadata.singleton = 1
+                WHERE metadata.schema_version IN (8, 9)
+                  AND intent.intent_id = NEW.intent_id
+                  AND intent.intent_kind = 'OPENING'
+                  AND intent.state != 'FAILED'
+                  AND NEW.account_id = intent.account_id
+                  AND NEW.environment = intent.environment
+                  AND NEW.risk_decision_id =
+                        'legacy-opening-migration'
+                  AND NEW.amount =
+                        etrade_opening_exposure_floor(
+                            intent.wire_payload
+                        )
+                  AND NEW.max_loss_amount = NEW.amount
+                  AND NEW.quote_observed_at = intent.created_at
+                  AND NEW.portfolio_observed_at =
+                        intent.created_at
+                  AND NEW.created_at = intent.created_at
+                  AND NEW.quote_digest =
+                        etrade_legacy_reservation_digest(
+                            'quote', metadata.schema_version,
+                            intent.intent_id, intent.payload_hash
+                        )
+                  AND NEW.portfolio_snapshot_digest =
+                        etrade_legacy_reservation_digest(
+                            'portfolio', metadata.schema_version,
+                            intent.intent_id, intent.payload_hash
+                        )
+                  AND NEW.capacity_decision_sha256 IS NULL
+                  AND NEW.released_reason_code IS NULL
+                  AND NEW.released_at IS NULL
+                  AND (
+                        (
+                            intent.state IN (
+                                'FILLED','CANCELLED',
+                                'REJECTED','EXPIRED'
+                            )
+                            AND NEW.state =
+                                'FILLED_PENDING_ABSORPTION'
+                        )
+                        OR
+                        (
+                            intent.state IN (
+                                'INTENT','CLAIMED',
+                                'SUBMISSION_UNKNOWN','SUBMITTED'
+                            )
+                            AND NEW.state = 'ACTIVE'
+                        )
+                  )
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'margin reservation insert lacks exact risk provenance');
+        END
+    """,
+    "validate_reservation_created_event_insert": """
+        CREATE TRIGGER validate_reservation_created_event_insert
+        BEFORE INSERT ON order_events
+        WHEN NEW.event_type = 'RESERVATION_CREATED'
+         AND NOT (
+            EXISTS (
+                SELECT 1
+                FROM margin_reservations AS reservation
+                JOIN order_intents AS intent
+                  ON intent.intent_id = reservation.intent_id
+                WHERE reservation.intent_id = NEW.intent_id
+                  AND reservation.account_id = NEW.account_id
+                  AND reservation.environment = NEW.environment
+                  AND reservation.created_at = NEW.created_at
+                  AND reservation.capacity_decision_sha256
+                        IS NOT NULL
+                  AND intent.client_order_id =
+                        NEW.client_order_id
+                  AND intent.state = 'INTENT'
+                  AND NEW.from_state = 'INTENT'
+                  AND NEW.to_state = 'INTENT'
+                  AND NEW.actor = 'system'
+                  AND NEW.reason_code =
+                        'RESERVATION_CREATED'
+                  AND NEW.broker_status IS NULL
+                  AND NEW.broker_order_id IS NULL
+                  AND NEW.observed_at IS NULL
+                  AND NEW.evidence_operation IS NULL
+                  AND NEW.http_status IS NULL
+                  AND NEW.raw_response_digest IS NULL
+                  AND NEW.broker_read_evidence_sha256 IS NULL
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM margin_reservations AS reservation
+                JOIN order_intents AS intent
+                  ON intent.intent_id = reservation.intent_id
+                JOIN ledger_metadata AS metadata
+                  ON metadata.singleton = 1
+                WHERE metadata.schema_version IN (8, 9)
+                  AND reservation.intent_id = NEW.intent_id
+                  AND reservation.account_id = NEW.account_id
+                  AND reservation.environment = NEW.environment
+                  AND reservation.created_at = NEW.created_at
+                  AND reservation.risk_decision_id =
+                        'legacy-opening-migration'
+                  AND reservation.capacity_decision_sha256
+                        IS NULL
+                  AND intent.client_order_id =
+                        NEW.client_order_id
+                  AND NEW.from_state = intent.state
+                  AND NEW.to_state = intent.state
+                  AND NEW.actor = 'schema-migration'
+                  AND NEW.reason_code =
+                        'RESERVATION_CREATED'
+                  AND NEW.broker_status IS NULL
+                  AND NEW.broker_order_id IS NULL
+                  AND NEW.observed_at IS NULL
+                  AND NEW.evidence_operation IS NULL
+                  AND NEW.http_status IS NULL
+                  AND NEW.raw_response_digest IS NULL
+                  AND NEW.broker_read_evidence_sha256 IS NULL
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation creation event lacks exact risk provenance');
+        END
+    """,
+    "validate_margin_reservation_pre_post_release": """
+        CREATE TRIGGER validate_margin_reservation_pre_post_release
+        BEFORE UPDATE ON margin_reservations
+        WHEN OLD.state = 'ACTIVE'
+         AND NEW.state = 'RELEASED'
+         AND NOT EXISTS (
+            SELECT 1
+            FROM order_intents AS intent
+            WHERE intent.intent_id = OLD.intent_id
+              AND intent.intent_kind = 'OPENING'
+              AND intent.state = 'FAILED'
+              AND intent.broker_order_id IS NULL
+              AND intent.updated_at = NEW.released_at
+              AND NEW.released_reason_code =
+                    'PRE_POST_ABORTED'
+              AND EXISTS (
+                    SELECT 1
+                    FROM order_events AS claim
+                    WHERE claim.intent_id = intent.intent_id
+                      AND claim.event_type =
+                            'SUBMISSION_CLAIMED'
+                      AND claim.from_state = 'INTENT'
+                      AND claim.to_state = 'CLAIMED'
+                      AND claim.reason_code =
+                            'SUBMISSION_CLAIMED'
+                      AND claim.created_at <= NEW.released_at
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM order_events AS post
+                    WHERE post.intent_id = intent.intent_id
+                      AND post.event_type = 'POST_STARTED'
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM transport_send_attempts AS attempt
+                    WHERE attempt.intent_id = intent.intent_id
+                      AND attempt.transport_operation =
+                            'SUBMIT_PLACE'
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM transport_response_receipts AS response
+                    WHERE response.intent_id = intent.intent_id
+                      AND response.transport_operation =
+                            'SUBMIT_PLACE'
+              )
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'active reservation release lacks pre-post failure proof');
+        END
+    """,
+    "validate_reservation_absorption_insert": """
+        CREATE TRIGGER validate_reservation_absorption_insert
+        BEFORE INSERT ON reservation_absorptions
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM order_intents AS intent
+            JOIN margin_reservations AS reservation
+              ON reservation.intent_id = intent.intent_id
+            JOIN broker_read_manifests AS terminal_manifest
+              ON terminal_manifest.evidence_sha256 =
+                    NEW.terminal_order_evidence_sha256
+            WHERE intent.intent_id = NEW.intent_id
+              AND intent.intent_kind = 'OPENING'
+              AND intent.account_id = NEW.account_id
+              AND intent.environment = NEW.environment
+              AND intent.broker_order_id = NEW.broker_order_id
+              AND intent.state = NEW.terminal_state
+              AND reservation.account_id = NEW.account_id
+              AND reservation.environment = NEW.environment
+              AND reservation.state = 'FILLED_PENDING_ABSORPTION'
+              AND reservation.capacity_decision_sha256
+                    IS NEW.baseline_capacity_decision_sha256
+              AND terminal_manifest.evidence_kind = 'ORDER_QUERY'
+              AND terminal_manifest.completeness = 'COMPLETE'
+              AND terminal_manifest.account_id = NEW.account_id
+              AND terminal_manifest.environment = NEW.environment
+              AND terminal_manifest.target_broker_order_id =
+                    NEW.broker_order_id
+              AND (
+                    (
+                        NEW.classification = 'ZERO_FILL'
+                        AND intent.state IN (
+                            'CANCELLED','REJECTED','EXPIRED'
+                        )
+                        AND NEW.absorbed_margin_amount = '0'
+                        AND NEW.post_capacity_decision_sha256 IS NULL
+                        AND NEW.post_capacity_evidence_sha256 IS NULL
+                    )
+                    OR
+                    (
+                        NEW.classification = 'FULL_FILL'
+                        AND intent.state = 'FILLED'
+                        AND NEW.absorbed_margin_amount = reservation.amount
+                        AND EXISTS (
+                            SELECT 1
+                            FROM capacity_decisions AS post_decision
+                            JOIN broker_read_manifests AS post_manifest
+                              ON post_manifest.evidence_sha256 =
+                                    NEW.post_capacity_evidence_sha256
+                            WHERE post_decision.capacity_decision_sha256 =
+                                    NEW.post_capacity_decision_sha256
+                              AND post_decision.evidence_sha256 =
+                                    NEW.post_capacity_evidence_sha256
+                              AND post_decision.account_id = NEW.account_id
+                              AND post_decision.environment = NEW.environment
+                              AND post_manifest.evidence_kind = 'CAPACITY'
+                              AND post_manifest.completeness = 'COMPLETE'
+                              AND post_manifest.account_id = NEW.account_id
+                              AND post_manifest.environment = NEW.environment
+                              AND post_manifest.target_broker_order_id IS NULL
+                        )
+                    )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'reservation absorption is not cross-bound to durable risk');
+        END
+    """,
+    "require_terminal_absorption_receipt": """
+        CREATE TRIGGER require_terminal_absorption_receipt
+        BEFORE UPDATE ON margin_reservations
+        WHEN OLD.state = 'FILLED_PENDING_ABSORPTION'
+         AND NEW.state = 'RELEASED'
+         AND NOT EXISTS (
+            SELECT 1
+            FROM reservation_absorptions
+            WHERE intent_id = OLD.intent_id
+              AND (
+                    (
+                        classification = 'ZERO_FILL'
+                        AND NEW.released_reason_code =
+                            'ZERO_FILL_CONFIRMED'
+                    )
+                    OR
+                    (
+                        classification = 'FULL_FILL'
+                        AND NEW.released_reason_code =
+                            'FULL_FILL_POSITION_ABSORBED'
+                    )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal reservation release lacks absorption receipt');
+        END
+    """,
+}
 
 
 class OrderIntentLedgerError(RuntimeError):
@@ -431,6 +1019,47 @@ class CapacityDecisionReceipt:
 
 
 @dataclass(frozen=True)
+class TerminalAbsorptionRequirement:
+    intent_id: str
+    classification: Literal["ZERO_FILL", "FULL_FILL"]
+    terminal_state: Literal[
+        "FILLED", "CANCELLED", "REJECTED", "EXPIRED"
+    ]
+    broker_order_id: str
+    terminal_order_evidence_sha256: str
+    baseline_capacity_decision_sha256: str | None
+    ordered_quantity: int
+    filled_quantity: int
+    post_capacity_required: bool
+
+
+@dataclass(frozen=True)
+class ReservationAbsorptionReceipt:
+    absorption_sha256: str
+    intent_id: str
+    account_id: str
+    environment: Literal["sandbox", "production"]
+    broker_order_id: str
+    terminal_state: Literal[
+        "FILLED", "CANCELLED", "REJECTED", "EXPIRED"
+    ]
+    classification: Literal["ZERO_FILL", "FULL_FILL"]
+    terminal_order_evidence_sha256: str
+    baseline_capacity_decision_sha256: str | None
+    post_capacity_decision_sha256: str | None
+    post_capacity_evidence_sha256: str | None
+    ordered_quantity: int
+    filled_quantity: int
+    placed_time_epoch_ms: str
+    executed_time_epoch_ms: str | None
+    canonical_lot_proof_json: str
+    lot_proof_sha256: str
+    absorbed_margin_amount: Decimal
+    observed_at: datetime
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
 class MarginReservation:
     intent_id: str
     account_id: str
@@ -687,6 +1316,61 @@ def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
         raise OrderIntentLedgerError(
             "ledger schema script ended with an incomplete statement"
         )
+
+
+def _normalized_schema_sql(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").lower().split())
+
+
+def _sqlite_opening_exposure_floor(wire_payload: Any) -> str | None:
+    """SQLite fail-closed adapter for the immutable opening-risk floor."""
+
+    try:
+        payload = json.loads(wire_payload)
+        if type(payload) is not dict:
+            return None
+        return _canonical_amount(_opening_exposure_floor(payload))
+    except Exception:
+        return None
+
+
+def _sqlite_decimal_gte(left: Any, right: Any) -> int:
+    """Compare canonical decimal text without SQLite's floating coercion."""
+
+    try:
+        return int(
+            _canonical_signed_decimal_text(left, "left decimal")
+            >= _canonical_signed_decimal_text(right, "right decimal")
+        )
+    except OrderIntentLedgerError:
+        return 0
+
+
+def _sqlite_legacy_reservation_digest(
+    kind: Any,
+    source_schema_version: Any,
+    intent_id: Any,
+    payload_hash: Any,
+) -> str | None:
+    if (
+        kind not in {"quote", "portfolio"}
+        or type(source_schema_version) is not int
+        or source_schema_version not in {8, 9}
+        or type(intent_id) is not str
+        or type(payload_hash) is not str
+    ):
+        return None
+    material = {
+        "source_schema_version": source_schema_version,
+        "intent_id": intent_id,
+        "payload_hash": payload_hash,
+    }
+    domain = (
+        b"etrade-legacy-reservation-quote.v1\0"
+        if kind == "quote"
+        else b"etrade-legacy-reservation-portfolio.v1\0"
+    )
+    return _domain_json_hash(domain, material)
 
 
 class OrderIntentLedger:
@@ -1564,8 +2248,7 @@ class OrderIntentLedger:
                 )
             cap = conn.execute(
                 """
-                SELECT cap_amount, observed_at, portfolio_snapshot_digest,
-                       capacity_decision_sha256
+                SELECT *
                 FROM reservation_caps
                 WHERE account_id = ? AND environment = ?
                 """,
@@ -1581,6 +2264,7 @@ class OrderIntentLedger:
                 raise OrderIntentIntegrityError(
                     "reservation must name the exact durable capacity decision"
                 )
+            self._verified_reservation_cap_row(conn, cap)
             if (
                 int(cap["observed_at"]) != _to_us(evidence.portfolio_observed_at)
                 or cap["portfolio_snapshot_digest"] != evidence.portfolio_snapshot_digest
@@ -1668,6 +2352,69 @@ class OrderIntentLedger:
                 (account_id, environment),
             ).fetchone()
         return int(row["total"])
+
+    def pending_terminal_reservations(
+        self, account_id: str, environment: str
+    ) -> tuple[IntentRecord, ...]:
+        """Return terminal opening intents whose risk is not yet absorbed."""
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT order_intents.*,
+                       margin_reservations.account_id
+                           AS reservation_account_id,
+                       margin_reservations.environment
+                           AS reservation_environment
+                FROM margin_reservations
+                JOIN order_intents USING (intent_id)
+                WHERE margin_reservations.state =
+                          'FILLED_PENDING_ABSORPTION'
+                  AND (
+                        (
+                            margin_reservations.account_id = ?
+                            AND margin_reservations.environment = ?
+                        )
+                        OR
+                        (
+                            order_intents.account_id = ?
+                            AND order_intents.environment = ?
+                        )
+                  )
+                ORDER BY order_intents.created_at, order_intents.intent_id
+                """,
+                (
+                    account_id,
+                    environment,
+                    account_id,
+                    environment,
+                ),
+            ).fetchall()
+            for row in rows:
+                if (
+                    row["account_id"] != account_id
+                    or row["environment"] != environment
+                    or row["reservation_account_id"] != account_id
+                    or row["reservation_environment"] != environment
+                    or row["intent_kind"] != "OPENING"
+                    or row["state"]
+                    not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+                    or row["broker_order_id"] is None
+                    or conn.execute(
+                        """
+                        SELECT 1 FROM reservation_absorptions
+                        WHERE intent_id = ?
+                        """,
+                        (row["intent_id"],),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise OrderIntentIntegrityError(
+                        "pending terminal reservation has inconsistent durable state"
+                    )
+            return tuple(self._intent_from_row(row) for row in rows)
 
     def claim_submission(self, intent_id: str, owner: str, *, lease_seconds: float) -> SubmissionLease:
         _validate_identity("intent_id", intent_id)
@@ -2383,21 +3130,282 @@ class OrderIntentLedger:
             self._append_reconciliation_event(conn, intent_id, intent["state"], terminal_state, "BROKER_TERMINAL_RECONCILED", reason_code, evidence, now)
             return self._intent_from_row(self._require_intent(conn, intent_id))
 
+    def terminal_absorption_requirement(
+        self,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+    ) -> TerminalAbsorptionRequirement:
+        """Classify an exact fresh terminal read without changing risk state."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(terminal_order_evidence) is not BrokerReadEvidenceRef
+            or terminal_order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "terminal absorption requires exact ORDER_QUERY evidence"
+            )
+        now = self._now_us()
+        with self._connection() as conn:
+            requirement, _, _, _, _ = (
+                self._terminal_absorption_requirement_conn(
+                    conn,
+                    intent_id,
+                    terminal_order_evidence,
+                    now,
+                )
+            )
+        return requirement
+
+    def absorb_terminal_reservation(
+        self,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+        *,
+        post_capacity_decision: CapacityDecisionReceipt | None = None,
+    ) -> ReservationAbsorptionReceipt:
+        """Release terminal reservation state only from exact durable proof."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(terminal_order_evidence) is not BrokerReadEvidenceRef
+            or terminal_order_evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "terminal absorption requires exact ORDER_QUERY evidence"
+            )
+        if (
+            post_capacity_decision is not None
+            and type(post_capacity_decision) is not CapacityDecisionReceipt
+        ):
+            raise OrderIntentValidationError(
+                "post-capacity proof must use the exact decision receipt type"
+            )
+        now = self._now_us()
+        with self._transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                receipt = self._reservation_absorption_from_row(
+                    conn, existing
+                )
+                requested_decision = (
+                    None
+                    if post_capacity_decision is None
+                    else post_capacity_decision.decision_sha256
+                )
+                if (
+                    receipt.terminal_order_evidence_sha256
+                    != terminal_order_evidence.evidence_sha256
+                    or receipt.post_capacity_decision_sha256
+                    != requested_decision
+                ):
+                    raise OrderIntentIntegrityError(
+                        "terminal reservation already has a conflicting absorption proof"
+                    )
+                return receipt
+
+            (
+                requirement,
+                intent,
+                reservation,
+                terminal_manifest,
+                terminal_result,
+            ) = self._terminal_absorption_requirement_conn(
+                conn,
+                intent_id,
+                terminal_order_evidence,
+                now,
+            )
+            post_decision_sha256: str | None = None
+            post_evidence_sha256: str | None = None
+            canonical_lot_proof: list[dict[str, Any]] = []
+            absorbed_margin_amount = "0"
+            observed_at = int(terminal_manifest["observed_at"])
+            if requirement.classification == "ZERO_FILL":
+                if post_capacity_decision is not None:
+                    raise OrderIntentIntegrityError(
+                        "zero-fill absorption cannot be rebound to capacity evidence"
+                    )
+            else:
+                if post_capacity_decision is None:
+                    raise OrderIntentReconciliationRequired(
+                        "full-fill absorption requires a newer exact capacity decision"
+                    )
+                (
+                    post_manifest,
+                    post_result,
+                ) = self._verified_capacity_decision_receipt(
+                    conn, post_capacity_decision, now
+                )
+                self._require_latest_complete_manifest_head(
+                    conn, post_manifest, recorded_at_boundary=now
+                )
+                if (
+                    post_manifest["account_id"] != intent["account_id"]
+                    or post_manifest["environment"]
+                    != intent["environment"]
+                    or int(post_manifest["observed_at"])
+                    <= int(terminal_manifest["observed_at"])
+                ):
+                    raise OrderIntentReconciliationRequired(
+                        "post-fill capacity evidence must be newer and bound to the same account"
+                    )
+                if self._manifest_request_started_at(
+                    conn, post_capacity_decision.evidence_sha256
+                ) <= int(terminal_manifest["observed_at"]):
+                    raise OrderIntentReconciliationRequired(
+                        "post-fill capacity read began before terminal order evidence"
+                    )
+                canonical_lot_proof = _terminal_position_lot_proof(
+                    post_result,
+                    broker_order_id=requirement.broker_order_id,
+                    fill_summary=terminal_result["fill_summary"],
+                )
+                post_decision_sha256 = (
+                    post_capacity_decision.decision_sha256
+                )
+                post_evidence_sha256 = (
+                    post_capacity_decision.evidence_sha256
+                )
+                absorbed_margin_amount = reservation["amount"]
+                observed_at = int(post_manifest["observed_at"])
+
+            lot_proof_json = _canonical_read_json(
+                canonical_lot_proof
+            )
+            lot_proof_sha256 = _domain_bytes_hash(
+                _LOT_PROOF_HASH_DOMAIN,
+                lot_proof_json.encode("utf-8"),
+            )
+            fill_summary = terminal_result["fill_summary"]
+            absorption_material = {
+                "intent_id": intent_id,
+                "account_id": intent["account_id"],
+                "environment": intent["environment"],
+                "broker_order_id": requirement.broker_order_id,
+                "terminal_state": requirement.terminal_state,
+                "classification": requirement.classification,
+                "terminal_order_evidence_sha256":
+                    terminal_order_evidence.evidence_sha256,
+                "baseline_capacity_decision_sha256":
+                    reservation["capacity_decision_sha256"],
+                "post_capacity_decision_sha256":
+                    post_decision_sha256,
+                "post_capacity_evidence_sha256":
+                    post_evidence_sha256,
+                "ordered_quantity": requirement.ordered_quantity,
+                "filled_quantity": requirement.filled_quantity,
+                "placed_time_epoch_ms":
+                    fill_summary["placed_time_epoch_ms"],
+                "executed_time_epoch_ms":
+                    fill_summary["executed_time_epoch_ms"],
+                "canonical_lot_proof_json": lot_proof_json,
+                "lot_proof_sha256": lot_proof_sha256,
+                "absorbed_margin_amount": absorbed_margin_amount,
+                "observed_at": observed_at,
+                "recorded_at": now,
+            }
+            absorption_sha256 = _domain_json_hash(
+                _RESERVATION_ABSORPTION_HASH_DOMAIN,
+                absorption_material,
+            )
+            conn.execute(
+                """
+                INSERT INTO reservation_absorptions (
+                    absorption_sha256, intent_id, account_id,
+                    environment, broker_order_id, terminal_state,
+                    classification, terminal_order_evidence_sha256,
+                    baseline_capacity_decision_sha256,
+                    post_capacity_decision_sha256,
+                    post_capacity_evidence_sha256, ordered_quantity,
+                    filled_quantity, placed_time_epoch_ms,
+                    executed_time_epoch_ms, canonical_lot_proof_json,
+                    lot_proof_sha256, absorbed_margin_amount,
+                    observed_at, recorded_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
+                )
+                """,
+                (
+                    absorption_sha256,
+                    *absorption_material.values(),
+                ),
+            )
+            release_reason = (
+                "ZERO_FILL_CONFIRMED"
+                if requirement.classification == "ZERO_FILL"
+                else "FULL_FILL_POSITION_ABSORBED"
+            )
+            conn.execute(
+                """
+                UPDATE margin_reservations
+                SET state = 'RELEASED', released_reason_code = ?,
+                    released_at = ?
+                WHERE intent_id = ?
+                  AND state = 'FILLED_PENDING_ABSORPTION'
+                """,
+                (release_reason, now, intent_id),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise OrderIntentIntegrityError(
+                    "terminal reservation release was not atomic"
+                )
+            self._append_event(
+                conn,
+                intent_id,
+                (
+                    "RESERVATION_RELEASED"
+                    if requirement.classification == "ZERO_FILL"
+                    else "FILLED_ABSORBED"
+                ),
+                intent["state"],
+                intent["state"],
+                "broker-evidence",
+                (
+                    "RESERVATION_RELEASED"
+                    if requirement.classification == "ZERO_FILL"
+                    else "FILLED_ABSORBED"
+                ),
+                now,
+                broker_status=intent["state"],
+                broker_order_id=requirement.broker_order_id,
+                observed_at=int(terminal_manifest["observed_at"]),
+                evidence_operation="ORDER_QUERY",
+                broker_read_evidence_sha256=(
+                    terminal_order_evidence.evidence_sha256
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            return self._reservation_absorption_from_row(conn, row)
+
     def absorb_filled_reservation(
         self, intent_id: str, evidence: AccountCapacityEvidence
     ) -> MarginReservation:
-        """Fail closed until R7b can prove a terminal order's position effect.
+        """Retained fail-closed compatibility shim for pre-R7e callers."""
 
-        A newer or merely different account digest cannot prove that the
-        snapshot incorporated this specific order, especially after a partial
-        fill. Keeping the reservation blocks new exposure without guessing.
-        """
         _validate_identity("intent_id", intent_id)
         if type(evidence) is not AccountCapacityEvidence:
-            raise OrderIntentValidationError("absorb_filled_reservation requires typed AccountCapacityEvidence")
-        AccountCapacityEvidence.validate(evidence, _from_us(self._now_us()))
+            raise OrderIntentValidationError(
+                "absorb_filled_reservation requires typed AccountCapacityEvidence"
+            )
+        AccountCapacityEvidence.validate(
+            evidence, _from_us(self._now_us())
+        )
         raise OrderIntentReconciliationRequired(
-            "terminal reservations require R7b position-level absorption evidence"
+            "use durable terminal order and schema-v2 capacity evidence"
         )
 
     def reconciliation_blockers(self, account_id: str, environment: str) -> tuple[IntentRecord, ...]:
@@ -2727,14 +3735,20 @@ class OrderIntentLedger:
 
     def _initialize_schema(self) -> None:
         with self._connection() as conn:
-            metadata_table = conn.execute(
+            metadata_before_lock = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_metadata'"
             ).fetchone()
-            if metadata_table is None:
+            if metadata_before_lock is None:
                 mode = conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
                 if str(mode).lower() != "delete":
                     raise OrderIntentLedgerError("ledger requires SQLite DELETE journaling in its private directory")
             conn.execute("BEGIN EXCLUSIVE")
+            # Another process may have initialized the securely precreated file
+            # while this constructor waited for the exclusive lock. Re-read the
+            # catalog under that lock rather than acting on stale pre-lock state.
+            metadata_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_metadata'"
+            ).fetchone()
             if metadata_table is None:
                 conn.execute("CREATE TABLE ledger_metadata (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)")
             conn.execute("INSERT OR IGNORE INTO ledger_metadata (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
@@ -2809,6 +3823,75 @@ class OrderIntentLedger:
                     CHECK (CAST(amount AS REAL) > 0 AND CAST(max_loss_amount AS REAL) > 0),
                     CHECK (length(quote_digest) = 64 AND length(portfolio_snapshot_digest) = 64),
                     CHECK ((state IN ('ACTIVE', 'FILLED_PENDING_ABSORPTION')) = (released_reason_code IS NULL AND released_at IS NULL))
+                );
+                CREATE TABLE IF NOT EXISTS reservation_absorptions (
+                    absorption_sha256 TEXT PRIMARY KEY
+                        CHECK (length(absorption_sha256) = 64),
+                    intent_id TEXT NOT NULL UNIQUE
+                        REFERENCES order_intents(intent_id),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (environment IN ('sandbox', 'production')),
+                    broker_order_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL CHECK (
+                        terminal_state IN (
+                            'FILLED','CANCELLED','REJECTED','EXPIRED'
+                        )
+                    ),
+                    classification TEXT NOT NULL
+                        CHECK (classification IN ('ZERO_FILL','FULL_FILL')),
+                    terminal_order_evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    baseline_capacity_decision_sha256 TEXT
+                        REFERENCES capacity_decisions(
+                            capacity_decision_sha256
+                        ),
+                    post_capacity_decision_sha256 TEXT
+                        REFERENCES capacity_decisions(
+                            capacity_decision_sha256
+                        ),
+                    post_capacity_evidence_sha256 TEXT
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    ordered_quantity INTEGER NOT NULL
+                        CHECK (ordered_quantity > 0),
+                    filled_quantity INTEGER NOT NULL CHECK (
+                        filled_quantity >= 0
+                        AND filled_quantity <= ordered_quantity
+                    ),
+                    placed_time_epoch_ms TEXT NOT NULL,
+                    executed_time_epoch_ms TEXT,
+                    canonical_lot_proof_json TEXT NOT NULL,
+                    lot_proof_sha256 TEXT NOT NULL
+                        CHECK (length(lot_proof_sha256) = 64),
+                    absorbed_margin_amount TEXT NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    CHECK (
+                        (
+                            classification = 'ZERO_FILL'
+                            AND terminal_state IN (
+                                'CANCELLED','REJECTED','EXPIRED'
+                            )
+                            AND filled_quantity = 0
+                            AND post_capacity_decision_sha256 IS NULL
+                            AND post_capacity_evidence_sha256 IS NULL
+                            AND executed_time_epoch_ms IS NULL
+                            AND canonical_lot_proof_json = '[]'
+                            AND absorbed_margin_amount = '0'
+                        )
+                        OR
+                        (
+                            classification = 'FULL_FILL'
+                            AND terminal_state = 'FILLED'
+                            AND filled_quantity = ordered_quantity
+                            AND baseline_capacity_decision_sha256 IS NOT NULL
+                            AND post_capacity_decision_sha256 IS NOT NULL
+                            AND post_capacity_evidence_sha256 IS NOT NULL
+                            AND executed_time_epoch_ms IS NOT NULL
+                            AND canonical_lot_proof_json != '[]'
+                            AND CAST(absorbed_margin_amount AS REAL) > 0
+                        )
+                    )
                 );
                 CREATE TABLE IF NOT EXISTS amendment_leases (
                     intent_id TEXT PRIMARY KEY REFERENCES order_intents(intent_id),
@@ -2940,6 +4023,10 @@ class OrderIntentLedger:
                 );
                 CREATE INDEX IF NOT EXISTS idx_intents_account_environment_state ON order_intents(account_id, environment, state);
                 CREATE INDEX IF NOT EXISTS idx_reservations_account_environment ON margin_reservations(account_id, environment, state);
+                CREATE INDEX IF NOT EXISTS idx_reservation_absorptions_account
+                ON reservation_absorptions(
+                    account_id, environment, classification
+                );
                 CREATE TABLE IF NOT EXISTS broker_order_history (
                     broker_order_id TEXT PRIMARY KEY,
                     intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
@@ -2959,14 +4046,6 @@ class OrderIntentLedger:
                 CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_delete BEFORE DELETE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_update BEFORE UPDATE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_delete BEFORE DELETE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_receipt_update BEFORE UPDATE ON broker_read_receipts BEGIN SELECT RAISE(ABORT, 'broker read receipts are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_receipt_delete BEFORE DELETE ON broker_read_receipts BEGIN SELECT RAISE(ABORT, 'broker read receipts are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_manifest_update BEFORE UPDATE ON broker_read_manifests BEGIN SELECT RAISE(ABORT, 'broker read manifests are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_manifest_delete BEFORE DELETE ON broker_read_manifests BEGIN SELECT RAISE(ABORT, 'broker read manifests are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_member_update BEFORE UPDATE ON broker_read_manifest_members BEGIN SELECT RAISE(ABORT, 'broker read manifest members are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_member_delete BEFORE DELETE ON broker_read_manifest_members BEGIN SELECT RAISE(ABORT, 'broker read manifest members are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_capacity_decision_update BEFORE UPDATE ON capacity_decisions BEGIN SELECT RAISE(ABORT, 'capacity decisions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS prevent_capacity_decision_delete BEFORE DELETE ON capacity_decisions BEGIN SELECT RAISE(ABORT, 'capacity decisions are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_intent_identity_mutation BEFORE UPDATE ON order_intents
                 WHEN OLD.account_id != NEW.account_id OR OLD.environment != NEW.environment OR OLD.strategy_id != NEW.strategy_id
                    OR OLD.decision_id != NEW.decision_id OR OLD.idempotency_scope != NEW.idempotency_scope
@@ -2979,11 +4058,109 @@ class OrderIntentLedger:
                 BEGIN SELECT RAISE(ABORT, 'terminal order intent cannot transition'); END;
                 """
             )
+            for definition in _REQUIRED_TRIGGER_DEFINITIONS.values():
+                conn.execute(
+                    definition.replace(
+                        "CREATE TRIGGER ",
+                        "CREATE TRIGGER IF NOT EXISTS ",
+                        1,
+                    )
+                )
+            self._migrate_legacy_opening_reservations(
+                conn, current_schema_version
+            )
             if current_schema_version != SCHEMA_VERSION:
                 conn.execute("UPDATE ledger_metadata SET schema_version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
             self._verify_schema_structure(conn)
             conn.execute("COMMIT")
             self._secure_sqlite_sidecars()
+
+    def _migrate_legacy_opening_reservations(
+        self,
+        conn: sqlite3.Connection,
+        source_schema_version: int,
+    ) -> None:
+        """Retain conservative risk for pre-reservation opening intents."""
+
+        if source_schema_version not in {8, 9}:
+            return
+        rows = conn.execute(
+            """
+            SELECT intent.*
+            FROM order_intents AS intent
+            LEFT JOIN margin_reservations AS reservation
+              ON reservation.intent_id = intent.intent_id
+            WHERE intent.intent_kind = 'OPENING'
+              AND intent.state != 'FAILED'
+              AND reservation.intent_id IS NULL
+            ORDER BY intent.intent_id
+            """
+        ).fetchall()
+        for intent in rows:
+            exposure = _canonical_amount(
+                _opening_exposure_floor(
+                    json.loads(intent["wire_payload"])
+                )
+            )
+            migration_material = {
+                "source_schema_version": source_schema_version,
+                "intent_id": intent["intent_id"],
+                "payload_hash": intent["payload_hash"],
+            }
+            quote_digest = _domain_json_hash(
+                b"etrade-legacy-reservation-quote.v1\0",
+                migration_material,
+            )
+            portfolio_digest = _domain_json_hash(
+                b"etrade-legacy-reservation-portfolio.v1\0",
+                migration_material,
+            )
+            reservation_state = (
+                "FILLED_PENDING_ABSORPTION"
+                if intent["state"]
+                in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+                else "ACTIVE"
+            )
+            observed_at = int(intent["created_at"])
+            conn.execute(
+                """
+                INSERT INTO margin_reservations (
+                    intent_id, account_id, environment, amount,
+                    risk_decision_id, max_loss_amount,
+                    quote_observed_at, quote_digest,
+                    portfolio_observed_at,
+                    portfolio_snapshot_digest,
+                    capacity_decision_sha256, state,
+                    released_reason_code, created_at, released_at
+                ) VALUES (
+                    ?, ?, ?, ?, 'legacy-opening-migration', ?, ?, ?, ?,
+                    ?, NULL, ?, NULL, ?, NULL
+                )
+                """,
+                (
+                    intent["intent_id"],
+                    intent["account_id"],
+                    intent["environment"],
+                    exposure,
+                    exposure,
+                    observed_at,
+                    quote_digest,
+                    observed_at,
+                    portfolio_digest,
+                    reservation_state,
+                    observed_at,
+                ),
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "RESERVATION_CREATED",
+                intent["state"],
+                intent["state"],
+                "schema-migration",
+                "RESERVATION_CREATED",
+                observed_at,
+            )
 
     @staticmethod
     def _ensure_broker_read_schema(conn: sqlite3.Connection) -> None:
@@ -3133,6 +4310,14 @@ class OrderIntentLedger:
                 account_id, environment, evidence_kind, observed_at
             )
             """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_broker_read_manifest_heads
+            ON broker_read_manifests (
+                account_id, environment, evidence_kind,
+                target_broker_order_id, completeness,
+                observed_at DESC, created_at
+            )
+            """,
         )
         for statement in statements:
             conn.execute(statement)
@@ -3177,8 +4362,7 @@ class OrderIntentLedger:
                     f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
                 )
 
-    @staticmethod
-    def _verify_schema_structure(conn: sqlite3.Connection) -> None:
+    def _verify_schema_structure(self, conn: sqlite3.Connection) -> None:
         if (
             str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             != "delete"
@@ -3252,6 +4436,28 @@ class OrderIntentLedger:
             "reservation_caps": {"capacity_decision_sha256"},
             "margin_reservations": {"capacity_decision_sha256"},
             "order_events": {"broker_read_evidence_sha256"},
+            "reservation_absorptions": {
+                "absorption_sha256",
+                "intent_id",
+                "account_id",
+                "environment",
+                "broker_order_id",
+                "terminal_state",
+                "classification",
+                "terminal_order_evidence_sha256",
+                "baseline_capacity_decision_sha256",
+                "post_capacity_decision_sha256",
+                "post_capacity_evidence_sha256",
+                "ordered_quantity",
+                "filled_quantity",
+                "placed_time_epoch_ms",
+                "executed_time_epoch_ms",
+                "canonical_lot_proof_json",
+                "lot_proof_sha256",
+                "absorbed_margin_amount",
+                "observed_at",
+                "recorded_at",
+            },
         }
         table_columns: dict[str, dict[str, sqlite3.Row]] = {}
         for table, required in required_columns.items():
@@ -3295,16 +4501,7 @@ class OrderIntentLedger:
                 raise OrderIntentLedgerError(
                     "broker read receipt schema permits missing provenance"
                 )
-        required_triggers = {
-            "prevent_broker_read_receipt_update",
-            "prevent_broker_read_receipt_delete",
-            "prevent_broker_read_manifest_update",
-            "prevent_broker_read_manifest_delete",
-            "prevent_broker_read_member_update",
-            "prevent_broker_read_member_delete",
-            "prevent_capacity_decision_update",
-            "prevent_capacity_decision_delete",
-        }
+        required_triggers = set(_REQUIRED_TRIGGER_DEFINITIONS)
         trigger_rows = conn.execute(
             """
             SELECT name, sql FROM sqlite_master
@@ -3316,12 +4513,10 @@ class OrderIntentLedger:
             raise OrderIntentLedgerError(
                 "ledger append-only provenance triggers are incomplete"
             )
-        for name in required_triggers:
-            sql = " ".join(str(triggers[name]).lower().split())
-            expected_action = (
-                "before update" if name.endswith("_update") else "before delete"
-            )
-            if expected_action not in sql or "raise(abort" not in sql:
+        for name, definition in _REQUIRED_TRIGGER_DEFINITIONS.items():
+            if _normalized_schema_sql(str(triggers[name])) != (
+                _normalized_schema_sql(definition)
+            ):
                 raise OrderIntentLedgerError(
                     "ledger provenance trigger definition is invalid"
                 )
@@ -3332,6 +4527,9 @@ class OrderIntentLedger:
             ("reservation_caps", "capacity_decisions"),
             ("margin_reservations", "capacity_decisions"),
             ("order_events", "broker_read_manifests"),
+            ("reservation_absorptions", "order_intents"),
+            ("reservation_absorptions", "broker_read_manifests"),
+            ("reservation_absorptions", "capacity_decisions"),
         }
         actual_foreign_keys = {
             (table, row["table"])
@@ -3365,6 +4563,7 @@ class OrderIntentLedger:
             raise OrderIntentLedgerError(
                 "ledger schema metadata is inconsistent"
             )
+        self._verify_durable_risk_state(conn)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -3373,6 +4572,24 @@ class OrderIntentLedger:
         conn = sqlite3.connect(str(self.path), timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
+            conn.create_function(
+                "etrade_opening_exposure_floor",
+                1,
+                _sqlite_opening_exposure_floor,
+                deterministic=True,
+            )
+            conn.create_function(
+                "etrade_decimal_gte",
+                2,
+                _sqlite_decimal_gte,
+                deterministic=True,
+            )
+            conn.create_function(
+                "etrade_legacy_reservation_digest",
+                4,
+                _sqlite_legacy_reservation_digest,
+                deterministic=True,
+            )
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA synchronous = FULL")
@@ -4073,12 +5290,664 @@ class OrderIntentLedger:
         _validate_sha256("expected_order_payload_hash", result)
         return result
 
-    @staticmethod
-    def _active_reservation_total(conn: sqlite3.Connection, account_id: str, environment: str) -> Decimal:
-        rows = conn.execute("SELECT amount FROM margin_reservations WHERE account_id = ? AND environment = ? AND state IN ('ACTIVE', 'FILLED_PENDING_ABSORPTION')", (account_id, environment)).fetchall()
+    def _active_reservation_total(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+    ) -> Decimal:
+        self._verify_durable_risk_state(
+            conn, account_id=account_id, environment=environment
+        )
+        rows = conn.execute(
+            """
+            SELECT reservation.amount, reservation.state,
+                   reservation.released_reason_code
+            FROM margin_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            WHERE (
+                    (
+                        reservation.account_id = ?
+                        AND reservation.environment = ?
+                    )
+                    OR
+                    (
+                        intent.account_id = ?
+                        AND intent.environment = ?
+                    )
+                  )
+              AND (
+                    reservation.state IN (
+                        'ACTIVE','FILLED_PENDING_ABSORPTION'
+                    )
+                    OR (
+                        reservation.state = 'RELEASED'
+                        AND reservation.released_reason_code =
+                            'FULL_FILL_POSITION_ABSORBED'
+                    )
+                  )
+            """,
+            (account_id, environment, account_id, environment),
+        ).fetchall()
         with localcontext() as decimal_context:
             decimal_context.prec = _DECIMAL_PRECISION
-            return sum((Decimal(row["amount"]) for row in rows), Decimal("0"))
+            return sum(
+                (Decimal(row["amount"]) for row in rows), Decimal("0")
+            )
+
+    def _verify_reservation_creation_provenance(
+        self,
+        conn: sqlite3.Connection,
+        reservation: sqlite3.Row,
+        amount: Decimal,
+    ) -> None:
+        """Rebuild the immutable opening floor and its creation event."""
+
+        try:
+            wire_payload = json.loads(
+                reservation["intent_wire_payload"]
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrderIntentIntegrityError(
+                "reservation intent payload is not valid JSON"
+            ) from exc
+        if type(wire_payload) is not dict:
+            raise OrderIntentIntegrityError(
+                "reservation intent payload is not an object"
+            )
+        try:
+            exposure_floor = _opening_exposure_floor(wire_payload)
+        except OrderIntentLedgerError as exc:
+            raise OrderIntentIntegrityError(
+                "reservation intent no longer has a defensible exposure floor"
+            ) from exc
+        max_loss = _canonical_signed_decimal_text(
+            reservation["max_loss_amount"],
+            "margin reservation max loss",
+        )
+        if amount < exposure_floor or max_loss < exposure_floor:
+            raise OrderIntentIntegrityError(
+                "margin reservation understates its immutable opening exposure"
+            )
+
+        creation_events = conn.execute(
+            """
+            SELECT * FROM order_events
+            WHERE intent_id = ?
+              AND event_type = 'RESERVATION_CREATED'
+            ORDER BY sequence
+            """,
+            (reservation["intent_id"],),
+        ).fetchall()
+        if len(creation_events) != 1:
+            raise OrderIntentIntegrityError(
+                "margin reservation lacks one creation event"
+            )
+        event = creation_events[0]
+        if (
+            event["account_id"] != reservation["account_id"]
+            or event["environment"] != reservation["environment"]
+            or event["client_order_id"]
+            != reservation["intent_client_order_id"]
+            or event["reason_code"] != "RESERVATION_CREATED"
+            or int(event["created_at"])
+            != int(reservation["created_at"])
+            or any(
+                event[field] is not None
+                for field in (
+                    "broker_status",
+                    "broker_order_id",
+                    "observed_at",
+                    "evidence_operation",
+                    "http_status",
+                    "raw_response_digest",
+                    "broker_read_evidence_sha256",
+                )
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "margin reservation creation event is disconnected"
+            )
+
+        decision_sha256 = reservation["capacity_decision_sha256"]
+        if decision_sha256 is None:
+            matching_versions = []
+            for source_version in (8, 9):
+                material = {
+                    "source_schema_version": source_version,
+                    "intent_id": reservation["intent_id"],
+                    "payload_hash": reservation["intent_payload_hash"],
+                }
+                if (
+                    reservation["quote_digest"]
+                    == _domain_json_hash(
+                        b"etrade-legacy-reservation-quote.v1\0",
+                        material,
+                    )
+                    and reservation["portfolio_snapshot_digest"]
+                    == _domain_json_hash(
+                        b"etrade-legacy-reservation-portfolio.v1\0",
+                        material,
+                    )
+                ):
+                    matching_versions.append(source_version)
+            synthetic_migration = (
+                matching_versions in ([8], [9])
+                and reservation["risk_decision_id"]
+                == "legacy-opening-migration"
+                and amount == exposure_floor
+                and max_loss == exposure_floor
+                and int(reservation["quote_observed_at"])
+                == int(reservation["intent_created_at"])
+                and int(reservation["portfolio_observed_at"])
+                == int(reservation["intent_created_at"])
+                and int(reservation["created_at"])
+                == int(reservation["intent_created_at"])
+                and event["actor"] == "schema-migration"
+                and event["from_state"] == event["to_state"]
+                and event["from_state"]
+                in {
+                    "INTENT",
+                    "CLAIMED",
+                    "SUBMISSION_UNKNOWN",
+                    "SUBMITTED",
+                    "FILLED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "EXPIRED",
+                }
+            )
+            historical_uncapped = (
+                reservation["risk_decision_id"]
+                == reservation["intent_decision_id"]
+                and int(reservation["created_at"])
+                >= int(reservation["intent_created_at"])
+                and event["actor"] == "system"
+                and event["from_state"] == "INTENT"
+                and event["to_state"] == "INTENT"
+            )
+            if not synthetic_migration and not historical_uncapped:
+                raise OrderIntentIntegrityError(
+                    "uncapped reservation lacks exact legacy migration provenance"
+                )
+        elif (
+            reservation["risk_decision_id"]
+            != reservation["intent_decision_id"]
+            or int(reservation["created_at"])
+            < int(reservation["intent_created_at"])
+            or event["actor"] != "system"
+            or event["from_state"] != "INTENT"
+            or event["to_state"] != "INTENT"
+        ):
+            raise OrderIntentIntegrityError(
+                "margin reservation creation provenance changed"
+            )
+
+        state = reservation["state"]
+        intent_state = reservation["intent_state"]
+        if (
+            state == "ACTIVE"
+            and intent_state
+            not in {
+                "INTENT",
+                "CLAIMED",
+                "SUBMISSION_UNKNOWN",
+                "SUBMITTED",
+            }
+        ) or (
+            state == "FILLED_PENDING_ABSORPTION"
+            and intent_state
+            not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        ):
+            raise OrderIntentIntegrityError(
+                "margin reservation lifecycle diverges from its intent"
+            )
+
+    @staticmethod
+    def _verify_pre_post_release_provenance(
+        conn: sqlite3.Connection,
+        reservation: sqlite3.Row,
+    ) -> None:
+        if (
+            reservation["intent_kind"] != "OPENING"
+            or reservation["intent_state"] != "FAILED"
+            or reservation["intent_broker_order_id"] is not None
+            or reservation["released_reason_code"]
+            != "PRE_POST_ABORTED"
+            or reservation["released_at"] is None
+            or int(reservation["released_at"])
+            != int(reservation["intent_updated_at"])
+        ):
+            raise OrderIntentIntegrityError(
+                "non-absorption reservation release is not a pre-post failure"
+            )
+        posted = conn.execute(
+            """
+            SELECT 1
+            FROM order_events
+            WHERE intent_id = ? AND event_type = 'POST_STARTED'
+            UNION ALL
+            SELECT 1
+            FROM transport_send_attempts
+            WHERE intent_id = ?
+              AND transport_operation = 'SUBMIT_PLACE'
+            UNION ALL
+            SELECT 1
+            FROM transport_response_receipts
+            WHERE intent_id = ?
+              AND transport_operation = 'SUBMIT_PLACE'
+            LIMIT 1
+            """,
+            (
+                reservation["intent_id"],
+                reservation["intent_id"],
+                reservation["intent_id"],
+            ),
+        ).fetchone()
+        if posted is not None:
+            raise OrderIntentIntegrityError(
+                "pre-post reservation release has durable POST evidence"
+            )
+        events = conn.execute(
+            """
+            SELECT * FROM order_events
+            WHERE intent_id = ?
+              AND event_type IN (
+                    'SUBMISSION_CLAIMED',
+                    'RESERVATION_RELEASED',
+                    'PRE_POST_FAILED'
+              )
+            ORDER BY sequence
+            """,
+            (reservation["intent_id"],),
+        ).fetchall()
+        claims = [
+            event
+            for event in events
+            if event["event_type"] == "SUBMISSION_CLAIMED"
+        ]
+        releases = [
+            event
+            for event in events
+            if event["event_type"] == "RESERVATION_RELEASED"
+        ]
+        failures = [
+            event
+            for event in events
+            if event["event_type"] == "PRE_POST_FAILED"
+        ]
+        if len(claims) != 1 or len(releases) != 1 or len(failures) != 1:
+            raise OrderIntentIntegrityError(
+                "pre-post reservation release event chain is incomplete"
+            )
+        claim, release, failure = claims[0], releases[0], failures[0]
+        released_at = int(reservation["released_at"])
+        identity = (
+            reservation["account_id"],
+            reservation["environment"],
+            reservation["intent_client_order_id"],
+        )
+        empty_evidence_fields = (
+            "broker_status",
+            "broker_order_id",
+            "observed_at",
+            "evidence_operation",
+            "http_status",
+            "raw_response_digest",
+            "broker_read_evidence_sha256",
+        )
+        if (
+            (
+                claim["account_id"],
+                claim["environment"],
+                claim["client_order_id"],
+            )
+            != identity
+            or claim["from_state"] != "INTENT"
+            or claim["to_state"] != "CLAIMED"
+            or claim["reason_code"] != "SUBMISSION_CLAIMED"
+            or (
+                release["account_id"],
+                release["environment"],
+                release["client_order_id"],
+            )
+            != identity
+            or release["from_state"] != "FAILED"
+            or release["to_state"] != "FAILED"
+            or release["actor"] != "system"
+            or release["reason_code"] != "RESERVATION_RELEASED"
+            or int(release["created_at"]) != released_at
+            or (
+                failure["account_id"],
+                failure["environment"],
+                failure["client_order_id"],
+            )
+            != identity
+            or failure["from_state"] != "CLAIMED"
+            or failure["to_state"] != "FAILED"
+            or failure["actor"] != claim["actor"]
+            or failure["reason_code"] != "PRE_POST_ABORTED"
+            or int(failure["created_at"]) != released_at
+            or int(release["sequence"]) + 1
+            != int(failure["sequence"])
+            or int(claim["sequence"]) >= int(release["sequence"])
+            or any(
+                event[field] is not None
+                for event in (claim, release, failure)
+                for field in empty_evidence_fields
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "pre-post reservation release event semantics changed"
+            )
+
+    def _verify_durable_risk_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_id: str | None = None,
+        environment: str | None = None,
+    ) -> None:
+        """Fail closed if durable reservation and absorption state diverge."""
+
+        if (account_id is None) != (environment is None):
+            raise OrderIntentIntegrityError(
+                "durable risk verification scope is incomplete"
+            )
+        parameters: tuple[str, ...] = ()
+        reservation_scope = ""
+        intent_scope = ""
+        absorption_scope = ""
+        cap_scope = ""
+        decision_cache: dict[
+            str, tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]
+        ] = {}
+        absorption_cache: dict[
+            str, ReservationAbsorptionReceipt
+        ] = {}
+        if account_id is not None and environment is not None:
+            parameters = (
+                account_id,
+                environment,
+                account_id,
+                environment,
+            )
+            reservation_scope = """
+                WHERE (
+                    (
+                        reservation.account_id = ?
+                        AND reservation.environment = ?
+                    )
+                    OR
+                    (
+                        intent.account_id = ?
+                        AND intent.environment = ?
+                    )
+                )
+            """
+            intent_scope = """
+                AND intent.account_id = ? AND intent.environment = ?
+            """
+            absorption_scope = """
+                WHERE (
+                    (
+                        absorption.account_id = ?
+                        AND absorption.environment = ?
+                    )
+                    OR
+                    (
+                        intent.account_id = ?
+                        AND intent.environment = ?
+                    )
+                )
+            """
+            cap_scope = """
+                WHERE (
+                    (
+                        cap.account_id = ?
+                        AND cap.environment = ?
+                    )
+                    OR
+                    (
+                        decision.account_id = ?
+                        AND decision.environment = ?
+                    )
+                )
+            """
+
+        missing_reservation = conn.execute(
+            f"""
+            SELECT intent.intent_id
+            FROM order_intents AS intent
+            LEFT JOIN margin_reservations AS reservation
+              ON reservation.intent_id = intent.intent_id
+            WHERE intent.intent_kind = 'OPENING'
+              AND intent.state != 'FAILED'
+              AND reservation.intent_id IS NULL
+              AND (
+                    intent.state != 'INTENT'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM order_events AS event
+                        WHERE event.intent_id = intent.intent_id
+                          AND event.event_type = 'RESERVATION_CREATED'
+                    )
+                  )
+              {intent_scope}
+            LIMIT 1
+            """,
+            (() if account_id is None else (account_id, environment)),
+        ).fetchone()
+        if missing_reservation is not None:
+            raise OrderIntentIntegrityError(
+                "opening intent lost its durable margin reservation"
+            )
+
+        reservations = conn.execute(
+            f"""
+            SELECT reservation.*, intent.account_id AS intent_account_id,
+                   intent.environment AS intent_environment,
+                   intent.intent_kind AS intent_kind,
+                   intent.state AS intent_state,
+                   intent.decision_id AS intent_decision_id,
+                   intent.wire_payload AS intent_wire_payload,
+                   intent.payload_hash AS intent_payload_hash,
+                   intent.client_order_id AS intent_client_order_id,
+                   intent.broker_order_id AS intent_broker_order_id,
+                   intent.created_at AS intent_created_at,
+                   intent.updated_at AS intent_updated_at
+            FROM margin_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            {reservation_scope}
+            ORDER BY reservation.intent_id
+            """,
+            parameters,
+        ).fetchall()
+        for reservation in reservations:
+            if (
+                reservation["intent_kind"] != "OPENING"
+                or reservation["account_id"]
+                != reservation["intent_account_id"]
+                or reservation["environment"]
+                != reservation["intent_environment"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "margin reservation identity diverges from its opening intent"
+                )
+            amount = _canonical_signed_decimal_text(
+                reservation["amount"], "margin reservation amount"
+            )
+            if amount <= 0:
+                raise OrderIntentIntegrityError(
+                    "margin reservation amount is not positive"
+                )
+            self._verify_reservation_creation_provenance(
+                conn, reservation, amount
+            )
+            decision_sha256 = reservation["capacity_decision_sha256"]
+            if decision_sha256 is not None:
+                decision, _manifest, _result = (
+                    self._cached_capacity_decision_row(
+                        conn, decision_sha256, decision_cache
+                    )
+                )
+                if (
+                    decision["account_id"] != reservation["account_id"]
+                    or decision["environment"] != reservation["environment"]
+                    or int(decision["observed_at"])
+                    != int(reservation["portfolio_observed_at"])
+                    or decision["capacity_snapshot_sha256"]
+                    != reservation["portfolio_snapshot_digest"]
+                ):
+                    raise OrderIntentIntegrityError(
+                        "margin reservation baseline decision chain diverges"
+                    )
+            absorption = conn.execute(
+                """
+                SELECT * FROM reservation_absorptions
+                WHERE intent_id = ?
+                """,
+                (reservation["intent_id"],),
+            ).fetchone()
+            absorption_reason = reservation["released_reason_code"] in {
+                "ZERO_FILL_CONFIRMED",
+                "FULL_FILL_POSITION_ABSORBED",
+            }
+            if reservation["state"] == "RELEASED" and absorption_reason:
+                if absorption is None:
+                    raise OrderIntentIntegrityError(
+                        "released terminal reservation lost its absorption receipt"
+                    )
+                absorption_sha256 = absorption["absorption_sha256"]
+                receipt = absorption_cache.get(absorption_sha256)
+                if receipt is None:
+                    receipt = self._reservation_absorption_from_row(
+                        conn,
+                        absorption,
+                        decision_cache=decision_cache,
+                    )
+                    absorption_cache[absorption_sha256] = receipt
+                expected_classification = (
+                    "ZERO_FILL"
+                    if reservation["released_reason_code"]
+                    == "ZERO_FILL_CONFIRMED"
+                    else "FULL_FILL"
+                )
+                if receipt.classification != expected_classification:
+                    raise OrderIntentIntegrityError(
+                        "released terminal reservation has the wrong absorption class"
+                    )
+            elif absorption is not None:
+                raise OrderIntentIntegrityError(
+                    "absorption receipt is disconnected from released terminal risk"
+                )
+            elif reservation["state"] == "RELEASED":
+                self._verify_pre_post_release_provenance(
+                    conn, reservation
+                )
+            if (
+                reservation["intent_state"] == "FILLED"
+                and reservation["state"] == "RELEASED"
+                and reservation["released_reason_code"]
+                != "FULL_FILL_POSITION_ABSORBED"
+            ):
+                raise OrderIntentIntegrityError(
+                    "filled opening reservation was released without retained risk"
+                )
+
+        absorptions = conn.execute(
+            f"""
+            SELECT absorption.*
+            FROM reservation_absorptions AS absorption
+            JOIN order_intents AS intent USING (intent_id)
+            {absorption_scope}
+            ORDER BY absorption.intent_id
+            """,
+            parameters,
+        ).fetchall()
+        for absorption in absorptions:
+            absorption_sha256 = absorption["absorption_sha256"]
+            if absorption_sha256 not in absorption_cache:
+                absorption_cache[absorption_sha256] = (
+                    self._reservation_absorption_from_row(
+                        conn,
+                        absorption,
+                        decision_cache=decision_cache,
+                    )
+                )
+
+        caps = conn.execute(
+            f"""
+            SELECT cap.*
+            FROM reservation_caps AS cap
+            LEFT JOIN capacity_decisions AS decision
+              ON decision.capacity_decision_sha256 =
+                    cap.capacity_decision_sha256
+            {cap_scope}
+            ORDER BY cap.account_id, cap.environment
+            """,
+            parameters,
+        ).fetchall()
+        for cap in caps:
+            if cap["capacity_decision_sha256"] is not None:
+                self._verified_reservation_cap_row(
+                    conn, cap, decision_cache=decision_cache
+                )
+
+    def _cached_capacity_decision_row(
+        self,
+        conn: sqlite3.Connection,
+        decision_sha256: str,
+        cache: dict[
+            str, tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]
+        ] | None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]:
+        if cache is None:
+            return self._verified_capacity_decision_row(
+                conn, decision_sha256
+            )
+        cached = cache.get(decision_sha256)
+        if cached is None:
+            cached = self._verified_capacity_decision_row(
+                conn, decision_sha256
+            )
+            cache[decision_sha256] = cached
+        return cached
+
+    def _verified_reservation_cap_row(
+        self,
+        conn: sqlite3.Connection,
+        cap: sqlite3.Row,
+        *,
+        decision_cache: dict[
+            str, tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]
+        ] | None = None,
+    ) -> sqlite3.Row:
+        decision_sha256 = cap["capacity_decision_sha256"]
+        if decision_sha256 is None:
+            raise OrderIntentIntegrityError(
+                "reservation cap lacks a durable capacity decision"
+            )
+        decision, _manifest, _result = (
+            self._cached_capacity_decision_row(
+                conn, decision_sha256, decision_cache
+            )
+        )
+        if (
+            cap["account_id"] != decision["account_id"]
+            or cap["environment"] != decision["environment"]
+            or cap["cap_amount"] != decision["cap_amount"]
+            or cap["broker_buying_power"]
+            != decision["broker_buying_power"]
+            or cap["risk_budget"] != decision["risk_budget"]
+            or int(cap["observed_at"]) != int(decision["observed_at"])
+            or cap["portfolio_snapshot_digest"]
+            != decision["capacity_snapshot_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation cap conflicts with its content-addressed decision"
+            )
+        return decision
 
     def _release_reservation(self, conn: sqlite3.Connection, intent_id: str, reason_code: str, now: int) -> None:
         reservation = conn.execute("SELECT * FROM margin_reservations WHERE intent_id = ?", (intent_id,)).fetchone()
@@ -4247,6 +6116,740 @@ class OrderIntentLedger:
                 "broker read manifest content hash does not verify"
             )
         return manifest, result
+
+    def _require_latest_complete_manifest_head(
+        self,
+        conn: sqlite3.Connection,
+        selected: sqlite3.Row,
+        *,
+        recorded_at_boundary: int,
+    ) -> None:
+        """Require selected evidence to be the unique semantic head at a time."""
+
+        if int(selected["created_at"]) > recorded_at_boundary:
+            raise OrderIntentReconciliationRequired(
+                "selected broker evidence did not exist at the decision boundary"
+            )
+        candidates = conn.execute(
+            """
+            SELECT evidence_sha256
+            FROM broker_read_manifests
+            WHERE evidence_kind = ?
+              AND account_id = ?
+              AND environment = ?
+              AND completeness = 'COMPLETE'
+              AND created_at <= ?
+              AND observed_at >= ?
+              AND (
+                    (
+                        ? IS NULL
+                        AND target_broker_order_id IS NULL
+                    )
+                    OR target_broker_order_id = ?
+                  )
+            ORDER BY observed_at DESC, evidence_sha256
+            """,
+            (
+                selected["evidence_kind"],
+                selected["account_id"],
+                selected["environment"],
+                recorded_at_boundary,
+                int(selected["observed_at"]),
+                selected["target_broker_order_id"],
+                selected["target_broker_order_id"],
+            ),
+        ).fetchall()
+        if not candidates:
+            raise OrderIntentReconciliationRequired(
+                "selected broker evidence has no complete durable head"
+            )
+        selected_observed_at = int(selected["observed_at"])
+        selected_result_sha256 = selected["canonical_result_sha256"]
+        for candidate_ref in candidates:
+            candidate, _result = self._verified_broker_read_manifest(
+                conn, candidate_ref["evidence_sha256"]
+            )
+            if (
+                candidate["account_id_key"]
+                != selected["account_id_key"]
+                or candidate["institution_type"]
+                != selected["institution_type"]
+                or candidate["origin"] != selected["origin"]
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "complete broker evidence heads disagree on account binding"
+                )
+            candidate_observed_at = int(candidate["observed_at"])
+            if candidate_observed_at > selected_observed_at:
+                raise OrderIntentReconciliationRequired(
+                    "selected broker evidence has been superseded"
+                )
+            if (
+                candidate_observed_at == selected_observed_at
+                and candidate["canonical_result_sha256"]
+                != selected_result_sha256
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "equal-time complete broker evidence heads conflict"
+                )
+
+    @staticmethod
+    def _manifest_request_started_at(
+        conn: sqlite3.Connection, evidence_sha256: str
+    ) -> int:
+        row = conn.execute(
+            """
+            SELECT MIN(receipt.request_started_at) AS first_started_at,
+                   COUNT(*) AS receipt_count
+            FROM broker_read_manifest_members AS member
+            JOIN broker_read_receipts AS receipt
+              ON receipt.receipt_sha256 = member.receipt_sha256
+            WHERE member.evidence_sha256 = ?
+            """,
+            (evidence_sha256,),
+        ).fetchone()
+        if row is None or int(row["receipt_count"]) <= 0:
+            raise OrderIntentIntegrityError(
+                "broker read manifest lost its request sequence"
+            )
+        return int(row["first_started_at"])
+
+    def _require_no_later_order_contradiction(
+        self,
+        conn: sqlite3.Connection,
+        selected_manifest: sqlite3.Row,
+        selected_result: dict[str, Any],
+        *,
+        recorded_at_boundary: int,
+    ) -> None:
+        semantic_keys = (
+            "schema",
+            "broker_order_id",
+            "raw_status",
+            "outcome",
+            "order_payload_hashes",
+            "not_found",
+            "replacement_links",
+            "fill_summary",
+        )
+        selected_semantics = {
+            key: selected_result.get(key) for key in semantic_keys
+        }
+        rows = conn.execute(
+            """
+            SELECT evidence_sha256
+            FROM broker_read_manifests
+            WHERE evidence_kind = 'ORDER_QUERY'
+              AND account_id = ?
+              AND environment = ?
+              AND target_broker_order_id = ?
+              AND completeness = 'COMPLETE'
+              AND created_at > ?
+              AND observed_at >= ?
+            ORDER BY observed_at, evidence_sha256
+            """,
+            (
+                selected_manifest["account_id"],
+                selected_manifest["environment"],
+                selected_manifest["target_broker_order_id"],
+                recorded_at_boundary,
+                int(selected_manifest["observed_at"]),
+            ),
+        ).fetchall()
+        for row in rows:
+            candidate, result = self._verified_broker_read_manifest(
+                conn, row["evidence_sha256"]
+            )
+            if (
+                candidate["account_id_key"]
+                != selected_manifest["account_id_key"]
+                or candidate["institution_type"]
+                != selected_manifest["institution_type"]
+                or candidate["origin"] != selected_manifest["origin"]
+                or {
+                    key: result.get(key) for key in semantic_keys
+                }
+                != selected_semantics
+            ):
+                raise OrderIntentIntegrityError(
+                    "later complete order evidence contradicts absorbed risk"
+                )
+
+    def _terminal_absorption_requirement_conn(
+        self,
+        conn: sqlite3.Connection,
+        intent_id: str,
+        terminal_order_evidence: BrokerReadEvidenceRef,
+        now: int,
+    ) -> tuple[
+        TerminalAbsorptionRequirement,
+        sqlite3.Row,
+        sqlite3.Row,
+        sqlite3.Row,
+        dict[str, Any],
+    ]:
+        intent = self._require_intent(conn, intent_id)
+        reservation = conn.execute(
+            """
+            SELECT * FROM margin_reservations WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone()
+        if (
+            intent["intent_kind"] != "OPENING"
+            or intent["state"]
+            not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+            or intent["broker_order_id"] is None
+            or reservation is None
+        ):
+            raise OrderIntentReconciliationRequired(
+                "only a terminal opening intent with durable risk can be absorbed"
+            )
+        if reservation["state"] != "FILLED_PENDING_ABSORPTION":
+            raise OrderIntentReconciliationRequired(
+                "terminal reservation is not pending absorption"
+            )
+        if (
+            reservation["account_id"] != intent["account_id"]
+            or reservation["environment"] != intent["environment"]
+        ):
+            raise OrderIntentIntegrityError(
+                "terminal reservation identity conflicts with its intent"
+            )
+        manifest, result = self._verified_broker_read_manifest(
+            conn, terminal_order_evidence.evidence_sha256
+        )
+        if (
+            manifest["evidence_kind"] != "ORDER_QUERY"
+            or manifest["completeness"] != "COMPLETE"
+            or manifest["account_id"] != intent["account_id"]
+            or manifest["environment"] != intent["environment"]
+            or manifest["target_broker_order_id"]
+            != intent["broker_order_id"]
+            or result.get("schema") != "etrade-order-query.v2"
+            or result.get("broker_order_id")
+            != intent["broker_order_id"]
+            or result.get("not_found") is not False
+            or result.get("outcome") != intent["state"]
+        ):
+            raise OrderIntentReconciliationRequired(
+                "terminal evidence is not an exact complete schema-v2 read of this intent"
+            )
+        observed_at = int(manifest["observed_at"])
+        if (
+            observed_at > now + 5_000_000
+            or now - observed_at
+            > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentReconciliationRequired(
+                "terminal absorption evidence is stale or from the future"
+            )
+        self._require_latest_complete_manifest_head(
+            conn, manifest, recorded_at_boundary=now
+        )
+        replacement_links = result.get("replacement_links")
+        if (
+            type(replacement_links) is not dict
+            or replacement_links
+            != {
+                "replaces_order_id": None,
+                "replaced_by_order_id": None,
+            }
+        ):
+            raise OrderIntentReconciliationRequired(
+                "replacement-linked terminal orders cannot be absorbed"
+            )
+        expected_payload_hash = self._expected_order_payload_hash_conn(
+            conn, intent
+        )
+        if expected_payload_hash not in result["order_payload_hashes"]:
+            raise OrderIntentBrokerTermsMismatch(
+                "terminal absorption order terms do not match the durable intent"
+            )
+        (
+            classification,
+            ordered_quantity,
+            filled_quantity,
+        ) = _terminal_fill_classification(
+            intent,
+            result,
+            manifest_observed_at=observed_at,
+        )
+        if (
+            classification == "FULL_FILL"
+            and reservation["capacity_decision_sha256"] is None
+        ):
+            raise OrderIntentReconciliationRequired(
+                "full-fill absorption lacks its baseline capacity decision"
+            )
+        requirement = TerminalAbsorptionRequirement(
+            intent_id=intent_id,
+            classification=classification,
+            terminal_state=intent["state"],
+            broker_order_id=intent["broker_order_id"],
+            terminal_order_evidence_sha256=(
+                terminal_order_evidence.evidence_sha256
+            ),
+            baseline_capacity_decision_sha256=(
+                reservation["capacity_decision_sha256"]
+            ),
+            ordered_quantity=ordered_quantity,
+            filled_quantity=filled_quantity,
+            post_capacity_required=classification == "FULL_FILL",
+        )
+        return requirement, intent, reservation, manifest, result
+
+    def _verified_capacity_decision_row(
+        self,
+        conn: sqlite3.Connection,
+        decision_sha256: str,
+    ) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]:
+        """Rebuild one historical capacity decision from its immutable source."""
+
+        _validate_sha256("capacity decision", decision_sha256)
+        row = conn.execute(
+            """
+            SELECT * FROM capacity_decisions
+            WHERE capacity_decision_sha256 = ?
+            """,
+            (decision_sha256,),
+        ).fetchone()
+        if row is None:
+            raise OrderIntentIntegrityError(
+                "capacity decision is not durable"
+            )
+        decision_material = {
+            "evidence_sha256": row["evidence_sha256"],
+            "account_id": row["account_id"],
+            "environment": row["environment"],
+            "broker_buying_power": row["broker_buying_power"],
+            "risk_budget": row["risk_budget"],
+            "cap_amount": row["cap_amount"],
+            "observed_at": int(row["observed_at"]),
+            "capacity_snapshot_sha256":
+                row["capacity_snapshot_sha256"],
+            "decided_at": int(row["decided_at"]),
+        }
+        expected_decision_sha256 = _domain_json_hash(
+            _CAPACITY_DECISION_HASH_DOMAIN, decision_material
+        )
+        if not hmac.compare_digest(
+            expected_decision_sha256, decision_sha256
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision digest does not verify"
+            )
+        manifest, result = self._verified_broker_read_manifest(
+            conn, row["evidence_sha256"]
+        )
+        _validate_capacity_manifest_result(result)
+        buying_power = _canonical_signed_decimal_text(
+            row["broker_buying_power"], "capacity decision buying power"
+        )
+        risk_budget = _canonical_signed_decimal_text(
+            row["risk_budget"], "capacity decision risk budget"
+        )
+        cap_amount = _canonical_signed_decimal_text(
+            row["cap_amount"], "capacity decision cap"
+        )
+        if (
+            buying_power < 0
+            or risk_budget < 0
+            or cap_amount != min(buying_power, risk_budget)
+            or manifest["evidence_kind"] != "CAPACITY"
+            or manifest["completeness"] != "COMPLETE"
+            or manifest["target_broker_order_id"] is not None
+            or manifest["account_id"] != row["account_id"]
+            or manifest["environment"] != row["environment"]
+            or int(manifest["observed_at"]) != int(row["observed_at"])
+            or int(row["decided_at"]) != int(row["observed_at"])
+            or result["broker_buying_power"]
+            != row["broker_buying_power"]
+            or result["state_sha256"]
+            != row["capacity_snapshot_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision is disconnected from its durable manifest"
+            )
+        return row, manifest, result
+
+    def _verified_capacity_decision_receipt(
+        self,
+        conn: sqlite3.Connection,
+        receipt: CapacityDecisionReceipt,
+        now: int,
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        _validate_sha256(
+            "post capacity decision", receipt.decision_sha256
+        )
+        _validate_sha256(
+            "post capacity evidence", receipt.evidence_sha256
+        )
+        _validate_timestamp(receipt.observed_at)
+        _validate_sha256(
+            "post capacity snapshot",
+            receipt.portfolio_snapshot_digest,
+        )
+        for name in (
+            "cap_amount",
+            "broker_buying_power",
+            "risk_budget",
+        ):
+            value = getattr(receipt, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise OrderIntentValidationError(
+                    f"{name} must be an exact non-negative Decimal"
+                )
+        row, manifest, result = self._verified_capacity_decision_row(
+            conn, receipt.decision_sha256
+        )
+        expected_values = (
+            receipt.evidence_sha256,
+            _canonical_amount(receipt.broker_buying_power),
+            _canonical_amount(receipt.risk_budget),
+            _canonical_amount(receipt.cap_amount),
+            _to_us(receipt.observed_at),
+            receipt.portfolio_snapshot_digest,
+        )
+        actual_values = (
+            row["evidence_sha256"],
+            row["broker_buying_power"],
+            row["risk_budget"],
+            row["cap_amount"],
+            int(row["observed_at"]),
+            row["capacity_snapshot_sha256"],
+        )
+        if actual_values != expected_values:
+            raise OrderIntentIntegrityError(
+                "post capacity receipt conflicts with its durable decision"
+            )
+        observed_at = int(manifest["observed_at"])
+        if (
+            manifest["evidence_kind"] != "CAPACITY"
+            or manifest["completeness"] != "COMPLETE"
+            or manifest["target_broker_order_id"] is not None
+            or result.get("schema") != "etrade-capacity.v2"
+            or result.get("state_sha256")
+            != receipt.portfolio_snapshot_digest
+            or observed_at != _to_us(receipt.observed_at)
+            or observed_at != int(row["observed_at"])
+            or observed_at > now + 5_000_000
+            or now - observed_at
+            > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentReconciliationRequired(
+                "post capacity decision lacks fresh complete schema-v2 evidence"
+            )
+        return manifest, result
+
+    def _reservation_absorption_from_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        decision_cache: dict[
+            str, tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]
+        ] | None = None,
+    ) -> ReservationAbsorptionReceipt:
+        lot_proof = _load_canonical_json(
+            row["canonical_lot_proof_json"],
+            "reservation lot proof",
+        )
+        if type(lot_proof) is not list:
+            raise OrderIntentIntegrityError(
+                "reservation lot proof must be an array"
+            )
+        expected_lot_sha256 = _domain_bytes_hash(
+            _LOT_PROOF_HASH_DOMAIN,
+            row["canonical_lot_proof_json"].encode("utf-8"),
+        )
+        if not hmac.compare_digest(
+            expected_lot_sha256, row["lot_proof_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation lot proof digest does not verify"
+            )
+        material = {
+            "intent_id": row["intent_id"],
+            "account_id": row["account_id"],
+            "environment": row["environment"],
+            "broker_order_id": row["broker_order_id"],
+            "terminal_state": row["terminal_state"],
+            "classification": row["classification"],
+            "terminal_order_evidence_sha256":
+                row["terminal_order_evidence_sha256"],
+            "baseline_capacity_decision_sha256":
+                row["baseline_capacity_decision_sha256"],
+            "post_capacity_decision_sha256":
+                row["post_capacity_decision_sha256"],
+            "post_capacity_evidence_sha256":
+                row["post_capacity_evidence_sha256"],
+            "ordered_quantity": int(row["ordered_quantity"]),
+            "filled_quantity": int(row["filled_quantity"]),
+            "placed_time_epoch_ms": row["placed_time_epoch_ms"],
+            "executed_time_epoch_ms": row["executed_time_epoch_ms"],
+            "canonical_lot_proof_json":
+                row["canonical_lot_proof_json"],
+            "lot_proof_sha256": row["lot_proof_sha256"],
+            "absorbed_margin_amount":
+                row["absorbed_margin_amount"],
+            "observed_at": int(row["observed_at"]),
+            "recorded_at": int(row["recorded_at"]),
+        }
+        expected_absorption_sha256 = _domain_json_hash(
+            _RESERVATION_ABSORPTION_HASH_DOMAIN, material
+        )
+        if not hmac.compare_digest(
+            expected_absorption_sha256, row["absorption_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation absorption digest does not verify"
+            )
+        intent = self._require_intent(conn, row["intent_id"])
+        reservation = conn.execute(
+            """
+            SELECT * FROM margin_reservations WHERE intent_id = ?
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        expected_reason = (
+            "ZERO_FILL_CONFIRMED"
+            if row["classification"] == "ZERO_FILL"
+            else "FULL_FILL_POSITION_ABSORBED"
+        )
+        if (
+            intent["account_id"] != row["account_id"]
+            or intent["environment"] != row["environment"]
+            or intent["broker_order_id"] != row["broker_order_id"]
+            or intent["state"] != row["terminal_state"]
+            or reservation is None
+            or reservation["state"] != "RELEASED"
+            or reservation["released_reason_code"] != expected_reason
+            or reservation["capacity_decision_sha256"]
+            != row["baseline_capacity_decision_sha256"]
+            or (
+                row["classification"] == "FULL_FILL"
+                and reservation["amount"]
+                != row["absorbed_margin_amount"]
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation absorption is disconnected from durable intent risk"
+            )
+        baseline_sha256 = row["baseline_capacity_decision_sha256"]
+        if baseline_sha256 is not None:
+            baseline, _baseline_manifest, _baseline_result = (
+                self._cached_capacity_decision_row(
+                    conn, baseline_sha256, decision_cache
+                )
+            )
+            if (
+                baseline["account_id"] != row["account_id"]
+                or baseline["environment"] != row["environment"]
+                or baseline["capacity_snapshot_sha256"]
+                != reservation["portfolio_snapshot_digest"]
+                or int(baseline["observed_at"])
+                != int(reservation["portfolio_observed_at"])
+            ):
+                raise OrderIntentIntegrityError(
+                    "reservation absorption baseline capacity chain changed"
+                )
+        terminal_manifest, terminal_result = (
+            self._verified_broker_read_manifest(
+                conn, row["terminal_order_evidence_sha256"]
+            )
+        )
+        try:
+            self._require_latest_complete_manifest_head(
+                conn,
+                terminal_manifest,
+                recorded_at_boundary=int(row["recorded_at"]),
+            )
+        except OrderIntentReconciliationRequired as exc:
+            raise OrderIntentIntegrityError(
+                "reservation absorption did not use the terminal evidence head"
+            ) from exc
+        if (
+            terminal_manifest["evidence_kind"] != "ORDER_QUERY"
+            or terminal_manifest["completeness"] != "COMPLETE"
+            or terminal_result.get("schema")
+            != "etrade-order-query.v2"
+            or terminal_result.get("not_found") is not False
+            or terminal_result.get("outcome") != intent["state"]
+            or terminal_result.get("broker_order_id")
+            != row["broker_order_id"]
+            or terminal_result.get("replacement_links")
+            != {
+                "replaces_order_id": None,
+                "replaced_by_order_id": None,
+            }
+            or self._expected_order_payload_hash_conn(conn, intent)
+            not in terminal_result.get("order_payload_hashes", [])
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation absorption terminal evidence no longer proves the intent"
+            )
+        try:
+            (
+                terminal_classification,
+                terminal_ordered_quantity,
+                terminal_filled_quantity,
+            ) = _terminal_fill_classification(
+                intent,
+                terminal_result,
+                manifest_observed_at=int(
+                    terminal_manifest["observed_at"]
+                ),
+            )
+        except OrderIntentReconciliationRequired as exc:
+            raise OrderIntentIntegrityError(
+                "reservation absorption terminal proof no longer verifies"
+            ) from exc
+        terminal_summary = terminal_result["fill_summary"]
+        if (
+            terminal_classification != row["classification"]
+            or terminal_ordered_quantity
+            != int(row["ordered_quantity"])
+            or terminal_filled_quantity
+            != int(row["filled_quantity"])
+            or terminal_summary["placed_time_epoch_ms"]
+            != row["placed_time_epoch_ms"]
+            or terminal_summary["executed_time_epoch_ms"]
+            != row["executed_time_epoch_ms"]
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation absorption terminal classification changed"
+            )
+        if (
+            terminal_manifest["account_id"] != row["account_id"]
+            or terminal_manifest["environment"] != row["environment"]
+            or terminal_manifest["target_broker_order_id"]
+            != row["broker_order_id"]
+        ):
+            raise OrderIntentIntegrityError(
+                "reservation absorption terminal evidence binding changed"
+            )
+        self._require_no_later_order_contradiction(
+            conn,
+            terminal_manifest,
+            terminal_result,
+            recorded_at_boundary=int(row["recorded_at"]),
+        )
+        amount = _canonical_signed_decimal_text(
+            row["absorbed_margin_amount"],
+            "absorbed margin amount",
+        )
+        if amount < 0:
+            raise OrderIntentIntegrityError(
+                "absorbed margin amount cannot be negative"
+            )
+        if row["classification"] == "ZERO_FILL":
+            if (
+                lot_proof
+                or int(row["observed_at"])
+                != int(terminal_manifest["observed_at"])
+                or amount != 0
+            ):
+                raise OrderIntentIntegrityError(
+                    "zero-fill absorption contains unsupported risk proof"
+                )
+        else:
+            decision, post_manifest, post_result = (
+                self._cached_capacity_decision_row(
+                    conn,
+                    row["post_capacity_decision_sha256"],
+                    decision_cache,
+                )
+            )
+            if (
+                decision["evidence_sha256"]
+                != row["post_capacity_evidence_sha256"]
+                or decision["account_id"] != row["account_id"]
+                or decision["environment"] != row["environment"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "reservation absorption post-capacity chain changed"
+                )
+            try:
+                self._require_latest_complete_manifest_head(
+                    conn,
+                    post_manifest,
+                    recorded_at_boundary=int(row["recorded_at"]),
+                )
+            except OrderIntentReconciliationRequired as exc:
+                raise OrderIntentIntegrityError(
+                    "reservation absorption did not use the capacity evidence head"
+                ) from exc
+            if (
+                post_manifest["evidence_kind"] != "CAPACITY"
+                or post_manifest["completeness"] != "COMPLETE"
+                or post_manifest["account_id"] != row["account_id"]
+                or post_manifest["environment"] != row["environment"]
+                or post_result.get("schema") != "etrade-capacity.v2"
+                or int(post_manifest["observed_at"])
+                <= int(terminal_manifest["observed_at"])
+                or int(post_manifest["observed_at"])
+                != int(row["observed_at"])
+                or post_result.get("state_sha256")
+                != decision["capacity_snapshot_sha256"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "reservation absorption post-capacity evidence changed"
+                )
+            if self._manifest_request_started_at(
+                conn, row["post_capacity_evidence_sha256"]
+            ) <= int(terminal_manifest["observed_at"]):
+                raise OrderIntentIntegrityError(
+                    "reservation absorption capacity read overlapped terminal evidence"
+                )
+            try:
+                rebuilt_lot_proof = _terminal_position_lot_proof(
+                    post_result,
+                    broker_order_id=row["broker_order_id"],
+                    fill_summary=terminal_summary,
+                )
+            except OrderIntentReconciliationRequired as exc:
+                raise OrderIntentIntegrityError(
+                    "reservation absorption lot proof no longer verifies"
+                ) from exc
+            if rebuilt_lot_proof != lot_proof:
+                raise OrderIntentIntegrityError(
+                    "reservation absorption lot proof is not reproducible"
+                )
+        return ReservationAbsorptionReceipt(
+            absorption_sha256=row["absorption_sha256"],
+            intent_id=row["intent_id"],
+            account_id=row["account_id"],
+            environment=row["environment"],
+            broker_order_id=row["broker_order_id"],
+            terminal_state=row["terminal_state"],
+            classification=row["classification"],
+            terminal_order_evidence_sha256=(
+                row["terminal_order_evidence_sha256"]
+            ),
+            baseline_capacity_decision_sha256=(
+                row["baseline_capacity_decision_sha256"]
+            ),
+            post_capacity_decision_sha256=(
+                row["post_capacity_decision_sha256"]
+            ),
+            post_capacity_evidence_sha256=(
+                row["post_capacity_evidence_sha256"]
+            ),
+            ordered_quantity=int(row["ordered_quantity"]),
+            filled_quantity=int(row["filled_quantity"]),
+            placed_time_epoch_ms=row["placed_time_epoch_ms"],
+            executed_time_epoch_ms=row["executed_time_epoch_ms"],
+            canonical_lot_proof_json=(
+                row["canonical_lot_proof_json"]
+            ),
+            lot_proof_sha256=row["lot_proof_sha256"],
+            absorbed_margin_amount=Decimal(
+                row["absorbed_margin_amount"]
+            ),
+            observed_at=_from_us(row["observed_at"]),
+            recorded_at=_from_us(row["recorded_at"]),
+        )
 
     def _require_intent(self, conn: sqlite3.Connection, intent_id: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
@@ -5078,12 +7681,19 @@ def _validate_order_query_receipt_lineage(
         "replacement_links",
         "normalized_order",
     }
+    schema = result.get("schema")
+    if schema == "etrade-order-query.v2":
+        expected_parsed_keys.add("fill_summary")
+    elif schema != "etrade-order-query.v1":
+        raise OrderIntentIntegrityError(
+            "order query receipt uses an unsupported result schema"
+        )
     if set(parsed) != expected_parsed_keys:
         raise OrderIntentIntegrityError(
             "order query receipt parser result has an unexpected shape"
         )
     expected_result = {
-        "schema": "etrade-order-query.v1",
+        "schema": schema,
         "broker_order_id": target_broker_order_id,
         "raw_status": parsed["raw_status"],
         "outcome": parsed["outcome"],
@@ -5093,6 +7703,8 @@ def _validate_order_query_receipt_lineage(
         "not_found": parsed["not_found"],
         "replacement_links": parsed["replacement_links"],
     }
+    if schema == "etrade-order-query.v2":
+        expected_result["fill_summary"] = parsed["fill_summary"]
     if result != expected_result:
         raise OrderIntentIntegrityError(
             "order query manifest result is disconnected from its receipt"
@@ -5109,6 +7721,12 @@ def _validate_capacity_receipt_lineage(
     member_roles: tuple[str, ...],
     receipt_rows: tuple[sqlite3.Row, ...],
 ) -> None:
+    schema = result.get("schema")
+    if schema not in {"etrade-capacity.v1", "etrade-capacity.v2"}:
+        raise OrderIntentIntegrityError(
+            "capacity manifest uses an unsupported result schema"
+        )
+    lots_required = schema == "etrade-capacity.v2"
     if member_roles[0] != "binding.start" or member_roles[-1] != "binding.end":
         raise OrderIntentIntegrityError(
             "capacity manifest lacks account-binding brackets"
@@ -5207,6 +7825,7 @@ def _validate_capacity_receipt_lineage(
             portfolio_rows,
             portfolio_roles,
             account_id_key=account_id_key,
+            lots_required=lots_required,
         )
 
         orders: list[dict[str, Any]] = []
@@ -5242,7 +7861,7 @@ def _validate_capacity_receipt_lineage(
         orders.sort(key=lambda item: item["order_id"])
         scans.append(
             {
-                "schema": "etrade-capacity.v1",
+                "schema": schema,
                 "account_status": binding_start["account_status"],
                 "account_mode": binding_start["account_mode"],
                 "account_type": binding_start["account_type"],
@@ -5273,13 +7892,20 @@ def _validate_capacity_receipt_lineage(
         )
     rebuilt = dict(scans[1])
     rebuilt["state_sha256"] = _domain_json_hash(
-        b"etrade-capacity-state.v1\0", economic_scans[1]
+        (
+            b"etrade-capacity-state.v2\0"
+            if lots_required
+            else b"etrade-capacity-state.v1\0"
+        ),
+        economic_scans[1],
     )
     if result != rebuilt:
         raise OrderIntentIntegrityError(
             "capacity manifest result is disconnected from its receipts"
         )
-    _validate_capacity_manifest_result(result)
+    _validate_capacity_manifest_result(
+        result, expected_account_id=account_id
+    )
 
 
 def _verified_binding_receipt(
@@ -5355,6 +7981,7 @@ def _rebuild_portfolio_scan(
     roles: list[str],
     *,
     account_id_key: str,
+    lots_required: bool,
 ) -> list[dict[str, Any]]:
     positions: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -5372,7 +7999,7 @@ def _rebuild_portfolio_scan(
         )
         expected_query = {
             "count": "50",
-            "lotsRequired": "false",
+            "lotsRequired": "true" if lots_required else "false",
             "marketSession": "REGULAR",
             "pageNumber": str(ordinal),
             "sortBy": "SYMBOL",
@@ -5593,7 +8220,697 @@ def _verify_broker_read_receipt_row(row: sqlite3.Row) -> None:
         )
 
 
-def _validate_capacity_manifest_result(result: dict[str, Any]) -> None:
+def _canonical_signed_decimal_text(
+    value: Any, label: str
+) -> Decimal:
+    if type(value) is not str or not value:
+        raise OrderIntentIntegrityError(
+            f"{label} must be a canonical decimal string"
+        )
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise OrderIntentIntegrityError(
+            f"{label} must be a finite decimal"
+        ) from exc
+    if not parsed.is_finite():
+        raise OrderIntentIntegrityError(
+            f"{label} must be a finite decimal"
+        )
+    normalized = format(parsed, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    if normalized in {"", "-0"}:
+        normalized = "0"
+    if normalized != value:
+        raise OrderIntentIntegrityError(
+            f"{label} is not canonical"
+        )
+    return parsed
+
+
+def _canonical_unsigned_integer_text(
+    value: Any,
+    label: str,
+    *,
+    positive: bool,
+) -> int:
+    if (
+        type(value) is not str
+        or not value.isascii()
+        or not value.isdigit()
+        or (len(value) > 1 and value[0] == "0")
+    ):
+        raise OrderIntentIntegrityError(
+            f"{label} must be a canonical integer string"
+        )
+    parsed = int(value)
+    if (positive and parsed <= 0) or (not positive and parsed < 0):
+        raise OrderIntentIntegrityError(
+            f"{label} is outside the allowed range"
+        )
+    return parsed
+
+
+def _validate_normalized_product(
+    product: Any, label: str
+) -> None:
+    expected = {
+        "symbol",
+        "security_type",
+        "call_put",
+        "expiry_year",
+        "expiry_month",
+        "expiry_day",
+        "strike_price",
+        "product_id",
+    }
+    if type(product) is not dict or set(product) != expected:
+        raise OrderIntentIntegrityError(
+            f"{label} product shape is invalid"
+        )
+    if (
+        type(product["symbol"]) is not str
+        or not product["symbol"]
+        or product["security_type"] not in {"EQ", "OPTN"}
+        or (
+            product["product_id"] is not None
+            and (
+                type(product["product_id"]) is not dict
+                or set(product["product_id"])
+                != {"symbol", "type_code"}
+                or any(
+                    value is not None
+                    and (type(value) is not str or not value)
+                    for value in product["product_id"].values()
+                )
+            )
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            f"{label} product identity is invalid"
+        )
+    if product["security_type"] == "OPTN":
+        if (
+            product["call_put"] not in {"PUT", "CALL"}
+            or any(
+                type(product[name]) is not str
+                for name in (
+                    "expiry_year",
+                    "expiry_month",
+                    "expiry_day",
+                    "strike_price",
+                )
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                f"{label} option identity is incomplete"
+            )
+        for name in ("expiry_year", "expiry_month", "expiry_day"):
+            _canonical_unsigned_integer_text(
+                product[name], f"{label} {name}", positive=True
+            )
+        strike = _canonical_signed_decimal_text(
+            product["strike_price"], f"{label} strike"
+        )
+        if strike <= 0:
+            raise OrderIntentIntegrityError(
+                f"{label} strike must be positive"
+            )
+
+
+def _validate_fill_summary_shape(summary: Any) -> None:
+    if (
+        type(summary) is not dict
+        or set(summary)
+        != {
+            "classification",
+            "placed_time_epoch_ms",
+            "executed_time_epoch_ms",
+            "legs",
+        }
+        or summary["classification"]
+        not in {
+            "OPEN",
+            "FULL_FILL",
+            "ZERO_FILL_TERMINAL",
+            "UNRESOLVED",
+        }
+        or type(summary["legs"]) is not list
+    ):
+        raise OrderIntentIntegrityError(
+            "order fill summary shape is invalid"
+        )
+    for name in (
+        "placed_time_epoch_ms",
+        "executed_time_epoch_ms",
+    ):
+        value = summary[name]
+        if value is not None:
+            parsed = _canonical_unsigned_integer_text(
+                value, f"fill summary {name}", positive=True
+            )
+            if len(value) != 13 or parsed > 9_223_372_036_854_775_807:
+                raise OrderIntentIntegrityError(
+                    f"fill summary {name} is invalid"
+                )
+    legs = summary["legs"]
+    if not legs:
+        if summary["classification"] != "UNRESOLVED":
+            raise OrderIntentIntegrityError(
+                "resolved fill summary must contain exact legs"
+            )
+        return
+    if len(legs) != 2:
+        raise OrderIntentIntegrityError(
+            "fill summary must contain exactly two legs"
+        )
+    numbers: set[int] = set()
+    quantities: list[tuple[Decimal, Decimal, Decimal]] = []
+    for leg in legs:
+        if (
+            type(leg) is not dict
+            or set(leg)
+            != {
+                "leg_number",
+                "product",
+                "order_action",
+                "ordered_quantity",
+                "filled_quantity",
+                "cancel_quantity",
+            }
+            or type(leg["leg_number"]) is not int
+            or leg["leg_number"] not in {1, 2}
+            or leg["order_action"] not in {
+                "BUY_OPEN",
+                "SELL_OPEN",
+            }
+        ):
+            raise OrderIntentIntegrityError(
+                "fill summary leg shape is invalid"
+            )
+        numbers.add(leg["leg_number"])
+        _validate_normalized_product(
+            leg["product"], "fill summary leg"
+        )
+        ordered = _canonical_signed_decimal_text(
+            leg["ordered_quantity"], "ordered quantity"
+        )
+        filled = _canonical_signed_decimal_text(
+            leg["filled_quantity"], "filled quantity"
+        )
+        cancelled = _canonical_signed_decimal_text(
+            leg["cancel_quantity"], "cancel quantity"
+        )
+        if (
+            ordered <= 0
+            or ordered != ordered.to_integral_value()
+            or filled < 0
+            or cancelled < 0
+            or filled + cancelled > ordered
+        ):
+            raise OrderIntentIntegrityError(
+                "fill summary quantities are inconsistent"
+            )
+        quantities.append((ordered, filled, cancelled))
+    if numbers != {1, 2}:
+        raise OrderIntentIntegrityError(
+            "fill summary leg numbers are ambiguous"
+        )
+    classification = summary["classification"]
+    executed = summary["executed_time_epoch_ms"]
+    if classification == "OPEN" and (
+        executed is not None
+        or any(filled != 0 or cancelled != 0 for _, filled, cancelled in quantities)
+    ):
+        raise OrderIntentIntegrityError(
+            "open fill summary is inconsistent"
+        )
+    if classification == "FULL_FILL" and (
+        executed is None
+        or any(
+            filled != ordered or cancelled != 0
+            for ordered, filled, cancelled in quantities
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "full-fill summary is inconsistent"
+        )
+    if classification == "ZERO_FILL_TERMINAL" and (
+        executed is not None
+        or any(
+            filled != 0 or cancelled != ordered
+            for ordered, filled, cancelled in quantities
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "zero-fill terminal summary is inconsistent"
+        )
+
+
+def _validate_capacity_v2_positions(
+    positions: list[Any],
+) -> None:
+    position_ids: list[str] = []
+    lot_ids: set[str] = set()
+    for position in positions:
+        if (
+            type(position) is not dict
+            or set(position)
+            != {
+                "position_id",
+                "account_id",
+                "product",
+                "quantity",
+                "position_type",
+                "position_indicator",
+                "osi_key",
+                "lots",
+            }
+        ):
+            raise OrderIntentIntegrityError(
+                "schema-v2 position shape is invalid"
+            )
+        _canonical_unsigned_integer_text(
+            position["position_id"],
+            "position id",
+            positive=True,
+        )
+        _canonical_unsigned_integer_text(
+            position["account_id"],
+            "position account id",
+            positive=True,
+        )
+        _canonical_signed_decimal_text(
+            position["quantity"], "position quantity"
+        )
+        _validate_normalized_product(
+            position["product"], "position"
+        )
+        for name in (
+            "position_type",
+            "position_indicator",
+            "osi_key",
+        ):
+            value = position[name]
+            if value is not None and (
+                type(value) is not str or not value
+            ):
+                raise OrderIntentIntegrityError(
+                    f"position {name} is invalid"
+                )
+        if type(position["lots"]) is not list:
+            raise OrderIntentIntegrityError(
+                "position lots must be an array"
+            )
+        if position["lots"] != sorted(
+            position["lots"], key=_canonical_read_json
+        ):
+            raise OrderIntentIntegrityError(
+                "position lots are not canonically ordered"
+            )
+        position_ids.append(position["position_id"])
+        for lot in position["lots"]:
+            if (
+                type(lot) is not dict
+                or set(lot)
+                != {
+                    "position_id",
+                    "position_lot_id",
+                    "order_no",
+                    "leg_no",
+                    "original_quantity",
+                    "remaining_quantity",
+                    "available_quantity",
+                    "acquired_date_epoch_ms",
+                }
+                or lot["position_id"] != position["position_id"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "position lot shape or parent identity is invalid"
+                )
+            _canonical_unsigned_integer_text(
+                lot["position_lot_id"],
+                "position lot id",
+                positive=True,
+            )
+            if lot["position_lot_id"] in lot_ids:
+                raise OrderIntentIntegrityError(
+                    "capacity positions contain a duplicate lot id"
+                )
+            lot_ids.add(lot["position_lot_id"])
+            if lot["order_no"] is not None:
+                _canonical_unsigned_integer_text(
+                    lot["order_no"],
+                    "position lot order number",
+                    positive=False,
+                )
+            if lot["leg_no"] is not None:
+                leg_no = _canonical_unsigned_integer_text(
+                    lot["leg_no"],
+                    "position lot leg number",
+                    positive=False,
+                )
+                if leg_no > 2_147_483_647:
+                    raise OrderIntentIntegrityError(
+                        "position lot leg number exceeds signed int32"
+                    )
+            for name in (
+                "original_quantity",
+                "remaining_quantity",
+                "available_quantity",
+            ):
+                _canonical_signed_decimal_text(
+                    lot[name], f"position lot {name}"
+                )
+            acquired = lot["acquired_date_epoch_ms"]
+            if (
+                type(acquired) is not str
+                or not acquired
+                or acquired in {"+0", "-0"}
+            ):
+                raise OrderIntentIntegrityError(
+                    "position lot acquired date is invalid"
+                )
+            acquired_digits = (
+                acquired[1:] if acquired.startswith("-") else acquired
+            )
+            if (
+                not acquired_digits.isascii()
+                or not acquired_digits.isdigit()
+                or (
+                    len(acquired_digits) > 1
+                    and acquired_digits[0] == "0"
+                )
+                or not -(2**63) <= int(acquired) <= 2**63 - 1
+            ):
+                raise OrderIntentIntegrityError(
+                    "position lot acquired date is invalid"
+                )
+    if position_ids != sorted(position_ids) or len(position_ids) != len(
+        set(position_ids)
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity position identities are ambiguous"
+        )
+
+
+def _terminal_fill_classification(
+    intent: sqlite3.Row,
+    result: dict[str, Any],
+    *,
+    manifest_observed_at: int,
+) -> tuple[Literal["ZERO_FILL", "FULL_FILL"], int, int]:
+    summary = result["fill_summary"]
+    _validate_fill_summary_shape(summary)
+    terminal_state = intent["state"]
+    if terminal_state == "FILLED":
+        expected_summary = "FULL_FILL"
+        expected_raw_status = "EXECUTED"
+        classification: Literal["ZERO_FILL", "FULL_FILL"] = "FULL_FILL"
+    else:
+        expected_summary = "ZERO_FILL_TERMINAL"
+        expected_raw_status = terminal_state
+        classification = "ZERO_FILL"
+    if (
+        summary["classification"] != expected_summary
+        or result["raw_status"] != expected_raw_status
+    ):
+        raise OrderIntentReconciliationRequired(
+            "terminal status and exact fill classification disagree"
+        )
+    placed = summary["placed_time_epoch_ms"]
+    if placed is None:
+        raise OrderIntentReconciliationRequired(
+            "terminal fill evidence lacks a placement timestamp"
+        )
+    placed_ms = int(placed)
+    if placed_ms * 1_000 > manifest_observed_at + 5_000_000:
+        raise OrderIntentReconciliationRequired(
+            "terminal placement timestamp is in the future"
+        )
+    executed = summary["executed_time_epoch_ms"]
+    if classification == "FULL_FILL":
+        if (
+            executed is None
+            or int(executed) < placed_ms
+            or int(executed) * 1_000
+            > manifest_observed_at + 5_000_000
+        ):
+            raise OrderIntentReconciliationRequired(
+                "full-fill execution timestamp is missing or inconsistent"
+            )
+    elif executed is not None:
+        raise OrderIntentReconciliationRequired(
+            "zero-fill terminal evidence contains an execution timestamp"
+        )
+    try:
+        payload = json.loads(intent["wire_payload"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise OrderIntentIntegrityError(
+            "durable intent payload cannot be decoded"
+        ) from exc
+    intent_legs = payload.get("legs")
+    if type(intent_legs) is not list or len(intent_legs) != 2:
+        raise OrderIntentIntegrityError(
+            "terminal opening intent is not an exact vertical"
+        )
+    unmatched = list(intent_legs)
+    ordered_values: set[int] = set()
+    filled_values: set[int] = set()
+    for fill_leg in summary["legs"]:
+        product = fill_leg["product"]
+        matches = [
+            leg
+            for leg in unmatched
+            if (
+                leg["symbol"] == product["symbol"]
+                and product["security_type"] == "OPTN"
+                and leg["callPut"] == product["call_put"]
+                and str(leg["expiryYear"]) == product["expiry_year"]
+                and str(leg["expiryMonth"]) == product["expiry_month"]
+                and str(leg["expiryDay"]) == product["expiry_day"]
+                and _canonical_amount(leg["strikePrice"])
+                == product["strike_price"]
+                and leg["orderAction"]
+                == fill_leg["order_action"]
+            )
+        ]
+        if len(matches) != 1:
+            raise OrderIntentReconciliationRequired(
+                "terminal fill legs do not match immutable intent products/actions"
+            )
+        intent_leg = matches[0]
+        unmatched.remove(intent_leg)
+        ordered = _canonical_signed_decimal_text(
+            fill_leg["ordered_quantity"], "terminal ordered quantity"
+        )
+        filled = _canonical_signed_decimal_text(
+            fill_leg["filled_quantity"], "terminal filled quantity"
+        )
+        if (
+            ordered != Decimal(intent_leg["quantity"])
+            or ordered != ordered.to_integral_value()
+            or filled != filled.to_integral_value()
+        ):
+            raise OrderIntentReconciliationRequired(
+                "terminal fill quantities do not match immutable intent"
+            )
+        ordered_values.add(int(ordered))
+        filled_values.add(int(filled))
+    if unmatched or len(ordered_values) != 1 or len(filled_values) != 1:
+        raise OrderIntentReconciliationRequired(
+            "terminal fill leg quantities are ambiguous"
+        )
+    ordered_quantity = next(iter(ordered_values))
+    filled_quantity = next(iter(filled_values))
+    if (
+        classification == "ZERO_FILL"
+        and filled_quantity != 0
+    ) or (
+        classification == "FULL_FILL"
+        and filled_quantity != ordered_quantity
+    ):
+        raise OrderIntentReconciliationRequired(
+            "terminal fill quantity is partial or unresolved"
+        )
+    return classification, ordered_quantity, filled_quantity
+
+
+def _terminal_position_lot_proof(
+    capacity_result: dict[str, Any],
+    *,
+    broker_order_id: str,
+    fill_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    _validate_capacity_manifest_result(capacity_result)
+    if capacity_result["schema"] != "etrade-capacity.v2":
+        raise OrderIntentReconciliationRequired(
+            "full-fill absorption requires schema-v2 position lots"
+        )
+    if any(
+        type(order) is dict
+        and order.get("order_id") == broker_order_id
+        for order in capacity_result["open_orders"]
+    ):
+        raise OrderIntentReconciliationRequired(
+            "terminal order remains present in active orders"
+        )
+    fill_legs = {
+        leg["leg_number"]: leg for leg in fill_summary["legs"]
+    }
+    matched_by_leg: dict[int, list[dict[str, Any]]] = {
+        1: [],
+        2: [],
+    }
+    proof: list[dict[str, Any]] = []
+    for position in capacity_result["positions"]:
+        target_lots = [
+            lot
+            for lot in position["lots"]
+            if lot["order_no"] == broker_order_id
+        ]
+        if not target_lots:
+            continue
+        parent_quantity = _canonical_signed_decimal_text(
+            position["quantity"], "target parent position quantity"
+        )
+        matched_parent_remaining = Decimal("0")
+        for lot in target_lots:
+            if lot["leg_no"] is None:
+                raise OrderIntentReconciliationRequired(
+                    "target position lot lacks an exact leg number"
+                )
+            leg_number = _canonical_unsigned_integer_text(
+                lot["leg_no"],
+                "target position lot leg number",
+                positive=True,
+            )
+            if leg_number not in {1, 2}:
+                raise OrderIntentReconciliationRequired(
+                    "target position lot has an unsupported leg number"
+                )
+            fill_leg = fill_legs[leg_number]
+            action = fill_leg["order_action"]
+            expected_type = (
+                "LONG" if action == "BUY_OPEN" else "SHORT"
+            )
+            expected_sign = Decimal("1") if action == "BUY_OPEN" else Decimal("-1")
+            if (
+                not _absorption_products_match(
+                    position["product"], fill_leg["product"]
+                )
+                or position["position_type"] != expected_type
+                or parent_quantity * expected_sign <= 0
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "target lot product/action direction is inconsistent"
+                )
+            original = _canonical_signed_decimal_text(
+                lot["original_quantity"], "target lot original quantity"
+            )
+            remaining = _canonical_signed_decimal_text(
+                lot["remaining_quantity"], "target lot remaining quantity"
+            )
+            available = _canonical_signed_decimal_text(
+                lot["available_quantity"], "target lot available quantity"
+            )
+            if (
+                original * expected_sign <= 0
+                or remaining * expected_sign <= 0
+                or available * expected_sign <= 0
+                or abs(available) > abs(remaining)
+                or abs(remaining) > abs(original)
+            ):
+                raise OrderIntentReconciliationRequired(
+                    "target lot quantities do not prove intact opening exposure"
+                )
+            matched_parent_remaining += abs(remaining)
+            item = {
+                "leg_number": leg_number,
+                "order_action": action,
+                "filled_quantity": fill_leg["filled_quantity"],
+                "position_id": position["position_id"],
+                "position_type": position["position_type"],
+                "position_quantity": position["quantity"],
+                "product": position["product"],
+                "lot": lot,
+            }
+            matched_by_leg[leg_number].append(item)
+            proof.append(item)
+        if abs(parent_quantity) < matched_parent_remaining:
+            raise OrderIntentReconciliationRequired(
+                "target lots exceed their parent position quantity"
+            )
+    if {number for number, items in matched_by_leg.items() if items} != {
+        1,
+        2,
+    }:
+        raise OrderIntentReconciliationRequired(
+            "post-fill positions lack exact lots for both spread legs"
+        )
+    for leg_number, items in matched_by_leg.items():
+        expected = _canonical_signed_decimal_text(
+            fill_legs[leg_number]["filled_quantity"],
+            "full-fill quantity",
+        )
+        for quantity_name in (
+            "original_quantity",
+            "remaining_quantity",
+            "available_quantity",
+        ):
+            actual = sum(
+                (
+                    abs(
+                        _canonical_signed_decimal_text(
+                            item["lot"][quantity_name],
+                            f"target lot {quantity_name}",
+                        )
+                    )
+                    for item in items
+                ),
+                Decimal("0"),
+            )
+            if actual != expected:
+                raise OrderIntentReconciliationRequired(
+                    "post-fill target lot quantities do not equal exact fills"
+                )
+    proof.sort(key=_canonical_read_json)
+    return proof
+
+
+def _absorption_products_match(
+    position_product: dict[str, Any],
+    fill_product: dict[str, Any],
+) -> bool:
+    economic_keys = (
+        "symbol",
+        "security_type",
+        "call_put",
+        "expiry_year",
+        "expiry_month",
+        "expiry_day",
+        "strike_price",
+    )
+    if any(
+        position_product[key] != fill_product[key]
+        for key in economic_keys
+    ):
+        return False
+    position_id = position_product["product_id"]
+    fill_id = fill_product["product_id"]
+    return (
+        position_id is None
+        or fill_id is None
+        or position_id == fill_id
+    )
+
+
+def _validate_capacity_manifest_result(
+    result: dict[str, Any],
+    *,
+    expected_account_id: str | None = None,
+) -> None:
     expected = {
         "schema",
         "account_status",
@@ -5609,8 +8926,9 @@ def _validate_capacity_manifest_result(result: dict[str, Any]) -> None:
         raise OrderIntentIntegrityError(
             "capacity manifest result shape is invalid"
         )
+    schema = result["schema"]
     if (
-        result["schema"] != "etrade-capacity.v1"
+        schema not in {"etrade-capacity.v1", "etrade-capacity.v2"}
         or result["account_status"] != "ACTIVE"
         or result["account_mode"] != "MARGIN"
         or type(result["account_type"]) is not str
@@ -5633,13 +8951,27 @@ def _validate_capacity_manifest_result(result: dict[str, Any]) -> None:
             "capacity manifest buying power is not canonical"
         )
     _validate_sha256("capacity state digest", result["state_sha256"])
+    if schema == "etrade-capacity.v2":
+        _validate_capacity_v2_positions(result["positions"])
+        if expected_account_id is not None and any(
+            position["account_id"] != expected_account_id
+            for position in result["positions"]
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity position belongs to a different account"
+            )
     state = {
         key: result[key]
         for key in expected
         if key not in {"state_sha256", "broker_buying_power_as_of"}
     }
     expected_digest = _domain_json_hash(
-        b"etrade-capacity-state.v1\0", state
+        (
+            b"etrade-capacity-state.v2\0"
+            if schema == "etrade-capacity.v2"
+            else b"etrade-capacity-state.v1\0"
+        ),
+        state,
     )
     if not hmac.compare_digest(expected_digest, result["state_sha256"]):
         raise OrderIntentIntegrityError(
@@ -5661,12 +8993,18 @@ def _validate_order_query_manifest_result(
         "not_found",
         "replacement_links",
     }
+    schema = result.get("schema")
+    if schema == "etrade-order-query.v2":
+        expected.add("fill_summary")
     if set(result) != expected:
         raise OrderIntentIntegrityError(
             "order query manifest result shape is invalid"
         )
     if (
-        result["schema"] != "etrade-order-query.v1"
+        schema not in {
+            "etrade-order-query.v1",
+            "etrade-order-query.v2",
+        }
         or type(result["broker_order_id"]) is not str
         or type(result["raw_status"]) is not str
         or result["outcome"]
@@ -5704,6 +9042,31 @@ def _validate_order_query_manifest_result(
     for payload_hash in hashes:
         _validate_sha256("order query payload hash", payload_hash)
     replacement_links = result["replacement_links"]
+    if schema == "etrade-order-query.v2":
+        _validate_fill_summary_shape(result["fill_summary"])
+        classification = result["fill_summary"]["classification"]
+        if result["not_found"]:
+            expected_outcome = "UNRESOLVED"
+        elif classification == "OPEN":
+            expected_outcome = "OPEN"
+        elif classification == "FULL_FILL":
+            expected_outcome = "FILLED"
+        elif classification == "ZERO_FILL_TERMINAL":
+            expected_outcome = result["raw_status"]
+            if expected_outcome not in {
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+            }:
+                raise OrderIntentIntegrityError(
+                    "zero-fill classification lacks a terminal broker status"
+                )
+        else:
+            expected_outcome = "UNRESOLVED"
+        if result["outcome"] != expected_outcome:
+            raise OrderIntentIntegrityError(
+                "order outcome conflicts with its exact fill classification"
+            )
     if result["not_found"]:
         if replacement_links:
             raise OrderIntentIntegrityError(
