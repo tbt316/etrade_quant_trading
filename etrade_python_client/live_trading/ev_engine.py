@@ -11,6 +11,8 @@ import pandas as pd
 import yfinance as yf
 import scipy.stats as stats
 import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable
 from sklearn.mixture import GaussianMixture
 from hmmlearn import hmm
 from live_trading.data_ingestion import DataIngestor, RollingRobustScaler
@@ -24,6 +26,91 @@ from scipy.optimize import linear_sum_assignment
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+PROBABILITY_ENGINE_SCHEMA_VERSION = 1
+MIN_REGIME_BUCKET_OBSERVATIONS = 10
+
+
+class ProbabilityEngineUnavailable(RuntimeError):
+    """The probability engine cannot produce a defensible result."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ProbabilityEngineResult:
+    """One typed probability-engine result.
+
+    This replaces the legacy three-value/five-value return contract.  The
+    result remains research-only until its regime taxonomy and input manifest
+    are independently certified.
+    """
+
+    probability_fn: Callable[[float], float] = field(repr=False, compare=False)
+    regime_name: str
+    projected_probabilities: tuple[float, ...]
+    models: tuple[dict[str, Any], ...] = field(repr=False, compare=False)
+    current_probabilities: tuple[float, ...]
+    validity_status: str = "UNVERIFIED"
+    execution_eligible: bool = False
+    schema_version: int = PROBABILITY_ENGINE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not callable(self.probability_fn):
+            raise ProbabilityEngineUnavailable("INVALID_PROBABILITY_FUNCTION")
+        if (
+            type(self.regime_name) is not str
+            or not self.regime_name.startswith("State_")
+        ):
+            raise ProbabilityEngineUnavailable("INVALID_REGIME_NAME")
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != PROBABILITY_ENGINE_SCHEMA_VERSION
+        ):
+            raise ProbabilityEngineUnavailable("INVALID_ENGINE_SCHEMA")
+        if self.validity_status != "UNVERIFIED" or self.execution_eligible:
+            raise ProbabilityEngineUnavailable(
+                "UNCERTIFIED_ENGINE_CANNOT_AUTHORIZE_EXECUTION"
+            )
+        if type(self.models) is not tuple or not self.models:
+            raise ProbabilityEngineUnavailable("INVALID_REGIME_MODELS")
+        for name, probabilities in (
+            ("PROJECTED", self.projected_probabilities),
+            ("CURRENT", self.current_probabilities),
+        ):
+            if (
+                type(probabilities) is not tuple
+                or len(probabilities) != len(self.models)
+                or any(
+                    type(value) not in {int, float}
+                    or not np.isfinite(value)
+                    or value < 0.0
+                    or value > 1.0
+                    for value in probabilities
+                )
+                or not np.isclose(sum(probabilities), 1.0, atol=1e-8)
+            ):
+                raise ProbabilityEngineUnavailable(
+                    f"INVALID_{name}_PROBABILITIES"
+                )
+
+    def probability(self, strike: float) -> float:
+        if (
+            type(strike) not in {int, float}
+            or not np.isfinite(strike)
+            or strike <= 0
+        ):
+            raise ProbabilityEngineUnavailable("INVALID_STRIKE")
+        value = self.probability_fn(float(strike))
+        if (
+            type(value) not in {int, float}
+            or not np.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            raise ProbabilityEngineUnavailable("INVALID_PROBABILITY_OUTPUT")
+        return float(value)
 
 def is_hmm_healthy(model):
     """Check if the HMM model has valid (non-NaN, non-Inf) parameters and
@@ -1756,63 +1843,191 @@ def _build_single_regime_prob_func(spot_price, bucket, regime_label=""):
     cached = fit_gmm(bucket, regime_label=regime_label)
     return lambda strike: query_gmm(cached, spot_price, strike)
 
-def get_probability_engine(spot_price, current_vix, regime_dict, horizon=45, hmm_model=None):
-    if not regime_dict or hmm_model is None:
-        return lambda strike: 0.0, "Unknown", None
-        
-    K = hmm_model.n_components
-    
-    # 1. Ingest Latest Data for current state projection
+def get_probability_engine(
+    spot_price,
+    current_vix,
+    regime_dict,
+    horizon=45,
+    hmm_model=None,
+) -> ProbabilityEngineResult:
+    """Build one typed, explicitly uncertified research probability engine.
+
+    Missing or statistically collapsed model inputs raise instead of returning
+    a zero-probability function.  A zero function makes an unavailable model
+    look maximally safe and is therefore never an acceptable fallback.
+    """
+
+    if (
+        type(spot_price) not in {int, float}
+        or not np.isfinite(spot_price)
+        or spot_price <= 0
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_SPOT_PRICE")
+    if (
+        type(current_vix) not in {int, float}
+        or not np.isfinite(current_vix)
+        or current_vix <= 0
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_VIX_VALUE")
+    if type(horizon) is not int or type(horizon) is bool or horizon < 1:
+        raise ProbabilityEngineUnavailable("INVALID_HORIZON")
+    if not isinstance(regime_dict, dict) or not regime_dict:
+        raise ProbabilityEngineUnavailable("REGIME_BUCKETS_UNAVAILABLE")
+    if hmm_model is None:
+        raise ProbabilityEngineUnavailable("HMM_MODEL_UNAVAILABLE")
+    if (
+        type(getattr(hmm_model, "n_components", None)) is not int
+        or hmm_model.n_components < 2
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_HMM_COMPONENT_COUNT")
+
+    state_count = hmm_model.n_components
+    normalized_buckets: list[np.ndarray] = []
+    for state in range(state_count):
+        key = f"State_{state}"
+        if key not in regime_dict:
+            raise ProbabilityEngineUnavailable(
+                f"MISSING_REGIME_BUCKET_STATE_{state}"
+            )
+        try:
+            bucket = np.asarray(regime_dict[key], dtype=float).reshape(-1)
+        except (TypeError, ValueError) as exc:
+            raise ProbabilityEngineUnavailable(
+                f"INVALID_REGIME_BUCKET_STATE_{state}"
+            ) from exc
+        if (
+            len(bucket) < MIN_REGIME_BUCKET_OBSERVATIONS
+            or not np.isfinite(bucket).all()
+            or np.any(bucket <= -1.0)
+        ):
+            raise ProbabilityEngineUnavailable(
+                f"INSUFFICIENT_REGIME_BUCKET_STATE_{state}"
+            )
+        normalized_buckets.append(bucket)
+
     ingestor = DataIngestor()
     start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
     end = datetime.now().strftime("%Y-%m-%d")
-    
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        stationary_df = asyncio.run(ingestor.build_fused_dataset(start, end, scale=False))
-    else:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, ingestor.build_fused_dataset(start, end, scale=False))
-            stationary_df = future.result()
-    
-    # Scale using stored scaler
-    scaled_values = hmm_model.scaler_.transform(stationary_df)
-    scaled_df = pd.DataFrame(scaled_values, index=stationary_df.index, columns=stationary_df.columns)
-    
-    # 2. Project using stored PCA
-    pcs = hmm_model.fusion_.sparse_pca.transform(scaled_df)
-    current_probs = hmm_model.predict_proba(pcs)[-1]
-    
-    # Probability Flip Detection
-    all_posteriors = hmm_model.predict_proba(pcs)
-    if len(all_posteriors) >= 3:
-        prev_turmoil_prob = all_posteriors[-2][np.argmax(current_probs)] # Simplified flip logic
-        # Implementation of detailed flip logic as per plan
-    
-    trading_horizon = calendar_days_to_trading_days(horizon)
 
-    if USE_MARKOV_TRANSITIONS:
-        projected_probs = current_probs @ np.linalg.matrix_power(hmm_model.transmat_, trading_horizon)
-    else:
-        projected_probs = current_probs
-    
-    models = []
-    for state in range(K):
-        key = f'State_{state}'
-        bucket = regime_dict.get(key, np.array([0.0]))
-        models.append(fit_gmm(bucket if len(bucket) >= 2 else np.array([0.0]), regime_label=key))
-        
+    try:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            stationary_df = asyncio.run(
+                ingestor.build_fused_dataset(start, end, scale=False)
+            )
+        else:
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    ingestor.build_fused_dataset(start, end, scale=False),
+                )
+                stationary_df = future.result()
+
+        if not isinstance(stationary_df, pd.DataFrame) or stationary_df.empty:
+            raise ProbabilityEngineUnavailable("FEATURE_DATA_UNAVAILABLE")
+        scaled_values = hmm_model.scaler_.transform(stationary_df)
+        scaled_df = pd.DataFrame(
+            scaled_values,
+            index=stationary_df.index,
+            columns=stationary_df.columns,
+        )
+        pcs = hmm_model.fusion_.sparse_pca.transform(scaled_df)
+    except ProbabilityEngineUnavailable:
+        raise
+    except Exception as exc:
+        raise ProbabilityEngineUnavailable(
+            "MODEL_INPUT_TRANSFORM_FAILED"
+        ) from exc
+
+    quality_ok, _quality_diagnostics = validate_hmm_quality(
+        hmm_model,
+        pcs,
+    )
+    if not quality_ok:
+        raise ProbabilityEngineUnavailable("HMM_QUALITY_REJECTED")
+
+    try:
+        all_posteriors = np.asarray(
+            hmm_model.predict_proba(pcs),
+            dtype=float,
+        )
+        if (
+            all_posteriors.ndim != 2
+            or all_posteriors.shape != (len(pcs), state_count)
+            or not np.isfinite(all_posteriors).all()
+            or np.any(all_posteriors < 0.0)
+            or not np.allclose(
+                all_posteriors.sum(axis=1),
+                1.0,
+                atol=1e-8,
+            )
+        ):
+            raise ProbabilityEngineUnavailable("INVALID_HMM_POSTERIORS")
+        current_probs = all_posteriors[-1]
+        trading_horizon = calendar_days_to_trading_days(horizon)
+        if USE_MARKOV_TRANSITIONS:
+            transition_matrix = np.asarray(
+                hmm_model.transmat_,
+                dtype=float,
+            )
+            if (
+                transition_matrix.shape != (state_count, state_count)
+                or not np.isfinite(transition_matrix).all()
+                or np.any(transition_matrix < 0.0)
+                or not np.allclose(
+                    transition_matrix.sum(axis=1),
+                    1.0,
+                    atol=1e-8,
+                )
+            ):
+                raise ProbabilityEngineUnavailable(
+                    "INVALID_HMM_TRANSITION_MATRIX"
+                )
+            projected_probs = current_probs @ np.linalg.matrix_power(
+                transition_matrix,
+                trading_horizon,
+            )
+        else:
+            projected_probs = current_probs.copy()
+    except ProbabilityEngineUnavailable:
+        raise
+    except Exception as exc:
+        raise ProbabilityEngineUnavailable("HMM_PROJECTION_FAILED") from exc
+
+    try:
+        models = tuple(
+            fit_gmm(bucket, regime_label=f"State_{state}")
+            for state, bucket in enumerate(normalized_buckets)
+        )
+    except Exception as exc:
+        raise ProbabilityEngineUnavailable("RETURN_MODEL_FIT_FAILED") from exc
+
     def prob_func(strike):
         total_prob = 0.0
-        for state in range(K):
-            prob_state = query_gmm(models[state], spot_price, strike)
-            total_prob += projected_probs[state] * prob_state
-        return total_prob
-        
-    dominant_state = np.argmax(projected_probs)
-    return prob_func, f"State_{dominant_state}", projected_probs, models, current_probs
+        for state in range(state_count):
+            probability_for_state = query_gmm(
+                models[state],
+                float(spot_price),
+                strike,
+            )
+            total_prob += projected_probs[state] * probability_for_state
+        return float(total_prob)
+
+    dominant_state = int(np.argmax(projected_probs))
+    return ProbabilityEngineResult(
+        probability_fn=prob_func,
+        regime_name=f"State_{dominant_state}",
+        projected_probabilities=tuple(
+            float(value) for value in projected_probs
+        ),
+        models=models,
+        current_probabilities=tuple(
+            float(value) for value in current_probs
+        ),
+    )
 
 def calculate_probability_of_touch(current_state_probs, trans_matrix, gmm_models, dte, strike_pct_drop, num_paths=1000, option_type="put"):
     """

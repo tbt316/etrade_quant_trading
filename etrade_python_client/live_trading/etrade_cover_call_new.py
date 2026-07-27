@@ -31,7 +31,8 @@ import logging
 import pandas as pd
 from live_trading.ev_engine import (
     build_regime_return_arrays, get_probability_engine, calculate_yield_metrics,
-    fetch_cached_yf_close, fetch_historical_data, _build_causal_regime_feature_frame
+    fetch_cached_yf_close, fetch_historical_data, _build_causal_regime_feature_frame,
+    ProbabilityEngineUnavailable,
 )
 import yfinance as yf
 from backtesting import backtest_bo
@@ -4863,19 +4864,48 @@ if __name__ == "__main__":
                     try:
                         spot_price = fetch_cached_yf_close(order['ticker']) or order['spread_data']['sell_option'].last_price # rough fallback
                         # Probability engine for current VIX and ticker
-                        prob_func, regime_name, _ = get_probability_engine(spot_price, vix_value, regime_dict, horizon=7, hmm_model=best_hmm)
-                        # print(f"Using {regime_name} regime for EV calculation")
+                        probability_engine = get_probability_engine(
+                            spot_price,
+                            vix_value,
+                            regime_dict,
+                            horizon=7,
+                            hmm_model=best_hmm,
+                        )
                         
                         metrics = calculate_yield_metrics(
                             order['spread_data']['sell_option'].strike_price,
                             order['spread_data']['buy_option'].strike_price,
                             order['spread_data']['profit'],
-                            prob_func
+                            probability_engine.probability,
                         )
-                        order['ev_data'] = metrics
-                    except Exception as ev_e:
-                        print(f"⚠️ EV Calculation Error for {order['ticker']}: {ev_e}")
-                        order['ev_data'] = {}
+                        order['ev_data'] = {
+                            **metrics,
+                            'status': probability_engine.validity_status,
+                            'execution_eligible': (
+                                probability_engine.execution_eligible
+                            ),
+                            'regime_name': probability_engine.regime_name,
+                        }
+                    except ProbabilityEngineUnavailable as ev_e:
+                        print(
+                            "⚠️ EV unavailable for "
+                            f"{order['ticker']}: {ev_e.code}"
+                        )
+                        order['ev_data'] = {
+                            'status': 'UNAVAILABLE',
+                            'execution_eligible': False,
+                            'reason_code': ev_e.code,
+                        }
+                    except Exception:
+                        print(
+                            "⚠️ EV unavailable for "
+                            f"{order['ticker']}: ENGINE_FAILURE"
+                        )
+                        order['ev_data'] = {
+                            'status': 'UNAVAILABLE',
+                            'execution_eligible': False,
+                            'reason_code': 'ENGINE_FAILURE',
+                        }
         
                 preview_orders.sort(key=lambda x: x['roi'], reverse=True)
         

@@ -260,6 +260,17 @@ The follow-on is an entitlement-approved immutable daily catalog with durable
 pagination evidence and batch/offline replay, not a return to future-dated
 universe discovery.
 
+P0-L8 now has a fail-closed compatibility repair. The probability engine has
+one typed result instead of incompatible three-value and five-value returns;
+missing inputs, sparse regime buckets, invalid posteriors/transitions, and a
+statistically collapsed HMM raise an explicit unavailable result instead of
+returning a zero-probability function. Every tracked caller uses the typed
+contract. The retained read-only candidate scanner records `UNAVAILABLE` or
+`UNVERIFIED` with `execution_eligible=false`, and the research plot path stops
+on failure. This does not close P0-L8: the engine still lacks a certified
+point-in-time input/model manifest and taxonomy-safe return buckets, so it
+cannot authorize an order.
+
 ## Required regime-aware causal record
 
 Every regime-aware run must persist the following fields and pass them before

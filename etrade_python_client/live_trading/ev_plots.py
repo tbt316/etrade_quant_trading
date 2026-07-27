@@ -879,12 +879,15 @@ def main(args):
     regime_dict, hmm_model, daily_models = build_regime_return_arrays(int(time.time()/86400), horizon=days_to_exp, n_components=args.force_k)
 
     print(f"Current VIX: {vix_price:.2f}")
-    spy_prob_func, regime_name, projected_weights, _, current_probs = get_probability_engine(
+    spy_probability_engine = get_probability_engine(
         spy_price, vix_price, regime_dict, horizon=days_to_exp, hmm_model=hmm_model
     )
-    spx_prob_func, _, _, _, _ = get_probability_engine(
+    spx_probability_engine = get_probability_engine(
         spx_price, vix_price, regime_dict, horizon=days_to_exp, hmm_model=hmm_model
     )
+    regime_name = spy_probability_engine.regime_name
+    projected_weights = spy_probability_engine.projected_probabilities
+    current_probs = spy_probability_engine.current_probabilities
     
     dominant_regime_label = get_regime_labels(hmm_model, pc_df=None).get(np.argmax(current_probs), "Unknown")
     print(f"\n[Regime Detection] Detected: {dominant_regime_label}")
@@ -990,7 +993,7 @@ def main(args):
                       f"| width=${width:.0f} credit=${spy_net_credit:.2f}",
                       end=" ", flush=True)
                 net_yield, es_per_c, ev_per_c, prob_loss = calculate_yield_metrics(
-                    spy_options, spy_short_opt["strike"], spy_long["strike"], spy_net_credit, spy_prob_func)
+                    spy_options, spy_short_opt["strike"], spy_long["strike"], spy_net_credit, spy_probability_engine.probability)
                 
                 margin_per_contract = width * 100
                 fractional_contracts = TARGET_MARGIN_DOLLARS / margin_per_contract
@@ -1037,7 +1040,7 @@ def main(args):
                       f"| width=${width:.0f} credit=${spx_net_credit:.2f}",
                       end=" ", flush=True)
                 net_yield, es_per_c, ev_per_c, prob_loss = calculate_yield_metrics(
-                    spx_options, spx_short_opt["strike"], spx_long["strike"], spx_net_credit, spx_prob_func)
+                    spx_options, spx_short_opt["strike"], spx_long["strike"], spx_net_credit, spx_probability_engine.probability)
 
                 margin_per_contract = width * 100
                 fractional_contracts = TARGET_MARGIN_DOLLARS / margin_per_contract
