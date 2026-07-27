@@ -43,14 +43,15 @@ from live_trading.runtime_safety import RuntimeSafetyBoundary
 
 
 _MAX_AUTHORIZATION_BYTES = 32 * 1024
-_MAX_RESPONSE_BYTES = 64 * 1024
+_MAX_MUTATION_RESPONSE_BYTES = 64 * 1024
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_RESPONSE_NODES = 512
 _REQUEST_TIMEOUT = (3.05, 10.0)
 _RESPONSE_WALL_TIMEOUT_SECONDS = 12.0
 _TOTAL_EXCHANGE_TIMEOUT_SECONDS = 15.0
 _EXCHANGE_RESULT_HEADER_BYTES = 39
 _EXCHANGE_RESULT_BUFFER_BYTES = (
-    _EXCHANGE_RESULT_HEADER_BYTES + _MAX_RESPONSE_BYTES + 1
+    _EXCHANGE_RESULT_HEADER_BYTES + _MAX_MUTATION_RESPONSE_BYTES + 1
 )
 _EXCHANGE_KIND_CODES = {
     "RESPONSE": 1,
@@ -80,7 +81,7 @@ class ETradeBrokerTransportError(RuntimeError):
 class _PreparedExchange:
     """Pickle-safe exact request handed to the isolated HTTP worker."""
 
-    method: Literal["POST", "PUT"]
+    method: Literal["GET", "POST", "PUT"]
     url: str
     headers: tuple[tuple[str, str], ...] = field(repr=False)
     body: bytes = field(repr=False)
@@ -727,7 +728,7 @@ def _copy_bound_request(request: BoundBrokerRequest) -> BoundBrokerRequest:
 
 
 def _require_pinned_adapter(adapter: HTTPAdapter) -> None:
-    """Reject any adapter configuration that could replay a mutation."""
+    """Reject retries and redirects for every isolated broker exchange."""
 
     if type(adapter) is not HTTPAdapter:
         raise ETradeBrokerTransportError(
@@ -771,15 +772,13 @@ def _validate_prepared_exchange(exchange: _PreparedExchange) -> None:
     parsed = urlsplit(exchange.url)
     if (
         type(exchange.method) is not str
-        or exchange.method not in {"POST", "PUT"}
+        or exchange.method not in {"GET", "POST", "PUT"}
         or type(exchange.url) is not str
         or parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.query
+        or f"{parsed.scheme}://{parsed.netloc}" not in _ETRADE_ORIGINS.values()
         or parsed.fragment
         or type(exchange.headers) is not tuple
         or type(exchange.body) is not bytes
-        or not exchange.body
     ):
         raise ETradeBrokerTransportError("isolated exchange request is invalid")
     normalized: dict[str, str] = {}
@@ -800,20 +799,30 @@ def _validate_prepared_exchange(exchange: _PreparedExchange) -> None:
                 "isolated exchange headers contain duplicates"
             )
         normalized[name] = pair[1]
-    expected_headers = {
-        "content-type",
+    common_headers = {
         "accept",
         "accept-encoding",
         "consumerkey",
-        "content-length",
         "authorization",
     }
+    if exchange.method == "GET":
+        valid_shape = (
+            not exchange.body
+            and set(normalized) == common_headers
+        )
+    else:
+        valid_shape = (
+            bool(exchange.body)
+            and not parsed.query
+            and set(normalized)
+            == common_headers | {"content-type", "content-length"}
+            and normalized["content-type"] == "application/xml"
+            and normalized["content-length"] == str(len(exchange.body))
+        )
     if (
-        set(normalized) != expected_headers
-        or normalized["content-type"] != "application/xml"
+        not valid_shape
         or normalized["accept"] != "application/json"
         or normalized["accept-encoding"] != "identity"
-        or normalized["content-length"] != str(len(exchange.body))
         or not normalized["consumerkey"]
         or not normalized["authorization"].startswith("OAuth ")
     ):
@@ -863,7 +872,7 @@ def _serialized_prepared_request(prepared: Any) -> _PreparedExchange:
         method=prepared.method,
         url=prepared.url,
         headers=tuple((name, value) for name, value in headers.items()),
-        body=prepared.body,
+        body=b"" if prepared.body is None else prepared.body,
     )
 
 
@@ -874,7 +883,7 @@ def _reconstruct_prepared_request(exchange: _PreparedExchange) -> PreparedReques
         method=exchange.method,
         url=exchange.url,
         headers=dict(exchange.headers),
-        data=exchange.body,
+        data=None if exchange.method == "GET" else exchange.body,
     )
     reconstructed = _serialized_prepared_request(prepared)
     if reconstructed != exchange:
@@ -886,7 +895,10 @@ def _reconstruct_prepared_request(exchange: _PreparedExchange) -> PreparedReques
 
 def _write_exchange_result(output: Any, result: _ExchangeResult) -> None:
     _validate_exchange_result(result)
-    if len(output) != _EXCHANGE_RESULT_BUFFER_BYTES:
+    if len(output) not in {
+        _EXCHANGE_RESULT_HEADER_BYTES + _MAX_MUTATION_RESPONSE_BYTES + 1,
+        _EXCHANGE_RESULT_HEADER_BYTES + _MAX_RESPONSE_BYTES + 1,
+    }:
         raise ETradeBrokerTransportError(
             "isolated exchange result buffer is invalid"
         )
@@ -908,8 +920,18 @@ def _write_exchange_result(output: Any, result: _ExchangeResult) -> None:
     output[:_EXCHANGE_RESULT_HEADER_BYTES] = header
 
 
-def _read_exchange_result(output: Any) -> _ExchangeResult:
-    if len(output) != _EXCHANGE_RESULT_BUFFER_BYTES:
+def _read_exchange_result(
+    output: Any,
+    *,
+    max_response_bytes: int = _MAX_MUTATION_RESPONSE_BYTES,
+) -> _ExchangeResult:
+    if (
+        type(max_response_bytes) is not int
+        or max_response_bytes
+        not in {_MAX_MUTATION_RESPONSE_BYTES, _MAX_RESPONSE_BYTES}
+        or len(output)
+        != _EXCHANGE_RESULT_HEADER_BYTES + max_response_bytes + 1
+    ):
         raise ETradeBrokerTransportError(
             "isolated exchange result buffer is invalid"
         )
@@ -918,7 +940,7 @@ def _read_exchange_result(output: Any) -> _ExchangeResult:
         "!BHI32s", header
     )
     kind = _EXCHANGE_CODE_KINDS.get(code)
-    if kind is None or raw_length > _MAX_RESPONSE_BYTES + 1:
+    if kind is None or raw_length > max_response_bytes + 1:
         raise ETradeBrokerTransportError(
             "isolated exchange result frame is invalid"
         )
@@ -939,8 +961,12 @@ def _read_exchange_result(output: Any) -> _ExchangeResult:
     return result
 
 
-def _exchange_worker(output: Any, exchange: _PreparedExchange) -> None:
-    """Perform exactly one mutation in a disposable process."""
+def _exchange_worker(
+    output: Any,
+    exchange: _PreparedExchange,
+    max_response_bytes: int,
+) -> None:
+    """Perform exactly one bounded broker exchange in a disposable process."""
 
     adapter: HTTPAdapter | None = None
     try:
@@ -955,7 +981,9 @@ def _exchange_worker(output: Any, exchange: _PreparedExchange) -> None:
             proxies={},
         )
         try:
-            status, raw = _read_bounded_response(response)
+            status, raw = _read_bounded_response(
+                response, max_response_bytes=max_response_bytes
+            )
         except (Timeout, TimeoutError):
             result = _ExchangeResult("TIMEOUT")
         except Exception:
@@ -991,21 +1019,30 @@ def _stop_exchange_process(process: Any) -> None:
 
 
 def _isolated_exchange(
-    prepared: Any, *, timeout_seconds: float
+    prepared: Any,
+    *,
+    timeout_seconds: float,
+    max_response_bytes: int = _MAX_MUTATION_RESPONSE_BYTES,
 ) -> _ExchangeResult:
     """Enforce one hard deadline over connect, headers, and response body."""
 
     if (
         type(timeout_seconds) is not float
         or not 0 < timeout_seconds <= _TOTAL_EXCHANGE_TIMEOUT_SECONDS
+        or type(max_response_bytes) is not int
+        or max_response_bytes
+        not in {_MAX_MUTATION_RESPONSE_BYTES, _MAX_RESPONSE_BYTES}
     ):
         raise ETradeBrokerTransportError("total exchange deadline is invalid")
     exchange = _serialized_prepared_request(prepared)
     context = multiprocessing.get_context("spawn")
-    output = context.RawArray("B", _EXCHANGE_RESULT_BUFFER_BYTES)
+    output = context.RawArray(
+        "B",
+        _EXCHANGE_RESULT_HEADER_BYTES + max_response_bytes + 1,
+    )
     process = context.Process(
         target=_exchange_worker,
-        args=(output, exchange),
+        args=(output, exchange, max_response_bytes),
         daemon=True,
     )
     deadline = time.monotonic() + timeout_seconds
@@ -1018,7 +1055,9 @@ def _isolated_exchange(
         if process.is_alive():
             return _ExchangeResult("TIMEOUT")
         try:
-            result = _read_exchange_result(output)
+            result = _read_exchange_result(
+                output, max_response_bytes=max_response_bytes
+            )
         except Exception:
             return _ExchangeResult("TRANSPORT_ERROR")
         return result
@@ -1478,7 +1517,7 @@ def _parse_reply_bytes(
             observed_at=observed_at,
         )
     raw_digest = hashlib.sha256(raw).hexdigest()
-    if len(raw) > _MAX_RESPONSE_BYTES:
+    if len(raw) > _MAX_MUTATION_RESPONSE_BYTES:
         return _unknown_reply(
             request,
             "RESPONSE_TOO_LARGE",
@@ -1584,7 +1623,19 @@ def _parse_reply_bytes(
     )
 
 
-def _read_bounded_response(response: Any) -> tuple[int, bytes]:
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_response_bytes: int = _MAX_MUTATION_RESPONSE_BYTES,
+) -> tuple[int, bytes]:
+    if (
+        type(max_response_bytes) is not int
+        or max_response_bytes
+        not in {_MAX_MUTATION_RESPONSE_BYTES, _MAX_RESPONSE_BYTES}
+    ):
+        raise ETradeBrokerTransportError(
+            "broker response byte bound is invalid"
+        )
     status = getattr(response, "status_code", None)
     raw_stream = getattr(response, "raw", None)
     reader = getattr(raw_stream, "read1", None)
@@ -1621,7 +1672,7 @@ def _read_bounded_response(response: Any) -> tuple[int, bytes]:
                 type(content_length) is not str
                 or not content_length.isascii()
                 or not content_length.isdigit()
-                or int(content_length) > _MAX_RESPONSE_BYTES
+                or int(content_length) > max_response_bytes
             ):
                 raise ETradeBrokerTransportError(
                     "broker response length is invalid"
@@ -1629,12 +1680,12 @@ def _read_bounded_response(response: Any) -> tuple[int, bytes]:
         deadline = time.monotonic() + _RESPONSE_WALL_TIMEOUT_SECONDS
         chunks: list[bytes] = []
         total = 0
-        while total <= _MAX_RESPONSE_BYTES:
+        while total <= max_response_bytes:
             if time.monotonic() >= deadline:
                 raise TimeoutError("broker response wall deadline expired")
             amount = min(
                 read_chunk_size,
-                _MAX_RESPONSE_BYTES + 1 - total,
+                max_response_bytes + 1 - total,
             )
             try:
                 chunk = reader(amount, decode_content=False)

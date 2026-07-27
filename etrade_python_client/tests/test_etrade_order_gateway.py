@@ -1,28 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
+from urllib.parse import quote
 from unittest.mock import patch
 
 from rauth import OAuth1Session
 
 import live_trading.etrade_order_gateway as gateway_module
+from live_trading.etrade_broker_reader import (
+    ETradeBrokerReader as ConcreteETradeBrokerReader,
+    _PARSER_CODE_SHA256,
+    _PARSER_CONFIG_SHA256,
+    _PARSER_SCHEMA,
+    _reparse_broker_read_response,
+)
 from live_trading.etrade_broker_transport import (
     ETradeBrokerTransport,
     SelectedBrokerAccount,
     _ExchangeResult,
 )
 from live_trading.etrade_order_gateway import (
-    BrokerCapacitySnapshot,
-    BrokerOrderNotFound,
-    BrokerOrderSnapshot,
     EtradeOrderGateway,
     GatewayReconciliationRequired,
     GatewayValidationError,
@@ -30,6 +37,9 @@ from live_trading.etrade_order_gateway import (
     SubmitOpeningCommand,
 )
 from live_trading.order_intent_ledger import (
+    BrokerReadManifestEvidence,
+    BrokerReadManifestMember,
+    BrokerReadResponseEvidence,
     OrderIntentLedger,
     OrderIntentReconciliationRequired,
     OrderIntentReservationError,
@@ -45,6 +55,49 @@ ACCOUNT_ID = "842468410"
 ACCOUNT_KEY = "account/key"
 INSTITUTION_TYPE = "BROKERAGE"
 OWNER = "gateway-worker"
+
+
+@dataclass(frozen=True)
+class BrokerOrderSnapshot:
+    account: SelectedBrokerAccount
+    environment: Literal["sandbox", "production"]
+    broker_order_id: str = field(repr=False)
+    outcome: Literal[
+        "OPEN",
+        "FILLED",
+        "CANCELLED",
+        "REJECTED",
+        "EXPIRED",
+        "UNRESOLVED",
+    ]
+    observed_at: datetime
+    http_status: int
+    raw_response_digest: str
+    order_payload_hash: str
+    complete: bool
+
+
+@dataclass(frozen=True)
+class BrokerOrderNotFound:
+    account: SelectedBrokerAccount
+    environment: Literal["sandbox", "production"]
+    broker_order_id: str = field(repr=False)
+    observed_at: datetime
+    http_status: int
+    raw_response_digest: str
+    complete: bool
+
+
+def _canonical_json(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+
+
+def _domain_json_sha256(domain, value):
+    return hashlib.sha256(
+        domain + _canonical_json(value).encode("utf-8")
+    ).hexdigest()
 
 
 class Clock:
@@ -185,10 +238,22 @@ class FakeReader:
         self.selected_hook = None
         self.query_behaviors = {}
         self.query_calls = []
+        self.authorization_counter = 0
+        self.ledger = None
+        self.runtime_safety = None
+        self.parsed_receipts = {}
 
-    def assert_gateway_binding(self, runtime_safety):
+    def assert_gateway_binding(self, ledger, runtime_safety):
         if self.environment != runtime_safety.environment:
             raise RuntimeSafetyError("reader environment mismatch")
+        if self.ledger is None:
+            self.ledger = ledger
+            self.runtime_safety = runtime_safety
+        elif (
+            self.ledger is not ledger
+            or self.runtime_safety is not runtime_safety
+        ):
+            raise RuntimeSafetyError("reader durable binding mismatch")
 
     def selected_account(self):
         if self.selected_hook is not None:
@@ -198,15 +263,165 @@ class FakeReader:
         return self.account
 
     def read_capacity(self, account):
-        return BrokerCapacitySnapshot(
-            account=self.account,
-            environment=self.environment,
-            broker_buying_power=Decimal("2000"),
-            observed_at=self.clock.now,
-            portfolio_snapshot_digest=self.capacity_digest,
-            positions_complete=self.capacity_complete,
-            open_orders_complete=self.capacity_complete,
-            source_response_digests=("1" * 64, "2" * 64),
+        if account != self.account:
+            raise RuntimeSafetyError("reader account mismatch")
+        if not self.capacity_complete:
+            receipt = self._record_response(
+                read_kind="ACCOUNT_LIST",
+                route="/v1/accounts/list.json",
+                raw=b'{"AccountListResponse":{"incomplete":true}}',
+                parsed=self._binding(),
+                final_response=True,
+            )
+            return self.ledger.record_broker_read_manifest(
+                BrokerReadManifestEvidence(
+                    evidence_kind="CAPACITY",
+                    account_id=self.account.account_id,
+                    account_id_key=self.account.account_id_key,
+                    institution_type=self.account.institution_type,
+                    environment=self.environment,
+                    origin=self._origin,
+                    target_broker_order_id=None,
+                    observed_at=self.clock.now,
+                    completeness="INCOMPLETE",
+                    canonical_result_json=_canonical_json({}),
+                ),
+                (
+                    BrokerReadManifestMember(
+                        role="binding.start",
+                        receipt_sha256=receipt.receipt_sha256,
+                    ),
+                ),
+            )
+
+        binding = self._binding()
+        encoded_account = quote(self.account.account_id_key, safe="")
+        as_of = str(int(self.clock.now.timestamp() * 1_000))
+        sources = [
+            (
+                "binding.start",
+                "ACCOUNT_LIST",
+                "/v1/accounts/list.json",
+                (),
+                b'{"AccountListResponse":{"binding":"start"}}',
+                binding,
+            )
+        ]
+        for scan in ("a", "b"):
+            sources.extend(
+                (
+                    (
+                        f"scan_{scan}.balance",
+                        "BALANCE",
+                        f"/v1/accounts/{encoded_account}/balance.json",
+                        (
+                            ("instType", self.account.institution_type),
+                            ("realTimeNAV", "true"),
+                        ),
+                        (
+                            '{"BalanceResponse":{"Computed":'
+                            '{"marginBuyingPower":2000}}}'
+                        ).encode("ascii"),
+                        {
+                            "account_id": self.account.account_id,
+                            "institution_type": self.account.institution_type,
+                            "margin_buying_power": "2000",
+                            "as_of_date": as_of,
+                        },
+                    ),
+                    (
+                        f"scan_{scan}.portfolio.0001",
+                        "PORTFOLIO_PAGE",
+                        f"/v1/accounts/{encoded_account}/portfolio.json",
+                        (
+                            ("count", "50"),
+                            ("lotsRequired", "false"),
+                            ("marketSession", "REGULAR"),
+                            ("pageNumber", "1"),
+                            ("sortBy", "SYMBOL"),
+                            ("sortOrder", "ASC"),
+                            ("totalsRequired", "false"),
+                            ("view", "COMPLETE"),
+                        ),
+                        b'{"PortfolioResponse":{"page":1}}',
+                        {
+                            "page_number": 1,
+                            "total_pages": 1,
+                            "metadata_field": "totalNoOfPages",
+                            "next_page": None,
+                            "positions": [],
+                        },
+                    ),
+                )
+            )
+            for lane in ("OPEN", "CANCEL_REQUESTED", "INDIVIDUAL_FILLS"):
+                sources.append(
+                    (
+                        f"scan_{scan}.orders.{lane}.0000",
+                        "OPEN_ORDERS_PAGE",
+                        f"/v1/accounts/{encoded_account}/orders.json",
+                        (("count", "100"), ("status", lane)),
+                        b'{"OrdersResponse":{"Order":[]}}',
+                        {
+                            "status_lane": lane,
+                            "orders": [],
+                            "marker": None,
+                        },
+                    )
+                )
+        sources.append(
+            (
+                "binding.end",
+                "ACCOUNT_LIST",
+                "/v1/accounts/list.json",
+                (),
+                b'{"AccountListResponse":{"binding":"end"}}',
+                binding,
+            )
+        )
+        members = []
+        for role, kind, route, query, raw, parsed in sources:
+            receipt = self._record_response(
+                read_kind=kind,
+                route=route,
+                query=query,
+                raw=raw,
+                parsed=parsed,
+                final_response=role == "binding.end",
+            )
+            members.append(
+                BrokerReadManifestMember(
+                    role=role, receipt_sha256=receipt.receipt_sha256
+                )
+            )
+        economic_state = {
+            "schema": "etrade-capacity.v1",
+            "account_status": "ACTIVE",
+            "account_mode": "MARGIN",
+            "account_type": "INDIVIDUAL",
+            "broker_buying_power": "2000",
+            "positions": [],
+            "open_orders": [],
+        }
+        result = dict(economic_state)
+        result["broker_buying_power_as_of"] = as_of
+        result["state_sha256"] = _domain_json_sha256(
+            b"etrade-capacity-state.v1\0", economic_state
+        )
+        return self.ledger.record_broker_read_manifest(
+            BrokerReadManifestEvidence(
+                evidence_kind="CAPACITY",
+                account_id=self.account.account_id,
+                account_id_key=self.account.account_id_key,
+                institution_type=self.account.institution_type,
+                environment=self.environment,
+                origin=self._origin,
+                target_broker_order_id=None,
+                observed_at=self.clock.now,
+                completeness="COMPLETE",
+                canonical_result_json=_canonical_json(result),
+            ),
+            tuple(members),
         )
 
     def query_order(self, account, broker_order_id):
@@ -217,16 +432,307 @@ class FakeReader:
         if callable(behavior):
             return behavior()
         if behavior is None:
-            return BrokerOrderNotFound(
-                account=self.account,
-                environment=self.environment,
+            return self._order_manifest(
                 broker_order_id=broker_order_id,
-                observed_at=self.clock.now,
-                http_status=404,
-                raw_response_digest="3" * 64,
-                complete=True,
+                outcome="UNRESOLVED",
+                payload_hashes=(),
+                not_found=True,
             )
-        return behavior
+        if type(behavior) is BrokerOrderNotFound:
+            return self._order_manifest(
+                broker_order_id=behavior.broker_order_id,
+                outcome="UNRESOLVED",
+                payload_hashes=(),
+                not_found=True,
+            )
+        if type(behavior) is not BrokerOrderSnapshot:
+            return behavior
+        return self._order_manifest(
+            broker_order_id=behavior.broker_order_id,
+            outcome=behavior.outcome,
+            payload_hashes=(behavior.order_payload_hash,),
+            not_found=False,
+        )
+
+    @property
+    def _origin(self):
+        return (
+            "https://api.etrade.com"
+            if self.environment == "production"
+            else "https://apisb.etrade.com"
+        )
+
+    def _binding(self):
+        return {
+            "account_id": self.account.account_id,
+            "account_id_key": self.account.account_id_key,
+            "institution_type": self.account.institution_type,
+            "account_status": "ACTIVE",
+            "account_mode": "MARGIN",
+            "account_type": "INDIVIDUAL",
+        }
+
+    def _record_response(
+        self,
+        *,
+        read_kind,
+        route,
+        raw,
+        parsed,
+        query=(),
+        target_broker_order_id=None,
+        http_status=200,
+        final_response=False,
+    ):
+        self.authorization_counter += 1
+        completed_at = (
+            self.clock.now
+            if final_response
+            else self.clock.now
+            - timedelta(milliseconds=50)
+            + timedelta(milliseconds=self.authorization_counter)
+        )
+        if read_kind == "ACCOUNT_LIST":
+            raw = _canonical_json(
+                {
+                    "AccountListResponse": {
+                        "Accounts": {
+                            "Account": [
+                                {
+                                    "accountId": self.account.account_id,
+                                    "accountIdKey": self.account.account_id_key,
+                                    "institutionType": self.account.institution_type,
+                                    "accountStatus": "ACTIVE",
+                                    "accountMode": "MARGIN",
+                                    "accountType": "INDIVIDUAL",
+                                }
+                            ]
+                        }
+                    }
+                }
+            ).encode("ascii")
+        elif read_kind == "BALANCE":
+            raw = _canonical_json(
+                {
+                    "BalanceResponse": {
+                        "accountId": self.account.account_id,
+                        "institutionType": self.account.institution_type,
+                        "asOfDate": parsed["as_of_date"],
+                        "Computed": {
+                            "marginBuyingPower": parsed[
+                                "margin_buying_power"
+                            ]
+                        },
+                    }
+                }
+            ).encode("ascii")
+        elif read_kind == "PORTFOLIO_PAGE":
+            raw = _canonical_json(
+                {
+                    "PortfolioResponse": {
+                        "AccountPortfolio": [
+                            {
+                                "accountId": self.account.account_id,
+                                "totalNoOfPages": "1",
+                                "Position": [],
+                            }
+                        ]
+                    }
+                }
+            ).encode("ascii")
+        elif read_kind == "OPEN_ORDERS_PAGE":
+            raw = b""
+            http_status = 204
+        evidence = BrokerReadResponseEvidence(
+            read_kind=read_kind,
+            account_id=self.account.account_id,
+            account_id_key=self.account.account_id_key,
+            institution_type=self.account.institution_type,
+            environment=self.environment,
+            origin=self._origin,
+            route=route,
+            query_json=_canonical_json(
+                [list(pair) for pair in sorted(query)]
+            ),
+            authorization_sha256=hashlib.sha256(
+                (
+                    "gateway-reader-authorization:"
+                    f"{self.authorization_counter}"
+                ).encode("ascii")
+            ).hexdigest(),
+            target_broker_order_id=target_broker_order_id,
+            request_started_at=completed_at - timedelta(microseconds=500),
+            response_completed_at=completed_at,
+            http_status=http_status,
+            raw_response_bytes=raw,
+            parser_schema=_PARSER_SCHEMA,
+            parser_code_sha256=_PARSER_CODE_SHA256,
+            parser_config_sha256=_PARSER_CONFIG_SHA256,
+            canonical_parsed_json="null",
+            completeness="INELIGIBLE",
+        )
+        canonical_parsed_json, completeness = (
+            _reparse_broker_read_response(evidence)
+        )
+        evidence = replace(
+            evidence,
+            canonical_parsed_json=canonical_parsed_json,
+            completeness=completeness,
+        )
+        receipt = self.ledger.record_broker_read_response(evidence)
+        self.parsed_receipts[receipt.receipt_sha256] = (
+            canonical_parsed_json
+        )
+        return receipt
+
+    def _order_manifest(
+        self,
+        *,
+        broker_order_id,
+        outcome,
+        payload_hashes,
+        not_found,
+    ):
+        binding = self._binding()
+        encoded_account = quote(self.account.account_id_key, safe="")
+        encoded_order = quote(broker_order_id, safe="")
+        binding_start = self._record_response(
+            read_kind="ACCOUNT_LIST",
+            route="/v1/accounts/list.json",
+            raw=b'{"AccountListResponse":{"binding":"query-start"}}',
+            parsed=binding,
+        )
+        raw = (
+            b""
+            if not_found
+            else _canonical_json(
+                {
+                    "OrdersResponse": {
+                        "Order": [
+                            {
+                                "orderId": broker_order_id,
+                                "orderType": "SPREADS",
+                                "OrderDetail": [
+                                    {
+                                        "accountId": self.account.account_id,
+                                        "orderNumber": broker_order_id,
+                                        "status": (
+                                            "EXECUTED"
+                                            if outcome == "FILLED"
+                                            else outcome
+                                        ),
+                                        "priceType": "NET_CREDIT",
+                                        "limitPrice": (
+                                            "1.50"
+                                            if order_payload_hash(1.50)
+                                            in payload_hashes
+                                            else "1.25"
+                                        ),
+                                        "orderTerm": "GOOD_FOR_DAY",
+                                        "marketSession": "REGULAR",
+                                        "allOrNone": False,
+                                        "stopPrice": "0",
+                                        "Instrument": [
+                                            self._known_leg(
+                                                "SELL_OPEN",
+                                                "620",
+                                                filled=outcome == "FILLED",
+                                            ),
+                                            self._known_leg(
+                                                "BUY_OPEN",
+                                                "615",
+                                                filled=outcome == "FILLED",
+                                            ),
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ).encode("ascii")
+        )
+        detail = self._record_response(
+            read_kind="ORDER_DETAIL",
+            route=(
+                f"/v1/accounts/{encoded_account}/orders/"
+                f"{encoded_order}.json"
+            ),
+            raw=raw,
+            parsed={},
+            target_broker_order_id=broker_order_id,
+            http_status=404 if not_found else 200,
+        )
+        parsed = json.loads(
+            self._receipt_parsed_json(detail.receipt_sha256)
+        )
+        binding_end = self._record_response(
+            read_kind="ACCOUNT_LIST",
+            route="/v1/accounts/list.json",
+            raw=b'{"AccountListResponse":{"binding":"query-end"}}',
+            parsed=binding,
+            final_response=True,
+        )
+        result = {
+            "schema": "etrade-order-query.v1",
+            "broker_order_id": broker_order_id,
+            "raw_status": parsed["raw_status"],
+            "outcome": parsed["outcome"],
+            "order_payload_hashes": parsed["order_payload_hashes"],
+            "http_status": 404 if not_found else 200,
+            "raw_response_digest": hashlib.sha256(raw).hexdigest(),
+            "not_found": parsed["not_found"],
+            "replacement_links": parsed["replacement_links"],
+        }
+        return self.ledger.record_broker_read_manifest(
+            BrokerReadManifestEvidence(
+                evidence_kind="ORDER_QUERY",
+                account_id=self.account.account_id,
+                account_id_key=self.account.account_id_key,
+                institution_type=self.account.institution_type,
+                environment=self.environment,
+                origin=self._origin,
+                target_broker_order_id=broker_order_id,
+                observed_at=self.clock.now,
+                completeness="COMPLETE",
+                canonical_result_json=_canonical_json(result),
+            ),
+            (
+                BrokerReadManifestMember(
+                    role="binding.start",
+                    receipt_sha256=binding_start.receipt_sha256,
+                ),
+                BrokerReadManifestMember(
+                    role="order.detail",
+                    receipt_sha256=detail.receipt_sha256,
+                ),
+                BrokerReadManifestMember(
+                    role="binding.end",
+                    receipt_sha256=binding_end.receipt_sha256,
+                ),
+            ),
+        )
+
+    def _known_leg(self, action, strike, *, filled):
+        return {
+            "Product": {
+                "symbol": "SPY",
+                "securityType": "OPTN",
+                "callPut": "PUT",
+                "expiryYear": "2027",
+                "expiryMonth": "1",
+                "expiryDay": "15",
+                "strikePrice": strike,
+            },
+            "orderAction": action,
+            "quantityType": "QUANTITY",
+            "orderedQuantity": "1",
+            "filledQuantity": "1" if filled else "0",
+            "cancelQuantity": "0",
+        }
+
+    def _receipt_parsed_json(self, receipt_sha256):
+        return self.parsed_receipts[receipt_sha256]
 
 
 class EtradeOrderGatewayTests(unittest.TestCase):
@@ -257,6 +763,10 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             side_effect=self.harness.exchange,
         )
         self.patcher.start()
+        self.reader_type_patcher = patch.object(
+            gateway_module, "ETradeBrokerReader", FakeReader
+        )
+        self.reader_type_patcher.start()
         self.reader = FakeReader(self.clock, self.account)
         self.transport = self.make_transport(
             self.ledger, self.boundary
@@ -272,6 +782,7 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         self.gateway.start()
 
     def tearDown(self):
+        self.reader_type_patcher.stop()
         self.patcher.stop()
         self.temporary.cleanup()
 
@@ -349,6 +860,41 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             ],
             ["SUBMIT_PREVIEW", "SUBMIT_PLACE"],
         )
+        reservation = self.ledger.get_margin_reservation(first.intent_id)
+        self.assertIsNotNone(reservation.capacity_decision_sha256)
+        self.assertEqual(len(reservation.capacity_decision_sha256), 64)
+
+    def test_fake_reader_requires_explicit_test_patch_and_dependencies_are_immutable(
+        self,
+    ):
+        with patch.object(
+            gateway_module,
+            "ETradeBrokerReader",
+            ConcreteETradeBrokerReader,
+        ):
+            with self.assertRaises(GatewayValidationError):
+                EtradeOrderGateway(
+                    runtime_safety=self.boundary,
+                    ledger=self.ledger,
+                    transport=self.transport,
+                    reader=FakeReader(self.clock, self.account),
+                    opening_risk_budget=Decimal("2000"),
+                    clock=self.clock,
+                )
+
+        for name, value in (
+            ("reader", self.reader),
+            ("transport", self.transport),
+            ("ledger", self.ledger),
+            ("runtime_safety", self.boundary),
+            ("_reader", self.reader),
+            ("_transport", self.transport),
+            ("_ledger", self.ledger),
+            ("_runtime_safety", self.boundary),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises((AttributeError, TypeError)):
+                    setattr(self.gateway, name, value)
 
     def test_no_id_timeout_is_durable_and_cannot_be_auto_reconciled(self):
         self.harness.add(preview_result(), _ExchangeResult("TIMEOUT"))
@@ -867,6 +1413,7 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         self.harness.add(preview_result(), place_result())
         limited.submit_opening(self.command())
 
+        self.clock.advance(1)
         with self.assertRaises(OrderIntentReservationError):
             limited.submit_opening(
                 self.command(key="order-2", decision="decision-2")

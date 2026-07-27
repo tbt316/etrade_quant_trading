@@ -8,13 +8,26 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+from live_trading.etrade_broker_reader import (
+    _PARSER_CODE_SHA256,
+    _PARSER_CONFIG_SHA256,
+    _PARSER_SCHEMA,
+    _reparse_broker_read_response,
+)
 
 from live_trading.order_intent_ledger import (
     SCHEMA_VERSION,
     BrokerEvidence,
+    BrokerReadManifestEvidence,
+    BrokerReadManifestMember,
+    BrokerReadResponseEvidence,
     AccountCapacityEvidence,
     OutboundAuthorization,
     TransportRequestEvidence,
@@ -170,7 +183,22 @@ def closing_payload():
     return payload
 
 
-def make_intent(*, account="acct-1", environment="production", key="key-1", decision="decision-1", kind="OPENING", strike=620):
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def domain_json_hash(domain: bytes, value: Any) -> str:
+    return hashlib.sha256(
+        domain + canonical_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def make_intent(*, account="1000000001", environment="production", key="key-1", decision="decision-1", kind="OPENING", strike=620):
     order_payload = raw_payload(strike)
     if kind == "CLOSING":
         order_payload["legs"][0]["orderAction"] = "SELL_CLOSE"
@@ -181,20 +209,7 @@ def make_intent(*, account="acct-1", environment="production", key="key-1", deci
     )
 
 
-def risk(record, clock, *, collateral="500", max_loss="400", quote_time=None):
-    return RiskEvidence(
-        decision_id=record.envelope.decision_id,
-        max_loss_amount=Decimal(max_loss), collateral_amount=Decimal(collateral),
-        quote_observed_at=quote_time or clock.now,
-        quote_digest="a" * 64, portfolio_observed_at=quote_time or clock.now, portfolio_snapshot_digest="b" * 64,
-    )
-
-
-def capacity(clock, *, account="acct-1", environment="production", observed_at=None, buying_power="1000", risk_budget="1000", digest="b" * 64):
-    return AccountCapacityEvidence(account_id=account, environment=environment, broker_buying_power=Decimal(buying_power), risk_budget=Decimal(risk_budget), observed_at=observed_at or clock.now, portfolio_snapshot_digest=digest)
-
-
-def evidence(record, clock, *, operation="ORDER_QUERY", outcome="OPEN", broker_order_id="broker-1", client_order_id=None, observed_at=None):
+def evidence(record, clock, *, operation="SUBMIT_ACK", outcome="OPEN", broker_order_id="2000000001", client_order_id=None, observed_at=None):
     return BrokerEvidence(
         account_id=record.envelope.account_id, environment=record.envelope.environment,
         client_order_id=client_order_id or record.client_order_id, broker_order_id=broker_order_id,
@@ -207,7 +222,7 @@ def transport_request(
     authorization,
     *,
     operation="SUBMIT_PREVIEW",
-    account_id="acct-1",
+    account_id="1000000001",
     account_id_key="account-key",
     institution_type="BROKERAGE",
     target_broker_order_id=None,
@@ -257,14 +272,650 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "runtime" / "orders.sqlite3"
         self.clock = Clock()
         self.ledger = OrderIntentLedger(self.path, clock=self.clock, run_id="run-a")
+        self.read_authorization_counter = 0
+        self.capacity_manifest_cache = {}
+        self.latest_capacity_decisions = {}
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def opening(self, *, key="key-1", account="acct-1"):
+    @staticmethod
+    def account_key(account):
+        suffix = hashlib.sha256(account.encode("ascii")).hexdigest()[:16]
+        return f"account-key-{suffix}"
+
+    def record_read(
+        self,
+        ledger,
+        *,
+        account,
+        environment,
+        observed_at,
+        read_kind,
+        route,
+        parsed=None,
+        raw,
+        query=(),
+        target_broker_order_id=None,
+        final_response=False,
+        return_parsed=False,
+    ):
+        self.read_authorization_counter += 1
+        authorization_sha256 = hashlib.sha256(
+            (
+                "order-ledger-test-authorization:"
+                f"{self.read_authorization_counter}"
+            ).encode("ascii")
+        ).hexdigest()
+        response_completed_at = (
+            observed_at
+            if final_response
+            else observed_at
+            - timedelta(seconds=30)
+            + timedelta(milliseconds=self.read_authorization_counter)
+        )
+        origin = (
+            "https://api.etrade.com"
+            if environment == "production"
+            else "https://apisb.etrade.com"
+        )
+        fixture = BrokerReadResponseEvidence(
+                read_kind=read_kind,
+                account_id=account,
+                account_id_key=self.account_key(account),
+                institution_type="BROKERAGE",
+                environment=environment,
+                origin=origin,
+                route=route,
+                query_json=canonical_json(
+                    [list(pair) for pair in sorted(query)]
+                ),
+                authorization_sha256=authorization_sha256,
+                target_broker_order_id=target_broker_order_id,
+                request_started_at=response_completed_at
+                - timedelta(microseconds=500),
+                response_completed_at=response_completed_at,
+                http_status=200,
+                raw_response_bytes=raw,
+                parser_schema=_PARSER_SCHEMA,
+                parser_code_sha256=_PARSER_CODE_SHA256,
+                parser_config_sha256=_PARSER_CONFIG_SHA256,
+                canonical_parsed_json=canonical_json(None),
+                completeness="INELIGIBLE",
+            )
+        canonical_parsed_json, completeness = (
+            _reparse_broker_read_response(fixture)
+        )
+        self.assertEqual(completeness, "COMPLETE")
+        if parsed is not None:
+            self.assertEqual(
+                canonical_parsed_json,
+                canonical_json(parsed),
+            )
+        receipt = ledger.record_broker_read_response(
+            replace(
+                fixture,
+                canonical_parsed_json=canonical_parsed_json,
+                completeness=completeness,
+            )
+        )
+        if return_parsed:
+            return receipt, json.loads(canonical_parsed_json)
+        return receipt
+
+    def set_capacity(
+        self,
+        *,
+        ledger=None,
+        account="1000000001",
+        environment="production",
+        observed_at=None,
+        buying_power="1000",
+        risk_budget="1000",
+        state_marker="default",
+    ):
+        ledger = ledger or self.ledger
+        observed_at = observed_at or self.clock.now
+        cache_key = (
+            str(ledger.path),
+            account,
+            environment,
+            observed_at,
+            str(buying_power),
+            str(risk_budget),
+            state_marker,
+        )
+        cached = self.capacity_manifest_cache.get(cache_key)
+        if cached is None:
+            account_key = self.account_key(account)
+            origin = (
+                "https://api.etrade.com"
+                if environment == "production"
+                else "https://apisb.etrade.com"
+            )
+            binding = {
+                "account_id": account,
+                "account_id_key": account_key,
+                "institution_type": "BROKERAGE",
+                "account_status": "ACTIVE",
+                "account_mode": "MARGIN",
+                "account_type": "INDIVIDUAL",
+            }
+            balance_as_of = str(
+                int(
+                    (
+                        observed_at - timedelta(seconds=30)
+                    ).timestamp()
+                    * 1_000
+                )
+            )
+            if state_marker == "default":
+                positions = []
+            else:
+                position_id = str(
+                    int(
+                        hashlib.sha256(
+                            state_marker.encode("ascii")
+                        ).hexdigest()[:15],
+                        16,
+                    )
+                    + 1
+                )
+                positions = [
+                    {
+                        "position_id": position_id,
+                        "account_id": account,
+                        "product": {
+                            "symbol": "SPY",
+                            "security_type": "EQ",
+                            "call_put": None,
+                            "expiry_year": None,
+                            "expiry_month": None,
+                            "expiry_day": None,
+                            "strike_price": None,
+                            "product_id": None,
+                        },
+                        "quantity": "1",
+                        "position_type": "LONG",
+                        "position_indicator": None,
+                        "osi_key": None,
+                    }
+                ]
+            sources = [
+                (
+                    "binding.start",
+                    "ACCOUNT_LIST",
+                    "/v1/accounts/list.json",
+                    (),
+                    binding,
+                )
+            ]
+            for scan in ("a", "b"):
+                sources.extend(
+                    (
+                        (
+                            f"scan_{scan}.balance",
+                            "BALANCE",
+                            f"/v1/accounts/{quote(account_key, safe='')}/balance.json",
+                            (
+                                ("instType", "BROKERAGE"),
+                                ("realTimeNAV", "true"),
+                            ),
+                            {
+                                "account_id": account,
+                                "institution_type": "BROKERAGE",
+                                "margin_buying_power": str(buying_power),
+                                "as_of_date": balance_as_of,
+                            },
+                        ),
+                        (
+                            f"scan_{scan}.portfolio.0001",
+                            "PORTFOLIO_PAGE",
+                            f"/v1/accounts/{quote(account_key, safe='')}/portfolio.json",
+                            (
+                                ("count", "50"),
+                                ("lotsRequired", "false"),
+                                ("marketSession", "REGULAR"),
+                                ("pageNumber", "1"),
+                                ("sortBy", "SYMBOL"),
+                                ("sortOrder", "ASC"),
+                                ("totalsRequired", "false"),
+                                ("view", "COMPLETE"),
+                            ),
+                            {
+                                "page_number": 1,
+                                "total_pages": 1,
+                                "metadata_field": "totalNoOfPages",
+                                "next_page": None,
+                                "positions": positions,
+                            },
+                        ),
+                    )
+                )
+                for lane in (
+                    "OPEN",
+                    "CANCEL_REQUESTED",
+                    "INDIVIDUAL_FILLS",
+                ):
+                    sources.append(
+                        (
+                            f"scan_{scan}.orders.{lane}.0000",
+                            "OPEN_ORDERS_PAGE",
+                            f"/v1/accounts/{quote(account_key, safe='')}/orders.json",
+                            (("count", "100"), ("status", lane)),
+                            {
+                                "status_lane": lane,
+                                "orders": [],
+                                "marker": None,
+                            },
+                        )
+                    )
+            sources.append(
+                (
+                    "binding.end",
+                    "ACCOUNT_LIST",
+                    "/v1/accounts/list.json",
+                    (),
+                    binding,
+                )
+            )
+            members = []
+            for role, read_kind, route, query, parsed in sources:
+                if read_kind == "ACCOUNT_LIST":
+                    raw_document = {
+                        "AccountListResponse": {
+                            "Accounts": {
+                                "Account": [
+                                    {
+                                        "accountId": account,
+                                        "accountIdKey": account_key,
+                                        "institutionType": "BROKERAGE",
+                                        "accountStatus": "ACTIVE",
+                                        "accountMode": "MARGIN",
+                                        "accountType": "INDIVIDUAL",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                elif read_kind == "BALANCE":
+                    raw_document = {
+                        "BalanceResponse": {
+                            "accountId": account,
+                            "institutionType": "BROKERAGE",
+                            "asOfDate": balance_as_of,
+                            "Computed": {
+                                "marginBuyingPower": str(buying_power)
+                            },
+                        }
+                    }
+                elif read_kind == "PORTFOLIO_PAGE":
+                    raw_document = {
+                        "PortfolioResponse": {
+                            "AccountPortfolio": [
+                                {
+                                    "accountId": account,
+                                    "totalNoOfPages": 1,
+                                    "Position": [
+                                        {
+                                            "positionId": position[
+                                                "position_id"
+                                            ],
+                                            "accountId": account,
+                                            "Product": {
+                                                "symbol": "SPY",
+                                                "securityType": "EQ",
+                                            },
+                                            "quantity": "1",
+                                            "positionType": "LONG",
+                                        }
+                                        for position in positions
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    self.assertEqual(read_kind, "OPEN_ORDERS_PAGE")
+                    raw_document = {"OrdersResponse": {"Order": []}}
+                raw = canonical_json(raw_document).encode("ascii")
+                receipt = self.record_read(
+                    ledger,
+                    account=account,
+                    environment=environment,
+                    observed_at=observed_at,
+                    read_kind=read_kind,
+                    route=route,
+                    query=query,
+                    parsed=parsed,
+                    raw=raw,
+                    final_response=role == "binding.end",
+                )
+                members.append(
+                    BrokerReadManifestMember(
+                        role=role,
+                        receipt_sha256=receipt.receipt_sha256,
+                    )
+                )
+            economic_state = {
+                "schema": "etrade-capacity.v1",
+                "account_status": "ACTIVE",
+                "account_mode": "MARGIN",
+                "account_type": "INDIVIDUAL",
+                "broker_buying_power": str(buying_power),
+                "positions": positions,
+                "open_orders": [],
+            }
+            result = dict(economic_state)
+            result["broker_buying_power_as_of"] = balance_as_of
+            result["state_sha256"] = domain_json_hash(
+                b"etrade-capacity-state.v1\0", economic_state
+            )
+            reference = ledger.record_broker_read_manifest(
+                BrokerReadManifestEvidence(
+                    evidence_kind="CAPACITY",
+                    account_id=account,
+                    account_id_key=account_key,
+                    institution_type="BROKERAGE",
+                    environment=environment,
+                    origin=origin,
+                    target_broker_order_id=None,
+                    observed_at=observed_at,
+                    completeness="COMPLETE",
+                    canonical_result_json=canonical_json(result),
+                ),
+                tuple(members),
+            )
+            self.capacity_manifest_cache[cache_key] = reference
+        else:
+            reference = cached
+        decision = ledger.set_reservation_cap_from_read(
+            reference, risk_budget=Decimal(str(risk_budget))
+        )
+        self.latest_capacity_decisions[
+            (str(ledger.path), account, environment)
+        ] = decision
+        return decision
+
+    def capacity_decision_for(
+        self, record, *, ledger=None
+    ):
+        ledger = ledger or self.ledger
+        key = (
+            str(ledger.path),
+            record.envelope.account_id,
+            record.envelope.environment,
+        )
+        return self.latest_capacity_decisions[key]
+
+    def risk(
+        self,
+        record,
+        *,
+        ledger=None,
+        collateral="500",
+        max_loss="400",
+        quote_time=None,
+        decision=None,
+        portfolio_observed_at=None,
+        portfolio_snapshot_digest=None,
+        capacity_decision_sha256=None,
+    ):
+        decision = decision or self.capacity_decision_for(
+            record, ledger=ledger
+        )
+        return RiskEvidence(
+            decision_id=record.envelope.decision_id,
+            max_loss_amount=Decimal(max_loss),
+            collateral_amount=Decimal(collateral),
+            quote_observed_at=quote_time or self.clock.now,
+            quote_digest="a" * 64,
+            portfolio_observed_at=(
+                portfolio_observed_at or decision.observed_at
+            ),
+            portfolio_snapshot_digest=(
+                portfolio_snapshot_digest
+                or decision.portfolio_snapshot_digest
+            ),
+            capacity_decision_sha256=(
+                capacity_decision_sha256 or decision.decision_sha256
+            ),
+        )
+
+    def capacity_evidence(self, decision):
+        return AccountCapacityEvidence(
+            account_id=self._capacity_account(decision),
+            environment=self._capacity_environment(decision),
+            broker_buying_power=decision.broker_buying_power,
+            risk_budget=decision.risk_budget,
+            observed_at=decision.observed_at,
+            portfolio_snapshot_digest=decision.portfolio_snapshot_digest,
+            broker_read_evidence_sha256=decision.evidence_sha256,
+        )
+
+    def _capacity_account(self, decision):
+        with sqlite3.connect(self.path) as conn:
+            return conn.execute(
+                """
+                SELECT account_id FROM capacity_decisions
+                WHERE capacity_decision_sha256 = ?
+                """,
+                (decision.decision_sha256,),
+            ).fetchone()[0]
+
+    def _capacity_environment(self, decision):
+        with sqlite3.connect(self.path) as conn:
+            return conn.execute(
+                """
+                SELECT environment FROM capacity_decisions
+                WHERE capacity_decision_sha256 = ?
+                """,
+                (decision.decision_sha256,),
+            ).fetchone()[0]
+
+    def query_evidence(
+        self,
+        record,
+        *,
+        ledger=None,
+        operation="ORDER_QUERY",
+        outcome="OPEN",
+        broker_order_id="2000000001",
+        observed_at=None,
+    ):
+        ledger = ledger or self.ledger
+        observed_at = observed_at or self.clock.now
+        account = record.envelope.account_id
+        environment = record.envelope.environment
+        account_key = self.account_key(account)
+        origin = (
+            "https://api.etrade.com"
+            if environment == "production"
+            else "https://apisb.etrade.com"
+        )
+        binding = {
+            "account_id": account,
+            "account_id_key": account_key,
+            "institution_type": "BROKERAGE",
+            "account_status": "ACTIVE",
+            "account_mode": "MARGIN",
+            "account_type": "INDIVIDUAL",
+        }
+        payload_hashes = [
+            ledger.expected_order_payload_hash(record.intent_id)
+        ]
+        binding_raw = canonical_json(
+            {
+                "AccountListResponse": {
+                    "Accounts": {
+                        "Account": [
+                            {
+                                "accountId": account,
+                                "accountIdKey": account_key,
+                                "institutionType": "BROKERAGE",
+                                "accountStatus": "ACTIVE",
+                                "accountMode": "MARGIN",
+                                "accountType": "INDIVIDUAL",
+                            }
+                        ]
+                    }
+                }
+            }
+        ).encode("ascii")
+        wire_payload = json.loads(record.envelope.wire_payload)
+        raw_status = "EXECUTED" if outcome == "FILLED" else outcome
+        raw = canonical_json(
+            {
+                "OrdersResponse": {
+                    "Order": [
+                        {
+                            "orderId": broker_order_id,
+                            "orderType": "SPREADS",
+                            "OrderDetail": [
+                                {
+                                    "accountId": account,
+                                    "orderNumber": broker_order_id,
+                                    "status": raw_status,
+                                    "priceType": wire_payload[
+                                        "priceType"
+                                    ],
+                                    "limitPrice": wire_payload[
+                                        "limitPrice"
+                                    ],
+                                    "orderTerm": "GOOD_FOR_DAY",
+                                    "marketSession": "REGULAR",
+                                    "allOrNone": False,
+                                    "stopPrice": 0,
+                                    "Instrument": [
+                                        {
+                                            "Product": {
+                                                "symbol": leg["symbol"],
+                                                "securityType": "OPTN",
+                                                "callPut": leg["callPut"],
+                                                "expiryYear": leg[
+                                                    "expiryYear"
+                                                ],
+                                                "expiryMonth": leg[
+                                                    "expiryMonth"
+                                                ],
+                                                "expiryDay": leg[
+                                                    "expiryDay"
+                                                ],
+                                                "strikePrice": leg[
+                                                    "strikePrice"
+                                                ],
+                                            },
+                                            "quantityType": "QUANTITY",
+                                            "orderedQuantity": leg[
+                                                "quantity"
+                                            ],
+                                            "filledQuantity": (
+                                                leg["quantity"]
+                                                if outcome == "FILLED"
+                                                else 0
+                                            ),
+                                            "orderAction": leg[
+                                                "orderAction"
+                                            ],
+                                        }
+                                        for leg in wire_payload["legs"]
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ).encode("ascii")
+        start = self.record_read(
+            ledger,
+            account=account,
+            environment=environment,
+            observed_at=observed_at,
+            read_kind="ACCOUNT_LIST",
+            route="/v1/accounts/list.json",
+            parsed=binding,
+            raw=binding_raw,
+        )
+        detail, detail_parsed = self.record_read(
+            ledger,
+            account=account,
+            environment=environment,
+            observed_at=observed_at,
+            read_kind="ORDER_DETAIL",
+            route=(
+                f"/v1/accounts/{quote(account_key, safe='')}/orders/"
+                f"{quote(broker_order_id, safe='')}.json"
+            ),
+            raw=raw,
+            target_broker_order_id=broker_order_id,
+            return_parsed=True,
+        )
+        self.assertIn(
+            payload_hashes[0],
+            detail_parsed["order_payload_hashes"],
+        )
+        end = self.record_read(
+            ledger,
+            account=account,
+            environment=environment,
+            observed_at=observed_at,
+            read_kind="ACCOUNT_LIST",
+            route="/v1/accounts/list.json",
+            parsed=binding,
+            raw=binding_raw,
+            final_response=True,
+        )
+        result = {
+            "schema": "etrade-order-query.v1",
+            "broker_order_id": broker_order_id,
+            "raw_status": detail_parsed["raw_status"],
+            "outcome": detail_parsed["outcome"],
+            "order_payload_hashes": detail_parsed[
+                "order_payload_hashes"
+            ],
+            "http_status": 200,
+            "raw_response_digest": hashlib.sha256(raw).hexdigest(),
+            "not_found": detail_parsed["not_found"],
+            "replacement_links": detail_parsed[
+                "replacement_links"
+            ],
+        }
+        reference = ledger.record_broker_read_manifest(
+            BrokerReadManifestEvidence(
+                evidence_kind="ORDER_QUERY",
+                account_id=account,
+                account_id_key=account_key,
+                institution_type="BROKERAGE",
+                environment=environment,
+                origin=origin,
+                target_broker_order_id=broker_order_id,
+                observed_at=observed_at,
+                completeness="COMPLETE",
+                canonical_result_json=canonical_json(result),
+            ),
+            (
+                BrokerReadManifestMember(
+                    "binding.start", start.receipt_sha256
+                ),
+                BrokerReadManifestMember(
+                    "order.detail", detail.receipt_sha256
+                ),
+                BrokerReadManifestMember(
+                    "binding.end", end.receipt_sha256
+                ),
+            ),
+        )
+        derived = ledger.broker_evidence_from_read(
+            record.intent_id, reference, operation=operation
+        )
+        self.assertIsNotNone(derived)
+        return derived
+
+    def opening(self, *, key="key-1", account="1000000001"):
         record = self.ledger.create_intent(make_intent(key=key, account=account)).intent
-        self.ledger.set_reservation_cap(capacity(self.clock, account=account))
-        self.ledger.reserve_margin(record.intent_id, risk(record, self.clock))
+        self.set_capacity(account=account)
+        self.ledger.reserve_margin(record.intent_id, self.risk(record))
         return record
 
     def begin_submission(self, record, owner, lease):
@@ -429,13 +1080,13 @@ class OrderIntentLedgerTests(unittest.TestCase):
         debit["legs"][0]["orderAction"] = "BUY_OPEN"
         debit["legs"][1]["orderAction"] = "SELL_OPEN"
         record = self.ledger.create_intent(OrderIntent.build(
-            account_id="acct-1", environment="production", strategy_id="credit-spread", decision_id="debit",
+            account_id="1000000001", environment="production", strategy_id="credit-spread", decision_id="debit",
             idempotency_scope="decision", idempotency_key="debit", intent_kind="OPENING", order_payload=debit,
         )).intent
-        self.ledger.set_reservation_cap(capacity(self.clock))
+        self.set_capacity()
         with self.assertRaises(OrderIntentReservationError):
-            self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, collateral="124.99", max_loss="124.99"))
-        reserved = self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, collateral="125", max_loss="125"))
+            self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="124.99", max_loss="124.99"))
+        reserved = self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="125", max_loss="125"))
         self.assertEqual(reserved.amount, Decimal("125"))
 
     def test_opening_vertical_price_type_must_match_put_and_call_risk_orientation(self):
@@ -469,28 +1120,29 @@ class OrderIntentLedgerTests(unittest.TestCase):
 
     def test_risk_evidence_is_required_positive_fresh_and_bound_to_decision(self):
         record = self.ledger.create_intent(make_intent()).intent
-        self.ledger.set_reservation_cap(capacity(self.clock))
+        self.set_capacity()
         with self.assertRaises(OrderIntentValidationError):
-            self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, collateral="0", max_loss="0"))
+            self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="0", max_loss="0"))
         with self.assertRaises(OrderIntentReservationError):
-            self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, collateral="1", max_loss="1"))
+            self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="1", max_loss="1"))
         with self.assertRaises(OrderIntentValidationError):
-            self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, quote_time=self.clock.now - timedelta(minutes=6)))
-        bad = risk(record, self.clock)
+            self.ledger.reserve_margin(record.intent_id, self.risk(record, quote_time=self.clock.now - timedelta(minutes=6)))
+        bad = self.risk(record)
         object.__setattr__(bad, "decision_id", "other-decision")
         with self.assertRaises(OrderIntentIntegrityError):
             self.ledger.reserve_margin(record.intent_id, bad)
-        reservation = self.ledger.reserve_margin(record.intent_id, risk(record, self.clock))
+        reservation = self.ledger.reserve_margin(record.intent_id, self.risk(record))
         self.assertEqual(reservation.max_loss_amount, Decimal("400"))
         self.assertEqual(reservation.quote_digest, "a" * 64)
-        changed = risk(record, self.clock)
+        changed = self.risk(record)
         object.__setattr__(changed, "quote_digest", "e" * 64)
         with self.assertRaises(OrderIntentTransitionError):
             self.ledger.reserve_margin(record.intent_id, changed)
 
     def test_evidence_rejects_numeric_identity_datetime_and_validate_subclasses(self):
         record = self.ledger.create_intent(make_intent()).intent
-        normal_capacity = capacity(self.clock)
+        capacity_decision = self.set_capacity()
+        normal_capacity = self.capacity_evidence(capacity_decision)
         with self.assertRaises(OrderIntentValidationError):
             self.ledger.set_reservation_cap(
                 BypassCapacityEvidence(**normal_capacity.__dict__)
@@ -498,17 +1150,18 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with self.assertRaises(OrderIntentValidationError):
             self.ledger.set_reservation_cap(
                 AccountCapacityEvidence(
-                    account_id="acct-1",
+                    account_id="1000000001",
                     environment="production",
                     broker_buying_power=AlwaysSmallDecimal("1"),
                     risk_budget=AlwaysSmallDecimal("1"),
                     observed_at=self.clock.now,
-                    portfolio_snapshot_digest="b" * 64,
+                    portfolio_snapshot_digest=capacity_decision.portfolio_snapshot_digest,
+                    broker_read_evidence_sha256=capacity_decision.evidence_sha256,
                 )
             )
         self.ledger.set_reservation_cap(normal_capacity)
 
-        normal_risk = risk(record, self.clock)
+        normal_risk = self.risk(record)
         with self.assertRaises(OrderIntentValidationError):
             self.ledger.reserve_margin(
                 record.intent_id, BypassRiskEvidence(**normal_risk.__dict__)
@@ -522,8 +1175,9 @@ class OrderIntentLedgerTests(unittest.TestCase):
                     collateral_amount=AlwaysSmallDecimal("1"),
                     quote_observed_at=self.clock.now,
                     quote_digest="a" * 64,
-                    portfolio_observed_at=self.clock.now,
-                    portfolio_snapshot_digest="b" * 64,
+                    portfolio_observed_at=capacity_decision.observed_at,
+                    portfolio_snapshot_digest=capacity_decision.portfolio_snapshot_digest,
+                    capacity_decision_sha256=capacity_decision.decision_sha256,
                 ),
             )
         with localcontext() as decimal_context:
@@ -531,7 +1185,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
             with self.assertRaises(OrderIntentReservationError):
                 self.ledger.reserve_margin(
                     record.intent_id,
-                    risk(record, self.clock, collateral="1", max_loss="1"),
+                    self.risk(record, collateral="1", max_loss="1"),
                 )
 
         self.ledger.reserve_margin(record.intent_id, normal_risk)
@@ -580,14 +1234,14 @@ class OrderIntentLedgerTests(unittest.TestCase):
             self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=30)
 
     def test_atomic_concurrent_reservation_cap_and_same_account_claim_blocker(self):
-        self.ledger.set_reservation_cap(capacity(self.clock))
+        self.set_capacity()
         left = self.ledger.create_intent(make_intent(key="left")).intent
         right = self.ledger.create_intent(make_intent(key="right")).intent
         barrier = threading.Barrier(2)
         def reserve(record):
             barrier.wait()
             try:
-                self.ledger.reserve_margin(record.intent_id, risk(record, self.clock, collateral="600", max_loss="400"))
+                self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="600", max_loss="400"))
                 return True
             except OrderIntentReservationError:
                 return False
@@ -598,7 +1252,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         other = right if winner is left else left
         self.ledger.reserve_margin(
             other.intent_id,
-            risk(other, self.clock, collateral="400", max_loss="400"),
+            self.risk(other, collateral="400", max_loss="400"),
         )
         lease = self.ledger.claim_submission(winner.intent_id, "worker-a", lease_seconds=30)
         self.begin_submission(winner, "worker-a", lease)
@@ -607,39 +1261,47 @@ class OrderIntentLedgerTests(unittest.TestCase):
 
     def test_capacity_snapshots_are_ordered_can_reach_zero_and_block_new_claims(self):
         record = self.ledger.create_intent(make_intent()).intent
-        self.ledger.set_reservation_cap(capacity(self.clock))
-        self.ledger.reserve_margin(record.intent_id, risk(record, self.clock))
+        self.set_capacity()
+        self.ledger.reserve_margin(record.intent_id, self.risk(record))
         with self.assertRaises(OrderIntentIntegrityError):
-            self.ledger.set_reservation_cap(capacity(self.clock, buying_power="0", risk_budget="0"))
+            self.set_capacity(buying_power="0", risk_budget="0")
         self.clock.advance(1)
-        self.assertEqual(self.ledger.set_reservation_cap(capacity(self.clock, buying_power="0", risk_budget="0")), Decimal("0"))
+        self.assertEqual(
+            self.set_capacity(
+                buying_power="0", risk_budget="0"
+            ).cap_amount,
+            Decimal("0"),
+        )
         with self.assertRaises(OrderIntentReservationError):
             self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=30)
         blocked = self.ledger.create_intent(make_intent(key="zero-cap", decision="zero-cap")).intent
         with self.assertRaises(OrderIntentReservationError):
-            self.ledger.reserve_margin(blocked.intent_id, risk(blocked, self.clock))
+            self.ledger.reserve_margin(blocked.intent_id, self.risk(blocked))
 
     def test_identical_equal_time_capacity_is_idempotent_but_conflict_fails(self):
-        snapshot = capacity(self.clock)
-
         self.assertEqual(
-            self.ledger.set_reservation_cap(snapshot),
+            self.set_capacity().cap_amount,
             Decimal("1000"),
         )
         self.assertEqual(
-            self.ledger.set_reservation_cap(snapshot),
+            self.set_capacity().cap_amount,
             Decimal("1000"),
         )
         with self.assertRaises(OrderIntentIntegrityError):
-            self.ledger.set_reservation_cap(
-                capacity(self.clock, digest="d" * 64)
-            )
+            self.set_capacity(state_marker="different")
 
     def test_reservation_requires_the_capacity_snapshot_used_for_its_portfolio_risk(self):
         record = self.ledger.create_intent(make_intent()).intent
-        self.ledger.set_reservation_cap(capacity(self.clock, digest="d" * 64))
+        decision = self.set_capacity(state_marker="different")
         with self.assertRaises(OrderIntentIntegrityError):
-            self.ledger.reserve_margin(record.intent_id, risk(record, self.clock))
+            self.ledger.reserve_margin(
+                record.intent_id,
+                self.risk(
+                    record,
+                    portfolio_snapshot_digest="b" * 64,
+                    capacity_decision_sha256=decision.decision_sha256,
+                ),
+            )
 
     def test_expired_claim_without_place_attempt_returns_to_intent_with_new_fence(self):
         record = self.opening()
@@ -668,7 +1330,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.clock.advance(6)
 
         self.assertEqual(
-            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+            self.ledger.reconciliation_blockers("1000000001", "production"), ()
         )
         self.assertEqual(self.ledger.get_intent(record.intent_id).state, "INTENT")
         replacement = self.ledger.claim_submission(
@@ -803,7 +1465,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.clock.advance(6)
 
         self.assertEqual(
-            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+            self.ledger.reconciliation_blockers("1000000001", "production"), ()
         )
         replacement = self.ledger.acquire_amendment_lease(
             submitted.intent_id,
@@ -848,7 +1510,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.clock.advance(6)
 
         self.assertEqual(
-            self.ledger.reconciliation_blockers("acct-1", "production"), ()
+            self.ledger.reconciliation_blockers("1000000001", "production"), ()
         )
         replacement = self.ledger.acquire_amendment_lease(
             submitted.intent_id,
@@ -1059,28 +1721,51 @@ class OrderIntentLedgerTests(unittest.TestCase):
         self.begin_submission(record, "worker", lease)
         self.ledger.record_post_unknown(record.intent_id, "worker", lease.fencing_token, "POST_TIMEOUT")
         restarted = OrderIntentLedger(self.path, clock=self.clock, run_id="run-b")
-        self.assertEqual([item.intent_id for item in restarted.reconciliation_blockers("acct-1", "production")], [record.intent_id])
-        filled = restarted.reconcile_terminal(record.intent_id, "FILLED", evidence(record, self.clock, outcome="FILLED"))
+        self.assertEqual([item.intent_id for item in restarted.reconciliation_blockers("1000000001", "production")], [record.intent_id])
+        filled_evidence = self.query_evidence(
+            record,
+            ledger=restarted,
+            outcome="FILLED",
+            broker_order_id="2000000001",
+        )
+        filled = restarted.reconcile_terminal(
+            record.intent_id, "FILLED", filled_evidence
+        )
         self.assertEqual(filled.state, "FILLED")
         self.assertEqual(restarted.get_margin_reservation(record.intent_id).state, "FILLED_PENDING_ABSORPTION")
         next_opening = restarted.create_intent(make_intent(key="next-opening", decision="next-decision")).intent
-        restarted.reserve_margin(next_opening.intent_id, risk(next_opening, self.clock))
+        restarted.reserve_margin(
+            next_opening.intent_id,
+            self.risk(next_opening, ledger=restarted),
+        )
         with self.assertRaises(OrderIntentReservationError):
             restarted.claim_submission(next_opening.intent_id, "new-worker", lease_seconds=30)
         self.clock.advance(1)
-        with self.assertRaises(OrderIntentReconciliationRequired):
-            restarted.absorb_filled_reservation(record.intent_id, capacity(self.clock))
+        refreshed_capacity = self.set_capacity(ledger=restarted)
         with self.assertRaises(OrderIntentReconciliationRequired):
             restarted.absorb_filled_reservation(
-                record.intent_id, capacity(self.clock, digest="d" * 64)
+                record.intent_id,
+                self.capacity_evidence(refreshed_capacity),
+            )
+        self.clock.advance(1)
+        changed_capacity = self.set_capacity(
+            ledger=restarted, state_marker="different"
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            restarted.absorb_filled_reservation(
+                record.intent_id,
+                self.capacity_evidence(changed_capacity),
             )
         self.assertEqual(
             restarted.get_margin_reservation(record.intent_id).state,
             "FILLED_PENDING_ABSORPTION",
         )
         event = next(item for item in restarted.events(record.intent_id) if item.reason_code == "BROKER_FILLED")
-        self.assertEqual(event.raw_response_digest, "c" * 64)
-        self.assertEqual((event.account_id, event.environment, event.client_order_id), ("acct-1", "production", record.client_order_id))
+        self.assertEqual(
+            event.raw_response_digest,
+            filled_evidence.raw_response_digest,
+        )
+        self.assertEqual((event.account_id, event.environment, event.client_order_id), ("1000000001", "production", record.client_order_id))
         self.assertEqual((event.evidence_operation, event.http_status, event.broker_status), ("ORDER_QUERY", 200, "FILLED"))
 
     def test_amendment_is_persisted_before_post_fenced_and_expiry_is_reconciliation_only(self):
@@ -1094,8 +1779,16 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with self.assertRaises(OrderIntentReconciliationRequired):
             self.ledger.acquire_amendment_lease(submitted.intent_id, "other", lease_seconds=5, idempotency_key="amend-1", amendment_payload=raw_payload())
         self.clock.advance(6)
-        self.assertEqual(self.ledger.reconciliation_blockers("acct-1", "production")[0].intent_id, submitted.intent_id)
-        self.ledger.reconcile_terminal(submitted.intent_id, "CANCELLED", evidence(submitted, self.clock, operation="AMEND_QUERY", outcome="CANCELLED", client_order_id=amendment.client_order_id))
+        self.assertEqual(self.ledger.reconciliation_blockers("1000000001", "production")[0].intent_id, submitted.intent_id)
+        amendment_evidence = self.query_evidence(
+            submitted,
+            operation="AMEND_QUERY",
+            outcome="CANCELLED",
+            broker_order_id=submitted.broker_order_id,
+        )
+        self.ledger.reconcile_terminal(
+            submitted.intent_id, "CANCELLED", amendment_evidence
+        )
         with sqlite3.connect(self.path) as conn:
             completion = conn.execute("SELECT completion_state FROM amendment_history WHERE intent_id = ? AND idempotency_key = ?", (submitted.intent_id, "amend-1")).fetchone()
         self.assertEqual(completion, ("TERMINAL",))
@@ -1123,7 +1816,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
             self.ledger.acquire_amendment_lease(record.intent_id, "nudger", lease_seconds=30, idempotency_key="amend-1", amendment_payload=raw_payload())
         with sqlite3.connect(self.path) as conn:
             history = conn.execute("SELECT target_broker_order_id, client_order_id, payload_hash FROM amendment_history WHERE intent_id = ? AND idempotency_key = ?", (record.intent_id, "amend-1")).fetchone()
-        self.assertEqual(history[:2], ("broker-1", amendment.client_order_id))
+        self.assertEqual(history[:2], ("2000000001", amendment.client_order_id))
         self.assertEqual(len(history[2]), 64)
 
     def test_original_intent_rejects_known_client_id_collision_with_completed_amendment(self):
@@ -1131,11 +1824,11 @@ class OrderIntentLedgerTests(unittest.TestCase):
         submit = self.ledger.claim_submission(source.intent_id, "worker", lease_seconds=30)
         self.begin_submission(source, "worker", submit)
         self.ledger.record_post_acknowledgement(source.intent_id, "worker", submit.fencing_token, evidence(source, self.clock, operation="SUBMIT_ACK"))
-        amendment = self.ledger.acquire_amendment_lease(source.intent_id, "nudger", lease_seconds=30, idempotency_key="amend-13221", amendment_payload=raw_payload())
+        amendment = self.ledger.acquire_amendment_lease(source.intent_id, "nudger", lease_seconds=30, idempotency_key="amend-68395", amendment_payload=raw_payload())
         self.begin_amendment(source, "nudger", amendment)
         self.ledger.record_amendment_acknowledgement(source.intent_id, "nudger", amendment.fencing_token, evidence(source, self.clock, operation="AMEND_ACK", client_order_id=amendment.client_order_id, broker_order_id="broker-amended"))
         with self.assertRaises(OrderIntentIntegrityError):
-            self.ledger.create_intent(make_intent(key="target-210261"))
+            self.ledger.create_intent(make_intent(key="target-338459"))
 
     def test_amendment_is_reprice_only_and_in_doubt_lease_cannot_be_released(self):
         record = self.opening()
@@ -1204,7 +1897,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         other = self.ledger.create_intent(make_intent(key="other-opening", decision="other-opening")).intent
         self.ledger.reserve_margin(
             other.intent_id,
-            risk(other, self.clock, collateral="400", max_loss="400"),
+            self.risk(other, collateral="400", max_loss="400"),
         )
         with self.assertRaises(OrderIntentReconciliationRequired):
             self.ledger.claim_submission(other.intent_id, "other", lease_seconds=30)
@@ -1216,7 +1909,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
         record = self.opening()
         submit = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=600)
         self.clock.advance(1)
-        self.ledger.set_reservation_cap(capacity(self.clock, buying_power="0", risk_budget="0"))
+        self.set_capacity(buying_power="0", risk_budget="0")
         with self.assertRaises(OrderIntentReservationError):
             self.begin_submission(record, "worker", submit)
         self.assertEqual(self.ledger.get_intent(record.intent_id).state, "CLAIMED")
@@ -1225,26 +1918,46 @@ class OrderIntentLedgerTests(unittest.TestCase):
         for terminal in ("CANCELLED", "EXPIRED"):
             with self.subTest(terminal=terminal):
                 self.clock.advance(1)
-                account = f"acct-{terminal.lower()}"
+                account = {
+                    "CANCELLED": "1000000011",
+                    "EXPIRED": "1000000012",
+                }[terminal]
+                broker_order_id = {
+                    "CANCELLED": "2000000011",
+                    "EXPIRED": "2000000012",
+                }[terminal]
                 record = self.opening(key=f"{terminal}-opening", account=account)
                 submit = self.ledger.claim_submission(record.intent_id, "worker", lease_seconds=30)
                 self.begin_submission(record, "worker", submit)
-                self.ledger.record_post_acknowledgement(record.intent_id, "worker", submit.fencing_token, evidence(record, self.clock, operation="SUBMIT_ACK", broker_order_id=f"{terminal}-broker"))
-                self.ledger.reconcile_terminal(record.intent_id, terminal, evidence(record, self.clock, operation="ORDER_QUERY", outcome=terminal, broker_order_id=f"{terminal}-broker"))
+                self.ledger.record_post_acknowledgement(record.intent_id, "worker", submit.fencing_token, evidence(record, self.clock, operation="SUBMIT_ACK", broker_order_id=broker_order_id))
+                terminal_evidence = self.query_evidence(
+                    record,
+                    outcome=terminal,
+                    broker_order_id=broker_order_id,
+                )
+                self.ledger.reconcile_terminal(
+                    record.intent_id, terminal, terminal_evidence
+                )
                 self.assertEqual(self.ledger.get_margin_reservation(record.intent_id).state, "FILLED_PENDING_ABSORPTION")
                 blocked = self.ledger.create_intent(make_intent(account=account, key=f"{terminal}-blocked", decision=f"{terminal}-blocked")).intent
-                self.ledger.reserve_margin(blocked.intent_id, risk(blocked, self.clock))
+                self.ledger.reserve_margin(blocked.intent_id, self.risk(blocked))
                 with self.assertRaises(OrderIntentReservationError):
                     self.ledger.claim_submission(blocked.intent_id, "blocked", lease_seconds=30)
                 self.clock.advance(1)
-                with self.assertRaises(OrderIntentReconciliationRequired):
-                    self.ledger.absorb_filled_reservation(
-                        record.intent_id, capacity(self.clock, account=account)
-                    )
+                refreshed_capacity = self.set_capacity(account=account)
                 with self.assertRaises(OrderIntentReconciliationRequired):
                     self.ledger.absorb_filled_reservation(
                         record.intent_id,
-                        capacity(self.clock, account=account, digest="d" * 64),
+                        self.capacity_evidence(refreshed_capacity),
+                    )
+                self.clock.advance(1)
+                changed_capacity = self.set_capacity(
+                    account=account, state_marker="different"
+                )
+                with self.assertRaises(OrderIntentReconciliationRequired):
+                    self.ledger.absorb_filled_reservation(
+                        record.intent_id,
+                        self.capacity_evidence(changed_capacity),
                     )
                 with self.assertRaises(OrderIntentReservationError):
                     self.ledger.claim_submission(blocked.intent_id, "still-blocked", lease_seconds=30)
@@ -1296,6 +2009,26 @@ class OrderIntentLedgerTests(unittest.TestCase):
             payload_hash=legacy.payload_hash,
         )
         claimed_client_id = stable_client_order_id(claimed_legacy)
+        query_wire = wire_order_payload(raw_payload())
+        query_canonical = canonical_order_payload(
+            json.loads(query_wire)
+        )
+        query_legacy = OrderIntent(
+            account_id="1000000099",
+            environment="production",
+            strategy_id="legacy-open",
+            decision_id="legacy-query-decision",
+            idempotency_scope="legacy",
+            idempotency_key="legacy-query",
+            intent_kind="OPENING",
+            wire_payload=query_wire,
+            canonical_payload=query_canonical,
+            payload_hash=hashlib.sha256(
+                b"etrade-order-payload.v2\0"
+                + query_canonical.encode("utf-8")
+            ).hexdigest(),
+        )
+        query_client_id = stable_client_order_id(query_legacy)
         now = int(self.clock.now.timestamp() * 1_000_000)
         with sqlite3.connect(self.path) as conn:
             conn.execute(
@@ -1326,6 +2059,38 @@ class OrderIntentLedgerTests(unittest.TestCase):
                     legacy.canonical_payload,
                     legacy.payload_hash,
                     legacy_client_id,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO order_intents (
+                    intent_id, account_id, environment, strategy_id, decision_id,
+                    idempotency_scope, idempotency_key, intent_kind, wire_payload,
+                    canonical_payload, payload_hash, client_order_id, state,
+                    broker_order_id, submission_fence, amendment_fence,
+                    submission_lease_owner, submission_lease_expires_at,
+                    pending_operation, pending_owner, pending_fence,
+                    last_reconciled_run, created_at, updated_at
+                ) VALUES (
+                    'legacy-query-intent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'SUBMITTED', '2000000099', 1, 0, NULL, NULL,
+                    NULL, NULL, NULL, 'legacy-run', ?, ?
+                )
+                """,
+                (
+                    query_legacy.account_id,
+                    query_legacy.environment,
+                    query_legacy.strategy_id,
+                    query_legacy.decision_id,
+                    query_legacy.idempotency_scope,
+                    query_legacy.idempotency_key,
+                    query_legacy.intent_kind,
+                    query_legacy.wire_payload,
+                    query_legacy.canonical_payload,
+                    query_legacy.payload_hash,
+                    query_client_id,
                     now,
                     now,
                 ),
@@ -1464,19 +2229,14 @@ class OrderIntentLedgerTests(unittest.TestCase):
         migrated.release_amendment_lease(
             legacy_record.intent_id, "legacy-amender", 1
         )
+        query_record = migrated.get_intent("legacy-query-intent")
+        legacy_query = self.query_evidence(
+            query_record,
+            ledger=migrated,
+            broker_order_id="2000000099",
+        )
         reconciled = migrated.mark_reconciled(
-            legacy_record.intent_id,
-            BrokerEvidence(
-                account_id=legacy.account_id,
-                environment=legacy.environment,
-                client_order_id=legacy_client_id,
-                broker_order_id="legacy-broker-order",
-                operation="ORDER_QUERY",
-                outcome="OPEN",
-                observed_at=self.clock.now,
-                http_status=200,
-                raw_response_digest="f" * 64,
-            ),
+            query_record.intent_id, legacy_query
         )
         self.assertEqual(reconciled.state, "SUBMITTED")
         self.assertEqual(migrated.path, self.path)
@@ -1541,8 +2301,10 @@ class OrderIntentLedgerTests(unittest.TestCase):
         record = migrated.create_intent(
             make_intent(key="migration-live", decision="migration-live")
         ).intent
-        migrated.set_reservation_cap(capacity(self.clock))
-        migrated.reserve_margin(record.intent_id, risk(record, self.clock))
+        self.set_capacity(ledger=migrated)
+        migrated.reserve_margin(
+            record.intent_id, self.risk(record, ledger=migrated)
+        )
         lease = migrated.claim_submission(
             record.intent_id, "worker", lease_seconds=5
         )

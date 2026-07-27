@@ -71,8 +71,9 @@ For every reliability incident:
 - Production startup requires an exact account ID, account key, and institution
   type plus an owner-only, signed, short-lived arm document bound to the same
   identity. The arm and identity must be revalidated after account refresh and
-  immediately before every order API call. R7 must preserve that invariant
-  while replacing the compatibility guard with one durable mutation gateway.
+  immediately before every order API call. The isolated R7 stack preserves
+  that invariant; future live composition must replace the compatibility guard
+  with that durable gateway as the sole mutation owner.
 - Every broker mutation must have one durable, uniquely fenced send claim
   before I/O and one parsed response receipt before acknowledgement. An
   ambiguous send is reconciliation-only and is never retried. A broker query
@@ -497,7 +498,8 @@ finding.
     metadata for order payloads, account/order response bodies, and
     account-bearing URLs.
 - `live_trading/order_intent_ledger.py`,
-  `live_trading/etrade_broker_transport.py`, and
+  `live_trading/etrade_broker_transport.py`,
+  `live_trading/etrade_broker_reader.py`, and
   `live_trading/etrade_order_gateway.py`
   - Persist immutable intent, reservation, authorization, exact send, preview,
     and parsed-response evidence.
@@ -507,8 +509,18 @@ finding.
     broker ID plus exact canonical order-term hash before reconciliation.
   - Revalidate the exact runtime/account/environment around each mutation and
     enforce a gateway-owned account risk ceiling.
-  - Remain intentionally disconnected from the live agent until the read side
-    and migration gates below are complete.
+  - Pin every broker GET to the configured origin and exact account, bound its
+    execution and retained bytes, disable redirects/retries/ambient session
+    state, and persist the raw response before any normalized result can leave
+    the reader.
+  - Independently replay the installed strict parser over each retained
+    response, then accept capacity only from a content-addressed schema-11
+    manifest containing two complete economically identical account scans.
+    Reconciliation uses only a direct query for the already durable broker
+    order ID.
+  - Remain intentionally disconnected from the live agent until the remaining
+    position, closing, cancellation, composition, and operational migration
+    gates below are complete.
 - `live_trading/etrade_check_option.py` and
   `live_trading/etrade_option_chains.py`
   - Remove hardcoded OAuth credentials from the current source and require
@@ -517,15 +529,14 @@ finding.
 ### Remaining risk
 
 This is containment in the current source, not production readiness. The
-compatibility order client still owns current live calls. The isolated R7a–R7c
-stack now provides a schema 10 intent ledger, hardened mutation transport, and
-opening/reprice coordinator, but no live code instantiates it.
+compatibility order client still owns current live calls. The isolated R7a–R7d
+stack now provides a schema-11 intent ledger, hardened mutation transport,
+origin-bound durable reader, and opening/reprice coordinator, but no live code
+instantiates it.
 
-The next gate is a concrete private E*TRADE reader with complete pagination,
-stable two-pass capacity snapshots, origin-bound durable raw/parser receipts,
-and atomic reconciliation evidence. Position absorption, closing capacity,
-durable per-intent cancellation, a single production composition root, and a
-static ban on every direct legacy mutation path also remain required.
+Position-bound fill absorption, closing capacity, durable per-intent
+cancellation, a single production composition root, and a static ban on every
+direct legacy mutation path remain required.
 
 The exposed OAuth keys still require external revocation and rotation. A later
 coordinated history purge must remove them from all refs and arrange cleanup of
@@ -547,15 +558,23 @@ deployed dashboard has not been reloaded or visually inspected with R6.
   files, guarded response/request logging, order calls without a boundary,
   placement-time arm expiry, dashboard credential rejection, and loopback/CORS
   behavior.
-- The current R7 ledger/transport/coordinator focused suite includes 88
-  deterministic tests for immutable identity, exact authorization/XML,
+- The current R7 ledger/reader/transport/coordinator focused suite includes
+  112 deterministic tests for immutable identity, exact authorization/XML,
   transport deadlines, send fencing, parsed receipts, crash/timeout recovery,
   capacity arithmetic, gateway-owned risk ceilings, environment/account
-  binding, exact order-term reconciliation, amendment replay, terminal-risk
-  retention, and additive schema 8→9→10 migration. Independent adversarial
-  reviews found no remaining reproducible P0/P1 mutation-state defect in the
-  isolated stack; they explicitly retain a no-go on live wiring until the
-  durable reader and remaining protocols are delivered.
+  binding, strict raw-response replay, pagination/marker completeness,
+  two-scan stability, exact order-term reconciliation, amendment replay,
+  terminal-risk retention, and additive schema 8→9→10→11 migration.
+  Independent adversarial review found and closed fail-open handling for
+  replacement-linked and partially filled terminal orders; both now remain
+  unresolved. The review explicitly retains a no-go on live wiring until the
+  remaining position, closing, cancellation, and composition protocols are
+  delivered.
+- The maintained `tests/` suite passes 277 tests in the clean Python 3.10
+  environment. An unscoped repository-root pytest invocation still
+  mis-collects two legacy `scratch/test_delta_*` research scripts and triggers
+  import-time market-data behavior; the reproducible-build/CI gate must
+  constrain collection and remove those import side effects.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.

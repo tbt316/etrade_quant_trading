@@ -152,7 +152,7 @@ flowchart LR
     LEDGER["R7a Order Intent Ledger<br/>(Implemented, Isolated)"]
     TRANSPORT["R7b Mutation Transport<br/>(Implemented, Isolated)"]
     GATE["R7c Order Gateway<br/>(Implemented, Isolated)"]
-    READER["Durable E*TRADE Reader<br/>(Required Before Live Wiring)"]
+    READER["R7d Durable E*TRADE Reader<br/>(Implemented, Isolated)"]
     BROKER["E*TRADE"]
 
     CLI --> SAFE
@@ -163,10 +163,12 @@ flowchart LR
     ACCOUNT --> DIRECT
     DIRECT -->|"current, guarded but non-durable"| BROKER
     DIRECT -.->|"future migration"| GATE
-    LEDGER --> GATE
-    LEDGER --> TRANSPORT
-    READER -.->|"not implemented yet"| GATE
+    GATE -->|"intent, reservation, reconciliation"| LEDGER
+    GATE -->|"capacity and known-order reads"| READER
     GATE --> TRANSPORT
+    READER -->|"append-only raw receipts + manifests"| LEDGER
+    TRANSPORT -->|"send claims + mutation receipts"| LEDGER
+    READER -.->|"bounded origin-pinned GETs; not connected yet"| BROKER
     TRANSPORT -.->|"not connected yet"| BROKER
 ```
 
@@ -177,10 +179,13 @@ mutation transport that claims every send before broker I/O and persists parsed
 responses. R7c composes those components into an opening/reprice coordinator
 with a gateway-owned risk ceiling, exact environment/account binding,
 restart reconciliation, and exact economic-term comparison. No live code
-instantiates this stack. A concrete origin-bound reader with durable raw and
-parsed receipts, position absorption, cancellation/closing protocols, and
-removal of legacy mutation paths remain mandatory before live wiring. The
-deployed service has not been restarted or inspected with R6 or R7.
+instantiates this stack. R7d adds the concrete origin-bound reader: every
+usable GET is durably recorded as bounded raw bytes, independently reparsed by
+the ledger, and grouped into a semantically complete manifest before it can
+authorize capacity or reconciliation. Position absorption,
+cancellation/closing protocols, the single live composition root, and removal
+of legacy mutation paths remain mandatory before live wiring. The deployed
+service has not been restarted or inspected with R6 or R7.
 
 ---
 
@@ -223,10 +228,11 @@ shadow/research-only and cannot affect E*TRADE order eligibility.
 ### 3. Live Runtime Safety
 
 *   **Runtime Safety Boundary** ([`runtime_safety.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/runtime_safety.py)): Resolves an explicit `sandbox` or `production` environment before OAuth construction. Production requires an exact account identity plus a versioned, signed arm file with a bounded lifetime; unsafe, missing, mismatched, future, or expired proof fails closed. The operator CLI writes the arm atomically as an owner-only file without accepting the signing secret as a command-line argument.
-*   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`order_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/order/order_bo.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh, and the compatibility order client repeats it immediately before every order API call. R7 must preserve the check inside the durable single mutation gateway.
+*   **Account Identity Revalidation** ([`accounts_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/accounts/accounts_bo.py), [`order_bo.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/order/order_bo.py)): Selects production accounts by exact account ID, account key, and institution type instead of a mutable list index. The live process revalidates the armed identity after startup and account refresh, and the compatibility order client repeats it immediately before every order API call. The isolated R7 reader, gateway, and transport preserve the same boundary; future live composition must make that gateway the sole mutation owner.
 *   **Durable Order Intent Ledger** ([`order_intent_ledger.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/order_intent_ledger.py), [`order_intent_ledger.md`](file:///Users/btian/EtradePythonClient/etrade_python_client/docs/order_intent_ledger.md)): R7a provides strict vertical-spread validation, account capacity reservations, stable identifiers, monotonic submission/amendment fences, immutable outbound authorizations, exact send/response receipts, and reconciliation-only handling after an ambiguous mutation.
 *   **Hardened Mutation Transport** ([`etrade_broker_transport.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_transport.py)): R7b is the only reviewed adapter permitted to derive E*TRADE mutation XML from a durable authorization. It disables ambient proxies, cookies, hooks, redirects, and retries; revalidates the armed account; claims the exact send before I/O; bounds the exchange in an isolated process; and records the parsed result before returning.
-*   **Order Gateway** ([`etrade_order_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_order_gateway.py)): R7c coordinates opening submissions and price-only amendments through the exact transport. Startup stays read-only until every known broker order is reconciled, unknown responses without a broker ID remain permanent blockers, returned order terms must hash to the durable authorization, and an immutable gateway policy—not a strategy command—sets the account risk ceiling. This component remains intentionally unreachable from the live agent until the durable broker reader and remaining execution protocols are delivered.
+*   **Order Gateway** ([`etrade_order_gateway.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_order_gateway.py)): R7c coordinates opening submissions and price-only amendments through the exact transport. Startup stays read-only until every known broker order is reconciled, unknown responses without a broker ID remain permanent blockers, returned order terms must hash to the durable authorization, and an immutable gateway policy—not a strategy command—sets the account risk ceiling. This component remains intentionally unreachable from the live agent until position absorption, closing/cancellation, live composition/static enforcement, and operational validation are delivered.
+*   **Durable E*TRADE Reader** ([`etrade_broker_reader.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_broker_reader.py)): R7d performs only exact origin-pinned, no-retry GETs in bounded disposable processes. It rebinds the configured account before and after a read, traverses explicit portfolio pages and reviewed active-order marker lanes, requires two economically identical capacity scans, and persists raw response bytes plus parser and request provenance before returning a content-addressed manifest. Known-order reconciliation uses only a direct lookup of the durable broker order ID; missing, incomplete, ambiguous, or mismatched evidence remains blocked.
 *   **Dashboard Containment** ([`etrade_cover_call_new.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_cover_call_new.py)): Serves the order-capable dashboard on loopback only, does not start ngrok automatically, and does not grant wildcard CORS. Startup rejects default or weak dashboard credentials, while local settings and touched logs use owner-only file handling.
 *   **Credential Source Cleanup** ([`etrade_check_option.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_check_option.py), [`etrade_option_chains.py`](file:///Users/btian/EtradePythonClient/etrade_python_client/live_trading/etrade_option_chains.py)): Removes hardcoded OAuth credentials from the current source and requires local configuration or environment variables. Because the repository is currently public and those values remain in Git history, the affected keys must be treated as compromised until they are revoked and rotated externally; a coordinated history purge remains separate follow-up work.
 

@@ -61,15 +61,17 @@ current source:
   quarantined.
 
 These changes do **not** satisfy Phase 0 or make the repository production
-ready. The existing order paths are guarded but not yet centralized, so R7 must
-preserve the arm/account check in a sole mutation owner and add durable
-idempotency, capacity reservations, and reconciliation. The current local dashboard settings
-are intentionally rejected until stronger credentials are provisioned. The
-repository is public, and OAuth keys retained in public Git history must be
-treated as compromised: external revoke/rotate is required, followed by a
-coordinated history purge and downstream cleanup. No live service restart,
-deployment, E*TRADE mutation, or exact served-dashboard verification has been
-performed for R6.
+ready. The existing order paths are guarded but not yet centralized. R7a–R7d
+preserve the arm/account check and add isolated durable intent identity,
+capacity reservations, mutation fencing, direct known-order reconciliation,
+and raw read provenance, but no live caller is composed through that stack.
+The current local dashboard settings are intentionally rejected until stronger
+credentials are provisioned. GitHub reports the repository as public on
+2026-07-26, and OAuth keys retained in its public history must be treated as
+compromised: external revoke/rotate is required, followed by a coordinated
+history purge and downstream cleanup. No live service restart, deployment,
+E*TRADE mutation, or exact served-dashboard verification has been performed
+for R6.
 
 ## What is worth preserving
 
@@ -290,13 +292,16 @@ explicit environment selection; exact production account identity; a
 versioned, signed arm document with a maximum 15-minute lifetime; refresh-time
 and order-call revalidation; strong dashboard credential validation; and
 owner-only local files. It does not yet provide the complete typed
-configuration model or an OS secret-store integration. Its compatibility
-order guard does not replace the R7 requirement for a durable single placement
-gateway with stable intent identity and reconciliation.
+configuration model or an OS secret-store integration. The isolated R7
+gateway, transport, reader, and ledger now provide stable intent identity and
+durable reconciliation evidence, but live composition and static enforcement
+must still replace the compatibility order paths.
 
 ### Boundary 2: E*TRADE gateway
 
-Only this module may make broker HTTP calls. It owns:
+One private gateway owns the broker boundary. Its read adapter and mutation
+transport are the only modules below that gateway permitted to make broker
+HTTP calls. Together they own:
 
 - OAuth lifecycle and environment binding.
 - Connect/read/total deadlines.
@@ -304,11 +309,15 @@ Only this module may make broker HTTP calls. It owns:
   `Partial`, `Unauthorized`, `RateLimited`, `TransientFailure`, and
   `PermanentFailure` outcomes.
 - Complete pagination and request-volume budgets.
-- Bounded retries for safe reads.
+- One recorded exchange per read attempt; callers may begin a new attempt only
+  from durable state, never through hidden transport retries.
 - No blind retry of mutating POSTs.
 - Redacted structured logging and correlation IDs.
-- `place_once(intent_id)`: query/reconcile the stable client ID before any retry
-  after an unknown response.
+- `place_once(intent_id)`: an unknown response with a durable broker ID is
+  reconciled by direct ID lookup before any further mutation. Because E*TRADE
+  does not echo the client order ID, an unknown response without a durable
+  broker ID remains blocked for supervised resolution and is never guessed or
+  retried.
 
 ### Boundary 3: canonical snapshots
 
@@ -378,6 +387,12 @@ PROPOSED
 intent, idempotency key, preview, broker IDs, price budget, every transition,
 actor, timestamps, retries, and reconciliation generation. Repricing has one
 owner and absolute slippage/debit/credit/time limits.
+
+Implementation status: schema 11 currently supports isolated opening and
+price-only reprice flows with `INTENT`, `CLAIMED`, `FAILED`,
+`SUBMISSION_UNKNOWN`, `SUBMITTED`, and terminal states. Terminal-fill
+absorption, new closing intents, cancellation, and live composition remain
+fail-closed release gates.
 
 ### Boundary 6: deterministic backtesting
 
@@ -500,6 +515,12 @@ Exit gate:
 
 ### Phase 2 — broker and snapshot foundations (weeks 2–3)
 
+Status: partially delivered. R7b–R7d provide the isolated bounded mutation
+transport, strict origin-bound reader, durable raw/parser receipts, explicit
+pagination, and two-scan capacity manifests. Shared OAuth recovery, general
+snapshot read models, health/readiness, graceful shutdown, metrics, and live
+composition remain open.
+
 Deliver:
 
 1. Extract the typed E*TRADE gateway.
@@ -519,6 +540,12 @@ Exit gate:
 - `SIGTERM` drains or durably records in-flight work within 30 seconds.
 
 ### Phase 3 — durable live control plane (weeks 3–5)
+
+Status: partially delivered. R7a–R7d provide the schema-11 ledger, stable
+opening intent identity, outbox-style send claims, reconciliation, capacity
+reservations, and a single isolated reprice owner. Fill absorption,
+closing/cancellation, the broader pure risk policy, process decomposition,
+dashboard command routing, and hardened live deployment remain open.
 
 Deliver:
 
@@ -641,19 +668,20 @@ boundaries are extracted. Remove old paths only after golden tests and
 shadow-parity prove equivalent intended behavior.
 
 The current stacked delivery names the source-level startup containment slice
-R6. R7a now implements the isolated durable order-intent foundation: strict
-vertical-spread validation, stable intent/client identity, capacity
+R6. R7a–R7d now implement an isolated schema-11 execution core: strict
+vertical-spread validation, stable intent/client identity, durable capacity
 reservations, monotonic submission/amendment fences, exact immutable outbound
-authorization, and reconciliation-only ambiguous outcomes. Its schema 9 ledger
-performs no network I/O and no live caller instantiates it. New closing orders
-and terminal reservation absorption deliberately fail closed until R7b adds
-position-level evidence.
+authorization, a no-retry mutation transport, an opening/reprice coordinator,
+and an origin-bound durable E*TRADE reader. The reader records bounded raw
+responses, the ledger independently replays their strict parser, and capacity
+or reconciliation can use only a semantically complete content-addressed
+manifest. No live caller instantiates this stack.
 
-R7b is therefore still the next production safety boundary: centralize every
-placement, amendment, and cancellation under one private E*TRADE gateway;
-preserve the arm/account check at the mutation boundary; derive broker evidence
-inside that gateway; reconcile all startup blockers; and statically prohibit
-direct legacy mutation calls. See `docs/order_intent_ledger.md`.
+The next R7 safety boundary is position-bound terminal-fill absorption,
+followed by closing-position capacity and one-shot per-intent cancellation.
+Only after those protocols pass restart/crash tests may the live composition
+root own the gateway and static enforcement prohibit every direct legacy
+mutation call. See `docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
 
@@ -704,11 +732,12 @@ R6 has not restarted or inspected the deployed dashboard, called E*TRADE, or
 exercised a live/sandbox mutation. Current-source credential removal also does
 not establish secret hygiene while the repository remains public and the old
 keys remain in Git history. External revoke/rotate, coordinated history purge,
-strong local credential reprovisioning, R7b durable gateway enforcement, and
-deployment verification remain required. R7a's isolated ledger passed 32
-focused tests and independent causal/security review, but it has no production
-call site and is not live-execution evidence. The remaining actions belong to
-the staged acceptance gates above.
+strong local credential reprovisioning, the remaining R7
+position/closing/cancellation protocols, durable-gateway composition, and
+deployment verification remain required. The isolated R7a–R7d stack has
+focused deterministic coverage and independent causal/security review, but it
+has no production call site and is not live-execution evidence. The remaining
+actions belong to the staged acceptance gates above.
 
 The working tree was already heavily modified and contains important untracked
 runtime sources. This review intentionally adds only this plan and does not

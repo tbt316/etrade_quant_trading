@@ -1,16 +1,18 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7a ledger + R7b transport + R7c coordinator, isolated
+**Delivery status:** R7a ledger + R7b transport + R7c coordinator + R7d
+durable reader, isolated
 
 **Production status:** not connected to live E*TRADE mutation paths
 
 `live_trading/order_intent_ledger.py` is the durable, broker-agnostic state
 machine for order identity, capacity reservation, fencing, and ambiguous broker
-outcomes. It performs no network I/O. `etrade_broker_transport.py` now owns the
-reviewed no-retry mutation exchange, and `etrade_order_gateway.py` coordinates
-opening submissions, price-only amendments, and restart reconciliation. The
-live agent still instantiates none of them, so this stack does not yet protect
-the current legacy order paths.
+outcomes. It performs no network I/O. `etrade_broker_transport.py` owns the
+reviewed no-retry mutation exchange, `etrade_broker_reader.py` owns the exact
+origin-bound GET surface, and `etrade_order_gateway.py` coordinates opening
+submissions, price-only amendments, and restart reconciliation. The live agent
+still instantiates none of them, so this stack does not yet protect the current
+legacy order paths.
 
 ## Supported scope
 
@@ -70,9 +72,10 @@ remains blocked rather than guessed or retried.
   evidence. The caller's asserted maximum loss cannot be below the exposure
   derived from strike width, price, contract multiplier, and quantity.
 - An opening terminal state retains its reservation as
-  `FILLED_PENDING_ABSORPTION`. R7a never releases it: neither a newer timestamp
-  nor a different account digest proves that a specific partial or terminal
-  fill is reflected in positions. R7b must add order-bound position evidence.
+  `FILLED_PENDING_ABSORPTION`. The schema-11 R7a–R7d stack never releases it:
+  neither a newer timestamp nor a different account digest proves that a
+  specific partial or terminal fill is reflected in positions. A later
+  position-absorption slice must add order-bound position evidence.
 - Evidence dataclasses and their security-critical string, timestamp, integer,
   byte, and `Decimal` fields must use exact built-in types. Subclass overrides
   cannot replace validation or comparison behavior.
@@ -85,19 +88,37 @@ remains blocked rather than guessed or retried.
   Strategy commands cannot raise it. Reconciliation requires the reader's
   normalized order payload to match the durable original, pending amendment, or
   latest completed amendment hash.
+- Capacity can be set only from a content-addressed schema-11 manifest. A
+  complete manifest brackets two independent scans with exact account-list
+  reads; fully traverses balance, every portfolio page, and all reviewed active
+  order status lanes; and requires both economic scans to match. Moving balance
+  effective timestamps are freshness-checked separately from economic
+  stability.
+- Every usable broker GET is pinned to the configured E*TRADE origin and exact
+  account, has no redirects/retries/ambient session state, runs in a bounded
+  disposable process, and is persisted before its result can leave the reader.
+  The ledger deterministically reruns the installed parser over the raw bytes
+  before accepting the normalized receipt.
+- Known-order reconciliation performs only the direct lookup for the already
+  durable broker order ID. A 404, partial fill, replacement ambiguity, payload
+  mismatch, or undocumented shape remains unresolved and cannot clear a
+  blocker.
 - Order events, broker-order history, amendment history, outbound
-  authorizations, transport attempts, preview receipts, and response receipts
-  are append-only.
+  authorizations, transport attempts, preview receipts, mutation responses,
+  broker-read responses, read manifests, and capacity decisions are
+  append-only.
 - The ledger database must live in an owner-only `0700` directory and remain an
   owner-only regular `0600` file. SQLite sidecars receive the same validation.
 
 ## Schema policy
 
-Schema 10 adds append-only transport attempts, broker-preview receipts, and
-parsed transport-response receipts. Additive schema 8→9→10 migration is
-restart-safe and tested. Unknown versions fail closed. Before any production
-migration, the operator runbook must add an atomic backup, integrity check,
-rollback exercise, and an explicit version-by-version migration.
+Schema 11 adds raw broker-read receipts, ordered semantic manifests, durable
+capacity decisions, and provenance foreign keys on caps, reservations, and
+events. Additive schema 8→9→10→11 migration is one explicit SQLite transaction
+and verifies required columns, foreign keys, append-only triggers, journal
+mode, foreign-key integrity, and `quick_check` before version promotion.
+Unknown or malformed schemas fail closed. A production operator must still
+take an atomic private backup and complete a rollback drill before migration.
 
 ## Remaining production release gates
 
@@ -105,29 +126,25 @@ The isolated R7 stack must not be used as evidence that live execution is
 production-ready. The following remain required before any order-capable
 process is enabled:
 
-1. A concrete private reader must pin the exact E*TRADE origin, runtime
-   boundary, environment, and account; completely paginate account/order data;
-   persist origin-bound raw/parser receipts; and atomically bind durable read
-   evidence to reconciliation and capacity decisions.
-2. Position-level fill evidence must safely absorb terminal opening
+1. Position-level fill evidence must safely absorb terminal opening
    reservations, including partial fills, replacements, assignment/exercise,
    and zero-fill proof for cancelled/rejected/expired orders.
-3. Closing-position capacity and one-shot per-intent cancellation need durable,
+2. Closing-position capacity and one-shot per-intent cancellation need durable,
    crash-tested protocols. Bulk cancellation remains disabled.
-4. The live composition root must construct the exact ledger, reader,
+3. The live composition root must construct the exact ledger, reader,
    transport, and coordinator, and static enforcement must reject direct legacy
    order mutations outside that root.
-5. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
+4. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
    every nonterminal/terminal broker status, replacement chains, cancellation,
    closing, and process death at each durable/I/O boundary.
-6. Operational migration needs a private database backup, integrity check,
+5. Operational migration needs a private database backup, integrity check,
    rollback drill, credential rotation/history purge, deployment restart, and
    observation of the exact served/live artifacts.
 
-The current focused ledger/transport/coordinator suite contains 88 deterministic
-tests. Independent adversarial reviews found no remaining reproducible
-mutation-core path to double-submit, exceed the gateway-owned reservation
-ceiling, release opening exposure early, reuse an identifier, substitute a
-different authorized economic payload, or clear an amendment merely because
-the old broker order is still open. This is source verification only; the
-durable reader and live migration gates above remain open.
+The focused ledger/reader/transport/coordinator suites exercise raw-parser
+binding, pagination and marker drift, two-scan stability, schema rollback,
+exact payload reconciliation, mutation fencing, and crash/timeout behavior.
+They contain 112 deterministic tests; the maintained repository `tests/` suite
+contains 277 passing tests in the clean Python 3.10 environment. This is source
+verification only; position, cancellation/closing, live composition, and
+operational migration gates above remain open.
