@@ -24,12 +24,24 @@ passed.
 
 ## Code-Only Sync
 
-From the Mac, copy the current working tree to the configured Pi destination
-for offline inspection:
+From the Mac, copy an immutable archive of the current `HEAD` commit to the
+configured Pi destination for offline inspection:
 
 ```bash
 ./deploy/sync_to_pi.sh
 ```
+
+The command rejects staged or unstaged tracked changes before creating a
+snapshot or contacting the Pi. Untracked and ignored working-tree files are
+never part of the code source presented to rsync. The extracted snapshot must
+contain every regular file in a NUL-delimited committed-tree manifest, so Git
+attributes cannot silently omit code and symbolic links or submodules fail
+before remote work. Git repository/index selector environment variables are
+also rejected, replacement objects are disabled, and the resolved Git
+directory must remain identical before the script switches to the repository
+root. A custom `PI_DIR` must be a normalized absolute path whose final directory
+is `etrade_python_client`; broad targets such as `/` or `/home` are rejected
+before remote work.
 
 ## Private Runtime State
 
@@ -52,12 +64,21 @@ Sync those from the Mac only when you intentionally want the Pi to inherit the c
 ./deploy/sync_to_pi.sh --state
 ```
 
-Copying private state does not arm, install, start, or authorize a service.
-After a copy, keep the Pi stopped and protect those files as secrets.
+Only regular, non-symlink files from that exact allowlist are eligible; they
+are copied into a separate owner-only temporary snapshot before any remote
+action. Copying private state does not arm, install, start, or authorize a
+service. After a copy, keep the Pi stopped and protect those files as secrets.
 
 ## Sync-Only Behavior
 
 Code-only sync excludes secrets, OAuth tokens, logs, virtual environments, and
-generated runtime files. `--state` adds only the explicitly listed private
-runtime files. `--restart` is unavailable and fails before any remote command
-or file transfer.
+generated runtime files as defense in depth around the committed archive.
+`--state` adds only the explicitly listed private runtime files. `--restart`
+is unavailable and fails before Git, temporary-file, remote-command, or file
+transfer work.
+
+By default rsync does not delete unrelated files already present on the Pi.
+`SYNC_DELETE=1 ./deploy/sync_to_pi.sh` requests deletion for an exact code
+mirror while retaining excluded private state. Until versioned release
+directories and atomic activation are delivered, even code-only sync remains
+an offline-inspection tool, not an approved deployment.

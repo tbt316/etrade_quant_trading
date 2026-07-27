@@ -2,6 +2,24 @@
 
 This sample Python application provides examples on using the ETRADE API endpoints.
 
+> **Safety status:** live order execution, service installation, and remote
+> restart are intentionally disabled while the durable execution migration is
+> incomplete. The repository is not yet approved for unattended trading.
+
+## Repository and Credential Hygiene
+
+- Create virtual environments locally; `venv/`, `.venv/`, package metadata,
+  caches, logs, generated reports, and runtime state are not source files and
+  must remain untracked.
+- Keep OAuth values, broker configuration, dashboard settings, session files,
+  and arming material only in ignored owner-readable local files. Commit only
+  placeholder examples such as `.env.example`.
+- Run `python etrade_python_client/scripts/check_repo_hygiene.py` before a
+  commit. CI applies the same deterministic check to Git's index.
+- Ignore rules and removal from the current index do not erase old Git history.
+  Previously exposed broker keys still require external revocation/rotation
+  and coordinated history cleanup.
+
 ## Table of Contents
 
 * [Requirements](#requirements)
@@ -26,8 +44,9 @@ already have Python 3 installed, download it from
 
 1. Unzip python zip file
 
-2. Edit [`config.ini`](EtradePythonClient/etrade_python_client/config.ini)
-with your consumer key and consumer secret; copy these from your application's keys' section
+2. Create a local, ignored `etrade_python_client/config.ini` and add the
+consumer key and consumer secret from the E*TRADE application keys page. Never
+commit that file.
 
 3. Create the virtual environment by running the Python's venv command; see the command syntax below
 

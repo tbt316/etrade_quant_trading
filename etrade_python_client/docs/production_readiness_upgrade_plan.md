@@ -166,16 +166,19 @@ function of an immutable input manifest.
 
 ### Operational path
 
-The deployed systemd unit launches the monolith directly with
-`--no-sandbox --trade` (`deploy/install_pi_service.sh:26-44`). Code is rsynced
-from the current working tree rather than deployed as an immutable build
-(`deploy/sync_to_pi.sh:55-123`). The repository currently has competing package
-definitions, critical untracked sources, a tracked virtual environment, and CI
-that runs only a network-backed integration marker. At audit time, 1,506 of
-1,724 tracked files were under `venv/`, 716 tracked files were bytecode, and the
-worktree reported roughly 475 tracked modifications/deletions plus 133
-untracked paths. Important untracked paths included the focused reliability
-tests, deployment tooling, and this repository's incident/context documents.
+The initial audit found a systemd installer that launched the monolith with
+`--no-sandbox --trade`, code sync directly from the mutable working tree,
+competing package definitions, a tracked virtual environment, and a
+network-oriented CI baseline. At that point 1,506 tracked files were under
+`venv/`.
+
+R7f now suspends service installation and remote restart. R8a removes 1,531
+generated, runtime, environment, package-metadata, and backup paths from the
+index without deleting their local copies. Code-only sync rejects tracked
+working-tree changes and presents rsync with an archive of one resolved `HEAD`
+commit, so untracked or ignored scratch code cannot enter a new transfer.
+Atomic versioned releases and exact remote cleanup remain required before
+deployment can be re-enabled.
 
 ## Stop-ship risk register
 
@@ -511,6 +514,14 @@ R8c validates a built artifact in deterministic offline CI; R8d introduces
 typed configuration and explicit runtime-state paths. This avoids mixing more
 than 1,500 mechanical index removals with packaging/runtime behavior.
 
+R8a removes 1,531 audited index entries while preserving every local file,
+narrows the `yfinance` cache ignore so the root package collision stays
+visible, and adds a dependency-free pre-install CI check over NUL-delimited Git
+index paths. The same slice changes sync-only deployment to a clean committed
+archive and fails before remote work when tracked state is dirty. This is index
+hygiene, not a Git-history purge; exposed credentials still require external
+revocation/rotation and coordinated all-ref cleanup.
+
 Deliver:
 
 1. Choose one package root and one `../pyproject.toml`; remove legacy
@@ -776,6 +787,7 @@ widths, and its disabled endpoint returned the fixed `503` schema; this does
 not verify the user's deployed artifact. The remaining actions belong to the
 staged acceptance gates above.
 
-The working tree was already heavily modified and contains important untracked
-runtime sources. This review intentionally adds only this plan and does not
-overwrite or normalize the existing work.
+The working tree began heavily modified and contains important untracked local
+work. R8a leaves those files in place and removes only the audited generated
+and runtime paths from Git tracking; it does not run a broad clean, reset, or
+add operation.

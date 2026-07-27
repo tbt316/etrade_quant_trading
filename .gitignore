@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
+.direnv/
+*.egg-info/
 .pytest_cache/
 
 # Logs
@@ -10,7 +13,7 @@ venv/
 server_log.txt
 ngrok.log
 dashboard_requests.log
-scratch/last_1000_logs.txt
+last_1000_logs.txt
 
 # Large data
 option_minute_aggregate_flat_files/
@@ -20,14 +23,17 @@ historical_quote/
 backtest_cache/
 backtest_logs/
 s_and_p_data/
-yfinance/
+/yfinance/prices/
+/etrade_python_client/yfinance/
 monthly_backtest_data/
 regime_review_2025/
 option_value_plot/
+/etrade_python_client/audit_plots/
+/etrade_python_client/executed_order_tracker/
+/etrade_python_client/backtesting/.engine_snapshots/
 
 # Cache files
 *.json
-!regime_review_2025/model_parameters.json
 *.csv
 *.db
 *.sqlite
@@ -41,15 +47,53 @@ option_value_plot/
 *.sqlite3-journal
 *.sqlite3-wal
 *.sqlite3-shm
+*.pkl
+*.pickle
+*.numbers
+*.parquet
+*.db.*
+*.sqlite.*
+*.sqlite3.*
+*.pkl.*
+*.pickle.*
+*.numbers.*
+*_cache.json*
+/etrade_python_client/backtesting/experiments_log.jsonl*
 
 # Secrets
-.env
-*.env
-.etrade_oauth
-config.ini
-.etrade_session.json
+.env*
+*.env*
+.[Ee][Nn][Vv]*
+*.[Ee][Nn][Vv]*
+!/.env.example
+.etrade_oauth*
+config.ini*
+credentials.json*
+.netrc
+.pypirc
+**/.aws/credentials
+**/.ssh/id_*
+*.key
+*.pem
+*.p12
+*.pfx
+.etrade_session.json*
+etrade_session.json*
+live_trading_settings.json*
+manual_order_status.json*
+nudge_history.json*
+nudge_state.json*
+production-arm.json*
+production_arm.json*
+spy_tracking_data.json*
+spy_vix_price_cache.json*
+trade_status.json*
 
 # Generated outputs
+/build/
+/dist/
+.coverage*
+htmlcov/
 cover_call_plot*/
 plot_result_overlay/
 training_results/
@@ -62,6 +106,17 @@ dashboard_verification.png
 # Debug
 debug/
 debug_traces/
+*.bak*
+*.backup
+*.old
+*.tmp
+*.swp
+*.swo
+*.save
+*~
+*.orig
+*.rej
+/polygonio/fix_patch.patch
 
 # IDEs
 .vscode/
