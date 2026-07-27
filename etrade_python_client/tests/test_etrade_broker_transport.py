@@ -344,6 +344,17 @@ class ETradeBrokerTransportTests(unittest.TestCase):
             ],
             ["SUBMIT_PREVIEW", "SUBMIT_PLACE"],
         )
+        receipts = case.ledger.transport_response_receipts(
+            case.record.intent_id
+        )
+        self.assertEqual(
+            [receipt.client_order_id for receipt in receipts],
+            [case.record.client_order_id, case.record.client_order_id],
+        )
+        self.assertEqual(
+            [receipt.target_broker_order_id for receipt in receipts],
+            [None, None],
+        )
         prepared, kwargs = case.adapter.calls[1]
         self.assertEqual(
             prepared.url,

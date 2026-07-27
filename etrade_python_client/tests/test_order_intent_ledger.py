@@ -619,6 +619,22 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with self.assertRaises(OrderIntentReservationError):
             self.ledger.reserve_margin(blocked.intent_id, risk(blocked, self.clock))
 
+    def test_identical_equal_time_capacity_is_idempotent_but_conflict_fails(self):
+        snapshot = capacity(self.clock)
+
+        self.assertEqual(
+            self.ledger.set_reservation_cap(snapshot),
+            Decimal("1000"),
+        )
+        self.assertEqual(
+            self.ledger.set_reservation_cap(snapshot),
+            Decimal("1000"),
+        )
+        with self.assertRaises(OrderIntentIntegrityError):
+            self.ledger.set_reservation_cap(
+                capacity(self.clock, digest="d" * 64)
+            )
+
     def test_reservation_requires_the_capacity_snapshot_used_for_its_portfolio_risk(self):
         record = self.ledger.create_intent(make_intent()).intent
         self.ledger.set_reservation_cap(capacity(self.clock, digest="d" * 64))

@@ -210,6 +210,8 @@ class IntentRecord:
     submission_fence: int
     submission_lease_owner: str | None
     submission_lease_expires_at: datetime | None
+    pending_operation: Literal["SUBMIT", "AMEND"] | None
+    pending_fence: int | None
     last_reconciled_run: str | None
     created_at: datetime
     updated_at: datetime
@@ -309,6 +311,8 @@ class TransportResponseReceipt:
     transport_operation: Literal[
         "SUBMIT_PREVIEW", "SUBMIT_PLACE", "AMEND_PREVIEW", "AMEND_PLACE"
     ]
+    client_order_id: str = field(repr=False)
+    target_broker_order_id: str | None = field(repr=False)
     response: TransportResponseEvidence
     recorded_at: datetime
 
@@ -472,6 +476,15 @@ def normalize_order_payload(order_payload: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in order_payload.items() if key not in _NORMALIZED_TRANSPORT_FIELDS}
 
 
+def canonical_order_payload_hash(order_payload: Mapping[str, Any]) -> str:
+    """Return the immutable economic hash used for broker-order comparison."""
+
+    normalized = normalize_order_payload(order_payload)
+    wire_payload = wire_order_payload(normalized)
+    canonical_payload = canonical_order_payload(json.loads(wire_payload))
+    return _payload_hash(canonical_payload)
+
+
 def wire_order_payload(order_payload: Mapping[str, Any]) -> str:
     """Return a strict broker-schema payload with primitive JSON values intact."""
     if type(order_payload) is not dict or not order_payload:
@@ -623,6 +636,80 @@ class OrderIntentLedger:
             row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
         return self._intent_from_row(row) if row else None
 
+    def expected_order_payload_hash(self, intent_id: str) -> str:
+        """Return the exact durable order terms a broker query must prove."""
+
+        _validate_identity("intent_id", intent_id)
+        with self._connection() as conn:
+            intent = self._require_intent(conn, intent_id)
+            if intent["pending_operation"] == "AMEND":
+                amendment = conn.execute(
+                    "SELECT * FROM amendment_leases WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                if (
+                    amendment is None
+                    or amendment["state"] != "IN_DOUBT"
+                    or int(amendment["fencing_token"])
+                    != int(intent["pending_fence"] or -1)
+                ):
+                    raise OrderIntentIntegrityError(
+                        "pending amendment lacks matching durable order terms"
+                    )
+                result = amendment["payload_hash"]
+            elif intent["pending_operation"] == "SUBMIT":
+                result = intent["payload_hash"]
+            else:
+                completed = conn.execute(
+                    """
+                    SELECT payload_hash, completed_at
+                    FROM amendment_history
+                    WHERE intent_id = ?
+                    ORDER BY completed_at DESC
+                    """,
+                    (intent_id,),
+                ).fetchall()
+                if not completed:
+                    result = intent["payload_hash"]
+                else:
+                    latest_at = int(completed[0]["completed_at"])
+                    latest_hashes = {
+                        row["payload_hash"]
+                        for row in completed
+                        if int(row["completed_at"]) == latest_at
+                    }
+                    if len(latest_hashes) != 1:
+                        raise OrderIntentIntegrityError(
+                            "latest durable amendment terms are ambiguous"
+                        )
+                    result = next(iter(latest_hashes))
+        _validate_sha256("expected_order_payload_hash", result)
+        return result
+
+    def completed_amendment_payload_hash(
+        self, intent_id: str, idempotency_key: str
+    ) -> str | None:
+        """Return immutable terms for a completed amendment replay."""
+
+        _validate_identity("intent_id", intent_id)
+        _validate_identity(
+            "amendment_idempotency_key", idempotency_key
+        )
+        with self._connection() as conn:
+            self._require_intent(conn, intent_id)
+            row = conn.execute(
+                """
+                SELECT payload_hash FROM amendment_history
+                WHERE intent_id = ? AND idempotency_key = ?
+                """,
+                (intent_id, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        result = row["payload_hash"]
+        _validate_sha256("completed_amendment_payload_hash", result)
+        return result
+
     def transport_response_receipts(
         self, intent_id: str
     ) -> tuple[TransportResponseReceipt, ...]:
@@ -633,19 +720,27 @@ class OrderIntentLedger:
             self._require_intent(conn, intent_id)
             rows = conn.execute(
                 """
-                SELECT * FROM transport_response_receipts
-                WHERE intent_id = ?
+                SELECT response.*,
+                    attempt.client_order_id AS request_client_order_id,
+                    attempt.target_broker_order_id AS request_target_broker_order_id
+                FROM transport_response_receipts AS response
+                JOIN transport_send_attempts AS attempt
+                  ON attempt.intent_id = response.intent_id
+                 AND attempt.authorization_operation = response.authorization_operation
+                 AND attempt.fencing_token = response.fencing_token
+                 AND attempt.transport_operation = response.transport_operation
+                WHERE response.intent_id = ?
                 ORDER BY
-                    CASE authorization_operation
+                    CASE response.authorization_operation
                         WHEN 'SUBMIT' THEN 0 ELSE 1
                     END,
-                    fencing_token,
-                    recorded_at,
+                    response.fencing_token,
+                    response.recorded_at,
                     CASE
-                        WHEN transport_operation LIKE '%_PREVIEW' THEN 0
+                        WHEN response.transport_operation LIKE '%_PREVIEW' THEN 0
                         ELSE 1
                     END,
-                    transport_operation
+                    response.transport_operation
                 """,
                 (intent_id,),
             ).fetchall()
@@ -658,9 +753,36 @@ class OrderIntentLedger:
         AccountCapacityEvidence.validate(evidence, _from_us(now))
         cap = _canonical_amount(min(evidence.broker_buying_power, evidence.risk_budget))
         with self._transaction() as conn:
-            existing = conn.execute("SELECT observed_at FROM reservation_caps WHERE account_id = ? AND environment = ?", (evidence.account_id, evidence.environment)).fetchone()
-            if existing is not None and _to_us(evidence.observed_at) <= int(existing["observed_at"]):
-                raise OrderIntentIntegrityError("capacity evidence must be newer than the persisted account snapshot")
+            existing = conn.execute(
+                """
+                SELECT * FROM reservation_caps
+                WHERE account_id = ? AND environment = ?
+                """,
+                (evidence.account_id, evidence.environment),
+            ).fetchone()
+            observed_at = _to_us(evidence.observed_at)
+            if existing is not None and observed_at == int(existing["observed_at"]):
+                expected = (
+                    cap,
+                    _canonical_amount(evidence.broker_buying_power),
+                    _canonical_amount(evidence.risk_budget),
+                    evidence.portfolio_snapshot_digest,
+                )
+                actual = (
+                    existing["cap_amount"],
+                    existing["broker_buying_power"],
+                    existing["risk_budget"],
+                    existing["portfolio_snapshot_digest"],
+                )
+                if actual == expected:
+                    return Decimal(existing["cap_amount"])
+                raise OrderIntentIntegrityError(
+                    "equal-time capacity evidence conflicts with the persisted snapshot"
+                )
+            if existing is not None and observed_at < int(existing["observed_at"]):
+                raise OrderIntentIntegrityError(
+                    "capacity evidence must not predate the persisted account snapshot"
+                )
             conn.execute(
                 """
                 INSERT INTO reservation_caps (account_id, environment, cap_amount, broker_buying_power, risk_budget, observed_at, portfolio_snapshot_digest, updated_at)
@@ -670,7 +792,7 @@ class OrderIntentLedger:
                     risk_budget = excluded.risk_budget, observed_at = excluded.observed_at,
                     portfolio_snapshot_digest = excluded.portfolio_snapshot_digest, updated_at = excluded.updated_at
                 """,
-                (evidence.account_id, evidence.environment, cap, _canonical_amount(evidence.broker_buying_power), _canonical_amount(evidence.risk_budget), _to_us(evidence.observed_at), evidence.portfolio_snapshot_digest, now),
+                (evidence.account_id, evidence.environment, cap, _canonical_amount(evidence.broker_buying_power), _canonical_amount(evidence.risk_budget), observed_at, evidence.portfolio_snapshot_digest, now),
             )
         return Decimal(cap)
 
@@ -749,6 +871,25 @@ class OrderIntentLedger:
         _validate_identity("environment", environment)
         with self._connection() as conn:
             return self._active_reservation_total(conn, account_id, environment)
+
+    def unabsorbed_filled_reservation_count(
+        self, account_id: str, environment: str
+    ) -> int:
+        """Return terminal opening risk not yet proven in positions."""
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM margin_reservations
+                WHERE account_id = ? AND environment = ?
+                  AND state = 'FILLED_PENDING_ABSORPTION'
+                """,
+                (account_id, environment),
+            ).fetchone()
+        return int(row["total"])
 
     def claim_submission(self, intent_id: str, owner: str, *, lease_seconds: float) -> SubmissionLease:
         _validate_identity("intent_id", intent_id)
@@ -2714,6 +2855,12 @@ class OrderIntentLedger:
             broker_order_id=row["broker_order_id"], submission_fence=int(row["submission_fence"]),
             submission_lease_owner=row["submission_lease_owner"],
             submission_lease_expires_at=_from_us(row["submission_lease_expires_at"]) if row["submission_lease_expires_at"] is not None else None,
+            pending_operation=row["pending_operation"],
+            pending_fence=(
+                int(row["pending_fence"])
+                if row["pending_fence"] is not None
+                else None
+            ),
             last_reconciled_run=row["last_reconciled_run"], created_at=_from_us(row["created_at"]), updated_at=_from_us(row["updated_at"]),
         )
 
@@ -2771,7 +2918,14 @@ def _transport_response_receipt(
     authorization_operation = row["authorization_operation"]
     fencing_token = int(row["fencing_token"])
     transport_operation = row["transport_operation"]
+    client_order_id = row["request_client_order_id"]
+    target_broker_order_id = row["request_target_broker_order_id"]
     _validate_identity("intent_id", intent_id)
+    _validate_identity("client_order_id", client_order_id)
+    if target_broker_order_id is not None:
+        _validate_identity(
+            "target_broker_order_id", target_broker_order_id
+        )
     _validate_fencing_token(fencing_token)
     if (
         authorization_operation not in {"SUBMIT", "AMEND"}
@@ -2787,6 +2941,8 @@ def _transport_response_receipt(
         authorization_operation=authorization_operation,
         fencing_token=fencing_token,
         transport_operation=transport_operation,
+        client_order_id=client_order_id,
+        target_broker_order_id=target_broker_order_id,
         response=response,
         recorded_at=_from_us(row["recorded_at"]),
     )

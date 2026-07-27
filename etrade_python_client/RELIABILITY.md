@@ -73,6 +73,14 @@ For every reliability incident:
   identity. The arm and identity must be revalidated after account refresh and
   immediately before every order API call. R7 must preserve that invariant
   while replacing the compatibility guard with one durable mutation gateway.
+- Every broker mutation must have one durable, uniquely fenced send claim
+  before I/O and one parsed response receipt before acknowledgement. An
+  ambiguous send is reconciliation-only and is never retried. A broker query
+  may clear it only for a durably known broker order ID whose exact account,
+  environment, and canonical economic terms match the authorization.
+- Account opening capacity must use an immutable gateway/operator risk ceiling,
+  not a strategy-command value. Incomplete, stale, unstable, or non-durable
+  balance/position/open-order evidence cannot authorize exposure.
 - An order-capable dashboard binds to loopback by default. Public tunneling is a
   separately supervised operator action, and wildcard CORS is forbidden.
 - Dashboard credentials must reject defaults and weak values. Settings, arm
@@ -488,6 +496,19 @@ finding.
     redacts authorization-bearing headers, and records only SHA-256/size
     metadata for order payloads, account/order response bodies, and
     account-bearing URLs.
+- `live_trading/order_intent_ledger.py`,
+  `live_trading/etrade_broker_transport.py`, and
+  `live_trading/etrade_order_gateway.py`
+  - Persist immutable intent, reservation, authorization, exact send, preview,
+    and parsed-response evidence.
+  - Permit only opening vertical submission and price-only amendment through a
+    no-retry, no-redirect, isolated mutation exchange.
+  - Keep every unknown no-ID result permanently blocked and require a known
+    broker ID plus exact canonical order-term hash before reconciliation.
+  - Revalidate the exact runtime/account/environment around each mutation and
+    enforce a gateway-owned account risk ceiling.
+  - Remain intentionally disconnected from the live agent until the read side
+    and migration gates below are complete.
 - `live_trading/etrade_check_option.py` and
   `live_trading/etrade_option_chains.py`
   - Remove hardcoded OAuth credentials from the current source and require
@@ -496,17 +517,15 @@ finding.
 ### Remaining risk
 
 This is containment in the current source, not production readiness. The
-compatibility order client now rejects calls without the current arm/account
-boundary. R7a adds an isolated schema 9 order-intent ledger with stable
-identity, account capacity reservations, monotonic fences, immutable outbound
-authorization, and reconciliation-only ambiguous outcomes. It performs no
-network I/O and no live code instantiates it. New closing intents and terminal
-reservation release fail closed until position/open-order evidence exists.
+compatibility order client still owns current live calls. The isolated R7a–R7c
+stack now provides a schema 10 intent ledger, hardened mutation transport, and
+opening/reprice coordinator, but no live code instantiates it.
 
-R7b must still make one private E*TRADE gateway the sole mutation owner,
-preserve the placement-time arm/account check, construct broker evidence from
-actual responses, reconcile durable blockers at startup, implement durable
-per-intent cancellation, and reject every direct legacy mutation path.
+The next gate is a concrete private E*TRADE reader with complete pagination,
+stable two-pass capacity snapshots, origin-bound durable raw/parser receipts,
+and atomic reconciliation evidence. Position absorption, closing capacity,
+durable per-intent cancellation, a single production composition root, and a
+static ban on every direct legacy mutation path also remain required.
 
 The exposed OAuth keys still require external revocation and rotation. A later
 coordinated history purge must remove them from all refs and arrange cleanup of
@@ -528,13 +547,15 @@ deployed dashboard has not been reloaded or visually inspected with R6.
   files, guarded response/request logging, order calls without a boundary,
   placement-time arm expiry, dashboard credential rejection, and loopback/CORS
   behavior.
-- R7a includes 32 deterministic order-ledger tests for immutable identity,
-  stable identifiers, exact outbound authorization, capacity/reservation
-  arithmetic, exact evidence types, stale evidence, concurrency, fencing ABA,
-  ambiguous outcomes, restart reconciliation, terminal-risk retention,
-  append-only histories, legacy-closing reconciliation, and the additive schema
-  8 to 9 migration. Independent causal and security reviews found no remaining
-  reproducible P0 in the isolated core.
+- The current R7 ledger/transport/coordinator focused suite includes 88
+  deterministic tests for immutable identity, exact authorization/XML,
+  transport deadlines, send fencing, parsed receipts, crash/timeout recovery,
+  capacity arithmetic, gateway-owned risk ceilings, environment/account
+  binding, exact order-term reconciliation, amendment replay, terminal-risk
+  retention, and additive schema 8→9→10 migration. Independent adversarial
+  reviews found no remaining reproducible P0/P1 mutation-state defect in the
+  isolated stack; they explicitly retain a no-go on live wiring until the
+  durable reader and remaining protocols are delivered.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.
