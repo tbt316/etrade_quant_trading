@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import patch
 
 from rauth import OAuth1Session
@@ -35,9 +36,16 @@ from live_trading.etrade_broker_transport import (
     _transport_response_evidence,
     _write_exchange_result,
 )
+from live_trading.etrade_broker_reader import (
+    _PARSER_CODE_SHA256,
+    _PARSER_CONFIG_SHA256,
+    _PARSER_SCHEMA,
+)
 from live_trading.order_intent_ledger import (
-    AccountCapacityEvidence,
     BrokerEvidence,
+    BrokerReadManifestEvidence,
+    BrokerReadManifestMember,
+    BrokerReadResponseEvidence,
     OrderIntent,
     OrderIntentLedger,
     OrderIntentReconciliationRequired,
@@ -51,6 +59,260 @@ ACCOUNT_ID = "842468410"
 ACCOUNT_KEY = "account/key"
 INSTITUTION_TYPE = "BROKERAGE"
 OWNER = "worker-1"
+ORIGIN = "https://api.etrade.com"
+
+
+def canonical_read_json(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+
+
+def capacity_state_sha256(value):
+    return hashlib.sha256(
+        b"etrade-capacity-state.v1\0"
+        + canonical_read_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def provision_durable_capacity(
+    ledger,
+    *,
+    account_id=ACCOUNT_ID,
+    account_key=ACCOUNT_KEY,
+    observed_at,
+):
+    """Record the minimal exact two-pass CAPACITY lineage used by production."""
+
+    encoded_account = quote(account_key, safe="")
+    binding = {
+        "account_id": account_id,
+        "account_id_key": account_key,
+        "institution_type": INSTITUTION_TYPE,
+        "account_status": "ACTIVE",
+        "account_mode": "MARGIN",
+        "account_type": "INDIVIDUAL",
+    }
+    economic_state = {
+        "schema": "etrade-capacity.v1",
+        "account_status": "ACTIVE",
+        "account_mode": "MARGIN",
+        "account_type": "INDIVIDUAL",
+        "broker_buying_power": "1000",
+        "positions": [],
+        "open_orders": [],
+    }
+    entries = [
+        (
+            "binding.start",
+            "ACCOUNT_LIST",
+            "/v1/accounts/list.json",
+            (),
+            200,
+            {
+                "AccountListResponse": {
+                    "Accounts": {
+                        "Account": [
+                            {
+                                "accountId": account_id,
+                                "accountIdKey": account_key,
+                                "institutionType": INSTITUTION_TYPE,
+                                "accountStatus": "ACTIVE",
+                                "accountMode": "MARGIN",
+                                "accountType": "INDIVIDUAL",
+                            }
+                        ]
+                    }
+                }
+            },
+            binding,
+        )
+    ]
+    balance_as_of_by_scan = {}
+    for scan in ("scan_a", "scan_b"):
+        entries.extend(
+            [
+                (
+                    f"{scan}.balance",
+                    "BALANCE",
+                    f"/v1/accounts/{encoded_account}/balance.json",
+                    (
+                        ("instType", INSTITUTION_TYPE),
+                        ("realTimeNAV", "true"),
+                    ),
+                    200,
+                    None,
+                    None,
+                ),
+                (
+                    f"{scan}.portfolio.0001",
+                    "PORTFOLIO_PAGE",
+                    f"/v1/accounts/{encoded_account}/portfolio.json",
+                    (
+                        ("count", "50"),
+                        ("lotsRequired", "false"),
+                        ("marketSession", "REGULAR"),
+                        ("pageNumber", "1"),
+                        ("sortBy", "SYMBOL"),
+                        ("sortOrder", "ASC"),
+                        ("totalsRequired", "false"),
+                        ("view", "COMPLETE"),
+                    ),
+                    204,
+                    None,
+                    {
+                        "page_number": 1,
+                        "total_pages": 0,
+                        "metadata_field": "HTTP_204",
+                        "next_page": None,
+                        "positions": [],
+                    },
+                ),
+                *(
+                    (
+                        f"{scan}.orders.{lane}.0000",
+                        "OPEN_ORDERS_PAGE",
+                        f"/v1/accounts/{encoded_account}/orders.json",
+                        (("count", "100"), ("status", lane)),
+                        204,
+                        None,
+                        {
+                            "status_lane": lane,
+                            "orders": [],
+                            "marker": None,
+                        },
+                    )
+                    for lane in (
+                        "OPEN",
+                        "CANCEL_REQUESTED",
+                        "INDIVIDUAL_FILLS",
+                    )
+                ),
+            ]
+        )
+    entries.append(
+        (
+            "binding.end",
+            "ACCOUNT_LIST",
+            "/v1/accounts/list.json",
+            (),
+            200,
+            {
+                "AccountListResponse": {
+                    "Accounts": {
+                        "Account": [
+                            {
+                                "accountId": account_id,
+                                "accountIdKey": account_key,
+                                "institutionType": INSTITUTION_TYPE,
+                                "accountStatus": "ACTIVE",
+                                "accountMode": "MARGIN",
+                                "accountType": "INDIVIDUAL",
+                            }
+                        ]
+                    }
+                }
+            },
+            binding,
+        )
+    )
+
+    members = []
+    final_completed_at = observed_at
+    for ordinal, (
+        role,
+        read_kind,
+        route,
+        query,
+        http_status,
+        raw_document,
+        parsed,
+    ) in enumerate(entries):
+        completed_at = (
+            observed_at
+            - timedelta(seconds=1)
+            + timedelta(milliseconds=ordinal * 50)
+        )
+        started_at = completed_at - timedelta(milliseconds=10)
+        if read_kind == "BALANCE":
+            balance_as_of = str(
+                int(completed_at.timestamp() * 1_000)
+            )
+            balance_as_of_by_scan[role.split(".", 1)[0]] = balance_as_of
+            raw_document = {
+                "BalanceResponse": {
+                    "accountId": account_id,
+                    "institutionType": INSTITUTION_TYPE,
+                    "asOfDate": balance_as_of,
+                    "Computed": {"marginBuyingPower": "1000"},
+                }
+            }
+            parsed = {
+                "account_id": account_id,
+                "institution_type": INSTITUTION_TYPE,
+                "margin_buying_power": "1000",
+                "as_of_date": balance_as_of,
+            }
+        raw = (
+            b""
+            if raw_document is None
+            else canonical_read_json(raw_document).encode("utf-8")
+        )
+        receipt = ledger.record_broker_read_response(
+            BrokerReadResponseEvidence(
+                read_kind=read_kind,
+                account_id=account_id,
+                account_id_key=account_key,
+                institution_type=INSTITUTION_TYPE,
+                environment="production",
+                origin=ORIGIN,
+                route=route,
+                query_json=canonical_read_json(
+                    [list(pair) for pair in sorted(query)]
+                ),
+                authorization_sha256=hashlib.sha256(
+                    f"capacity-auth-{ordinal}".encode("ascii")
+                ).hexdigest(),
+                target_broker_order_id=None,
+                request_started_at=started_at,
+                response_completed_at=completed_at,
+                http_status=http_status,
+                raw_response_bytes=raw,
+                parser_schema=_PARSER_SCHEMA,
+                parser_code_sha256=_PARSER_CODE_SHA256,
+                parser_config_sha256=_PARSER_CONFIG_SHA256,
+                canonical_parsed_json=canonical_read_json(parsed),
+                completeness="COMPLETE",
+            )
+        )
+        members.append(
+            BrokerReadManifestMember(role, receipt.receipt_sha256)
+        )
+        final_completed_at = completed_at
+
+    result = {
+        **economic_state,
+        "broker_buying_power_as_of": balance_as_of_by_scan["scan_b"],
+        "state_sha256": capacity_state_sha256(economic_state),
+    }
+    evidence = ledger.record_broker_read_manifest(
+        BrokerReadManifestEvidence(
+            evidence_kind="CAPACITY",
+            account_id=account_id,
+            account_id_key=account_key,
+            institution_type=INSTITUTION_TYPE,
+            environment="production",
+            origin=ORIGIN,
+            target_broker_order_id=None,
+            observed_at=final_completed_at,
+            completeness="COMPLETE",
+            canonical_result_json=canonical_read_json(result),
+        ),
+        tuple(members),
+    )
+    return ledger.set_reservation_cap_from_read(
+        evidence, risk_budget=Decimal("1000")
+    )
 
 
 def vertical_payload(*, limit_price=1.25, symbol="SPY"):
@@ -136,9 +398,25 @@ class AdapterHarness:
         self.outcomes = list(outcomes)
         self.calls = []
 
-    def exchange(self, prepared, *, timeout_seconds):
+    def exchange(
+        self,
+        prepared,
+        *,
+        timeout_seconds,
+        max_response_bytes=64 * 1024,
+    ):
+        if max_response_bytes != 64 * 1024:
+            raise AssertionError(
+                "mutation exchange must retain its exact response-byte ceiling"
+            )
         self.calls.append(
-            (prepared, {"timeout_seconds": timeout_seconds})
+            (
+                prepared,
+                {
+                    "timeout_seconds": timeout_seconds,
+                    "max_response_bytes": max_response_bytes,
+                },
+            )
         )
         if not self.outcomes:
             raise AssertionError("unexpected broker request")
@@ -207,15 +485,11 @@ class ETradeBrokerTransportTests(unittest.TestCase):
         )
         record = ledger.create_intent(intent, intent_id="intent-1").intent
         observed_at = datetime.now(timezone.utc)
-        ledger.set_reservation_cap(
-            AccountCapacityEvidence(
-                account_id=account_id,
-                environment="production",
-                broker_buying_power=Decimal("1000"),
-                risk_budget=Decimal("1000"),
-                observed_at=observed_at,
-                portfolio_snapshot_digest="b" * 64,
-            )
+        capacity_decision = provision_durable_capacity(
+            ledger,
+            account_id=account_id,
+            account_key=account_key,
+            observed_at=observed_at,
         )
         ledger.reserve_margin(
             record.intent_id,
@@ -225,8 +499,13 @@ class ETradeBrokerTransportTests(unittest.TestCase):
                 collateral_amount=Decimal("500"),
                 quote_observed_at=observed_at,
                 quote_digest="a" * 64,
-                portfolio_observed_at=observed_at,
-                portfolio_snapshot_digest="b" * 64,
+                portfolio_observed_at=capacity_decision.observed_at,
+                portfolio_snapshot_digest=(
+                    capacity_decision.portfolio_snapshot_digest
+                ),
+                capacity_decision_sha256=(
+                    capacity_decision.decision_sha256
+                ),
             ),
         )
         lease = ledger.claim_submission(
@@ -507,7 +786,9 @@ class ETradeBrokerTransportTests(unittest.TestCase):
             return_value=response,
         ) as send:
             _exchange_worker(
-                output, _serialized_prepared_request(prepared)
+                output,
+                _serialized_prepared_request(prepared),
+                64 * 1024,
             )
 
         self.assertEqual(send.call_count, 1)

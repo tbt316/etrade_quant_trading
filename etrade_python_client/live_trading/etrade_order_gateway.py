@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal
 
 from live_trading.etrade_broker_transport import (
     BrokerReply,
@@ -20,11 +20,19 @@ from live_trading.etrade_broker_transport import (
     ETradeBrokerTransportError,
     SelectedBrokerAccount,
 )
+from live_trading.etrade_broker_reader import (
+    ETradeBrokerReader,
+    ETradeBrokerReaderError,
+    ETradeBrokerReaderIntegrityError,
+    ETradeBrokerReaderUnavailable,
+)
 from live_trading.order_intent_ledger import (
-    AccountCapacityEvidence,
+    BrokerReadEvidenceRef,
     BrokerEvidence,
+    CapacityDecisionReceipt,
     IntentRecord,
     OrderIntent,
+    OrderIntentBrokerTermsMismatch,
     OrderIntentIntegrityError,
     OrderIntentLedger,
     OrderIntentLedgerError,
@@ -38,7 +46,6 @@ from live_trading.runtime_safety import RuntimeSafetyBoundary, RuntimeSafetyErro
 
 
 _MAX_COMMAND_BYTES = 32 * 1024
-_MAX_EVIDENCE_AGE_SECONDS = 300
 _MAX_LEASE_SECONDS = 300
 
 
@@ -52,76 +59,6 @@ class GatewayValidationError(EtradeOrderGatewayError):
 
 class GatewayReconciliationRequired(EtradeOrderGatewayError):
     """New mutations are blocked by unresolved durable broker work."""
-
-
-@dataclass(frozen=True)
-class BrokerCapacitySnapshot:
-    """Complete account risk snapshot produced by a read-only adapter."""
-
-    account: SelectedBrokerAccount
-    environment: Literal["sandbox", "production"]
-    broker_buying_power: Decimal
-    observed_at: datetime
-    portfolio_snapshot_digest: str
-    positions_complete: bool
-    open_orders_complete: bool
-    source_response_digests: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class BrokerOrderSnapshot:
-    """Exact normalized status for one known broker order id."""
-
-    account: SelectedBrokerAccount
-    environment: Literal["sandbox", "production"]
-    broker_order_id: str = field(repr=False)
-    outcome: Literal[
-        "OPEN",
-        "FILLED",
-        "CANCELLED",
-        "REJECTED",
-        "EXPIRED",
-        "UNRESOLVED",
-    ]
-    observed_at: datetime
-    http_status: int
-    raw_response_digest: str
-    order_payload_hash: str
-    complete: bool
-
-
-@dataclass(frozen=True)
-class BrokerOrderNotFound:
-    """Complete negative lookup for one known broker order id."""
-
-    account: SelectedBrokerAccount
-    environment: Literal["sandbox", "production"]
-    broker_order_id: str = field(repr=False)
-    observed_at: datetime
-    http_status: int
-    raw_response_digest: str
-    complete: bool
-
-
-@runtime_checkable
-class EtradeBrokerReader(Protocol):
-    """Read-only evidence required by the order coordinator."""
-
-    def assert_gateway_binding(
-        self, runtime_safety: RuntimeSafetyBoundary
-    ) -> None: ...
-
-    def selected_account(self) -> SelectedBrokerAccount: ...
-
-    def read_capacity(
-        self, account: SelectedBrokerAccount
-    ) -> BrokerCapacitySnapshot: ...
-
-    def query_order(
-        self,
-        account: SelectedBrokerAccount,
-        broker_order_id: str,
-    ) -> BrokerOrderSnapshot | BrokerOrderNotFound: ...
 
 
 @dataclass(frozen=True)
@@ -166,11 +103,21 @@ class _ReconciliationContext:
     operation: Literal["ORDER_QUERY", "AMEND_QUERY"]
     client_order_id: str = field(repr=False)
     broker_order_id: str = field(repr=False)
-    expected_order_payload_hash: str
 
 
 class EtradeOrderGateway:
     """Compose runtime arming, durable state, typed reads, and one transport."""
+
+    __slots__ = (
+        "_runtime_safety",
+        "_ledger",
+        "_transport",
+        "_reader",
+        "_opening_risk_budget",
+        "_clock",
+        "_started",
+        "_account",
+    )
 
     def __init__(
         self,
@@ -178,7 +125,7 @@ class EtradeOrderGateway:
         runtime_safety: RuntimeSafetyBoundary,
         ledger: OrderIntentLedger,
         transport: ETradeBrokerTransport,
-        reader: EtradeBrokerReader,
+        reader: ETradeBrokerReader,
         opening_risk_budget: Decimal,
         clock=None,
     ) -> None:
@@ -194,14 +141,18 @@ class EtradeOrderGateway:
             raise GatewayValidationError(
                 "gateway requires the exact hardened ETradeBrokerTransport"
             )
-        if not isinstance(reader, EtradeBrokerReader):
+        if type(reader) is not ETradeBrokerReader:
             raise GatewayValidationError(
-                "reader does not implement the read-only broker protocol"
+                "gateway requires the exact hardened ETradeBrokerReader"
             )
         try:
             transport.assert_gateway_binding(ledger, runtime_safety)
-            reader.assert_gateway_binding(runtime_safety)
-        except (ETradeBrokerTransportError, RuntimeSafetyError) as exc:
+            reader.assert_gateway_binding(ledger, runtime_safety)
+        except (
+            ETradeBrokerTransportError,
+            ETradeBrokerReaderError,
+            RuntimeSafetyError,
+        ) as exc:
             raise GatewayValidationError(
                 "gateway adapters and runtime safety boundary do not match"
             ) from exc
@@ -210,14 +161,41 @@ class EtradeOrderGateway:
             "opening_risk_budget",
             allow_zero=True,
         )
-        self.runtime_safety = runtime_safety
-        self.ledger = ledger
-        self.transport = transport
-        self.reader = reader
+        self._runtime_safety = runtime_safety
+        self._ledger = ledger
+        self._transport = transport
+        self._reader = reader
         self._opening_risk_budget = opening_risk_budget
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started = False
         self._account: SelectedBrokerAccount | None = None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            name
+            not in {"_started", "_account"}
+            and hasattr(self, name)
+        ):
+            raise AttributeError(
+                "gateway safety dependencies are immutable"
+            )
+        object.__setattr__(self, name, value)
+
+    @property
+    def runtime_safety(self) -> RuntimeSafetyBoundary:
+        return self._runtime_safety
+
+    @property
+    def ledger(self) -> OrderIntentLedger:
+        return self._ledger
+
+    @property
+    def transport(self) -> ETradeBrokerTransport:
+        return self._transport
+
+    @property
+    def reader(self) -> ETradeBrokerReader:
+        return self._reader
 
     def start(self) -> None:
         """Reconcile every resolvable prior order before enabling mutation."""
@@ -273,7 +251,6 @@ class EtradeOrderGateway:
             return existing
         if self.ledger.get_margin_reservation(record.intent_id) is None:
             capacity = self._read_capacity(account)
-            self.ledger.set_reservation_cap(capacity)
             self.ledger.reserve_margin(
                 record.intent_id,
                 RiskEvidence(
@@ -286,6 +263,7 @@ class EtradeOrderGateway:
                     portfolio_snapshot_digest=(
                         capacity.portfolio_snapshot_digest
                     ),
+                    capacity_decision_sha256=capacity.decision_sha256,
                 ),
             )
         lease = self.ledger.claim_submission(
@@ -508,13 +486,24 @@ class EtradeOrderGateway:
         )
 
     def _checked_account(self) -> SelectedBrokerAccount:
+        if (
+            type(self._runtime_safety) is not RuntimeSafetyBoundary
+            or type(self._ledger) is not OrderIntentLedger
+            or type(self._transport) is not ETradeBrokerTransport
+            or type(self._reader) is not ETradeBrokerReader
+        ):
+            raise GatewayValidationError(
+                "gateway safety dependency identity changed after construction"
+            )
         initial_now = self._now()
         self.runtime_safety.assert_current(initial_now)
         self.transport.assert_gateway_binding(
             self.ledger, self.runtime_safety
         )
         transport_account = self.transport.selected_account()
-        self.reader.assert_gateway_binding(self.runtime_safety)
+        self.reader.assert_gateway_binding(
+            self.ledger, self.runtime_safety
+        )
         reader_account = self.reader.selected_account()
         _validate_account(transport_account)
         _validate_account(reader_account)
@@ -531,49 +520,54 @@ class EtradeOrderGateway:
     def _read_capacity(
         self,
         account: SelectedBrokerAccount,
-    ) -> AccountCapacityEvidence:
+    ) -> CapacityDecisionReceipt:
         checked = self._checked_account()
         _require_same_account(account, checked)
-        snapshot = self.reader.read_capacity(checked)
-        if type(snapshot) is not BrokerCapacitySnapshot:
+        try:
+            evidence = self.reader.read_capacity(checked)
+        except ETradeBrokerReaderUnavailable as exc:
+            raise GatewayReconciliationRequired(
+                "broker capacity did not yield a stable complete snapshot"
+            ) from exc
+        except ETradeBrokerReaderIntegrityError as exc:
             raise GatewayValidationError(
-                "capacity reader returned an invalid typed response"
-            )
-        _validate_account(snapshot.account)
-        _require_same_account(checked, snapshot.account)
-        _require_environment(
-            self.runtime_safety.environment, snapshot.environment
-        )
-        _exact_decimal(
-            snapshot.broker_buying_power,
-            "broker_buying_power",
-            allow_zero=True,
-        )
-        _fresh_time(snapshot.observed_at, self._now(), "capacity observed_at")
-        _exact_sha256(
-            snapshot.portfolio_snapshot_digest,
-            "portfolio_snapshot_digest",
-        )
+                "broker capacity evidence violated the durable read contract"
+            ) from exc
+        except ETradeBrokerReaderError as exc:
+            raise GatewayReconciliationRequired(
+                "broker capacity could not be read safely"
+            ) from exc
         if (
-            snapshot.positions_complete is not True
-            or snapshot.open_orders_complete is not True
-            or type(snapshot.source_response_digests) is not tuple
-            or not snapshot.source_response_digests
+            type(evidence) is not BrokerReadEvidenceRef
+            or evidence.evidence_kind != "CAPACITY"
         ):
             raise GatewayValidationError(
-                "capacity snapshot must prove complete positions and open orders"
+                "capacity reader returned an invalid durable evidence reference"
             )
-        for digest in snapshot.source_response_digests:
-            _exact_sha256(digest, "capacity source response digest")
+        try:
+            verified = self.ledger.broker_read_evidence(
+                evidence.evidence_sha256
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "capacity evidence reference failed durable verification"
+            ) from exc
+        if verified != evidence:
+            raise GatewayValidationError(
+                "capacity evidence reference failed durable verification"
+            )
         self._checked_account()
-        return AccountCapacityEvidence(
-            account_id=checked.account_id,
-            environment=self.runtime_safety.environment,
-            broker_buying_power=snapshot.broker_buying_power,
-            risk_budget=self._opening_risk_budget,
-            observed_at=snapshot.observed_at,
-            portfolio_snapshot_digest=snapshot.portfolio_snapshot_digest,
-        )
+        try:
+            decision = self.ledger.set_reservation_cap_from_read(
+                evidence,
+                risk_budget=self._opening_risk_budget,
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "durable capacity evidence could not authorize a cap"
+            ) from exc
+        self._checked_account()
+        return decision
 
     def _reconcile_once(
         self,
@@ -584,55 +578,56 @@ class EtradeOrderGateway:
         if context is None:
             return
         try:
-            reply = self.reader.query_order(
+            read_evidence = self.reader.query_order(
                 account, context.broker_order_id
             )
-        except Exception:
+        except ETradeBrokerReaderUnavailable:
             return
-        if type(reply) not in {BrokerOrderSnapshot, BrokerOrderNotFound}:
-            return
-        try:
-            _validate_order_read(
-                reply,
-                account,
-                context.broker_order_id,
-                self.runtime_safety.environment,
-                self._now(),
-            )
-        except (GatewayValidationError, RuntimeSafetyError):
-            return
-        if type(reply) is BrokerOrderNotFound:
-            return
-        if reply.outcome == "UNRESOLVED":
-            return
+        except ETradeBrokerReaderIntegrityError as exc:
+            raise GatewayValidationError(
+                "durable broker read integrity failed during reconciliation"
+            ) from exc
+        except ETradeBrokerReaderError as exc:
+            raise GatewayReconciliationRequired(
+                "broker reader could not safely reconcile the known order"
+            ) from exc
         if (
-            reply.order_payload_hash
-            != context.expected_order_payload_hash
+            type(read_evidence) is not BrokerReadEvidenceRef
+            or read_evidence.evidence_kind != "ORDER_QUERY"
         ):
-            return
-        evidence = BrokerEvidence(
-            account_id=account.account_id,
-            environment=self.runtime_safety.environment,
-            client_order_id=context.client_order_id,
-            broker_order_id=reply.broker_order_id,
-            operation=context.operation,
-            outcome=reply.outcome,
-            observed_at=reply.observed_at,
-            http_status=reply.http_status,
-            raw_response_digest=reply.raw_response_digest,
-        )
+            raise GatewayValidationError(
+                "order reader returned an invalid durable evidence reference"
+            )
         try:
-            if reply.outcome == "OPEN":
+            evidence = self.ledger.broker_evidence_from_read(
+                record.intent_id,
+                read_evidence,
+                operation=context.operation,
+            )
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "durable broker order evidence failed ledger validation"
+            ) from exc
+        if evidence is None:
+            return
+        try:
+            if evidence.outcome == "OPEN":
                 if record.pending_operation is not None:
                     self.ledger.reconcile_open(record.intent_id, evidence)
                 else:
                     self.ledger.mark_reconciled(record.intent_id, evidence)
             else:
                 self.ledger.reconcile_terminal(
-                    record.intent_id, reply.outcome, evidence
+                    record.intent_id, evidence.outcome, evidence
                 )
-        except OrderIntentLedgerError:
-            return
+        except OrderIntentBrokerTermsMismatch as exc:
+            raise GatewayReconciliationRequired(
+                "known broker order terms do not match the pending operation"
+            ) from exc
+        except OrderIntentLedgerError as exc:
+            raise GatewayValidationError(
+                "broker evidence could not be applied atomically"
+            ) from exc
 
     def _reconciliation_context(
         self, record: IntentRecord
@@ -646,7 +641,6 @@ class EtradeOrderGateway:
                 "ORDER_QUERY",
                 record.client_order_id,
                 record.broker_order_id,
-                self.ledger.expected_order_payload_hash(record.intent_id),
             )
         operation = (
             "SUBMIT_PLACE"
@@ -664,7 +658,6 @@ class EtradeOrderGateway:
             else "AMEND_QUERY",
             receipt.client_order_id,
             receipt.response.broker_order_id,
-            self.ledger.expected_order_payload_hash(record.intent_id),
         )
 
     def _pending_place_receipt(
@@ -909,67 +902,6 @@ def _require_same_account(
         raise RuntimeSafetyError(
             "broker account identity changed during the operation"
         )
-
-
-def _require_environment(expected: str, actual: str) -> None:
-    if (
-        type(expected) is not str
-        or expected not in {"sandbox", "production"}
-        or type(actual) is not str
-        or actual != expected
-    ):
-        raise RuntimeSafetyError(
-            "broker environment changed during the operation"
-        )
-
-
-def _validate_order_read(
-    reply: BrokerOrderSnapshot | BrokerOrderNotFound,
-    account: SelectedBrokerAccount,
-    broker_order_id: str,
-    environment: str,
-    now: datetime,
-) -> None:
-    _validate_account(reply.account)
-    _require_same_account(account, reply.account)
-    _require_environment(environment, reply.environment)
-    _exact_broker_id(reply.broker_order_id)
-    if reply.broker_order_id != broker_order_id:
-        raise GatewayValidationError(
-            "order read returned a different broker order id"
-        )
-    _fresh_time(reply.observed_at, now, "order observed_at")
-    if type(reply.http_status) is not int or reply.http_status not in {
-        200,
-        404,
-    }:
-        raise GatewayValidationError(
-            "order read has an unsupported HTTP status"
-        )
-    _exact_sha256(reply.raw_response_digest, "order raw_response_digest")
-    if reply.complete is not True:
-        raise GatewayValidationError("order read must be complete")
-    if type(reply) is BrokerOrderSnapshot:
-        _exact_sha256(
-            reply.order_payload_hash, "order_payload_hash"
-        )
-        if reply.http_status != 200 or reply.outcome not in {
-            "OPEN",
-            "FILLED",
-            "CANCELLED",
-            "REJECTED",
-            "EXPIRED",
-            "UNRESOLVED",
-        }:
-            raise GatewayValidationError(
-                "order snapshot outcome is invalid"
-            )
-
-
-def _fresh_time(value: datetime, now: datetime, name: str) -> None:
-    _exact_utc_time(value, name)
-    if value > now or (now - value).total_seconds() > _MAX_EVIDENCE_AGE_SECONDS:
-        raise GatewayValidationError(f"{name} is stale or future-dated")
 
 
 def _exact_payload_bytes(value: Any) -> None:

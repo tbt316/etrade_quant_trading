@@ -25,8 +25,8 @@ from typing import Any, Callable, Iterator, Literal, Mapping
 from urllib.parse import quote
 
 
-SCHEMA_VERSION = 10
-_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9})
+SCHEMA_VERSION = 11
+_MIGRATABLE_SCHEMA_VERSIONS = frozenset({8, 9, 10})
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
 _DECIMAL_PRECISION = 50
@@ -37,6 +37,38 @@ _PREVIEW_RECEIPT_MAX_AGE_SECONDS = 180
 _TRANSPORT_OPERATIONS = frozenset(
     {"SUBMIT_PREVIEW", "SUBMIT_PLACE", "AMEND_PREVIEW", "AMEND_PLACE"}
 )
+_BROKER_READ_KINDS = frozenset(
+    {
+        "ACCOUNT_LIST",
+        "BALANCE",
+        "PORTFOLIO_PAGE",
+        "OPEN_ORDERS_PAGE",
+        "ORDER_DETAIL",
+    }
+)
+_BROKER_READ_COMPLETENESS = frozenset(
+    {"COMPLETE", "HAS_NEXT", "INELIGIBLE"}
+)
+_BROKER_READ_EVIDENCE_KINDS = frozenset({"CAPACITY", "ORDER_QUERY"})
+_BROKER_READ_EVIDENCE_COMPLETENESS = frozenset(
+    {"COMPLETE", "INCOMPLETE", "UNSTABLE"}
+)
+_ETRADE_ORIGINS = {
+    "sandbox": "https://apisb.etrade.com",
+    "production": "https://api.etrade.com",
+}
+_MAX_BROKER_READ_BYTES = 2 * 1024 * 1024
+_MAX_BROKER_READ_SPAN_SECONDS = 60
+_ACTIVE_ORDER_READ_LANES = (
+    "OPEN",
+    "CANCEL_REQUESTED",
+    "INDIVIDUAL_FILLS",
+)
+_READ_REQUEST_HASH_DOMAIN = b"etrade-read-request.v1\0"
+_READ_PARSED_HASH_DOMAIN = b"etrade-read-parsed.v1\0"
+_READ_RECEIPT_HASH_DOMAIN = b"etrade-read-receipt.v1\0"
+_READ_MANIFEST_HASH_DOMAIN = b"etrade-read-manifest.v1\0"
+_CAPACITY_DECISION_HASH_DOMAIN = b"etrade-capacity-decision.v1\0"
 _INTENT_KINDS = frozenset({"OPENING", "CLOSING"})
 _ENVIRONMENTS = frozenset({"sandbox", "production"})
 _TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"})
@@ -128,6 +160,12 @@ class OrderIntentLeaseConflict(OrderIntentLedgerError):
 
 class OrderIntentReconciliationRequired(OrderIntentLedgerError):
     """The account/environment has unfinished broker work to reconcile."""
+
+
+class OrderIntentBrokerTermsMismatch(
+    OrderIntentIntegrityError, OrderIntentReconciliationRequired
+):
+    """Known broker order terms do not yet match the durable operation."""
 
 
 class OrderIntentReservationError(OrderIntentLedgerError):
@@ -317,6 +355,81 @@ class TransportResponseReceipt:
     recorded_at: datetime
 
 
+@dataclass(frozen=True, repr=False)
+class BrokerReadResponseEvidence:
+    """One exact, bounded E*TRADE GET response before semantic assembly."""
+
+    read_kind: Literal[
+        "ACCOUNT_LIST",
+        "BALANCE",
+        "PORTFOLIO_PAGE",
+        "OPEN_ORDERS_PAGE",
+        "ORDER_DETAIL",
+    ]
+    account_id: str
+    account_id_key: str
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    origin: str
+    route: str
+    query_json: str
+    authorization_sha256: str
+    target_broker_order_id: str | None
+    request_started_at: datetime
+    response_completed_at: datetime
+    http_status: int
+    raw_response_bytes: bytes
+    parser_schema: str
+    parser_code_sha256: str
+    parser_config_sha256: str
+    canonical_parsed_json: str
+    completeness: Literal["COMPLETE", "HAS_NEXT", "INELIGIBLE"]
+
+
+@dataclass(frozen=True)
+class BrokerReadReceiptRef:
+    receipt_sha256: str
+
+
+@dataclass(frozen=True)
+class BrokerReadManifestMember:
+    role: str
+    receipt_sha256: str
+
+
+@dataclass(frozen=True, repr=False)
+class BrokerReadManifestEvidence:
+    """A typed result assembled only from durable raw-response receipts."""
+
+    evidence_kind: Literal["CAPACITY", "ORDER_QUERY"]
+    account_id: str
+    account_id_key: str
+    institution_type: str
+    environment: Literal["sandbox", "production"]
+    origin: str
+    target_broker_order_id: str | None
+    observed_at: datetime
+    completeness: Literal["COMPLETE", "INCOMPLETE", "UNSTABLE"]
+    canonical_result_json: str
+
+
+@dataclass(frozen=True)
+class BrokerReadEvidenceRef:
+    evidence_sha256: str
+    evidence_kind: Literal["CAPACITY", "ORDER_QUERY"]
+
+
+@dataclass(frozen=True)
+class CapacityDecisionReceipt:
+    decision_sha256: str
+    evidence_sha256: str
+    cap_amount: Decimal
+    broker_buying_power: Decimal
+    risk_budget: Decimal
+    observed_at: datetime
+    portfolio_snapshot_digest: str
+
+
 @dataclass(frozen=True)
 class MarginReservation:
     intent_id: str
@@ -329,6 +442,7 @@ class MarginReservation:
     quote_digest: str
     portfolio_observed_at: datetime
     portfolio_snapshot_digest: str
+    capacity_decision_sha256: str | None
     state: str
     released_reason_code: str | None
     created_at: datetime
@@ -348,6 +462,8 @@ class BrokerEvidence:
     observed_at: datetime
     http_status: int
     raw_response_digest: str
+    broker_read_evidence_sha256: str | None = None
+    order_payload_hashes: tuple[str, ...] = ()
 
     def validate(self, now: datetime) -> None:
         if type(self) is not BrokerEvidence:
@@ -368,6 +484,29 @@ class BrokerEvidence:
         if type(self.http_status) is not int or self.http_status < 200 or self.http_status > 299:
             raise OrderIntentValidationError("valid broker evidence requires successful 2xx http_status")
         _validate_sha256("raw_response_digest", self.raw_response_digest)
+        if self.operation in {"ORDER_QUERY", "AMEND_QUERY"}:
+            _validate_sha256(
+                "broker_read_evidence_sha256",
+                self.broker_read_evidence_sha256,
+            )
+            if (
+                type(self.order_payload_hashes) is not tuple
+                or not self.order_payload_hashes
+                or len(set(self.order_payload_hashes))
+                != len(self.order_payload_hashes)
+            ):
+                raise OrderIntentValidationError(
+                    "query evidence requires unique durable order payload hashes"
+                )
+            for payload_hash in self.order_payload_hashes:
+                _validate_sha256("order_payload_hash", payload_hash)
+        elif (
+            self.broker_read_evidence_sha256 is not None
+            or self.order_payload_hashes
+        ):
+            raise OrderIntentValidationError(
+                "transport acknowledgements cannot claim broker-read provenance"
+            )
 
 
 @dataclass(frozen=True)
@@ -379,6 +518,7 @@ class RiskEvidence:
     quote_digest: str
     portfolio_observed_at: datetime
     portfolio_snapshot_digest: str
+    capacity_decision_sha256: str
 
     def validate(self, now: datetime) -> None:
         if type(self) is not RiskEvidence:
@@ -397,6 +537,10 @@ class RiskEvidence:
         if self.portfolio_observed_at > now + timedelta(seconds=5) or now - self.portfolio_observed_at > timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
             raise OrderIntentValidationError("portfolio risk evidence is stale or from the future")
         _validate_sha256("portfolio_snapshot_digest", self.portfolio_snapshot_digest)
+        _validate_sha256(
+            "capacity_decision_sha256",
+            self.capacity_decision_sha256,
+        )
 
 
 @dataclass(frozen=True)
@@ -409,6 +553,7 @@ class AccountCapacityEvidence:
     risk_budget: Decimal
     observed_at: datetime
     portfolio_snapshot_digest: str
+    broker_read_evidence_sha256: str | None = None
 
     def validate(self, now: datetime) -> None:
         if type(self) is not AccountCapacityEvidence:
@@ -424,6 +569,11 @@ class AccountCapacityEvidence:
         if self.observed_at > now + timedelta(seconds=5) or now - self.observed_at > timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
             raise OrderIntentValidationError("capacity evidence is stale or from the future")
         _validate_sha256("portfolio_snapshot_digest", self.portfolio_snapshot_digest)
+        if self.broker_read_evidence_sha256 is not None:
+            _validate_sha256(
+                "broker_read_evidence_sha256",
+                self.broker_read_evidence_sha256,
+            )
 
 
 @dataclass(frozen=True)
@@ -444,6 +594,7 @@ class IntentEvent:
     evidence_operation: str | None
     http_status: int | None
     raw_response_digest: str | None
+    broker_read_evidence_sha256: str | None
     created_at: datetime
 
 
@@ -520,6 +671,22 @@ def _stable_amendment_client_order_id(intent: sqlite3.Row, idempotency_key: str)
     material = "\x1f".join((intent["account_id"], intent["environment"], intent["idempotency_scope"], intent["idempotency_key"], "amend", idempotency_key)).encode("utf-8")
     value = int.from_bytes(hashlib.sha256(_CLIENT_ID_DOMAIN + material).digest()[:8], "big")
     return str(1_000_000_000 + value % 9_000_000_000)
+
+
+def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a multi-statement schema script without SQLite's implicit commit."""
+
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise OrderIntentLedgerError(
+            "ledger schema script ended with an incomplete statement"
+        )
 
 
 class OrderIntentLedger:
@@ -642,47 +809,7 @@ class OrderIntentLedger:
         _validate_identity("intent_id", intent_id)
         with self._connection() as conn:
             intent = self._require_intent(conn, intent_id)
-            if intent["pending_operation"] == "AMEND":
-                amendment = conn.execute(
-                    "SELECT * FROM amendment_leases WHERE intent_id = ?",
-                    (intent_id,),
-                ).fetchone()
-                if (
-                    amendment is None
-                    or amendment["state"] != "IN_DOUBT"
-                    or int(amendment["fencing_token"])
-                    != int(intent["pending_fence"] or -1)
-                ):
-                    raise OrderIntentIntegrityError(
-                        "pending amendment lacks matching durable order terms"
-                    )
-                result = amendment["payload_hash"]
-            elif intent["pending_operation"] == "SUBMIT":
-                result = intent["payload_hash"]
-            else:
-                completed = conn.execute(
-                    """
-                    SELECT payload_hash, completed_at
-                    FROM amendment_history
-                    WHERE intent_id = ?
-                    ORDER BY completed_at DESC
-                    """,
-                    (intent_id,),
-                ).fetchall()
-                if not completed:
-                    result = intent["payload_hash"]
-                else:
-                    latest_at = int(completed[0]["completed_at"])
-                    latest_hashes = {
-                        row["payload_hash"]
-                        for row in completed
-                        if int(row["completed_at"]) == latest_at
-                    }
-                    if len(latest_hashes) != 1:
-                        raise OrderIntentIntegrityError(
-                            "latest durable amendment terms are ambiguous"
-                        )
-                    result = next(iter(latest_hashes))
+            result = self._expected_order_payload_hash_conn(conn, intent)
         _validate_sha256("expected_order_payload_hash", result)
         return result
 
@@ -746,55 +873,676 @@ class OrderIntentLedger:
             ).fetchall()
         return tuple(_transport_response_receipt(row) for row in rows)
 
-    def set_reservation_cap(self, evidence: AccountCapacityEvidence) -> Decimal:
-        if type(evidence) is not AccountCapacityEvidence:
-            raise OrderIntentValidationError("set_reservation_cap requires typed AccountCapacityEvidence")
+    def record_broker_read_response(
+        self, evidence: BrokerReadResponseEvidence
+    ) -> BrokerReadReceiptRef:
+        """Persist one exact bounded GET response before returning it to a reader."""
+
         now = self._now_us()
-        AccountCapacityEvidence.validate(evidence, _from_us(now))
-        cap = _canonical_amount(min(evidence.broker_buying_power, evidence.risk_budget))
+        _validate_broker_read_response_evidence(evidence, _from_us(now))
+        from live_trading.etrade_broker_reader import (
+            _PARSER_CODE_SHA256,
+            _PARSER_CONFIG_SHA256,
+            _PARSER_SCHEMA,
+            _reparse_broker_read_response,
+        )
+
+        if (
+            evidence.parser_schema != _PARSER_SCHEMA
+            or evidence.parser_code_sha256 != _PARSER_CODE_SHA256
+            or evidence.parser_config_sha256 != _PARSER_CONFIG_SHA256
+        ):
+            raise OrderIntentIntegrityError(
+                "broker read response did not use the installed parser"
+            )
+        reparsed_json, reparsed_completeness = (
+            _reparse_broker_read_response(evidence)
+        )
+        if (
+            not hmac.compare_digest(
+                reparsed_json, evidence.canonical_parsed_json
+            )
+            or reparsed_completeness != evidence.completeness
+        ):
+            raise OrderIntentIntegrityError(
+                "broker read parser output does not match raw response bytes"
+            )
+        request_material = {
+            "read_kind": evidence.read_kind,
+            "account_id": evidence.account_id,
+            "account_id_key": evidence.account_id_key,
+            "institution_type": evidence.institution_type,
+            "environment": evidence.environment,
+            "origin": evidence.origin,
+            "http_method": "GET",
+            "route": evidence.route,
+            "query_json": evidence.query_json,
+            "authorization_sha256": evidence.authorization_sha256,
+            "target_broker_order_id": evidence.target_broker_order_id,
+        }
+        request_sha256 = _domain_json_hash(
+            _READ_REQUEST_HASH_DOMAIN, request_material
+        )
+        raw_response_sha256 = hashlib.sha256(
+            evidence.raw_response_bytes
+        ).hexdigest()
+        canonical_parsed_sha256 = _domain_bytes_hash(
+            _READ_PARSED_HASH_DOMAIN,
+            evidence.canonical_parsed_json.encode("utf-8"),
+        )
+        request_started_at = _to_us(evidence.request_started_at)
+        response_completed_at = _to_us(evidence.response_completed_at)
+        # The broker-observed completion time is deterministic, so a crash
+        # after commit but before return can replay to the same content ID.
+        recorded_at = response_completed_at
+        receipt_material = {
+            "request_sha256": request_sha256,
+            "request_started_at": request_started_at,
+            "response_completed_at": response_completed_at,
+            "http_status": evidence.http_status,
+            "raw_byte_length": len(evidence.raw_response_bytes),
+            "raw_response_sha256": raw_response_sha256,
+            "parser_schema": evidence.parser_schema,
+            "parser_code_sha256": evidence.parser_code_sha256,
+            "parser_config_sha256": evidence.parser_config_sha256,
+            "canonical_parsed_sha256": canonical_parsed_sha256,
+            "completeness": evidence.completeness,
+            "recorded_at": recorded_at,
+        }
+        receipt_sha256 = _domain_json_hash(
+            _READ_RECEIPT_HASH_DOMAIN, receipt_material
+        )
+        values = (
+            receipt_sha256,
+            evidence.read_kind,
+            evidence.account_id,
+            evidence.account_id_key,
+            evidence.institution_type,
+            evidence.environment,
+            evidence.origin,
+            "GET",
+            evidence.route,
+            evidence.query_json,
+            evidence.authorization_sha256,
+            request_sha256,
+            evidence.target_broker_order_id,
+            request_started_at,
+            response_completed_at,
+            evidence.http_status,
+            evidence.raw_response_bytes,
+            len(evidence.raw_response_bytes),
+            raw_response_sha256,
+            evidence.parser_schema,
+            evidence.parser_code_sha256,
+            evidence.parser_config_sha256,
+            evidence.canonical_parsed_json,
+            canonical_parsed_sha256,
+            evidence.completeness,
+            recorded_at,
+        )
         with self._transaction() as conn:
             existing = conn.execute(
+                """
+                SELECT * FROM broker_read_receipts
+                WHERE receipt_sha256 = ?
+                """,
+                (receipt_sha256,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO broker_read_receipts (
+                        receipt_sha256, read_kind, account_id, account_id_key,
+                        institution_type, environment, origin, http_method,
+                        route, query_json, authorization_sha256,
+                        request_sha256,
+                        target_broker_order_id, request_started_at,
+                        response_completed_at, http_status, raw_response_bytes,
+                        raw_byte_length, raw_response_sha256, parser_schema,
+                        parser_code_sha256, parser_config_sha256,
+                        canonical_parsed_json, canonical_parsed_sha256,
+                        completeness, recorded_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    values,
+                )
+            else:
+                columns = (
+                    "receipt_sha256",
+                    "read_kind",
+                    "account_id",
+                    "account_id_key",
+                    "institution_type",
+                    "environment",
+                    "origin",
+                    "http_method",
+                    "route",
+                    "query_json",
+                    "authorization_sha256",
+                    "request_sha256",
+                    "target_broker_order_id",
+                    "request_started_at",
+                    "response_completed_at",
+                    "http_status",
+                    "raw_response_bytes",
+                    "raw_byte_length",
+                    "raw_response_sha256",
+                    "parser_schema",
+                    "parser_code_sha256",
+                    "parser_config_sha256",
+                    "canonical_parsed_json",
+                    "canonical_parsed_sha256",
+                    "completeness",
+                    "recorded_at",
+                )
+                if tuple(existing[column] for column in columns) != values:
+                    raise OrderIntentIntegrityError(
+                        "broker read receipt content-address collision"
+                    )
+        return BrokerReadReceiptRef(receipt_sha256)
+
+    def record_broker_read_manifest(
+        self,
+        evidence: BrokerReadManifestEvidence,
+        members: tuple[BrokerReadManifestMember, ...],
+    ) -> BrokerReadEvidenceRef:
+        """Persist one immutable typed result and its ordered response lineage."""
+
+        now = self._now_us()
+        _validate_broker_read_manifest_evidence(evidence, _from_us(now))
+        _validate_broker_read_manifest_members(members)
+        canonical_result_sha256 = _domain_bytes_hash(
+            _READ_PARSED_HASH_DOMAIN,
+            evidence.canonical_result_json.encode("utf-8"),
+        )
+        observed_at = _to_us(evidence.observed_at)
+        created_at = observed_at
+        member_material = [
+            {
+                "ordinal": ordinal,
+                "role": member.role,
+                "receipt_sha256": member.receipt_sha256,
+            }
+            for ordinal, member in enumerate(members)
+        ]
+        manifest_material = {
+            "evidence_kind": evidence.evidence_kind,
+            "account_id": evidence.account_id,
+            "account_id_key": evidence.account_id_key,
+            "institution_type": evidence.institution_type,
+            "environment": evidence.environment,
+            "origin": evidence.origin,
+            "target_broker_order_id": evidence.target_broker_order_id,
+            "observed_at": observed_at,
+            "completeness": evidence.completeness,
+            "canonical_result_sha256": canonical_result_sha256,
+            "members": member_material,
+            "created_at": created_at,
+        }
+        evidence_sha256 = _domain_json_hash(
+            _READ_MANIFEST_HASH_DOMAIN, manifest_material
+        )
+        manifest_values = (
+            evidence_sha256,
+            evidence.evidence_kind,
+            evidence.account_id,
+            evidence.account_id_key,
+            evidence.institution_type,
+            evidence.environment,
+            evidence.origin,
+            evidence.target_broker_order_id,
+            observed_at,
+            evidence.completeness,
+            evidence.canonical_result_json,
+            canonical_result_sha256,
+            created_at,
+        )
+        with self._transaction() as conn:
+            receipt_rows = []
+            for member in members:
+                receipt = conn.execute(
+                    """
+                    SELECT * FROM broker_read_receipts
+                    WHERE receipt_sha256 = ?
+                    """,
+                    (member.receipt_sha256,),
+                ).fetchone()
+                if receipt is None:
+                    raise OrderIntentIntegrityError(
+                        "broker read manifest references an unknown receipt"
+                    )
+                _verify_broker_read_receipt_row(receipt)
+                if (
+                    receipt["account_id"] != evidence.account_id
+                    or receipt["account_id_key"] != evidence.account_id_key
+                    or receipt["institution_type"]
+                    != evidence.institution_type
+                    or receipt["environment"] != evidence.environment
+                    or receipt["origin"] != evidence.origin
+                    or int(receipt["response_completed_at"]) > observed_at
+                ):
+                    raise OrderIntentIntegrityError(
+                        "broker read manifest member binding is inconsistent"
+                    )
+                receipt_rows.append(receipt)
+            if evidence.completeness == "COMPLETE" and any(
+                row["completeness"] == "INELIGIBLE"
+                for row in receipt_rows
+            ):
+                raise OrderIntentIntegrityError(
+                    "complete broker read evidence has an ineligible member"
+                )
+            result = _load_canonical_json_object(
+                evidence.canonical_result_json,
+                "broker read manifest result",
+            )
+            _validate_broker_read_manifest_semantics(
+                evidence_kind=evidence.evidence_kind,
+                account_id=evidence.account_id,
+                account_id_key=evidence.account_id_key,
+                institution_type=evidence.institution_type,
+                target_broker_order_id=evidence.target_broker_order_id,
+                observed_at=observed_at,
+                completeness=evidence.completeness,
+                result=result,
+                member_roles=tuple(member.role for member in members),
+                receipt_rows=tuple(receipt_rows),
+            )
+            existing = conn.execute(
+                """
+                SELECT * FROM broker_read_manifests
+                WHERE evidence_sha256 = ?
+                """,
+                (evidence_sha256,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO broker_read_manifests (
+                        evidence_sha256, evidence_kind, account_id,
+                        account_id_key, institution_type, environment, origin,
+                        target_broker_order_id, observed_at, completeness,
+                        canonical_result_json, canonical_result_sha256,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    manifest_values,
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO broker_read_manifest_members (
+                        evidence_sha256, member_ordinal, member_role,
+                        receipt_sha256
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            evidence_sha256,
+                            ordinal,
+                            member.role,
+                            member.receipt_sha256,
+                        )
+                        for ordinal, member in enumerate(members)
+                    ),
+                )
+            else:
+                columns = (
+                    "evidence_sha256",
+                    "evidence_kind",
+                    "account_id",
+                    "account_id_key",
+                    "institution_type",
+                    "environment",
+                    "origin",
+                    "target_broker_order_id",
+                    "observed_at",
+                    "completeness",
+                    "canonical_result_json",
+                    "canonical_result_sha256",
+                    "created_at",
+                )
+                if tuple(existing[column] for column in columns) != manifest_values:
+                    raise OrderIntentIntegrityError(
+                        "broker read manifest content-address collision"
+                    )
+                existing_members = conn.execute(
+                    """
+                    SELECT member_role, receipt_sha256
+                    FROM broker_read_manifest_members
+                    WHERE evidence_sha256 = ?
+                    ORDER BY member_ordinal
+                    """,
+                    (evidence_sha256,),
+                ).fetchall()
+                if tuple(
+                    (row["member_role"], row["receipt_sha256"])
+                    for row in existing_members
+                ) != tuple(
+                    (member.role, member.receipt_sha256)
+                    for member in members
+                ):
+                    raise OrderIntentIntegrityError(
+                        "broker read manifest membership conflicts"
+                    )
+        return BrokerReadEvidenceRef(
+            evidence_sha256, evidence.evidence_kind
+        )
+
+    def broker_read_evidence(
+        self, evidence_sha256: str
+    ) -> BrokerReadEvidenceRef:
+        """Verify and return a redacted reference to immutable read evidence."""
+
+        _validate_sha256("evidence_sha256", evidence_sha256)
+        with self._connection() as conn:
+            row, _ = self._verified_broker_read_manifest(
+                conn, evidence_sha256
+            )
+        return BrokerReadEvidenceRef(
+            evidence_sha256, row["evidence_kind"]
+        )
+
+    def set_reservation_cap_from_read(
+        self,
+        evidence: BrokerReadEvidenceRef,
+        *,
+        risk_budget: Decimal,
+    ) -> CapacityDecisionReceipt:
+        """Derive and persist a cap only from a complete durable capacity read."""
+
+        if (
+            type(evidence) is not BrokerReadEvidenceRef
+            or evidence.evidence_kind != "CAPACITY"
+        ):
+            raise OrderIntentValidationError(
+                "capacity requires an exact CAPACITY evidence reference"
+            )
+        _validate_sha256("capacity evidence", evidence.evidence_sha256)
+        if (
+            type(risk_budget) is not Decimal
+            or not risk_budget.is_finite()
+            or risk_budget < 0
+        ):
+            raise OrderIntentValidationError(
+                "risk_budget must be a non-negative finite Decimal"
+            )
+        now = self._now_us()
+        with self._transaction() as conn:
+            manifest, result = self._verified_broker_read_manifest(
+                conn, evidence.evidence_sha256
+            )
+            if (
+                manifest["evidence_kind"] != "CAPACITY"
+                or manifest["completeness"] != "COMPLETE"
+                or manifest["target_broker_order_id"] is not None
+            ):
+                raise OrderIntentIntegrityError(
+                    "capacity evidence is not a complete capacity manifest"
+                )
+            _validate_capacity_manifest_result(result)
+            observed_at = int(manifest["observed_at"])
+            if (
+                observed_at > now + 5_000_000
+                or now - observed_at
+                > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentValidationError(
+                    "capacity evidence is stale or from the future"
+                )
+            broker_buying_power = Decimal(
+                result["broker_buying_power"]
+            )
+            canonical_risk_budget = _canonical_amount(risk_budget)
+            cap_amount = _canonical_amount(
+                min(broker_buying_power, risk_budget)
+            )
+            snapshot_digest = result["state_sha256"]
+            decided_at = observed_at
+            decision_material = {
+                "evidence_sha256": evidence.evidence_sha256,
+                "account_id": manifest["account_id"],
+                "environment": manifest["environment"],
+                "broker_buying_power": _canonical_amount(
+                    broker_buying_power
+                ),
+                "risk_budget": canonical_risk_budget,
+                "cap_amount": cap_amount,
+                "observed_at": observed_at,
+                "capacity_snapshot_sha256": snapshot_digest,
+                "decided_at": decided_at,
+            }
+            decision_sha256 = _domain_json_hash(
+                _CAPACITY_DECISION_HASH_DOMAIN, decision_material
+            )
+            decision_values = (
+                decision_sha256,
+                evidence.evidence_sha256,
+                manifest["account_id"],
+                manifest["environment"],
+                _canonical_amount(broker_buying_power),
+                canonical_risk_budget,
+                cap_amount,
+                observed_at,
+                snapshot_digest,
+                decided_at,
+            )
+            existing_decision = conn.execute(
+                """
+                SELECT * FROM capacity_decisions
+                WHERE capacity_decision_sha256 = ?
+                """,
+                (decision_sha256,),
+            ).fetchone()
+            if existing_decision is None:
+                conn.execute(
+                    """
+                    INSERT INTO capacity_decisions (
+                        capacity_decision_sha256, evidence_sha256,
+                        account_id, environment, broker_buying_power,
+                        risk_budget, cap_amount, observed_at,
+                        capacity_snapshot_sha256, decided_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    decision_values,
+                )
+            else:
+                columns = (
+                    "capacity_decision_sha256",
+                    "evidence_sha256",
+                    "account_id",
+                    "environment",
+                    "broker_buying_power",
+                    "risk_budget",
+                    "cap_amount",
+                    "observed_at",
+                    "capacity_snapshot_sha256",
+                    "decided_at",
+                )
+                if tuple(
+                    existing_decision[column] for column in columns
+                ) != decision_values:
+                    raise OrderIntentIntegrityError(
+                        "capacity decision content-address collision"
+                    )
+            existing_cap = conn.execute(
                 """
                 SELECT * FROM reservation_caps
                 WHERE account_id = ? AND environment = ?
                 """,
-                (evidence.account_id, evidence.environment),
+                (manifest["account_id"], manifest["environment"]),
             ).fetchone()
-            observed_at = _to_us(evidence.observed_at)
-            if existing is not None and observed_at == int(existing["observed_at"]):
-                expected = (
-                    cap,
-                    _canonical_amount(evidence.broker_buying_power),
-                    _canonical_amount(evidence.risk_budget),
-                    evidence.portfolio_snapshot_digest,
-                )
-                actual = (
-                    existing["cap_amount"],
-                    existing["broker_buying_power"],
-                    existing["risk_budget"],
-                    existing["portfolio_snapshot_digest"],
-                )
-                if actual == expected:
-                    return Decimal(existing["cap_amount"])
-                raise OrderIntentIntegrityError(
-                    "equal-time capacity evidence conflicts with the persisted snapshot"
-                )
-            if existing is not None and observed_at < int(existing["observed_at"]):
+            if (
+                existing_cap is not None
+                and observed_at < int(existing_cap["observed_at"])
+            ):
                 raise OrderIntentIntegrityError(
                     "capacity evidence must not predate the persisted account snapshot"
                 )
+            if (
+                existing_cap is not None
+                and observed_at == int(existing_cap["observed_at"])
+                and existing_cap["capacity_decision_sha256"]
+                not in {None, decision_sha256}
+            ):
+                raise OrderIntentIntegrityError(
+                    "equal-time capacity evidence conflicts with the persisted snapshot"
+                )
             conn.execute(
                 """
-                INSERT INTO reservation_caps (account_id, environment, cap_amount, broker_buying_power, risk_budget, observed_at, portfolio_snapshot_digest, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO reservation_caps (
+                    account_id, environment, cap_amount,
+                    broker_buying_power, risk_budget, observed_at,
+                    portfolio_snapshot_digest, updated_at,
+                    capacity_decision_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, environment) DO UPDATE SET
-                    cap_amount = excluded.cap_amount, broker_buying_power = excluded.broker_buying_power,
-                    risk_budget = excluded.risk_budget, observed_at = excluded.observed_at,
-                    portfolio_snapshot_digest = excluded.portfolio_snapshot_digest, updated_at = excluded.updated_at
+                    cap_amount = excluded.cap_amount,
+                    broker_buying_power = excluded.broker_buying_power,
+                    risk_budget = excluded.risk_budget,
+                    observed_at = excluded.observed_at,
+                    portfolio_snapshot_digest =
+                        excluded.portfolio_snapshot_digest,
+                    updated_at = excluded.updated_at,
+                    capacity_decision_sha256 =
+                        excluded.capacity_decision_sha256
                 """,
-                (evidence.account_id, evidence.environment, cap, _canonical_amount(evidence.broker_buying_power), _canonical_amount(evidence.risk_budget), observed_at, evidence.portfolio_snapshot_digest, now),
+                (
+                    manifest["account_id"],
+                    manifest["environment"],
+                    cap_amount,
+                    _canonical_amount(broker_buying_power),
+                    canonical_risk_budget,
+                    observed_at,
+                    snapshot_digest,
+                    now,
+                    decision_sha256,
+                ),
             )
-        return Decimal(cap)
+        return CapacityDecisionReceipt(
+            decision_sha256=decision_sha256,
+            evidence_sha256=evidence.evidence_sha256,
+            cap_amount=Decimal(cap_amount),
+            broker_buying_power=broker_buying_power,
+            risk_budget=Decimal(canonical_risk_budget),
+            observed_at=_from_us(observed_at),
+            portfolio_snapshot_digest=snapshot_digest,
+        )
+
+    def broker_evidence_from_read(
+        self,
+        intent_id: str,
+        evidence: BrokerReadEvidenceRef,
+        *,
+        operation: Literal["ORDER_QUERY", "AMEND_QUERY"],
+    ) -> BrokerEvidence | None:
+        """Derive reconciliation facts from a durable known-order manifest."""
+
+        _validate_identity("intent_id", intent_id)
+        if (
+            type(evidence) is not BrokerReadEvidenceRef
+            or evidence.evidence_kind != "ORDER_QUERY"
+        ):
+            raise OrderIntentValidationError(
+                "order reconciliation requires exact ORDER_QUERY evidence"
+            )
+        if type(operation) is not str or operation not in {
+            "ORDER_QUERY",
+            "AMEND_QUERY",
+        }:
+            raise OrderIntentValidationError(
+                "read evidence operation is invalid"
+            )
+        now = self._now_us()
+        with self._connection() as conn:
+            intent = self._require_intent(conn, intent_id)
+            manifest, result = self._verified_broker_read_manifest(
+                conn, evidence.evidence_sha256
+            )
+            _validate_order_query_manifest_result(result)
+            if (
+                manifest["evidence_kind"] != "ORDER_QUERY"
+                or manifest["account_id"] != intent["account_id"]
+                or manifest["environment"] != intent["environment"]
+                or manifest["target_broker_order_id"]
+                != result["broker_order_id"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "order read evidence does not match the durable intent"
+                )
+            if (
+                manifest["completeness"] != "COMPLETE"
+                or result["not_found"] is True
+                or result["outcome"] == "UNRESOLVED"
+            ):
+                return None
+            observed_at = int(manifest["observed_at"])
+            if (
+                observed_at > now + 5_000_000
+                or now - observed_at
+                > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+            ):
+                raise OrderIntentValidationError(
+                    "order read evidence is stale or from the future"
+                )
+            expected_client_id = intent["client_order_id"]
+            if operation == "AMEND_QUERY":
+                amendment = conn.execute(
+                    """
+                    SELECT client_order_id FROM amendment_leases
+                    WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                if amendment is None:
+                    raise OrderIntentIntegrityError(
+                        "amendment query lacks a durable amendment operation"
+                    )
+                expected_client_id = amendment["client_order_id"]
+        return BrokerEvidence(
+            account_id=manifest["account_id"],
+            environment=manifest["environment"],
+            client_order_id=expected_client_id,
+            broker_order_id=result["broker_order_id"],
+            operation=operation,
+            outcome=result["outcome"],
+            observed_at=_from_us(observed_at),
+            http_status=result["http_status"],
+            raw_response_digest=result["raw_response_digest"],
+            broker_read_evidence_sha256=evidence.evidence_sha256,
+            order_payload_hashes=tuple(result["order_payload_hashes"]),
+        )
+
+    def set_reservation_cap(self, evidence: AccountCapacityEvidence) -> Decimal:
+        """Compatibility wrapper that still requires durable broker evidence."""
+
+        if type(evidence) is not AccountCapacityEvidence:
+            raise OrderIntentValidationError("set_reservation_cap requires typed AccountCapacityEvidence")
+        AccountCapacityEvidence.validate(
+            evidence, _from_us(self._now_us())
+        )
+        if evidence.broker_read_evidence_sha256 is None:
+            raise OrderIntentValidationError(
+                "capacity evidence must reference a durable broker-read manifest"
+            )
+        decision = self.set_reservation_cap_from_read(
+            BrokerReadEvidenceRef(
+                evidence.broker_read_evidence_sha256, "CAPACITY"
+            ),
+            risk_budget=evidence.risk_budget,
+        )
+        if (
+            decision.broker_buying_power != evidence.broker_buying_power
+            or decision.observed_at != evidence.observed_at
+            or decision.portfolio_snapshot_digest
+            != evidence.portfolio_snapshot_digest
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity wrapper conflicts with durable read evidence"
+            )
+        return decision.cap_amount
 
     def reserve_margin(self, intent_id: str, evidence: RiskEvidence) -> MarginReservation:
         _validate_identity("intent_id", intent_id)
@@ -815,11 +1563,24 @@ class OrderIntentLedger:
                     "risk evidence is below the immutable opening exposure floor"
                 )
             cap = conn.execute(
-                "SELECT cap_amount, observed_at, portfolio_snapshot_digest FROM reservation_caps WHERE account_id = ? AND environment = ?",
+                """
+                SELECT cap_amount, observed_at, portfolio_snapshot_digest,
+                       capacity_decision_sha256
+                FROM reservation_caps
+                WHERE account_id = ? AND environment = ?
+                """,
                 (intent["account_id"], intent["environment"]),
             ).fetchone()
             if cap is None:
                 raise OrderIntentReservationError("opening reservations require an account/environment cap")
+            if (
+                cap["capacity_decision_sha256"] is None
+                or evidence.capacity_decision_sha256
+                != cap["capacity_decision_sha256"]
+            ):
+                raise OrderIntentIntegrityError(
+                    "reservation must name the exact durable capacity decision"
+                )
             if (
                 int(cap["observed_at"]) != _to_us(evidence.portfolio_observed_at)
                 or cap["portfolio_snapshot_digest"] != evidence.portfolio_snapshot_digest
@@ -837,6 +1598,8 @@ class OrderIntentLedger:
                     and reservation.max_loss_amount == evidence.max_loss_amount and reservation.quote_observed_at == evidence.quote_observed_at
                     and reservation.quote_digest == evidence.quote_digest and reservation.portfolio_observed_at == evidence.portfolio_observed_at
                     and reservation.portfolio_snapshot_digest == evidence.portfolio_snapshot_digest
+                    and reservation.capacity_decision_sha256
+                    == evidence.capacity_decision_sha256
                 ):
                     return reservation
                 raise OrderIntentTransitionError("reservation already exists and is immutable")
@@ -850,10 +1613,25 @@ class OrderIntentLedger:
                 """
                 INSERT INTO margin_reservations (
                     intent_id, account_id, environment, amount, risk_decision_id, max_loss_amount,
-                    quote_observed_at, quote_digest, portfolio_observed_at, portfolio_snapshot_digest, state, released_reason_code, created_at, released_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL, ?, NULL)
+                    quote_observed_at, quote_digest, portfolio_observed_at,
+                    portfolio_snapshot_digest, capacity_decision_sha256,
+                    state, released_reason_code, created_at, released_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL, ?, NULL)
                 """,
-                (intent_id, intent["account_id"], intent["environment"], value, evidence.decision_id, _canonical_amount(evidence.max_loss_amount), _to_us(evidence.quote_observed_at), evidence.quote_digest, _to_us(evidence.portfolio_observed_at), evidence.portfolio_snapshot_digest, now),
+                (
+                    intent_id,
+                    intent["account_id"],
+                    intent["environment"],
+                    value,
+                    evidence.decision_id,
+                    _canonical_amount(evidence.max_loss_amount),
+                    _to_us(evidence.quote_observed_at),
+                    evidence.quote_digest,
+                    _to_us(evidence.portfolio_observed_at),
+                    evidence.portfolio_snapshot_digest,
+                    evidence.capacity_decision_sha256,
+                    now,
+                ),
             )
             self._append_event(conn, intent_id, "RESERVATION_CREATED", "INTENT", "INTENT", "system", "RESERVATION_CREATED", now)
             return self._reservation_from_row(
@@ -1885,7 +2663,12 @@ class OrderIntentLedger:
         try:
             os.fchmod(descriptor, 0o600)
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+                or info.st_nlink != 1
+            ):
                 raise OrderIntentValidationError("new ledger database is not owner-only")
         finally:
             os.close(descriptor)
@@ -1920,7 +2703,12 @@ class OrderIntentLedger:
             raise OrderIntentValidationError(f"could not safely open {label}") from exc
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+                or info.st_nlink != 1
+            ):
                 raise OrderIntentValidationError(f"{label} must be regular, current-user, and owner-only")
         finally:
             os.close(descriptor)
@@ -1946,13 +2734,17 @@ class OrderIntentLedger:
                 mode = conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
                 if str(mode).lower() != "delete":
                     raise OrderIntentLedgerError("ledger requires SQLite DELETE journaling in its private directory")
+            conn.execute("BEGIN EXCLUSIVE")
+            if metadata_table is None:
                 conn.execute("CREATE TABLE ledger_metadata (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)")
             conn.execute("INSERT OR IGNORE INTO ledger_metadata (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
             metadata = conn.execute("SELECT schema_version FROM ledger_metadata WHERE singleton = 1").fetchone()
             current_schema_version = int(metadata["schema_version"])
             if current_schema_version != SCHEMA_VERSION and current_schema_version not in _MIGRATABLE_SCHEMA_VERSIONS:
                 raise OrderIntentLedgerError(f"unsupported ledger schema {metadata['schema_version']}; expected {SCHEMA_VERSION}")
-            conn.executescript(
+            self._ensure_broker_read_schema(conn)
+            _execute_sql_script(
+                conn,
                 """
                 CREATE TABLE IF NOT EXISTS order_intents (
                     intent_id TEXT PRIMARY KEY,
@@ -1993,6 +2785,7 @@ class OrderIntentLedger:
                     observed_at INTEGER NOT NULL,
                     portfolio_snapshot_digest TEXT NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    capacity_decision_sha256 TEXT REFERENCES capacity_decisions(capacity_decision_sha256),
                     PRIMARY KEY (account_id, environment),
                     CHECK (CAST(cap_amount AS REAL) >= 0 AND CAST(broker_buying_power AS REAL) >= 0 AND CAST(risk_budget AS REAL) >= 0),
                     CHECK (length(portfolio_snapshot_digest) = 64)
@@ -2008,6 +2801,7 @@ class OrderIntentLedger:
                     quote_digest TEXT NOT NULL,
                     portfolio_observed_at INTEGER NOT NULL,
                     portfolio_snapshot_digest TEXT NOT NULL,
+                    capacity_decision_sha256 TEXT REFERENCES capacity_decisions(capacity_decision_sha256),
                     state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'FILLED_PENDING_ABSORPTION', 'RELEASED')),
                     released_reason_code TEXT,
                     created_at INTEGER NOT NULL,
@@ -2139,6 +2933,7 @@ class OrderIntentLedger:
                     evidence_operation TEXT,
                     http_status INTEGER,
                     raw_response_digest TEXT,
+                    broker_read_evidence_sha256 TEXT REFERENCES broker_read_manifests(evidence_sha256),
                     created_at INTEGER NOT NULL,
                     CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
                     CHECK (raw_response_digest IS NULL OR length(raw_response_digest) = 64)
@@ -2164,6 +2959,14 @@ class OrderIntentLedger:
                 CREATE TRIGGER IF NOT EXISTS prevent_transport_response_receipt_delete BEFORE DELETE ON transport_response_receipts BEGIN SELECT RAISE(ABORT, 'transport response receipts are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_update BEFORE UPDATE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_broker_order_history_delete BEFORE DELETE ON broker_order_history BEGIN SELECT RAISE(ABORT, 'broker order history is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_receipt_update BEFORE UPDATE ON broker_read_receipts BEGIN SELECT RAISE(ABORT, 'broker read receipts are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_receipt_delete BEFORE DELETE ON broker_read_receipts BEGIN SELECT RAISE(ABORT, 'broker read receipts are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_manifest_update BEFORE UPDATE ON broker_read_manifests BEGIN SELECT RAISE(ABORT, 'broker read manifests are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_manifest_delete BEFORE DELETE ON broker_read_manifests BEGIN SELECT RAISE(ABORT, 'broker read manifests are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_member_update BEFORE UPDATE ON broker_read_manifest_members BEGIN SELECT RAISE(ABORT, 'broker read manifest members are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_broker_read_member_delete BEFORE DELETE ON broker_read_manifest_members BEGIN SELECT RAISE(ABORT, 'broker read manifest members are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_capacity_decision_update BEFORE UPDATE ON capacity_decisions BEGIN SELECT RAISE(ABORT, 'capacity decisions are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS prevent_capacity_decision_delete BEFORE DELETE ON capacity_decisions BEGIN SELECT RAISE(ABORT, 'capacity decisions are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS prevent_intent_identity_mutation BEFORE UPDATE ON order_intents
                 WHEN OLD.account_id != NEW.account_id OR OLD.environment != NEW.environment OR OLD.strategy_id != NEW.strategy_id
                    OR OLD.decision_id != NEW.decision_id OR OLD.idempotency_scope != NEW.idempotency_scope
@@ -2178,7 +2981,390 @@ class OrderIntentLedger:
             )
             if current_schema_version != SCHEMA_VERSION:
                 conn.execute("UPDATE ledger_metadata SET schema_version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
+            self._verify_schema_structure(conn)
+            conn.execute("COMMIT")
             self._secure_sqlite_sidecars()
+
+    @staticmethod
+    def _ensure_broker_read_schema(conn: sqlite3.Connection) -> None:
+        """Create schema-11 provenance tables before dependent column upgrades."""
+
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS broker_read_receipts (
+                receipt_sha256 TEXT NOT NULL PRIMARY KEY
+                    CHECK (length(receipt_sha256) = 64),
+                read_kind TEXT NOT NULL CHECK (read_kind IN (
+                    'ACCOUNT_LIST','BALANCE','PORTFOLIO_PAGE',
+                    'OPEN_ORDERS_PAGE','ORDER_DETAIL'
+                )),
+                account_id TEXT NOT NULL,
+                account_id_key TEXT NOT NULL,
+                institution_type TEXT NOT NULL,
+                environment TEXT NOT NULL
+                    CHECK (environment IN ('sandbox', 'production')),
+                origin TEXT NOT NULL,
+                http_method TEXT NOT NULL CHECK (http_method = 'GET'),
+                route TEXT NOT NULL,
+                query_json TEXT NOT NULL,
+                authorization_sha256 TEXT NOT NULL
+                    CHECK (length(authorization_sha256) = 64),
+                request_sha256 TEXT NOT NULL
+                    CHECK (length(request_sha256) = 64),
+                target_broker_order_id TEXT,
+                request_started_at INTEGER NOT NULL,
+                response_completed_at INTEGER NOT NULL,
+                http_status INTEGER NOT NULL
+                    CHECK (http_status BETWEEN 100 AND 599),
+                raw_response_bytes BLOB NOT NULL,
+                raw_byte_length INTEGER NOT NULL
+                    CHECK (
+                        raw_byte_length = length(raw_response_bytes)
+                        AND raw_byte_length <= 2097152
+                    ),
+                raw_response_sha256 TEXT NOT NULL
+                    CHECK (length(raw_response_sha256) = 64),
+                parser_schema TEXT NOT NULL,
+                parser_code_sha256 TEXT NOT NULL
+                    CHECK (length(parser_code_sha256) = 64),
+                parser_config_sha256 TEXT NOT NULL
+                    CHECK (length(parser_config_sha256) = 64),
+                canonical_parsed_json TEXT NOT NULL,
+                canonical_parsed_sha256 TEXT NOT NULL
+                    CHECK (length(canonical_parsed_sha256) = 64),
+                completeness TEXT NOT NULL CHECK (
+                    completeness IN ('COMPLETE','HAS_NEXT','INELIGIBLE')
+                ),
+                recorded_at INTEGER NOT NULL,
+                CHECK (response_completed_at >= request_started_at),
+                CHECK (
+                    (environment = 'production'
+                     AND origin = 'https://api.etrade.com')
+                    OR
+                    (environment = 'sandbox'
+                     AND origin = 'https://apisb.etrade.com')
+                ),
+                CHECK (
+                    (read_kind = 'ORDER_DETAIL')
+                    = (target_broker_order_id IS NOT NULL)
+                )
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS broker_read_manifests (
+                evidence_sha256 TEXT NOT NULL PRIMARY KEY
+                    CHECK (length(evidence_sha256) = 64),
+                evidence_kind TEXT NOT NULL
+                    CHECK (evidence_kind IN ('CAPACITY','ORDER_QUERY')),
+                account_id TEXT NOT NULL,
+                account_id_key TEXT NOT NULL,
+                institution_type TEXT NOT NULL,
+                environment TEXT NOT NULL
+                    CHECK (environment IN ('sandbox', 'production')),
+                origin TEXT NOT NULL,
+                target_broker_order_id TEXT,
+                observed_at INTEGER NOT NULL,
+                completeness TEXT NOT NULL CHECK (
+                    completeness IN ('COMPLETE','INCOMPLETE','UNSTABLE')
+                ),
+                canonical_result_json TEXT NOT NULL,
+                canonical_result_sha256 TEXT NOT NULL
+                    CHECK (length(canonical_result_sha256) = 64),
+                created_at INTEGER NOT NULL,
+                CHECK (
+                    (evidence_kind = 'ORDER_QUERY')
+                    = (target_broker_order_id IS NOT NULL)
+                ),
+                CHECK (
+                    (environment = 'production'
+                     AND origin = 'https://api.etrade.com')
+                    OR
+                    (environment = 'sandbox'
+                     AND origin = 'https://apisb.etrade.com')
+                )
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS broker_read_manifest_members (
+                evidence_sha256 TEXT NOT NULL
+                    REFERENCES broker_read_manifests(evidence_sha256),
+                member_ordinal INTEGER NOT NULL
+                    CHECK (member_ordinal >= 0),
+                member_role TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL
+                    REFERENCES broker_read_receipts(receipt_sha256),
+                PRIMARY KEY (evidence_sha256, member_ordinal),
+                UNIQUE (evidence_sha256, member_role),
+                UNIQUE (evidence_sha256, receipt_sha256)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS capacity_decisions (
+                capacity_decision_sha256 TEXT NOT NULL PRIMARY KEY
+                    CHECK (length(capacity_decision_sha256) = 64),
+                evidence_sha256 TEXT NOT NULL
+                    REFERENCES broker_read_manifests(evidence_sha256),
+                account_id TEXT NOT NULL,
+                environment TEXT NOT NULL
+                    CHECK (environment IN ('sandbox', 'production')),
+                broker_buying_power TEXT NOT NULL,
+                risk_budget TEXT NOT NULL,
+                cap_amount TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                capacity_snapshot_sha256 TEXT NOT NULL
+                    CHECK (length(capacity_snapshot_sha256) = 64),
+                decided_at INTEGER NOT NULL,
+                CHECK (
+                    CAST(broker_buying_power AS REAL) >= 0
+                    AND CAST(risk_budget AS REAL) >= 0
+                    AND CAST(cap_amount AS REAL) >= 0
+                )
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_broker_read_receipts_binding
+            ON broker_read_receipts (
+                account_id, environment, response_completed_at
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_broker_read_manifests_binding
+            ON broker_read_manifests (
+                account_id, environment, evidence_kind, observed_at
+            )
+            """,
+        )
+        for statement in statements:
+            conn.execute(statement)
+        column_upgrades = (
+            (
+                "broker_read_receipts",
+                "authorization_sha256",
+                "TEXT",
+            ),
+            (
+                "reservation_caps",
+                "capacity_decision_sha256",
+                "TEXT REFERENCES capacity_decisions(capacity_decision_sha256)",
+            ),
+            (
+                "margin_reservations",
+                "capacity_decision_sha256",
+                "TEXT REFERENCES capacity_decisions(capacity_decision_sha256)",
+            ),
+            (
+                "order_events",
+                "broker_read_evidence_sha256",
+                "TEXT REFERENCES broker_read_manifests(evidence_sha256)",
+            ),
+        )
+        for table, column, definition in column_upgrades:
+            table_exists = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """,
+                (table,),
+            ).fetchone()
+            if table_exists is None:
+                continue
+            columns = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
+
+    @staticmethod
+    def _verify_schema_structure(conn: sqlite3.Connection) -> None:
+        if (
+            str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            != "delete"
+            or int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1
+        ):
+            raise OrderIntentLedgerError(
+                "ledger SQLite safety pragmas are not active"
+            )
+        required_columns = {
+            "broker_read_receipts": {
+                "receipt_sha256",
+                "read_kind",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "origin",
+                "http_method",
+                "route",
+                "query_json",
+                "authorization_sha256",
+                "request_sha256",
+                "target_broker_order_id",
+                "request_started_at",
+                "response_completed_at",
+                "http_status",
+                "raw_response_bytes",
+                "raw_byte_length",
+                "raw_response_sha256",
+                "parser_schema",
+                "parser_code_sha256",
+                "parser_config_sha256",
+                "canonical_parsed_json",
+                "canonical_parsed_sha256",
+                "completeness",
+                "recorded_at",
+            },
+            "broker_read_manifests": {
+                "evidence_sha256",
+                "evidence_kind",
+                "account_id",
+                "account_id_key",
+                "institution_type",
+                "environment",
+                "origin",
+                "target_broker_order_id",
+                "observed_at",
+                "completeness",
+                "canonical_result_json",
+                "canonical_result_sha256",
+                "created_at",
+            },
+            "broker_read_manifest_members": {
+                "evidence_sha256",
+                "member_ordinal",
+                "member_role",
+                "receipt_sha256",
+            },
+            "capacity_decisions": {
+                "capacity_decision_sha256",
+                "evidence_sha256",
+                "account_id",
+                "environment",
+                "broker_buying_power",
+                "risk_budget",
+                "cap_amount",
+                "observed_at",
+                "capacity_snapshot_sha256",
+                "decided_at",
+            },
+            "reservation_caps": {"capacity_decision_sha256"},
+            "margin_reservations": {"capacity_decision_sha256"},
+            "order_events": {"broker_read_evidence_sha256"},
+        }
+        table_columns: dict[str, dict[str, sqlite3.Row]] = {}
+        for table, required in required_columns.items():
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            columns = {row["name"]: row for row in rows}
+            if not required.issubset(columns):
+                raise OrderIntentLedgerError(
+                    f"ledger table {table} is structurally incomplete"
+                )
+            table_columns[table] = columns
+        for column in (
+            "receipt_sha256",
+            "read_kind",
+            "account_id",
+            "account_id_key",
+            "institution_type",
+            "environment",
+            "origin",
+            "http_method",
+            "route",
+            "query_json",
+            "authorization_sha256",
+            "request_sha256",
+            "request_started_at",
+            "response_completed_at",
+            "http_status",
+            "raw_response_bytes",
+            "raw_byte_length",
+            "raw_response_sha256",
+            "parser_schema",
+            "parser_code_sha256",
+            "parser_config_sha256",
+            "canonical_parsed_json",
+            "canonical_parsed_sha256",
+            "completeness",
+            "recorded_at",
+        ):
+            if int(
+                table_columns["broker_read_receipts"][column]["notnull"]
+            ) != 1:
+                raise OrderIntentLedgerError(
+                    "broker read receipt schema permits missing provenance"
+                )
+        required_triggers = {
+            "prevent_broker_read_receipt_update",
+            "prevent_broker_read_receipt_delete",
+            "prevent_broker_read_manifest_update",
+            "prevent_broker_read_manifest_delete",
+            "prevent_broker_read_member_update",
+            "prevent_broker_read_member_delete",
+            "prevent_capacity_decision_update",
+            "prevent_capacity_decision_delete",
+        }
+        trigger_rows = conn.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger'
+            """
+        ).fetchall()
+        triggers = {row["name"]: row["sql"] for row in trigger_rows}
+        if not required_triggers.issubset(triggers):
+            raise OrderIntentLedgerError(
+                "ledger append-only provenance triggers are incomplete"
+            )
+        for name in required_triggers:
+            sql = " ".join(str(triggers[name]).lower().split())
+            expected_action = (
+                "before update" if name.endswith("_update") else "before delete"
+            )
+            if expected_action not in sql or "raise(abort" not in sql:
+                raise OrderIntentLedgerError(
+                    "ledger provenance trigger definition is invalid"
+                )
+        required_foreign_keys = {
+            ("broker_read_manifest_members", "broker_read_manifests"),
+            ("broker_read_manifest_members", "broker_read_receipts"),
+            ("capacity_decisions", "broker_read_manifests"),
+            ("reservation_caps", "capacity_decisions"),
+            ("margin_reservations", "capacity_decisions"),
+            ("order_events", "broker_read_manifests"),
+        }
+        actual_foreign_keys = {
+            (table, row["table"])
+            for table in required_columns
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if not required_foreign_keys.issubset(actual_foreign_keys):
+            raise OrderIntentLedgerError(
+                "ledger provenance foreign keys are incomplete"
+            )
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise OrderIntentLedgerError(
+                "ledger contains foreign-key violations"
+            )
+        quick_check = conn.execute("PRAGMA quick_check").fetchall()
+        if [row[0] for row in quick_check] != ["ok"]:
+            raise OrderIntentLedgerError(
+                "ledger structural integrity check failed"
+            )
+        metadata = conn.execute(
+            """
+            SELECT singleton, schema_version FROM ledger_metadata
+            ORDER BY singleton
+            """
+        ).fetchall()
+        if (
+            len(metadata) != 1
+            or int(metadata[0]["singleton"]) != 1
+            or int(metadata[0]["schema_version"]) != SCHEMA_VERSION
+        ):
+            raise OrderIntentLedgerError(
+                "ledger schema metadata is inconsistent"
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -2359,8 +3545,24 @@ class OrderIntentLedger:
 
     def _require_active_opening_reservation(self, conn: sqlite3.Connection, intent: sqlite3.Row, now: int) -> None:
         reservation = conn.execute("SELECT * FROM margin_reservations WHERE intent_id = ?", (intent["intent_id"],)).fetchone()
-        cap = conn.execute("SELECT cap_amount, observed_at, portfolio_snapshot_digest FROM reservation_caps WHERE account_id = ? AND environment = ?", (intent["account_id"], intent["environment"])).fetchone()
-        if reservation is None or reservation["state"] != "ACTIVE" or cap is None:
+        cap = conn.execute(
+            """
+            SELECT cap_amount, observed_at, portfolio_snapshot_digest,
+                   capacity_decision_sha256
+            FROM reservation_caps
+            WHERE account_id = ? AND environment = ?
+            """,
+            (intent["account_id"], intent["environment"]),
+        ).fetchone()
+        if (
+            reservation is None
+            or reservation["state"] != "ACTIVE"
+            or cap is None
+            or reservation["capacity_decision_sha256"] is None
+            or cap["capacity_decision_sha256"] is None
+            or reservation["capacity_decision_sha256"]
+            != cap["capacity_decision_sha256"]
+        ):
             raise OrderIntentReservationError("opening submission requires an active capped margin reservation")
         if now - int(reservation["quote_observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000 or now - int(reservation["portfolio_observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000 or now - int(cap["observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000:
             raise OrderIntentReservationError("opening submission requires fresh quote, portfolio, and capacity evidence")
@@ -2770,8 +3972,7 @@ class OrderIntentLedger:
         if completed is not None and (completed["intent_id"], completed["idempotency_key"]) != (intent_id, idempotency_key):
             raise OrderIntentIntegrityError("amendment client order id collides with completed amendment history")
 
-    @staticmethod
-    def _validate_broker_evidence(conn: sqlite3.Connection, intent: sqlite3.Row, evidence: BrokerEvidence, *, allowed_operations: set[str], allowed_outcomes: set[str]) -> None:
+    def _validate_broker_evidence(self, conn: sqlite3.Connection, intent: sqlite3.Row, evidence: BrokerEvidence, *, allowed_operations: set[str], allowed_outcomes: set[str]) -> None:
         if evidence.operation not in allowed_operations or evidence.outcome not in allowed_outcomes:
             raise OrderIntentValidationError("broker evidence operation/outcome is not valid for this transition")
         if evidence.account_id != intent["account_id"] or evidence.environment != intent["environment"]:
@@ -2784,6 +3985,93 @@ class OrderIntentLedger:
             expected_client_id = amendment["client_order_id"]
         if evidence.client_order_id != expected_client_id:
             raise OrderIntentIntegrityError("broker evidence client order id does not match durable intent")
+        if evidence.operation in {"ORDER_QUERY", "AMEND_QUERY"}:
+            if evidence.broker_read_evidence_sha256 is None:
+                raise OrderIntentIntegrityError(
+                    "query evidence lacks durable broker-read provenance"
+                )
+            manifest, result = self._verified_broker_read_manifest(
+                conn, evidence.broker_read_evidence_sha256
+            )
+            _validate_order_query_manifest_result(result)
+            if (
+                manifest["evidence_kind"] != "ORDER_QUERY"
+                or manifest["completeness"] != "COMPLETE"
+                or manifest["account_id"] != evidence.account_id
+                or manifest["environment"] != evidence.environment
+                or manifest["target_broker_order_id"]
+                != evidence.broker_order_id
+                or int(manifest["observed_at"])
+                != _to_us(evidence.observed_at)
+                or result["broker_order_id"]
+                != evidence.broker_order_id
+                or result["outcome"] != evidence.outcome
+                or result["http_status"] != evidence.http_status
+                or result["raw_response_digest"]
+                != evidence.raw_response_digest
+                or tuple(result["order_payload_hashes"])
+                != evidence.order_payload_hashes
+                or result["not_found"] is not False
+            ):
+                raise OrderIntentIntegrityError(
+                    "broker evidence conflicts with its durable read manifest"
+                )
+            expected_payload_hash = self._expected_order_payload_hash_conn(
+                conn, intent
+            )
+            if expected_payload_hash not in evidence.order_payload_hashes:
+                raise OrderIntentBrokerTermsMismatch(
+                    "broker order terms do not match the durable intent"
+                )
+
+    @staticmethod
+    def _expected_order_payload_hash_conn(
+        conn: sqlite3.Connection, intent: sqlite3.Row
+    ) -> str:
+        intent_id = intent["intent_id"]
+        if intent["pending_operation"] == "AMEND":
+            amendment = conn.execute(
+                "SELECT * FROM amendment_leases WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            if (
+                amendment is None
+                or amendment["state"] != "IN_DOUBT"
+                or int(amendment["fencing_token"])
+                != int(intent["pending_fence"] or -1)
+            ):
+                raise OrderIntentIntegrityError(
+                    "pending amendment lacks matching durable order terms"
+                )
+            result = amendment["payload_hash"]
+        elif intent["pending_operation"] == "SUBMIT":
+            result = intent["payload_hash"]
+        else:
+            completed = conn.execute(
+                """
+                SELECT payload_hash, completed_at
+                FROM amendment_history
+                WHERE intent_id = ?
+                ORDER BY completed_at DESC
+                """,
+                (intent_id,),
+            ).fetchall()
+            if not completed:
+                result = intent["payload_hash"]
+            else:
+                latest_at = int(completed[0]["completed_at"])
+                latest_hashes = {
+                    row["payload_hash"]
+                    for row in completed
+                    if int(row["completed_at"]) == latest_at
+                }
+                if len(latest_hashes) != 1:
+                    raise OrderIntentIntegrityError(
+                        "latest durable amendment terms are ambiguous"
+                    )
+                result = next(iter(latest_hashes))
+        _validate_sha256("expected_order_payload_hash", result)
+        return result
 
     @staticmethod
     def _active_reservation_total(conn: sqlite3.Connection, account_id: str, environment: str) -> Decimal:
@@ -2801,9 +4089,9 @@ class OrderIntentLedger:
         self._append_event(conn, intent_id, "RESERVATION_RELEASED", intent["state"], intent["state"], "system", "RESERVATION_RELEASED", now, broker_order_id=intent["broker_order_id"])
 
     def _append_reconciliation_event(self, conn: sqlite3.Connection, intent_id: str, from_state: str, to_state: str, event_type: str, reason_code: str, evidence: BrokerEvidence, now: int) -> None:
-        self._append_event(conn, intent_id, event_type, from_state, to_state, "broker-evidence", reason_code, now, broker_status=evidence.outcome, broker_order_id=evidence.broker_order_id, observed_at=_to_us(evidence.observed_at), evidence_operation=evidence.operation, http_status=evidence.http_status, raw_response_digest=evidence.raw_response_digest)
+        self._append_event(conn, intent_id, event_type, from_state, to_state, "broker-evidence", reason_code, now, broker_status=evidence.outcome, broker_order_id=evidence.broker_order_id, observed_at=_to_us(evidence.observed_at), evidence_operation=evidence.operation, http_status=evidence.http_status, raw_response_digest=evidence.raw_response_digest, broker_read_evidence_sha256=evidence.broker_read_evidence_sha256)
 
-    def _append_event(self, conn: sqlite3.Connection, intent_id: str, event_type: str, from_state: str | None, to_state: str | None, actor: str, reason_code: str, now: int, *, broker_status: str | None = None, broker_order_id: str | None = None, observed_at: int | None = None, evidence_operation: str | None = None, http_status: int | None = None, raw_response_digest: str | None = None) -> None:
+    def _append_event(self, conn: sqlite3.Connection, intent_id: str, event_type: str, from_state: str | None, to_state: str | None, actor: str, reason_code: str, now: int, *, broker_status: str | None = None, broker_order_id: str | None = None, observed_at: int | None = None, evidence_operation: str | None = None, http_status: int | None = None, raw_response_digest: str | None = None, broker_read_evidence_sha256: str | None = None) -> None:
         if reason_code not in _REASON_CODES:
             raise OrderIntentValidationError("reason_code is not allowlisted")
         _validate_identity("actor", actor)
@@ -2812,11 +4100,153 @@ class OrderIntentLedger:
             raise OrderIntentValidationError("cannot append event for unknown intent")
         conn.execute(
             """
-            INSERT INTO order_events (intent_id, account_id, environment, client_order_id, event_type, from_state, to_state, actor, reason_code, broker_status, broker_order_id, observed_at, evidence_operation, http_status, raw_response_digest, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_events (
+                intent_id, account_id, environment, client_order_id,
+                event_type, from_state, to_state, actor, reason_code,
+                broker_status, broker_order_id, observed_at,
+                evidence_operation, http_status, raw_response_digest,
+                broker_read_evidence_sha256, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (intent_id, identity["account_id"], identity["environment"], identity["client_order_id"], event_type, from_state, to_state, actor, reason_code, broker_status, broker_order_id, observed_at, evidence_operation, http_status, raw_response_digest, now),
+            (intent_id, identity["account_id"], identity["environment"], identity["client_order_id"], event_type, from_state, to_state, actor, reason_code, broker_status, broker_order_id, observed_at, evidence_operation, http_status, raw_response_digest, broker_read_evidence_sha256, now),
         )
+
+    @staticmethod
+    def _verified_broker_read_manifest(
+        conn: sqlite3.Connection, evidence_sha256: str
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        _validate_sha256("evidence_sha256", evidence_sha256)
+        manifest = conn.execute(
+            """
+            SELECT * FROM broker_read_manifests
+            WHERE evidence_sha256 = ?
+            """,
+            (evidence_sha256,),
+        ).fetchone()
+        if manifest is None:
+            raise OrderIntentIntegrityError(
+                "unknown durable broker read evidence"
+            )
+        members = conn.execute(
+            """
+            SELECT member_ordinal, member_role, receipt_sha256
+            FROM broker_read_manifest_members
+            WHERE evidence_sha256 = ?
+            ORDER BY member_ordinal
+            """,
+            (evidence_sha256,),
+        ).fetchall()
+        if not members or tuple(
+            int(row["member_ordinal"]) for row in members
+        ) != tuple(range(len(members))):
+            raise OrderIntentIntegrityError(
+                "broker read manifest member sequence is incomplete"
+            )
+        member_material = []
+        receipt_rows: list[sqlite3.Row] = []
+        seen_roles: set[str] = set()
+        seen_receipts: set[str] = set()
+        for member in members:
+            role = member["member_role"]
+            receipt_sha256 = member["receipt_sha256"]
+            if (
+                type(role) is not str
+                or not role
+                or role in seen_roles
+                or receipt_sha256 in seen_receipts
+            ):
+                raise OrderIntentIntegrityError(
+                    "broker read manifest membership is ambiguous"
+                )
+            receipt = conn.execute(
+                """
+                SELECT * FROM broker_read_receipts
+                WHERE receipt_sha256 = ?
+                """,
+                (receipt_sha256,),
+            ).fetchone()
+            if receipt is None:
+                raise OrderIntentIntegrityError(
+                    "broker read manifest receipt is missing"
+                )
+            _verify_broker_read_receipt_row(receipt)
+            if (
+                receipt["account_id"] != manifest["account_id"]
+                or receipt["account_id_key"]
+                != manifest["account_id_key"]
+                or receipt["institution_type"]
+                != manifest["institution_type"]
+                or receipt["environment"] != manifest["environment"]
+                or receipt["origin"] != manifest["origin"]
+                or int(receipt["response_completed_at"])
+                > int(manifest["observed_at"])
+            ):
+                raise OrderIntentIntegrityError(
+                    "broker read receipt binding changed after persistence"
+                )
+            seen_roles.add(role)
+            seen_receipts.add(receipt_sha256)
+            receipt_rows.append(receipt)
+            member_material.append(
+                {
+                    "ordinal": int(member["member_ordinal"]),
+                    "role": role,
+                    "receipt_sha256": receipt_sha256,
+                }
+            )
+        canonical_result_json = manifest["canonical_result_json"]
+        result = _load_canonical_json_object(
+            canonical_result_json, "broker read manifest result"
+        )
+        result_sha256 = _domain_bytes_hash(
+            _READ_PARSED_HASH_DOMAIN,
+            canonical_result_json.encode("utf-8"),
+        )
+        if result_sha256 != manifest["canonical_result_sha256"]:
+            raise OrderIntentIntegrityError(
+                "broker read manifest parsed digest does not verify"
+            )
+        _validate_broker_read_manifest_semantics(
+            evidence_kind=manifest["evidence_kind"],
+            account_id=manifest["account_id"],
+            account_id_key=manifest["account_id_key"],
+            institution_type=manifest["institution_type"],
+            target_broker_order_id=manifest["target_broker_order_id"],
+            observed_at=int(manifest["observed_at"]),
+            completeness=manifest["completeness"],
+            result=result,
+            member_roles=tuple(
+                member["member_role"] for member in members
+            ),
+            receipt_rows=tuple(receipt_rows),
+        )
+        manifest_material = {
+            "evidence_kind": manifest["evidence_kind"],
+            "account_id": manifest["account_id"],
+            "account_id_key": manifest["account_id_key"],
+            "institution_type": manifest["institution_type"],
+            "environment": manifest["environment"],
+            "origin": manifest["origin"],
+            "target_broker_order_id": manifest[
+                "target_broker_order_id"
+            ],
+            "observed_at": int(manifest["observed_at"]),
+            "completeness": manifest["completeness"],
+            "canonical_result_sha256": result_sha256,
+            "members": member_material,
+            "created_at": int(manifest["created_at"]),
+        }
+        expected_evidence_sha256 = _domain_json_hash(
+            _READ_MANIFEST_HASH_DOMAIN, manifest_material
+        )
+        if not hmac.compare_digest(
+            expected_evidence_sha256, evidence_sha256
+        ):
+            raise OrderIntentIntegrityError(
+                "broker read manifest content hash does not verify"
+            )
+        return manifest, result
 
     def _require_intent(self, conn: sqlite3.Connection, intent_id: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
@@ -2866,11 +4296,11 @@ class OrderIntentLedger:
 
     @staticmethod
     def _reservation_from_row(row: sqlite3.Row) -> MarginReservation:
-        return MarginReservation(intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], amount=Decimal(row["amount"]), risk_decision_id=row["risk_decision_id"], max_loss_amount=Decimal(row["max_loss_amount"]), quote_observed_at=_from_us(row["quote_observed_at"]), quote_digest=row["quote_digest"], portfolio_observed_at=_from_us(row["portfolio_observed_at"]), portfolio_snapshot_digest=row["portfolio_snapshot_digest"], state=row["state"], released_reason_code=row["released_reason_code"], created_at=_from_us(row["created_at"]), released_at=_from_us(row["released_at"]) if row["released_at"] is not None else None)
+        return MarginReservation(intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], amount=Decimal(row["amount"]), risk_decision_id=row["risk_decision_id"], max_loss_amount=Decimal(row["max_loss_amount"]), quote_observed_at=_from_us(row["quote_observed_at"]), quote_digest=row["quote_digest"], portfolio_observed_at=_from_us(row["portfolio_observed_at"]), portfolio_snapshot_digest=row["portfolio_snapshot_digest"], capacity_decision_sha256=row["capacity_decision_sha256"], state=row["state"], released_reason_code=row["released_reason_code"], created_at=_from_us(row["created_at"]), released_at=_from_us(row["released_at"]) if row["released_at"] is not None else None)
 
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> IntentEvent:
-        return IntentEvent(sequence=int(row["sequence"]), intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], client_order_id=row["client_order_id"], event_type=row["event_type"], from_state=row["from_state"], to_state=row["to_state"], actor=row["actor"], reason_code=row["reason_code"], broker_status=row["broker_status"], broker_order_id=row["broker_order_id"], observed_at=_from_us(row["observed_at"]) if row["observed_at"] is not None else None, evidence_operation=row["evidence_operation"], http_status=row["http_status"], raw_response_digest=row["raw_response_digest"], created_at=_from_us(row["created_at"]))
+        return IntentEvent(sequence=int(row["sequence"]), intent_id=row["intent_id"], account_id=row["account_id"], environment=row["environment"], client_order_id=row["client_order_id"], event_type=row["event_type"], from_state=row["from_state"], to_state=row["to_state"], actor=row["actor"], reason_code=row["reason_code"], broker_status=row["broker_status"], broker_order_id=row["broker_order_id"], observed_at=_from_us(row["observed_at"]) if row["observed_at"] is not None else None, evidence_operation=row["evidence_operation"], http_status=row["http_status"], raw_response_digest=row["raw_response_digest"], broker_read_evidence_sha256=row["broker_read_evidence_sha256"], created_at=_from_us(row["created_at"]))
 
 
 def _transport_response_receipt(
@@ -3203,6 +4633,1124 @@ def _outbound_authorization(
         payload_bytes=payload_bytes,
         payload_digest=hashlib.sha256(payload_bytes).hexdigest(),
     )
+
+
+def _domain_bytes_hash(domain: bytes, payload: bytes) -> str:
+    if type(domain) is not bytes or not domain.endswith(b"\0"):
+        raise OrderIntentValidationError("hash domain is invalid")
+    if type(payload) is not bytes:
+        raise OrderIntentValidationError("hash payload must be exact bytes")
+    return hashlib.sha256(domain + payload).hexdigest()
+
+
+def _domain_json_hash(domain: bytes, value: Any) -> str:
+    return _domain_bytes_hash(
+        domain, _canonical_read_json(value).encode("utf-8")
+    )
+
+
+def _canonical_read_json(value: Any) -> str:
+    _validate_read_json_tree(value)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _load_canonical_json(value: str, label: str) -> Any:
+    if (
+        type(value) is not str
+        or not value
+        or len(value.encode("utf-8")) > _MAX_BROKER_READ_BYTES
+    ):
+        raise OrderIntentValidationError(
+            f"{label} must be bounded canonical JSON"
+        )
+
+    def strict_object(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if type(key) is not str or key in result:
+                raise OrderIntentValidationError(
+                    f"{label} contains duplicate or invalid keys"
+                )
+            result[key] = item
+        return result
+
+    def reject_constant(_constant: str) -> Any:
+        raise OrderIntentValidationError(
+            f"{label} contains a non-finite number"
+        )
+
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except OrderIntentValidationError:
+        raise
+    except Exception as exc:
+        raise OrderIntentValidationError(
+            f"{label} is not valid JSON"
+        ) from exc
+    _validate_read_json_tree(parsed)
+    if _canonical_read_json(parsed) != value:
+        raise OrderIntentValidationError(
+            f"{label} is not in canonical form"
+        )
+    return parsed
+
+
+def _load_canonical_json_object(
+    value: str, label: str
+) -> dict[str, Any]:
+    parsed = _load_canonical_json(value, label)
+    if type(parsed) is not dict:
+        raise OrderIntentValidationError(
+            f"{label} must be a JSON object"
+        )
+    return parsed
+
+
+def _validate_read_json_tree(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > 50_000 or depth > 48:
+            raise OrderIntentValidationError(
+                "canonical broker read JSON is too complex"
+            )
+        item_type = type(item)
+        if item is None or item_type in {str, bool, int}:
+            if item_type is str and len(item) > _MAX_BROKER_READ_BYTES:
+                raise OrderIntentValidationError(
+                    "canonical broker read string is too large"
+                )
+            continue
+        if item_type is list:
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        if item_type is dict:
+            if any(type(key) is not str for key in item):
+                raise OrderIntentValidationError(
+                    "canonical broker read keys must be strings"
+                )
+            stack.extend((child, depth + 1) for child in item.values())
+            continue
+        raise OrderIntentValidationError(
+            "canonical broker read JSON uses an unsupported scalar"
+        )
+
+
+def _validate_broker_read_response_evidence(
+    evidence: BrokerReadResponseEvidence, now: datetime
+) -> None:
+    if type(evidence) is not BrokerReadResponseEvidence:
+        raise OrderIntentValidationError(
+            "broker read response must use its exact evidence type"
+        )
+    if (
+        type(evidence.read_kind) is not str
+        or evidence.read_kind not in _BROKER_READ_KINDS
+        or type(evidence.completeness) is not str
+        or evidence.completeness not in _BROKER_READ_COMPLETENESS
+    ):
+        raise OrderIntentValidationError(
+            "broker read response kind/completeness is invalid"
+        )
+    _validate_identity("read account id", evidence.account_id)
+    _validate_identity("read account key", evidence.account_id_key)
+    _validate_identity(
+        "read institution type", evidence.institution_type
+    )
+    _validate_environment(evidence.environment)
+    if evidence.origin != _ETRADE_ORIGINS[evidence.environment]:
+        raise OrderIntentValidationError(
+            "broker read origin is not pinned to its environment"
+        )
+    if (
+        type(evidence.route) is not str
+        or not evidence.route.startswith("/v1/accounts/")
+        or len(evidence.route) > 1024
+        or "?" in evidence.route
+        or "#" in evidence.route
+        or any(ord(char) < 33 or ord(char) > 126 for char in evidence.route)
+    ):
+        raise OrderIntentValidationError("broker read route is invalid")
+    query = _load_canonical_json(
+        evidence.query_json, "broker read query"
+    )
+    if (
+        type(query) is not list
+        or any(
+            type(pair) is not list
+            or len(pair) != 2
+            or any(type(item) is not str for item in pair)
+            for pair in query
+        )
+        or query != sorted(query)
+        or len({pair[0] for pair in query}) != len(query)
+    ):
+        raise OrderIntentValidationError(
+            "broker read query must be a canonical unique string pair list"
+        )
+    _validate_sha256(
+        "broker read authorization digest",
+        evidence.authorization_sha256,
+    )
+    if evidence.read_kind == "ORDER_DETAIL":
+        _validate_identity(
+            "target broker order id",
+            evidence.target_broker_order_id,
+        )
+    elif evidence.target_broker_order_id is not None:
+        raise OrderIntentValidationError(
+            "only an order-detail read may name a broker order id"
+        )
+    _validate_timestamp(evidence.request_started_at)
+    _validate_timestamp(evidence.response_completed_at)
+    _validate_timestamp(now)
+    if (
+        evidence.response_completed_at < evidence.request_started_at
+        or evidence.response_completed_at > now + timedelta(seconds=5)
+        or now - evidence.response_completed_at
+        > timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS)
+    ):
+        raise OrderIntentValidationError(
+            "broker read response time is invalid or stale"
+        )
+    if (
+        type(evidence.http_status) is not int
+        or not 100 <= evidence.http_status <= 599
+        or type(evidence.raw_response_bytes) is not bytes
+        or len(evidence.raw_response_bytes) > _MAX_BROKER_READ_BYTES
+    ):
+        raise OrderIntentValidationError(
+            "broker read response status/body is invalid"
+        )
+    _validate_identity("parser schema", evidence.parser_schema)
+    _validate_sha256("parser code digest", evidence.parser_code_sha256)
+    _validate_sha256(
+        "parser config digest", evidence.parser_config_sha256
+    )
+    _load_canonical_json(
+        evidence.canonical_parsed_json, "parsed broker response"
+    )
+
+
+def _validate_broker_read_manifest_evidence(
+    evidence: BrokerReadManifestEvidence, now: datetime
+) -> None:
+    if type(evidence) is not BrokerReadManifestEvidence:
+        raise OrderIntentValidationError(
+            "broker read manifest must use its exact evidence type"
+        )
+    if (
+        type(evidence.evidence_kind) is not str
+        or evidence.evidence_kind not in _BROKER_READ_EVIDENCE_KINDS
+        or type(evidence.completeness) is not str
+        or evidence.completeness
+        not in _BROKER_READ_EVIDENCE_COMPLETENESS
+    ):
+        raise OrderIntentValidationError(
+            "broker read manifest kind/completeness is invalid"
+        )
+    _validate_identity("manifest account id", evidence.account_id)
+    _validate_identity("manifest account key", evidence.account_id_key)
+    _validate_identity(
+        "manifest institution type", evidence.institution_type
+    )
+    _validate_environment(evidence.environment)
+    if evidence.origin != _ETRADE_ORIGINS[evidence.environment]:
+        raise OrderIntentValidationError(
+            "broker read manifest origin is invalid"
+        )
+    if evidence.evidence_kind == "ORDER_QUERY":
+        _validate_identity(
+            "manifest broker order id",
+            evidence.target_broker_order_id,
+        )
+    elif evidence.target_broker_order_id is not None:
+        raise OrderIntentValidationError(
+            "capacity manifests cannot target an order"
+        )
+    _validate_timestamp(evidence.observed_at)
+    _validate_timestamp(now)
+    if (
+        evidence.observed_at > now + timedelta(seconds=5)
+        or now - evidence.observed_at
+        > timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS)
+    ):
+        raise OrderIntentValidationError(
+            "broker read manifest is stale or from the future"
+        )
+    _load_canonical_json_object(
+        evidence.canonical_result_json, "broker read manifest result"
+    )
+
+
+def _validate_broker_read_manifest_members(
+    members: tuple[BrokerReadManifestMember, ...],
+) -> None:
+    if (
+        type(members) is not tuple
+        or not members
+        or len(members) > 2_048
+        or any(type(member) is not BrokerReadManifestMember for member in members)
+    ):
+        raise OrderIntentValidationError(
+            "broker read manifest members are invalid"
+        )
+    roles: set[str] = set()
+    receipts: set[str] = set()
+    for member in members:
+        _validate_identity("broker read member role", member.role)
+        _validate_sha256(
+            "broker read member receipt", member.receipt_sha256
+        )
+        if member.role in roles or member.receipt_sha256 in receipts:
+            raise OrderIntentValidationError(
+                "broker read manifest members must be unique"
+            )
+        roles.add(member.role)
+        receipts.add(member.receipt_sha256)
+
+
+def _validate_broker_read_manifest_semantics(
+    *,
+    evidence_kind: str,
+    account_id: str,
+    account_id_key: str,
+    institution_type: str,
+    target_broker_order_id: str | None,
+    observed_at: int,
+    completeness: str,
+    result: dict[str, Any],
+    member_roles: tuple[str, ...],
+    receipt_rows: tuple[sqlite3.Row, ...],
+) -> None:
+    """Rebuild complete manifest results from their ordered durable receipts."""
+
+    if len(member_roles) != len(receipt_rows) or not receipt_rows:
+        raise OrderIntentIntegrityError(
+            "broker read manifest receipt lineage is incomplete"
+        )
+    if any(
+        int(row["response_completed_at"]) > observed_at
+        or observed_at - int(row["request_started_at"])
+        > _MAX_BROKER_READ_SPAN_SECONDS * 1_000_000
+        for row in receipt_rows
+    ):
+        raise OrderIntentIntegrityError(
+            "broker read manifest exceeds its bounded observation window"
+        )
+    if any(
+        int(previous["response_completed_at"])
+        > int(current["request_started_at"])
+        for previous, current in zip(receipt_rows, receipt_rows[1:])
+    ):
+        raise OrderIntentIntegrityError(
+            "broker read manifest receipts are not chronologically ordered"
+        )
+    if int(receipt_rows[-1]["response_completed_at"]) != observed_at:
+        raise OrderIntentIntegrityError(
+            "broker read manifest timestamp is not its final response"
+        )
+    authorization_digests = tuple(
+        row["authorization_sha256"] for row in receipt_rows
+    )
+    if (
+        any(type(value) is not str for value in authorization_digests)
+        or len(set(authorization_digests)) != len(authorization_digests)
+    ):
+        raise OrderIntentIntegrityError(
+            "broker read manifest does not prove distinct OAuth exchanges"
+        )
+
+    parser_provenance = {
+        (
+            row["parser_schema"],
+            row["parser_code_sha256"],
+            row["parser_config_sha256"],
+        )
+        for row in receipt_rows
+    }
+    if len(parser_provenance) != 1:
+        raise OrderIntentIntegrityError(
+            "broker read manifest mixes parser versions"
+        )
+    if completeness != "COMPLETE":
+        return
+    if any(row["completeness"] == "INELIGIBLE" for row in receipt_rows):
+        raise OrderIntentIntegrityError(
+            "complete broker read manifest contains ineligible evidence"
+        )
+    if evidence_kind == "ORDER_QUERY":
+        _validate_order_query_receipt_lineage(
+            account_id=account_id,
+            account_id_key=account_id_key,
+            institution_type=institution_type,
+            target_broker_order_id=target_broker_order_id,
+            result=result,
+            member_roles=member_roles,
+            receipt_rows=receipt_rows,
+        )
+        return
+    if evidence_kind == "CAPACITY":
+        _validate_capacity_receipt_lineage(
+            account_id=account_id,
+            account_id_key=account_id_key,
+            institution_type=institution_type,
+            result=result,
+            member_roles=member_roles,
+            receipt_rows=receipt_rows,
+        )
+        return
+    raise OrderIntentIntegrityError(
+        "broker read manifest evidence kind is unsupported"
+    )
+
+
+def _validate_order_query_receipt_lineage(
+    *,
+    account_id: str,
+    account_id_key: str,
+    institution_type: str,
+    target_broker_order_id: str | None,
+    result: dict[str, Any],
+    member_roles: tuple[str, ...],
+    receipt_rows: tuple[sqlite3.Row, ...],
+) -> None:
+    if (
+        target_broker_order_id is None
+        or member_roles
+        != ("binding.start", "order.detail", "binding.end")
+        or tuple(row["read_kind"] for row in receipt_rows)
+        != ("ACCOUNT_LIST", "ORDER_DETAIL", "ACCOUNT_LIST")
+    ):
+        raise OrderIntentIntegrityError(
+            "order query manifest lacks its exact read sequence"
+        )
+    binding_start = _verified_binding_receipt(
+        receipt_rows[0],
+        account_id=account_id,
+        account_id_key=account_id_key,
+        institution_type=institution_type,
+    )
+    binding_end = _verified_binding_receipt(
+        receipt_rows[2],
+        account_id=account_id,
+        account_id_key=account_id_key,
+        institution_type=institution_type,
+    )
+    if binding_start != binding_end:
+        raise OrderIntentIntegrityError(
+            "order query account binding changed during observation"
+        )
+    detail = receipt_rows[1]
+    encoded_account = quote(account_id_key, safe="")
+    encoded_order = quote(target_broker_order_id, safe="")
+    if (
+        detail["route"]
+        != f"/v1/accounts/{encoded_account}/orders/{encoded_order}.json"
+        or _receipt_query(detail)
+        or detail["target_broker_order_id"] != target_broker_order_id
+        or detail["completeness"] != "COMPLETE"
+        or receipt_rows[0]["completeness"] != "COMPLETE"
+        or receipt_rows[2]["completeness"] != "COMPLETE"
+    ):
+        raise OrderIntentIntegrityError(
+            "order query receipt is not bound to the exact known order"
+        )
+    parsed = _receipt_parsed_object(detail)
+    expected_parsed_keys = {
+        "not_found",
+        "raw_status",
+        "outcome",
+        "order_payload_hashes",
+        "replacement_links",
+        "normalized_order",
+    }
+    if set(parsed) != expected_parsed_keys:
+        raise OrderIntentIntegrityError(
+            "order query receipt parser result has an unexpected shape"
+        )
+    expected_result = {
+        "schema": "etrade-order-query.v1",
+        "broker_order_id": target_broker_order_id,
+        "raw_status": parsed["raw_status"],
+        "outcome": parsed["outcome"],
+        "order_payload_hashes": parsed["order_payload_hashes"],
+        "http_status": int(detail["http_status"]),
+        "raw_response_digest": detail["raw_response_sha256"],
+        "not_found": parsed["not_found"],
+        "replacement_links": parsed["replacement_links"],
+    }
+    if result != expected_result:
+        raise OrderIntentIntegrityError(
+            "order query manifest result is disconnected from its receipt"
+        )
+    _validate_order_query_manifest_result(result)
+
+
+def _validate_capacity_receipt_lineage(
+    *,
+    account_id: str,
+    account_id_key: str,
+    institution_type: str,
+    result: dict[str, Any],
+    member_roles: tuple[str, ...],
+    receipt_rows: tuple[sqlite3.Row, ...],
+) -> None:
+    if member_roles[0] != "binding.start" or member_roles[-1] != "binding.end":
+        raise OrderIntentIntegrityError(
+            "capacity manifest lacks account-binding brackets"
+        )
+    binding_start = _verified_binding_receipt(
+        receipt_rows[0],
+        account_id=account_id,
+        account_id_key=account_id_key,
+        institution_type=institution_type,
+    )
+    binding_end = _verified_binding_receipt(
+        receipt_rows[-1],
+        account_id=account_id,
+        account_id_key=account_id_key,
+        institution_type=institution_type,
+    )
+    if binding_start != binding_end:
+        raise OrderIntentIntegrityError(
+            "capacity account binding changed during observation"
+        )
+    cursor = 1
+    scans: list[dict[str, Any]] = []
+    for scan_name in ("scan_a", "scan_b"):
+        if (
+            cursor >= len(receipt_rows) - 1
+            or member_roles[cursor] != f"{scan_name}.balance"
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity manifest lacks both balance scans"
+            )
+        balance_row = receipt_rows[cursor]
+        _validate_capacity_route(
+            balance_row,
+            account_id_key=account_id_key,
+            expected_kind="BALANCE",
+        )
+        if (
+            _receipt_query(balance_row)
+            != {
+                "instType": institution_type,
+                "realTimeNAV": "true",
+            }
+            or balance_row["completeness"] != "COMPLETE"
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity balance request is not the reviewed real-time read"
+            )
+        balance = _receipt_parsed_object(balance_row)
+        if (
+            set(balance)
+            != {
+                "account_id",
+                "institution_type",
+                "margin_buying_power",
+                "as_of_date",
+            }
+            or balance["account_id"] != account_id
+            or balance["institution_type"] not in {None, institution_type}
+            or type(balance["margin_buying_power"]) is not str
+            or type(balance["as_of_date"]) is not str
+            or len(balance["as_of_date"]) != 13
+            or not balance["as_of_date"].isdigit()
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity balance parser result is invalid"
+            )
+        balance_as_of_us = int(balance["as_of_date"]) * 1_000
+        balance_completed_us = int(
+            balance_row["response_completed_at"]
+        )
+        if (
+            balance_as_of_us > balance_completed_us + 5_000_000
+            or balance_completed_us - balance_as_of_us
+            > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity balance effective time is stale or future"
+            )
+        cursor += 1
+
+        portfolio_rows: list[sqlite3.Row] = []
+        portfolio_roles: list[str] = []
+        portfolio_prefix = f"{scan_name}.portfolio."
+        while (
+            cursor < len(receipt_rows) - 1
+            and member_roles[cursor].startswith(portfolio_prefix)
+        ):
+            portfolio_roles.append(member_roles[cursor])
+            portfolio_rows.append(receipt_rows[cursor])
+            cursor += 1
+        if not portfolio_rows:
+            raise OrderIntentIntegrityError(
+                "capacity scan lacks a complete portfolio traversal"
+            )
+        positions = _rebuild_portfolio_scan(
+            portfolio_rows,
+            portfolio_roles,
+            account_id_key=account_id_key,
+        )
+
+        orders: list[dict[str, Any]] = []
+        seen_order_ids: set[str] = set()
+        for lane in _ACTIVE_ORDER_READ_LANES:
+            lane_rows: list[sqlite3.Row] = []
+            lane_roles: list[str] = []
+            lane_prefix = f"{scan_name}.orders.{lane}."
+            while (
+                cursor < len(receipt_rows) - 1
+                and member_roles[cursor].startswith(lane_prefix)
+            ):
+                lane_roles.append(member_roles[cursor])
+                lane_rows.append(receipt_rows[cursor])
+                cursor += 1
+            if not lane_rows:
+                raise OrderIntentIntegrityError(
+                    "capacity scan lacks an active-order status traversal"
+                )
+            for order in _rebuild_order_lane(
+                lane_rows,
+                lane_roles,
+                account_id_key=account_id_key,
+                lane=lane,
+            ):
+                order_id = order.get("order_id")
+                if type(order_id) is not str or order_id in seen_order_ids:
+                    raise OrderIntentIntegrityError(
+                        "capacity scan contains ambiguous active orders"
+                    )
+                seen_order_ids.add(order_id)
+                orders.append(order)
+        orders.sort(key=lambda item: item["order_id"])
+        scans.append(
+            {
+                "schema": "etrade-capacity.v1",
+                "account_status": binding_start["account_status"],
+                "account_mode": binding_start["account_mode"],
+                "account_type": binding_start["account_type"],
+                "broker_buying_power": balance["margin_buying_power"],
+                "broker_buying_power_as_of": balance["as_of_date"],
+                "positions": positions,
+                "open_orders": orders,
+            }
+        )
+    if cursor != len(receipt_rows) - 1:
+        raise OrderIntentIntegrityError(
+            "capacity manifest contains an unrecognized receipt role"
+        )
+    economic_scans = []
+    for scan in scans:
+        economic = dict(scan)
+        economic.pop("broker_buying_power_as_of")
+        economic_scans.append(economic)
+    if economic_scans[0] != economic_scans[1]:
+        raise OrderIntentIntegrityError(
+            "capacity manifest scans are not semantically stable"
+        )
+    if int(scans[1]["broker_buying_power_as_of"]) < int(
+        scans[0]["broker_buying_power_as_of"]
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity balance effective time moved backward"
+        )
+    rebuilt = dict(scans[1])
+    rebuilt["state_sha256"] = _domain_json_hash(
+        b"etrade-capacity-state.v1\0", economic_scans[1]
+    )
+    if result != rebuilt:
+        raise OrderIntentIntegrityError(
+            "capacity manifest result is disconnected from its receipts"
+        )
+    _validate_capacity_manifest_result(result)
+
+
+def _verified_binding_receipt(
+    row: sqlite3.Row,
+    *,
+    account_id: str,
+    account_id_key: str,
+    institution_type: str,
+) -> dict[str, Any]:
+    if (
+        row["read_kind"] != "ACCOUNT_LIST"
+        or row["route"] != "/v1/accounts/list.json"
+        or _receipt_query(row)
+        or row["target_broker_order_id"] is not None
+        or row["http_status"] != 200
+        or row["completeness"] != "COMPLETE"
+    ):
+        raise OrderIntentIntegrityError(
+            "account binding receipt is not an exact account-list read"
+        )
+    parsed = _receipt_parsed_object(row)
+    if (
+        set(parsed)
+        != {
+            "account_id",
+            "account_id_key",
+            "institution_type",
+            "account_status",
+            "account_mode",
+            "account_type",
+        }
+        or parsed["account_id"] != account_id
+        or parsed["account_id_key"] != account_id_key
+        or parsed["institution_type"] != institution_type
+        or parsed["account_status"] != "ACTIVE"
+        or parsed["account_mode"] != "MARGIN"
+        or type(parsed["account_type"]) is not str
+        or not parsed["account_type"]
+    ):
+        raise OrderIntentIntegrityError(
+            "account binding receipt is not the configured active margin account"
+        )
+    return parsed
+
+
+def _validate_capacity_route(
+    row: sqlite3.Row,
+    *,
+    account_id_key: str,
+    expected_kind: str,
+) -> None:
+    suffixes = {
+        "BALANCE": "balance.json",
+        "PORTFOLIO_PAGE": "portfolio.json",
+        "OPEN_ORDERS_PAGE": "orders.json",
+    }
+    suffix = suffixes.get(expected_kind)
+    if (
+        suffix is None
+        or row["read_kind"] != expected_kind
+        or row["route"]
+        != f"/v1/accounts/{quote(account_id_key, safe='')}/{suffix}"
+        or row["target_broker_order_id"] is not None
+        or row["http_status"] not in {200, 204}
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity receipt route or account binding is invalid"
+        )
+
+
+def _rebuild_portfolio_scan(
+    rows: list[sqlite3.Row],
+    roles: list[str],
+    *,
+    account_id_key: str,
+) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_next: int | None = None
+    for ordinal, (row, role) in enumerate(zip(rows, roles), start=1):
+        expected_role = role.rsplit(".", 1)[0] + f".{ordinal:04d}"
+        if role != expected_role:
+            raise OrderIntentIntegrityError(
+                "portfolio manifest roles are not contiguous"
+            )
+        _validate_capacity_route(
+            row,
+            account_id_key=account_id_key,
+            expected_kind="PORTFOLIO_PAGE",
+        )
+        expected_query = {
+            "count": "50",
+            "lotsRequired": "false",
+            "marketSession": "REGULAR",
+            "pageNumber": str(ordinal),
+            "sortBy": "SYMBOL",
+            "sortOrder": "ASC",
+            "totalsRequired": "false",
+            "view": "COMPLETE",
+        }
+        if _receipt_query(row) != expected_query:
+            raise OrderIntentIntegrityError(
+                "portfolio page query is not the fixed complete traversal"
+            )
+        parsed = _receipt_parsed_object(row)
+        if (
+            set(parsed)
+            != {
+                "page_number",
+                "total_pages",
+                "metadata_field",
+                "next_page",
+                "positions",
+            }
+            or parsed["page_number"] != ordinal
+            or type(parsed["positions"]) is not list
+            or (
+                ordinal > 1
+                and previous_next != ordinal
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "portfolio parser result is not contiguous"
+            )
+        is_last = ordinal == len(rows)
+        if (
+            row["completeness"]
+            != ("COMPLETE" if is_last else "HAS_NEXT")
+            or (
+                not is_last
+                and parsed["next_page"] != ordinal + 1
+            )
+            or (is_last and parsed["next_page"] is not None)
+        ):
+            raise OrderIntentIntegrityError(
+                "portfolio receipt completeness conflicts with pagination"
+            )
+        previous_next = parsed["next_page"]
+        for position in parsed["positions"]:
+            if type(position) is not dict:
+                raise OrderIntentIntegrityError(
+                    "portfolio position result is not an object"
+                )
+            position_id = position.get("position_id")
+            if type(position_id) is not str or position_id in seen_ids:
+                raise OrderIntentIntegrityError(
+                    "portfolio position identity is ambiguous"
+                )
+            seen_ids.add(position_id)
+            positions.append(position)
+    positions.sort(key=lambda item: item["position_id"])
+    return positions
+
+
+def _rebuild_order_lane(
+    rows: list[sqlite3.Row],
+    roles: list[str],
+    *,
+    account_id_key: str,
+    lane: str,
+) -> list[dict[str, Any]]:
+    orders: list[dict[str, Any]] = []
+    previous_marker: str | None = None
+    for ordinal, (row, role) in enumerate(zip(rows, roles)):
+        expected_role = role.rsplit(".", 1)[0] + f".{ordinal:04d}"
+        if role != expected_role:
+            raise OrderIntentIntegrityError(
+                "order manifest roles are not contiguous"
+            )
+        _validate_capacity_route(
+            row,
+            account_id_key=account_id_key,
+            expected_kind="OPEN_ORDERS_PAGE",
+        )
+        query = _receipt_query(row)
+        expected_query = {"count": "100", "status": lane}
+        if ordinal:
+            expected_query["marker"] = previous_marker
+        if query != expected_query:
+            raise OrderIntentIntegrityError(
+                "active-order marker traversal is incomplete"
+            )
+        parsed = _receipt_parsed_object(row)
+        if (
+            set(parsed) != {"status_lane", "orders", "marker"}
+            or parsed["status_lane"] != lane
+            or type(parsed["orders"]) is not list
+        ):
+            raise OrderIntentIntegrityError(
+                "active-order parser result is invalid"
+            )
+        is_last = ordinal == len(rows) - 1
+        if (
+            row["completeness"]
+            != ("COMPLETE" if is_last else "HAS_NEXT")
+            or (is_last and parsed["marker"] is not None)
+            or (
+                not is_last
+                and (
+                    type(parsed["marker"]) is not str
+                    or not parsed["marker"]
+                )
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "active-order receipt completeness conflicts with markers"
+            )
+        previous_marker = parsed["marker"]
+        orders.extend(parsed["orders"])
+    return orders
+
+
+def _receipt_query(row: sqlite3.Row) -> dict[str, str]:
+    parsed = _load_canonical_json(
+        row["query_json"], "broker read receipt query"
+    )
+    if (
+        type(parsed) is not list
+        or any(
+            type(pair) is not list
+            or len(pair) != 2
+            or any(type(item) is not str for item in pair)
+            for pair in parsed
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "broker read receipt query shape is invalid"
+        )
+    return {pair[0]: pair[1] for pair in parsed}
+
+
+def _receipt_parsed_object(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        return _load_canonical_json_object(
+            row["canonical_parsed_json"],
+            "broker read receipt parser result",
+        )
+    except OrderIntentValidationError as exc:
+        raise OrderIntentIntegrityError(
+            "broker read receipt parser result is corrupt"
+        ) from exc
+
+
+def _verify_broker_read_receipt_row(row: sqlite3.Row) -> None:
+    raw = row["raw_response_bytes"]
+    if (
+        type(raw) is not bytes
+        or len(raw) != int(row["raw_byte_length"])
+        or len(raw) > _MAX_BROKER_READ_BYTES
+    ):
+        raise OrderIntentIntegrityError(
+            "broker read receipt raw bytes are corrupt"
+        )
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(raw_digest, row["raw_response_sha256"]):
+        raise OrderIntentIntegrityError(
+            "broker read receipt raw digest does not verify"
+        )
+    _load_canonical_json(row["query_json"], "persisted broker query")
+    _load_canonical_json(
+        row["canonical_parsed_json"], "persisted parsed broker response"
+    )
+    parsed_digest = _domain_bytes_hash(
+        _READ_PARSED_HASH_DOMAIN,
+        row["canonical_parsed_json"].encode("utf-8"),
+    )
+    if parsed_digest != row["canonical_parsed_sha256"]:
+        raise OrderIntentIntegrityError(
+            "broker read receipt parsed digest does not verify"
+        )
+    request_material = {
+        "read_kind": row["read_kind"],
+        "account_id": row["account_id"],
+        "account_id_key": row["account_id_key"],
+        "institution_type": row["institution_type"],
+        "environment": row["environment"],
+        "origin": row["origin"],
+        "http_method": row["http_method"],
+        "route": row["route"],
+        "query_json": row["query_json"],
+        "authorization_sha256": row["authorization_sha256"],
+        "target_broker_order_id": row["target_broker_order_id"],
+    }
+    request_digest = _domain_json_hash(
+        _READ_REQUEST_HASH_DOMAIN, request_material
+    )
+    if request_digest != row["request_sha256"]:
+        raise OrderIntentIntegrityError(
+            "broker read request digest does not verify"
+        )
+    receipt_material = {
+        "request_sha256": request_digest,
+        "request_started_at": int(row["request_started_at"]),
+        "response_completed_at": int(row["response_completed_at"]),
+        "http_status": int(row["http_status"]),
+        "raw_byte_length": int(row["raw_byte_length"]),
+        "raw_response_sha256": raw_digest,
+        "parser_schema": row["parser_schema"],
+        "parser_code_sha256": row["parser_code_sha256"],
+        "parser_config_sha256": row["parser_config_sha256"],
+        "canonical_parsed_sha256": parsed_digest,
+        "completeness": row["completeness"],
+        "recorded_at": int(row["recorded_at"]),
+    }
+    receipt_digest = _domain_json_hash(
+        _READ_RECEIPT_HASH_DOMAIN, receipt_material
+    )
+    if not hmac.compare_digest(receipt_digest, row["receipt_sha256"]):
+        raise OrderIntentIntegrityError(
+            "broker read receipt content hash does not verify"
+        )
+
+
+def _validate_capacity_manifest_result(result: dict[str, Any]) -> None:
+    expected = {
+        "schema",
+        "account_status",
+        "account_mode",
+        "account_type",
+        "broker_buying_power",
+        "broker_buying_power_as_of",
+        "positions",
+        "open_orders",
+        "state_sha256",
+    }
+    if set(result) != expected:
+        raise OrderIntentIntegrityError(
+            "capacity manifest result shape is invalid"
+        )
+    if (
+        result["schema"] != "etrade-capacity.v1"
+        or result["account_status"] != "ACTIVE"
+        or result["account_mode"] != "MARGIN"
+        or type(result["account_type"]) is not str
+        or not result["account_type"]
+        or type(result["positions"]) is not list
+        or type(result["open_orders"]) is not list
+        or type(result["broker_buying_power_as_of"]) is not str
+        or len(result["broker_buying_power_as_of"]) != 13
+        or not result["broker_buying_power_as_of"].isdigit()
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity manifest is not eligible for margin opening risk"
+        )
+    buying_power = result["broker_buying_power"]
+    if (
+        type(buying_power) is not str
+        or _canonical_amount(buying_power) != buying_power
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity manifest buying power is not canonical"
+        )
+    _validate_sha256("capacity state digest", result["state_sha256"])
+    state = {
+        key: result[key]
+        for key in expected
+        if key not in {"state_sha256", "broker_buying_power_as_of"}
+    }
+    expected_digest = _domain_json_hash(
+        b"etrade-capacity-state.v1\0", state
+    )
+    if not hmac.compare_digest(expected_digest, result["state_sha256"]):
+        raise OrderIntentIntegrityError(
+            "capacity manifest state digest does not verify"
+        )
+
+
+def _validate_order_query_manifest_result(
+    result: dict[str, Any],
+) -> None:
+    expected = {
+        "schema",
+        "broker_order_id",
+        "raw_status",
+        "outcome",
+        "order_payload_hashes",
+        "http_status",
+        "raw_response_digest",
+        "not_found",
+        "replacement_links",
+    }
+    if set(result) != expected:
+        raise OrderIntentIntegrityError(
+            "order query manifest result shape is invalid"
+        )
+    if (
+        result["schema"] != "etrade-order-query.v1"
+        or type(result["broker_order_id"]) is not str
+        or type(result["raw_status"]) is not str
+        or result["outcome"]
+        not in {
+            "OPEN",
+            "FILLED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+            "UNRESOLVED",
+        }
+        or type(result["order_payload_hashes"]) is not list
+        or type(result["http_status"]) is not int
+        or not 100 <= result["http_status"] <= 599
+        or type(result["not_found"]) is not bool
+        or type(result["replacement_links"]) is not dict
+    ):
+        raise OrderIntentIntegrityError(
+            "order query manifest contains invalid typed values"
+        )
+    _validate_identity("manifest broker order id", result["broker_order_id"])
+    _validate_sha256(
+        "order query raw response digest",
+        result["raw_response_digest"],
+    )
+    hashes = result["order_payload_hashes"]
+    if (
+        len(hashes) > 2
+        or len(set(hashes)) != len(hashes)
+        or hashes != sorted(hashes)
+    ):
+        raise OrderIntentIntegrityError(
+            "order query payload hashes are ambiguous"
+        )
+    for payload_hash in hashes:
+        _validate_sha256("order query payload hash", payload_hash)
+    replacement_links = result["replacement_links"]
+    if result["not_found"]:
+        if replacement_links:
+            raise OrderIntentIntegrityError(
+                "negative order evidence cannot contain replacement links"
+            )
+    else:
+        expected_replacement_keys = {
+            "replaces_order_id",
+            "replaced_by_order_id",
+        }
+        if set(replacement_links) != expected_replacement_keys:
+            raise OrderIntentIntegrityError(
+                "order replacement-link shape is invalid"
+            )
+        for name, broker_order_id in replacement_links.items():
+            if broker_order_id is not None:
+                _validate_identity(name, broker_order_id)
+        if (
+            any(
+                broker_order_id is not None
+                for broker_order_id in replacement_links.values()
+            )
+            and result["outcome"] != "UNRESOLVED"
+        ):
+            raise OrderIntentIntegrityError(
+                "replacement-linked order evidence must stay unresolved"
+            )
+    if result["not_found"]:
+        if (
+            result["http_status"] != 404
+            or result["outcome"] != "UNRESOLVED"
+            or result["raw_status"] != "NOT_FOUND"
+            or hashes
+        ):
+            raise OrderIntentIntegrityError(
+                "negative order evidence is inconsistent"
+            )
+    elif (
+        result["http_status"] != 200
+        or (
+            result["outcome"] != "UNRESOLVED"
+            and not hashes
+        )
+    ):
+        raise OrderIntentIntegrityError(
+            "resolved order evidence is incomplete"
+        )
 
 
 def _validate_mapping_keys(value: Mapping[str, Any], allowed: frozenset[str], context: str) -> None:
