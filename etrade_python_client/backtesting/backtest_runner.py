@@ -338,7 +338,7 @@ class BacktestResult:
     causal_validity_reasons: List[str] = field(
         default_factory=lambda: [
             "contract_reference_available_at_is_modeled_not_provider_observed",
-            "contract_reference_pagination_completeness_unverified",
+            "ohlcv_range_coverage_truth_unverified",
             "fill_timestamp_causality_not_certified",
         ]
     )
@@ -347,6 +347,10 @@ class BacktestResult:
     )
     contract_universe_snapshot_request_count: int = 0
     contract_universe_request_amplification: float = 0.0
+    contract_universe_missing_request_count: int = 0
+    contract_universe_missing_requests: List[str] = field(
+        default_factory=list
+    )
 
 
 class BacktestPathLogger:
@@ -468,13 +472,16 @@ async def _fetch_point_in_time_contract_universe(
 ) -> Optional[ContractUniverseSnapshot]:
     """Fetch and seal the reference universe as of the trade decision date."""
 
-    contracts = await client.fetch_contracts_list(
+    fetch_snapshot = getattr(client, "fetch_contracts_snapshot", None)
+    if not callable(fetch_snapshot):
+        return None
+    reference_evidence = await fetch_snapshot(
         underlying,
         expiration,
         contract_type,
         trade_date,
     )
-    if not contracts:
+    if reference_evidence is None:
         return None
     return build_contract_universe_snapshot(
         underlying=underlying,
@@ -486,7 +493,7 @@ async def _fetch_point_in_time_contract_universe(
         # modeling boundary, not provider evidence; the run remains UNVERIFIED.
         available_at=decision_time,
         decision_time=decision_time,
-        contracts=contracts,
+        reference_evidence=reference_evidence,
     )
 
 
@@ -1323,11 +1330,23 @@ async def run_put_credit_spread_backtest(
             for key, snapshot in sorted(contract_universes.items())
         }
 
-        missing_snapshot_count = len(task_meta) - len(contract_universes)
-        if missing_snapshot_count:
+        missing_snapshot_keys = [
+            key for key in task_meta if key not in contract_universes
+        ]
+        result.contract_universe_missing_requests = [
+            "|".join(key) for key in missing_snapshot_keys
+        ]
+        result.contract_universe_missing_request_count = len(
+            missing_snapshot_keys
+        )
+        if missing_snapshot_keys:
+            result.causal_validity_reasons.append(
+                "requested_contract_universe_snapshots_missing_"
+                "potential_selection_bias"
+            )
             print(
                 "  WARNING: "
-                f"{missing_snapshot_count} point-in-time contract snapshots "
+                f"{len(missing_snapshot_keys)} point-in-time contract snapshots "
                 "were unavailable and cannot authorize eligibility"
             )
 

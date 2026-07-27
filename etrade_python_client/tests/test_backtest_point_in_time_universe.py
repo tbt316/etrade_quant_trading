@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import inspect
 import unittest
 from pathlib import Path
@@ -8,10 +9,19 @@ import pandas as pd
 
 import backtesting.backtest_runner as backtest_module
 from backtesting.contract_universe import (
+    CONTRACT_REFERENCE_ENVIRONMENT,
+    CONTRACT_REFERENCE_EVIDENCE_SCHEMA_VERSION,
+    CONTRACT_REFERENCE_REPLAY_SCOPE,
+    CONTRACT_REFERENCE_SOURCE,
     CONTRACT_UNIVERSE_CAUSAL_STATUS,
+    CONTRACT_UNIVERSE_TERMINAL_CHAIN_STATUS,
+    ConfirmedContractReferenceSnapshot,
+    ContractReferencePageEvidence,
     ContractUniverseError,
+    OptionContractIdentity,
     acquisition_union_by_expiration,
     build_contract_universe_snapshot,
+    contract_reference_snapshot_sha256,
     filter_chain_for_snapshot,
 )
 
@@ -27,6 +37,78 @@ def _contract(ticker: str, strike: float, contract_type: str = "put") -> dict:
         "strike": strike,
         "contract_type": contract_type,
     }
+
+
+def _sha256(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _confirmed_reference(
+    contracts: list[dict],
+    *,
+    underlying: str = "SPY",
+    expiration: str = EXPIRATION,
+    contract_type: str = "put",
+    as_of_date: str = TRADE_DATE,
+) -> ConfirmedContractReferenceSnapshot:
+    identities = tuple(
+        sorted(
+            OptionContractIdentity(
+                option_ticker=row["option_ticker"],
+                strike=row["strike"],
+                contract_type=row.get("contract_type", contract_type),
+            )
+            for row in contracts
+        )
+    )
+    roots = ("SPX", "SPXW") if underlying == "SPX" else (underlying,)
+    pages = tuple(
+        ContractReferencePageEvidence(
+            root_ordinal=ordinal,
+            root_ticker=root,
+            page_ordinal=1,
+            request_sha256=_sha256(
+                f"{underlying}|{expiration}|{contract_type}|"
+                f"{as_of_date}|{root}|request"
+            ),
+            response_sha256=_sha256(
+                f"{underlying}|{expiration}|{contract_type}|"
+                f"{as_of_date}|{root}|response"
+            ),
+            result_count=len(identities) if len(roots) == 1 else (
+                len(identities) if ordinal == 0 else 0
+            ),
+            next_request_sha256=None,
+            is_terminal=True,
+        )
+        for ordinal, root in enumerate(roots)
+    )
+    digest = contract_reference_snapshot_sha256(
+        schema_version=CONTRACT_REFERENCE_EVIDENCE_SCHEMA_VERSION,
+        environment=CONTRACT_REFERENCE_ENVIRONMENT,
+        source=CONTRACT_REFERENCE_SOURCE,
+        underlying=underlying,
+        expiration=expiration,
+        contract_type=contract_type,
+        as_of_date=as_of_date,
+        expected_roots=roots,
+        pages=pages,
+        contracts=identities,
+    )
+    return ConfirmedContractReferenceSnapshot(
+        underlying=underlying,
+        expiration=expiration,
+        contract_type=contract_type,
+        as_of_date=as_of_date,
+        attempt_id=_sha256(
+            f"{underlying}|{expiration}|{contract_type}|{as_of_date}"
+        ),
+        snapshot_sha256=digest,
+        confirmed_at=f"{as_of_date}T23:59:59Z",
+        expected_roots=roots,
+        pages=pages,
+        contracts=identities,
+    )
 
 
 def _snapshot(
@@ -86,7 +168,7 @@ class ContractUniverseDomainTests(unittest.TestCase):
         )
         self.assertFalse(left.provider_available_at_verified)
         self.assertEqual(left.completeness_status, "UNVERIFIED")
-        self.assertFalse(left.provider_page_evidence_verified)
+        self.assertFalse(left.reference_terminal_chain_replayed)
         with self.assertRaises(AttributeError):
             left.available_at = "2025-04-04T20:00:00Z"
 
@@ -232,12 +314,14 @@ class PointInTimeSourceBoundaryTests(unittest.TestCase):
 
 class _RecordingReferenceClient:
     def __init__(self, contracts=None):
-        self.contracts = contracts or [
-            _contract("O:SPY250516P00100000", 100)
-        ]
+        self.contracts = (
+            [_contract("O:SPY250516P00100000", 100)]
+            if contracts is None
+            else contracts
+        )
         self.calls = []
 
-    async def fetch_contracts_list(
+    async def fetch_contracts_snapshot(
         self,
         underlying,
         expiration,
@@ -247,7 +331,15 @@ class _RecordingReferenceClient:
         self.calls.append(
             (underlying, expiration, contract_type, as_of)
         )
-        return list(self.contracts)
+        if not self.contracts:
+            return None
+        return _confirmed_reference(
+            list(self.contracts),
+            underlying=underlying,
+            expiration=expiration,
+            contract_type=contract_type,
+            as_of_date=as_of,
+        )
 
 
 class PointInTimeFetchBoundaryTests(unittest.IsolatedAsyncioTestCase):
@@ -272,6 +364,19 @@ class PointInTimeFetchBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.as_of_date, TRADE_DATE)
         self.assertEqual(snapshot.available_at, DECISION_TIME)
         self.assertEqual(snapshot.causal_status, "UNVERIFIED")
+        self.assertEqual(
+            snapshot.completeness_status,
+            CONTRACT_UNIVERSE_TERMINAL_CHAIN_STATUS,
+        )
+        self.assertTrue(snapshot.reference_terminal_chain_replayed)
+        self.assertEqual(
+            snapshot.to_manifest()["reference_evidence_replay_scope"],
+            CONTRACT_REFERENCE_REPLAY_SCOPE,
+        )
+        self.assertNotIn(
+            "provider_page_evidence_verified",
+            snapshot.to_manifest(),
+        )
 
 
 class _NoPriceCache:
@@ -290,6 +395,7 @@ class _NoPriceCache:
 
 class _UniverseRecordingClient:
     instances = []
+    return_missing = False
 
     def __init__(self, *_args, **_kwargs):
         self.api_calls = 0
@@ -304,7 +410,7 @@ class _UniverseRecordingClient:
     async def __aexit__(self, *_args):
         return False
 
-    async def fetch_contracts_list(
+    async def fetch_contracts_snapshot(
         self,
         underlying,
         expiration,
@@ -314,9 +420,11 @@ class _UniverseRecordingClient:
         self.reference_calls.append(
             (underlying, expiration, contract_type, as_of)
         )
+        if self.return_missing:
+            return None
         yymmdd = expiration[2:4] + expiration[5:7] + expiration[8:10]
         flag = "P" if contract_type == "put" else "C"
-        return [
+        contracts = [
             _contract(
                 f"O:{underlying}{yymmdd}{flag}00050000",
                 50,
@@ -328,6 +436,13 @@ class _UniverseRecordingClient:
                 contract_type,
             ),
         ]
+        return _confirmed_reference(
+            contracts,
+            underlying=underlying,
+            expiration=expiration,
+            contract_type=contract_type,
+            as_of_date=as_of,
+        )
 
     async def fetch_chain_ohlcv_batch(
         self,
@@ -350,8 +465,9 @@ class _UniverseRecordingClient:
 
 
 class BacktestAcquisitionPrefixTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, underlying_prices):
+    async def _run(self, underlying_prices, *, missing=False):
         _UniverseRecordingClient.instances.clear()
+        _UniverseRecordingClient.return_missing = missing
         with (
             patch.object(
                 backtest_module,
@@ -423,8 +539,47 @@ class BacktestAcquisitionPrefixTests(unittest.IsolatedAsyncioTestCase):
             prefix_result.causal_validity_reasons,
         )
         self.assertIn(
-            "contract_reference_pagination_completeness_unverified",
+            "ohlcv_range_coverage_truth_unverified",
             prefix_result.causal_validity_reasons,
+        )
+        self.assertEqual(
+            prefix_result.contract_universe_missing_request_count,
+            0,
+        )
+        self.assertNotIn(
+            "requested_contract_universe_snapshots_missing_"
+            "potential_selection_bias",
+            prefix_result.causal_validity_reasons,
+        )
+
+    async def test_missing_snapshot_requests_are_machine_readable_and_causal(self):
+        result, client = await self._run(
+            pd.Series(
+                [100.0, 100.0],
+                index=["2011-05-03", TRADE_DATE],
+            ),
+            missing=True,
+        )
+
+        self.assertTrue(client.reference_calls)
+        self.assertEqual(
+            result.contract_universe_missing_request_count,
+            result.contract_universe_snapshot_request_count,
+        )
+        self.assertEqual(
+            len(result.contract_universe_missing_requests),
+            result.contract_universe_missing_request_count,
+        )
+        self.assertTrue(
+            all(
+                request.startswith(f"{TRADE_DATE}|")
+                for request in result.contract_universe_missing_requests
+            )
+        )
+        self.assertIn(
+            "requested_contract_universe_snapshots_missing_"
+            "potential_selection_bias",
+            result.causal_validity_reasons,
         )
 
 

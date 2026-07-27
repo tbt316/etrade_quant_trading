@@ -4,20 +4,32 @@ Cache-aware: checks OptionDataCache before making API calls.
 Supports batch request aggregation with semaphore-based concurrency.
 """
 import asyncio
+import hashlib
+import json
 import logging
+import math
 import os
 import ssl
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import certifi
 import pytz
 
 from backtesting.massive_config import API_KEY, BASE_URL
-from backtesting.option_data_cache import OptionDataCache
+from backtesting.contract_universe import (
+    CONTRACT_REFERENCE_MAX_RESULTS_PER_PAGE,
+    ConfirmedContractReferenceSnapshot,
+)
+from backtesting.option_data_cache import (
+    MAX_CONTRACT_REFERENCE_PAGES_PER_ROOT,
+    ContractReferenceCacheError,
+    OptionDataCache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +48,31 @@ OPTION_TRADE_HISTORY_START_DATE = os.environ.get(
     "MASSIVE_OPTION_TRADES_START_DATE",
     "2014-06-02",
 )
+
+_CONTRACT_REFERENCE_PATH = "/v3/reference/options/contracts"
+_CONTRACT_REFERENCE_REQUEST_DIGEST_DOMAIN = (
+    "etrade_backtest_contract_reference_request_v1"
+)
+_CONTRACT_REFERENCE_RESPONSE_DIGEST_DOMAIN = (
+    "etrade_backtest_contract_reference_response_v1"
+)
+_SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "apikey",
+        "api_key",
+        "authorization",
+        "access_token",
+        "token",
+    }
+)
+
+
+class _ContractReferenceAcquisitionError(RuntimeError):
+    """Internal typed failure that is safe to persist as a code only."""
+
+    def __init__(self, failure_code: str):
+        super().__init__(failure_code)
+        self.failure_code = failure_code
 
 
 class MassiveAPIClient:
@@ -237,7 +274,12 @@ class MassiveAPIClient:
             dd = exp_str[4:6]
             expiration = f"{yy}-{mm}-{dd}"
             
-            contract_type = "call" if rem[6] == 'C' else "put"
+            if rem[6] == "C":
+                contract_type = "call"
+            elif rem[6] == "P":
+                contract_type = "put"
+            else:
+                return {}
             
             strike_raw = rem[7:]
             strike = float(strike_raw) / 1000.0
@@ -251,7 +293,380 @@ class MassiveAPIClient:
         except Exception:
             return {}
 
+    @staticmethod
+    def _canonical_json_sha256(value: object, domain: str) -> str:
+        try:
+            encoded = json.dumps(
+                {
+                    "domain": domain,
+                    "value": value,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+        except (TypeError, ValueError) as exc:
+            raise _ContractReferenceAcquisitionError(
+                "NON_CANONICAL_PROVIDER_RESPONSE"
+            ) from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _reference_request_identity(
+        url: str,
+        params: dict,
+    ) -> tuple[str, str]:
+        """Return a credential-free request URL and its canonical identity."""
+
+        if type(url) is not str or not url:
+            raise _ContractReferenceAcquisitionError(
+                "INVALID_PAGINATION_URL"
+            )
+        if type(params) is not dict:
+            raise _ContractReferenceAcquisitionError(
+                "INVALID_REFERENCE_PARAMETERS"
+            )
+        parts = urlsplit(url)
+        base = urlsplit(BASE_URL)
+        if (
+            parts.scheme.lower() != "https"
+            or parts.scheme.lower() != base.scheme.lower()
+            or parts.hostname != base.hostname
+            or parts.port != base.port
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path != _CONTRACT_REFERENCE_PATH
+            or bool(parts.fragment)
+        ):
+            raise _ContractReferenceAcquisitionError(
+                "INVALID_PAGINATION_URL"
+            )
+
+        query_pairs = [
+            (key, value)
+            for key, value in parse_qsl(
+                parts.query,
+                keep_blank_values=True,
+            )
+            if key.casefold() not in _SENSITIVE_QUERY_KEYS
+        ]
+        parameter_pairs = []
+        for key, value in params.items():
+            if type(key) is not str:
+                raise _ContractReferenceAcquisitionError(
+                    "INVALID_REFERENCE_PARAMETERS"
+                )
+            if key.casefold() in _SENSITIVE_QUERY_KEYS:
+                continue
+            if type(value) not in {str, int, float, bool}:
+                raise _ContractReferenceAcquisitionError(
+                    "INVALID_REFERENCE_PARAMETERS"
+                )
+            parameter_pairs.append((key, str(value)))
+
+        credential_free_url = urlunsplit(
+            (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+                parts.path,
+                urlencode(query_pairs),
+                "",
+            )
+        )
+        request_payload = {
+            "method": "GET",
+            "scheme": parts.scheme.lower(),
+            "authority": parts.netloc.lower(),
+            "path": parts.path,
+            "query": sorted(query_pairs + parameter_pairs),
+        }
+        request_sha256 = MassiveAPIClient._canonical_json_sha256(
+            request_payload,
+            _CONTRACT_REFERENCE_REQUEST_DIGEST_DOMAIN,
+        )
+        return credential_free_url, request_sha256
+
+    @staticmethod
+    def _canonical_strike_text(value: object) -> str:
+        if type(value) not in {int, float} or type(value) is bool:
+            raise _ContractReferenceAcquisitionError(
+                "MALFORMED_CONTRACT_ROW"
+            )
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise _ContractReferenceAcquisitionError(
+                "MALFORMED_CONTRACT_ROW"
+            )
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise _ContractReferenceAcquisitionError(
+                "MALFORMED_CONTRACT_ROW"
+            ) from exc
+        return format(decimal_value.normalize(), "f")
+
+    def _strict_reference_contract(
+        self,
+        item: object,
+        *,
+        root_ticker: str,
+        expiration: str,
+        contract_type: str,
+    ) -> dict:
+        if type(item) is not dict:
+            raise _ContractReferenceAcquisitionError(
+                "MALFORMED_CONTRACT_ROW"
+            )
+        ticker = item.get("ticker")
+        strike = item.get("strike_price")
+        if type(ticker) is not str or not ticker:
+            raise _ContractReferenceAcquisitionError(
+                "MALFORMED_CONTRACT_ROW"
+            )
+        strike_text = self._canonical_strike_text(strike)
+        parsed = self._parse_ticker(ticker)
+        if (
+            parsed.get("underlying") != root_ticker
+            or parsed.get("expiration") != expiration
+            or parsed.get("contract_type") != contract_type
+            or self._canonical_strike_text(parsed.get("strike"))
+            != strike_text
+        ):
+            raise _ContractReferenceAcquisitionError(
+                "CONTRACT_ROW_BINDING_MISMATCH"
+            )
+        if (
+            "expiration_date" in item
+            and item["expiration_date"] != expiration
+        ):
+            raise _ContractReferenceAcquisitionError(
+                "CONTRACT_ROW_BINDING_MISMATCH"
+            )
+        if (
+            "contract_type" in item
+            and item["contract_type"] != contract_type
+        ):
+            raise _ContractReferenceAcquisitionError(
+                "CONTRACT_ROW_BINDING_MISMATCH"
+            )
+        return {
+            "option_ticker": ticker,
+            "strike": float(strike),
+            "contract_type": contract_type,
+        }
+
+    def _finish_reference_failure(
+        self,
+        attempt_id: str,
+        failure_code: str,
+    ) -> None:
+        try:
+            self.cache.finish_contract_reference_failure(
+                attempt_id,
+                failure_code,
+            )
+        except ContractReferenceCacheError:
+            logger.error(
+                "Contract-reference attempt could not record failure: %s",
+                attempt_id,
+            )
+
     # ── Contracts List ──────────────────────────────────────────────
+
+    async def fetch_contracts_snapshot(
+        self,
+        underlying: str,
+        expiration: str,
+        contract_type: str,
+        as_of: str,
+    ) -> Optional[ConfirmedContractReferenceSnapshot]:
+        """
+        Return only a durable, complete, exact-tuple reference snapshot.
+
+        Attempts are recorded before provider I/O. Every successful page is
+        linked by credential-free request/response hashes. Empty, offline,
+        interrupted, malformed, over-limit, and conflicting attempts never
+        publish a cache head and therefore cannot authorize eligibility.
+        """
+        cached = self.cache.get_confirmed_contract_reference(
+            underlying=underlying,
+            expiration=expiration,
+            contract_type=contract_type,
+            as_of_date=as_of,
+        )
+        if cached is not None:
+            self.cache_hits += 1
+            return cached
+
+        expected_roots = (
+            ("SPX", "SPXW")
+            if underlying == "SPX"
+            else (underlying,)
+        )
+        try:
+            attempt_id = self.cache.begin_contract_reference_attempt(
+                underlying=underlying,
+                expiration=expiration,
+                contract_type=contract_type,
+                as_of_date=as_of,
+                expected_roots=expected_roots,
+            )
+        except ContractReferenceCacheError:
+            logger.error(
+                "Contract-reference attempt could not start for exact tuple"
+            )
+            return None
+
+        if self.offline_only:
+            self._finish_reference_failure(attempt_id, "OFFLINE_ONLY")
+            return None
+
+        print(
+            f"{CLR_YEL}  [API FETCH] {underlying} contracts for "
+            f"{expiration} (as_of {as_of}){CLR_RST}"
+        )
+        all_contracts: list[dict] = []
+        seen_tickers: set[str] = set()
+
+        try:
+            for root_ordinal, root_ticker in enumerate(expected_roots):
+                url = f"{BASE_URL}{_CONTRACT_REFERENCE_PATH}"
+                params = {
+                    "underlying_ticker": root_ticker,
+                    "contract_type": contract_type,
+                    "expiration_date": expiration,
+                    "as_of": as_of,
+                    "limit": CONTRACT_REFERENCE_MAX_RESULTS_PER_PAGE,
+                    "order": "asc",
+                    "sort": "strike_price",
+                }
+                page_ordinal = 1
+                seen_requests: set[str] = set()
+
+                while True:
+                    if page_ordinal > MAX_CONTRACT_REFERENCE_PAGES_PER_ROOT:
+                        raise _ContractReferenceAcquisitionError(
+                            "PAGE_LIMIT_EXCEEDED"
+                        )
+                    request_url, request_sha256 = (
+                        self._reference_request_identity(url, params)
+                    )
+                    if request_sha256 in seen_requests:
+                        raise _ContractReferenceAcquisitionError(
+                            "PAGINATION_LOOP"
+                        )
+                    seen_requests.add(request_sha256)
+
+                    try:
+                        data = await self._get(
+                            request_url,
+                            dict(params),
+                        )
+                    except Exception as exc:
+                        raise _ContractReferenceAcquisitionError(
+                            "REQUEST_FAILED"
+                        ) from exc
+                    if data is None:
+                        raise _ContractReferenceAcquisitionError(
+                            "REQUEST_FAILED"
+                        )
+                    if type(data) is not dict:
+                        raise _ContractReferenceAcquisitionError(
+                            "MALFORMED_PROVIDER_RESPONSE"
+                        )
+                    results = data.get("results")
+                    if type(results) is not list:
+                        raise _ContractReferenceAcquisitionError(
+                            "MALFORMED_PROVIDER_RESPONSE"
+                        )
+
+                    next_url = data.get("next_url")
+                    if next_url is None:
+                        next_request_sha256 = None
+                        next_request_url = None
+                    else:
+                        if type(next_url) is not str or not next_url:
+                            raise _ContractReferenceAcquisitionError(
+                                "INVALID_PAGINATION_URL"
+                            )
+                        next_request_url, next_request_sha256 = (
+                            self._reference_request_identity(next_url, {})
+                        )
+                    response_evidence = dict(data)
+                    if next_request_url is not None:
+                        response_evidence["next_url"] = next_request_url
+                    response_sha256 = self._canonical_json_sha256(
+                        response_evidence,
+                        _CONTRACT_REFERENCE_RESPONSE_DIGEST_DOMAIN,
+                    )
+
+                    self.cache.record_contract_reference_page(
+                        attempt_id=attempt_id,
+                        root_ordinal=root_ordinal,
+                        root_ticker=root_ticker,
+                        page_ordinal=page_ordinal,
+                        request_sha256=request_sha256,
+                        response_sha256=response_sha256,
+                        result_count=len(results),
+                        next_request_sha256=next_request_sha256,
+                        is_terminal=next_request_url is None,
+                    )
+
+                    for item in results:
+                        contract = self._strict_reference_contract(
+                            item,
+                            root_ticker=root_ticker,
+                            expiration=expiration,
+                            contract_type=contract_type,
+                        )
+                        ticker = contract["option_ticker"]
+                        if ticker in seen_tickers:
+                            raise _ContractReferenceAcquisitionError(
+                                "DUPLICATE_CONTRACT_TICKER"
+                            )
+                        seen_tickers.add(ticker)
+                        all_contracts.append(contract)
+
+                    if next_request_url is None:
+                        break
+                    if page_ordinal == MAX_CONTRACT_REFERENCE_PAGES_PER_ROOT:
+                        raise _ContractReferenceAcquisitionError(
+                            "PAGE_LIMIT_EXCEEDED"
+                        )
+                    if next_request_sha256 in seen_requests:
+                        raise _ContractReferenceAcquisitionError(
+                            "PAGINATION_LOOP"
+                        )
+                    url = next_request_url
+                    params = {}
+                    page_ordinal += 1
+
+            if not all_contracts:
+                self.cache.finish_contract_reference_empty(attempt_id)
+                return None
+
+            return self.cache.confirm_contract_reference_attempt(
+                attempt_id,
+                all_contracts,
+            )
+        except _ContractReferenceAcquisitionError as exc:
+            self._finish_reference_failure(
+                attempt_id,
+                exc.failure_code,
+            )
+            return None
+        except ContractReferenceCacheError:
+            self._finish_reference_failure(
+                attempt_id,
+                "EVIDENCE_REJECTED",
+            )
+            return None
+        except Exception:
+            self._finish_reference_failure(
+                attempt_id,
+                "UNEXPECTED_ACQUISITION_ERROR",
+            )
+            return None
 
     async def fetch_contracts_list(
         self,
@@ -260,82 +675,17 @@ class MassiveAPIClient:
         contract_type: str,
         as_of: str,
     ) -> List[dict]:
-        """
-        Get list of option contracts for an underlying/expiration.
-        Returns list of {"option_ticker": str, "strike": float}.
+        """Compatibility adapter that unwraps only confirmed snapshot rows."""
 
-        ``as_of`` is only a date-granular provider query parameter. This raw
-        adapter does not prove an intraday ``available_at`` and its return value
-        must not be used directly as a backtest eligibility universe. The
-        runner seals and checks an exact decision-date snapshot separately.
-        """
-        # Check cache
-        cached = self.cache.get_cached_contracts(
-            underlying, expiration, contract_type, as_of
-        )
-        if cached is not None:
-            self.cache_hits += 1
-            return cached
-
-        if self.offline_only:
-            self.cache.mark_fetch_complete(underlying, as_of, expiration, contract_type, "contracts")
+        if not expiration:
             return []
-
-        # Fetch from API with pagination
-        print(f"{CLR_YEL}  [API FETCH] {underlying} contracts for {expiration} (as_of {as_of}){CLR_RST}")
-        all_contracts = []
-        
-        # If underlying is SPX, query both SPX and SPXW (weekly) options
-        underlyings_to_query = [underlying]
-        if underlying == "SPX":
-            underlyings_to_query = ["SPX", "SPXW"]
-            
-        for und in underlyings_to_query:
-            url = f"{BASE_URL}/v3/reference/options/contracts"
-            params = {
-                "underlying_ticker": und,
-                "contract_type": contract_type,
-                "as_of": as_of,
-                "limit": 1000,
-                "order": "asc",
-                "sort": "strike_price",
-            }
-            if expiration:
-                params["expiration_date"] = expiration
-
-            while url:
-                data = await self._get(url, params)
-                if not data or "results" not in data:
-                    break
-
-                for item in data["results"]:
-                    parsed = self._parse_ticker(item["ticker"])
-                    if parsed.get("contract_type") != contract_type:
-                        continue
-                    if expiration and parsed.get("expiration") != expiration:
-                        continue
-                    all_contracts.append({
-                        "option_ticker": item["ticker"],
-                        "strike": item["strike_price"],
-                        "contract_type": contract_type,
-                    })
-
-                # Handle pagination
-                next_url = data.get("next_url")
-                if next_url:
-                    url = next_url
-                    params = {}  # next_url includes all params
-                else:
-                    break
-
-        # Save to cache
-        if all_contracts:
-            self.cache.save_contracts(
-                underlying, expiration, contract_type, as_of, all_contracts
-            )
-        self.cache.mark_fetch_complete(underlying, as_of, expiration, contract_type, "contracts")
-
-        return all_contracts
+        snapshot = await self.fetch_contracts_snapshot(
+            underlying,
+            expiration,
+            contract_type,
+            as_of,
+        )
+        return snapshot.as_legacy_records() if snapshot is not None else []
 
     # ── OHLCV Daily Bars ────────────────────────────────────────────
 
