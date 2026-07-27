@@ -137,9 +137,17 @@ def test_package_data_contract_is_explicit_and_complete() -> None:
 
     assert package_data == {
         "backtesting": ["strategies/*.yaml"],
-        "live_trading": ["dashboard_template.html"],
+        "live_trading": [
+            "dashboard_template.html",
+            "runtime_config.example.json",
+        ],
     }
     assert (SOURCE_ROOT / "live_trading" / "dashboard_template.html").is_file()
+    assert (
+        SOURCE_ROOT
+        / "live_trading"
+        / "runtime_config.example.json"
+    ).is_file()
     assert sorted(
         path.name
         for path in (SOURCE_ROOT / "backtesting" / "strategies").glob("*.yaml")

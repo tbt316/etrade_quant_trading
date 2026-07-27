@@ -21,6 +21,7 @@ dashboard_requests.log
 *.json
 *.csv
 !docs/regime_v2_calibration_plan.json
+!live_trading/runtime_config.example.json
 !research_reports/regime_v2_calibration_artifact.json
 
 # Plots and HTML outputs

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "mode": "paper",
+  "runtime_root": "runtime",
+  "strategy": {
+    "enabled": false,
+    "strategy_id": "disabled",
+    "symbols": []
+  },
+  "data": {
+    "require_complete_snapshots": true,
+    "max_snapshot_age_seconds": 300
+  },
+  "model": {
+    "enabled": false,
+    "required_for_entry": false,
+    "max_signal_age_seconds": 86400
+  },
+  "execution": {
+    "selected_account_id_key": null,
+    "account_allowlist": [],
+    "broker_mutations_enabled": false
+  },
+  "risk": {
+    "max_order_contracts": 0,
+    "max_order_loss_cents": 0,
+    "max_account_open_risk_cents": 0,
+    "max_daily_loss_cents": 0,
+    "max_quote_age_seconds": 30
+  }
+}

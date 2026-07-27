@@ -31,6 +31,7 @@ SUPPORTED_MODULES = (
     "live_trading.etrade_cover_call_new",
     "live_trading.etrade_put_credit_spread",
     "live_trading.regime_detector_v2",
+    "live_trading.runtime_config",
     "live_trading.runtime_safety",
     "market.market_bo",
     "order.order_bo",
@@ -93,6 +94,31 @@ def main() -> int:
     )
     if not dashboard.is_file():
         raise RuntimeSmokeError("installed dashboard template is missing")
+    runtime_example = importlib.resources.files("live_trading").joinpath(
+        "runtime_config.example.json"
+    )
+    if not runtime_example.is_file():
+        raise RuntimeSmokeError(
+            "installed runtime-configuration example is missing"
+        )
+    from live_trading.runtime_config import (
+        CONFIG_SCHEMA_VERSION,
+        load_runtime_config,
+    )
+
+    with importlib.resources.as_file(runtime_example) as config_path:
+        runtime_config = load_runtime_config(config_path)
+    if runtime_config.schema_version != CONFIG_SCHEMA_VERSION:
+        raise RuntimeSmokeError(
+            "installed runtime-configuration example has the wrong schema"
+        )
+    if (
+        runtime_config.mode != "paper"
+        or runtime_config.execution.broker_mutations_enabled is not False
+    ):
+        raise RuntimeSmokeError(
+            "installed runtime-configuration example is not disabled paper mode"
+        )
     strategies = sorted(
         path.name
         for path in importlib.resources.files("backtesting")

@@ -302,6 +302,13 @@ flowchart TB
 - Strategy, data, model, execution, and risk policies are separate typed
   sections; unknown keys and invalid ranges are errors.
 
+The exact schema-version-1 contract, four-mode capability table, immutable path
+rules, and service-environment/local-fallback secret boundary are documented in
+[`runtime_configuration.md`](runtime_configuration.md). Version 1 deliberately
+grants no broker-mutation authority in any mode. In particular, `live` is an
+unarmed startup declaration and configuration cannot replace the independent
+short-lived production arm.
+
 R6 implements a narrow compatibility boundary around the existing monolith:
 explicit environment selection; exact production account identity; a
 versioned, signed arm document with a maximum 15-minute lifetime; refresh-time
@@ -551,6 +558,15 @@ Canonical live imports are checked from an empty owner-only directory and may
 not create backtest/cache directories. Integration-marked tests are excluded
 explicitly. Remaining runtime-state paths move under typed configuration in
 R8d.
+
+R8d defines one strict JSON startup contract with separate strategy, data,
+model, execution, and risk sections; exact account allowlisting; and paths
+resolved relative to the configuration file rather than the process working
+directory. Its packaged example is a valid disabled `paper` configuration and
+contains no credentials. Operational configuration, secret fallbacks, OAuth
+state, arms, databases, and logs remain excluded from release artifacts. R8d
+does not compose the durable gateway and does not change the R7f mutation
+quarantine.
 
 Deliver:
 

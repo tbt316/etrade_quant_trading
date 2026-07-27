@@ -106,15 +106,38 @@ The installable packages live under `etrade_python_client/`:
 - `scratch/`: research-only scripts and outputs; not distributed.
 
 The wheel includes only the ten explicitly allowlisted packages, the dashboard
-template, and three strategy YAML files. It excludes credentials, runtime
-state, caches, reports, tests, and scratch material.
+template, the credential-free runtime-configuration example, and three strategy
+YAML files. It excludes credentials, operational configuration, runtime state,
+caches, reports, tests, and scratch material.
+
+## Runtime configuration
+
+[`docs/runtime_configuration.md`](etrade_python_client/docs/runtime_configuration.md)
+defines the strict schema-versioned startup contract and mode semantics for
+`sandbox`, `shadow`, `paper`, and `live`. The packaged example is a valid,
+disabled `paper` configuration containing no credentials or account identity.
+Schema version 1 grants no broker-mutation authority in any mode; `live` always
+loads unarmed, and configuration is never a substitute for the independently
+signed production arm.
+
+Copy the example outside the checkout or installed package and protect the
+operational copy before editing non-secret settings:
+
+```bash
+install -d -m 700 /path/to/private/etrade
+install -m 600 \
+  etrade_python_client/live_trading/runtime_config.example.json \
+  /path/to/private/etrade/runtime_config.json
+```
 
 ## Credentials and local state
 
 Never commit OAuth values, market-data keys, sessions, arming documents, broker
-responses, or runtime databases. Use ignored owner-readable local files or
-environment variables. The repository hygiene check enforces the tracked-index
-boundary.
+responses, operational runtime configuration, local secret files, or runtime
+databases. Prefer the service or OS environment for secrets. A permitted local
+development fallback must be an ignored, owner-only regular file and is never
+valid as a source for the production arming secret. The repository hygiene
+check enforces the tracked-index boundary.
 
 Removing a credential from the current tree does not remove it from Git
 history. Previously exposed E*TRADE keys must still be revoked and rotated, and
@@ -126,6 +149,8 @@ history cleanup must be coordinated separately.
   maps the current backtest, live, dashboard, and regime flows.
 - [`docs/production_readiness_upgrade_plan.md`](etrade_python_client/docs/production_readiness_upgrade_plan.md)
   records the phased production-readiness gates.
+- [`docs/runtime_configuration.md`](etrade_python_client/docs/runtime_configuration.md)
+  defines the typed non-secret runtime configuration and local-secret boundary.
 - [`RELIABILITY.md`](etrade_python_client/RELIABILITY.md) is the incident and
   invariant ledger.
 - [`docs/market_regime_detect_specs.md`](etrade_python_client/docs/market_regime_detect_specs.md)

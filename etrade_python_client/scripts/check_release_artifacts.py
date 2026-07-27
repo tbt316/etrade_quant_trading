@@ -47,6 +47,7 @@ EXPECTED_PACKAGE_DATA = frozenset(
         "backtesting/strategies/baseline_put_spread_catchup_refill.yaml",
         "backtesting/strategies/put_call_credit_spread.yaml",
         "live_trading/dashboard_template.html",
+        "live_trading/runtime_config.example.json",
     }
 )
 TRACKED_SDIST_FILES = frozenset(
@@ -97,6 +98,9 @@ FORBIDDEN_NAMES = frozenset(
         "etrade_session.json",
         "live_trading_settings.json",
         "production_arm.json",
+        "runtime_config.json",
+        "runtime_secrets.json",
+        "secrets.json",
         "session.json",
     }
 )

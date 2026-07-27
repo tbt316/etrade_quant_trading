@@ -79,7 +79,7 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 backtesting = ["strategies/*.yaml"]
-live_trading = ["dashboard_template.html"]
+live_trading = ["dashboard_template.html", "runtime_config.example.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["etrade_python_client/tests"]
