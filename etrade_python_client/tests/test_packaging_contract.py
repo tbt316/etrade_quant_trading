@@ -231,6 +231,9 @@ def test_ci_builds_and_tests_an_immutable_offline_artifact() -> None:
     assert "python -m build --sdist --wheel --no-isolation" in workflow
     assert workflow.count("git archive --format=tar HEAD") == 2
     assert workflow.count("umask 022") == 2
+    assert "${{ runner.temp }}" not in workflow
+    assert "MPLCONFIGDIR=$RUNNER_TEMP/matplotlib" in workflow
+    assert "XDG_CACHE_HOME=$RUNNER_TEMP/cache" in workflow
     assert "SOURCE_DATE_EPOCH=" in workflow
     assert "scripts/check_release_artifacts.py" in workflow
     assert workflow.count("scripts/normalize_sdist.py") == 2

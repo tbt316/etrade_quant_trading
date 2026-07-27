@@ -19,13 +19,11 @@ jobs:
     timeout-minutes: 30
     env:
       LC_ALL: C.UTF-8
-      MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
       PIP_NO_INPUT: '1'
       PYTHONHASHSEED: '0'
       PYTHONDONTWRITEBYTECODE: '1'
       TZ: UTC
-      XDG_CACHE_HOME: ${{ runner.temp }}/cache
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -41,8 +39,14 @@ jobs:
             requirements/runtime.lock
             requirements/test.lock
 
-      - name: Set reproducible build timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Set isolated paths and reproducible build timestamp
+        run: |
+          install -d -m 700 \
+            "$RUNNER_TEMP/cache" \
+            "$RUNNER_TEMP/matplotlib"
+          echo "MPLCONFIGDIR=$RUNNER_TEMP/matplotlib" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/cache" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
       - name: Enforce repository hygiene
         working-directory: etrade_python_client
