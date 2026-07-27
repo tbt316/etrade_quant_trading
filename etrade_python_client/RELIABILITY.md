@@ -546,6 +546,21 @@ finding.
 - `deploy/install_pi_service.sh` and `deploy/sync_to_pi.sh`
   - Reject service installation and remote restart before privileged, SSH,
     rsync, or service-manager actions.
+  - Reject code sync when tracked state differs from `HEAD`; otherwise archive
+    the exact resolved commit and present only that temporary snapshot to
+    rsync. Ignored and untracked working-tree files cannot enter the code
+    source. Repository/index overrides and replacement objects are neutralized,
+    repository identity is anchored before switching directories, and a
+    NUL-delimited tree manifest rejects symbolic links, submodules, or files
+    omitted by Git attributes before any remote command.
+- `.gitignore`, `scripts/check_repo_hygiene.py`, and CI
+  - Remove 1,531 audited virtual-environment, generated, runtime, cache,
+    package-metadata, and backup entries from the index without deleting local
+    copies.
+  - Fail deterministically before dependency installation when any tracked path
+    is ignored, is not a regular Git file, or violates the explicit
+    environment, private-key, secret, state, cache, database, log, backup, or
+    generated-output policy.
 - `live_trading/etrade_check_option.py` and
   `live_trading/etrade_option_chains.py`
   - Remove hardcoded OAuth credentials from the current source and require
@@ -601,16 +616,21 @@ it does not verify the exact deployed dashboard.
   unresolved. The review explicitly retains a no-go on live wiring until the
   remaining partial/complex terminal, closing, cancellation, and composition
   protocols are delivered.
-- The maintained `tests/` suite passes 361 tests in the clean Python 3.10
+- The maintained `tests/` suite passes 467 tests in the clean Python 3.10
   environment. An unscoped repository-root pytest invocation still
   mis-collects two legacy `scratch/test_delta_*` research scripts and triggers
   import-time market-data behavior; the reproducible-build/CI gate must
   constrain collection and remove those import side effects.
-- R7f's checker passes across all 169 tracked application Python sources,
+- The current mutation-boundary checker passes across all 170 tracked
+  application Python sources,
   including tracked scratch. Focused tests cover exact reject-only tombstones,
   fixed route schemas and side-effect ordering, read-only HTML, same-origin
   positions framing, gateway privacy, mutation bypass attacks, and
   install/restart containment.
+- The R8a repository/deployment containment suites pass 110 focused tests,
+  including ignored and semantic secret variants, unsafe Git modes and index
+  overrides, immutable-snapshot completeness, Git-attribute omissions,
+  committed symlinks, path/target injection, and pre-remote failure ordering.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.
