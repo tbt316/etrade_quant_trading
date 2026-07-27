@@ -5,15 +5,17 @@ usage() {
   cat <<'USAGE'
 Usage:
   ./deploy/sync_to_pi.sh [--state]
+  ./deploy/sync_to_pi.sh --rollback RELEASE_ID
 
 Options:
-  --state     Also sync private runtime state such as config.ini and OAuth/settings JSON files.
-  --restart   Rejected while live deployment is suspended.
+  --state                Rejected until atomic state-generation migration exists.
+  --rollback RELEASE_ID  Atomically select an already verified release.
+  --restart              Rejected while live deployment is suspended.
 
 Environment:
-  PI_TARGET       SSH target. Defaults to pi@raspberrypi.local.
-  PI_DIR          Destination repo directory on the Pi. Defaults to /home/pi/etrade_python_client.
-  SYNC_DELETE     Set to 1 to delete remote files that no longer exist locally.
+  PI_TARGET    SSH target. Defaults to pi@raspberrypi.local.
+  PI_DIR       Deployment root on the Pi. Defaults to /home/pi/etrade_python_client.
+  SYNC_DELETE  Deprecated compatibility setting; only exact 0 or 1 is accepted.
 USAGE
 }
 
@@ -22,12 +24,21 @@ PI_TARGET="${PI_TARGET:-pi@raspberrypi.local}"
 PI_DIR="${PI_DIR:-/home/pi/etrade_python_client}"
 SYNC_STATE=0
 RESTART=0
+ROLLBACK_RELEASE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state)
       SYNC_STATE=1
       shift
+      ;;
+    --rollback)
+      if [[ $# -lt 2 ]]; then
+        echo "--rollback requires an exact release ID." >&2
+        exit 78
+      fi
+      ROLLBACK_RELEASE="$2"
+      shift 2
       ;;
     --restart)
       RESTART=1
@@ -49,6 +60,14 @@ if [[ "$RESTART" == "1" ]]; then
   echo "Remote restart is suspended; no files were synced and no remote command ran." >&2
   exit 78
 fi
+if [[ "$SYNC_STATE" == "1" && -n "$ROLLBACK_RELEASE" ]]; then
+  echo "--state and --rollback cannot be combined." >&2
+  exit 78
+fi
+if [[ "$SYNC_STATE" == "1" ]]; then
+  echo "Private state sync is suspended until an atomic state-generation consumer exists; no remote command ran." >&2
+  exit 78
+fi
 
 if [[ ! "$PI_TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "PI_TARGET must be an explicit user@host SSH target." >&2
@@ -68,6 +87,14 @@ if [[
 fi
 if [[ "${SYNC_DELETE:-0}" != "0" && "${SYNC_DELETE:-0}" != "1" ]]; then
   echo "SYNC_DELETE must be exactly 0 or 1." >&2
+  exit 78
+fi
+if [[
+  -n "$ROLLBACK_RELEASE"
+  && ! "$ROLLBACK_RELEASE" =~ ^[0-9a-f]{40}-[0-9a-f]{64}$
+  && ! "$ROLLBACK_RELEASE" =~ ^[0-9a-f]{64}-[0-9a-f]{64}$
+]]; then
+  echo "--rollback requires a canonical commit-and-archive release ID." >&2
   exit 78
 fi
 
@@ -104,39 +131,16 @@ if [[ -z "$APP_REPO_PATH" ]]; then
 fi
 
 DEPLOY_COMMIT="$(git -C "$GIT_ROOT" rev-parse --verify 'HEAD^{commit}')"
+if [[
+  ! "$DEPLOY_COMMIT" =~ ^[0-9a-f]{40}$
+  && ! "$DEPLOY_COMMIT" =~ ^[0-9a-f]{64}$
+]]; then
+  echo "Resolved HEAD is not a canonical Git commit identity." >&2
+  exit 78
+fi
 if ! git -C "$GIT_ROOT" diff --quiet "$DEPLOY_COMMIT" --; then
   echo "Tracked changes are present; commit them before syncing code." >&2
   exit 78
-fi
-
-STATE_FILES=(
-  config.ini
-  .env
-  .etrade_oauth
-  live_trading_settings.json
-  trade_status.json
-  manual_order_status.json
-  spy_tracking_data.json
-  spy_vix_price_cache.json
-  nudge_history.json
-  nudge_state.json
-)
-STATE_SOURCE_PATHS=()
-if [[ "$SYNC_STATE" == "1" ]]; then
-  for state_file in "${STATE_FILES[@]}"; do
-    state_path="$APP_DIR/$state_file"
-    if [[ -L "$state_path" ]]; then
-      echo "Refusing symbolic-link state file: $state_file" >&2
-      exit 78
-    fi
-    if [[ -e "$state_path" && ! -f "$state_path" ]]; then
-      echo "Refusing non-regular state path: $state_file" >&2
-      exit 78
-    fi
-    if [[ -f "$state_path" ]]; then
-      STATE_SOURCE_PATHS+=("$state_path")
-    fi
-  done
 fi
 
 SNAPSHOT_ROOT="$(
@@ -153,120 +157,185 @@ trap cleanup_snapshot EXIT
 chmod 700 "$SNAPSHOT_ROOT"
 SYNC_SOURCE="$SNAPSHOT_ROOT/code"
 mkdir -m 700 "$SYNC_SOURCE"
+CODE_ARCHIVE="$SNAPSHOT_ROOT/release.tar"
 
-git -C "$GIT_ROOT" archive --format=tar "$DEPLOY_COMMIT:$APP_REPO_PATH" \
-  | tar -xf - -C "$SYNC_SOURCE"
-if [[ ! -f "$SYNC_SOURCE/deploy/sync_to_pi.sh" ]]; then
+git -C "$GIT_ROOT" archive --format=tar \
+  --output="$CODE_ARCHIVE" \
+  "$DEPLOY_COMMIT:$APP_REPO_PATH"
+chmod 600 "$CODE_ARCHIVE"
+tar -xf "$CODE_ARCHIVE" -C "$SYNC_SOURCE"
+if [[
+  ! -f "$SYNC_SOURCE/deploy/sync_to_pi.sh"
+  || ! -f "$SYNC_SOURCE/deploy/pi_release.sh"
+  || ! -f "$SYNC_SOURCE/scripts/check_repo_hygiene.py"
+]]; then
   echo "Committed deployment snapshot is incomplete; no remote command ran." >&2
   exit 1
 fi
-snapshot_symlink="$(find "$SYNC_SOURCE" -type l -print -quit)"
-if [[ -n "$snapshot_symlink" ]]; then
-  echo "Committed deployment snapshot contains a symbolic link; no remote command ran." >&2
+snapshot_unsafe_path="$(
+  find "$SYNC_SOURCE" -mindepth 1 \
+    ! -type d ! -type f \
+    -print -quit
+)"
+if [[ -n "$snapshot_unsafe_path" ]]; then
+  echo "Committed deployment snapshot contains an unsafe file type; no remote command ran." >&2
   exit 78
 fi
 TRACKED_MANIFEST="$SNAPSHOT_ROOT/tracked-paths"
-git -C "$GIT_ROOT" ls-tree -r -z --name-only \
+git -C "$GIT_ROOT" ls-tree -r -z \
   "$DEPLOY_COMMIT:$APP_REPO_PATH" > "$TRACKED_MANIFEST"
-while IFS= read -r -d '' tracked_path; do
+TRACKED_BLOB="$SNAPSHOT_ROOT/tracked-blob"
+TRACKED_ATTRIBUTE="$SNAPSHOT_ROOT/tracked-attribute"
+TRACKED_FILE_COUNT=0
+while IFS= read -r -d '' tracked_entry; do
+  ((TRACKED_FILE_COUNT += 1))
+  if [[ "$tracked_entry" != *$'\t'* ]]; then
+    echo "Committed tree manifest is malformed; no remote command ran." >&2
+    exit 78
+  fi
+  tracked_identity="${tracked_entry%%$'\t'*}"
+  tracked_path="${tracked_entry#*$'\t'}"
+  read -r tracked_mode tracked_type tracked_oid <<< "$tracked_identity"
+  if [[
+    "$tracked_type" != "blob"
+    || ( "$tracked_mode" != "100644" && "$tracked_mode" != "100755" )
+    || ( ! "$tracked_oid" =~ ^[0-9a-f]{40}$ && ! "$tracked_oid" =~ ^[0-9a-f]{64}$ )
+  ]]; then
+    echo "Committed deployment tree contains an unsupported entry; no remote command ran." >&2
+    exit 78
+  fi
+  if [[
+    "$tracked_path" == /* || "$tracked_path" == ../*
+    || "$tracked_path" == */../* || "$tracked_path" == */..
+    || "$tracked_path" == *$'\n'* || "$tracked_path" == *$'\r'*
+  ]]; then
+    echo "Committed deployment snapshot contains an unsafe tracked path." >&2
+    exit 78
+  fi
+  repository_tracked_path="$APP_REPO_PATH/$tracked_path"
+  git -C "$GIT_ROOT" check-attr -z export-subst -- \
+    "$repository_tracked_path" > "$TRACKED_ATTRIBUTE"
+  {
+    IFS= read -r -d '' attribute_path
+    IFS= read -r -d '' attribute_name
+    IFS= read -r -d '' attribute_value
+  } < "$TRACKED_ATTRIBUTE"
+  if [[
+    "$attribute_path" != "$repository_tracked_path"
+    || "$attribute_name" != "export-subst"
+  ]]; then
+    echo "Git attribute proof was malformed; no remote command ran." >&2
+    exit 78
+  fi
+  if [[ "$attribute_value" != "unspecified" && "$attribute_value" != "unset" ]]; then
+    echo "Refusing an export-subst deployment path; no remote command ran." >&2
+    exit 78
+  fi
   snapshot_path="$SYNC_SOURCE/$tracked_path"
   if [[ ! -f "$snapshot_path" ]]; then
     echo "Committed deployment snapshot omitted or changed a tracked path; no remote command ran." >&2
     exit 78
   fi
+  if [[
+    ( "$tracked_mode" == "100755" && ! -x "$snapshot_path" )
+    || ( "$tracked_mode" == "100644" && -x "$snapshot_path" )
+  ]]; then
+    echo "Committed deployment snapshot changed a tracked executable mode; no remote command ran." >&2
+    exit 78
+  fi
+  git -C "$GIT_ROOT" cat-file blob "$tracked_oid" > "$TRACKED_BLOB"
+  if ! cmp -s "$TRACKED_BLOB" "$snapshot_path"; then
+    echo "Committed deployment snapshot differs from an exact Git blob; no remote command ran." >&2
+    exit 78
+  fi
 done < "$TRACKED_MANIFEST"
+SNAPSHOT_FILE_COUNT=0
+while IFS= read -r -d '' snapshot_file; do
+  ((SNAPSHOT_FILE_COUNT += 1))
+done < <(find "$SYNC_SOURCE" -type f -print0)
+if [[ "$SNAPSHOT_FILE_COUNT" -ne "$TRACKED_FILE_COUNT" ]]; then
+  echo "Committed deployment snapshot contains an untracked file; no remote command ran." >&2
+  exit 78
+fi
+if ! python3 -I "$SYNC_SOURCE/scripts/check_repo_hygiene.py" \
+  --start "$GIT_ROOT" \
+  --tree "$DEPLOY_COMMIT" \
+  --tree-prefix "$APP_REPO_PATH" \
+  --redact-paths; then
+  echo "Resolved release tree failed deployment hygiene; no remote command ran." >&2
+  exit 78
+fi
+if ! bash -n "$SYNC_SOURCE/deploy/sync_to_pi.sh"; then
+  echo "Committed sync script failed its syntax precheck; no remote command ran." >&2
+  exit 78
+fi
+if ! bash -n "$SYNC_SOURCE/deploy/pi_release.sh"; then
+  echo "Committed release helper failed its syntax precheck; no remote command ran." >&2
+  exit 78
+fi
 
-STATE_PATHS=()
-if [[ "$SYNC_STATE" == "1" && "${#STATE_SOURCE_PATHS[@]}" -gt 0 ]]; then
-  STATE_SNAPSHOT="$SNAPSHOT_ROOT/state"
-  mkdir -m 700 "$STATE_SNAPSHOT"
-  for state_source in "${STATE_SOURCE_PATHS[@]}"; do
-    state_name="${state_source##*/}"
-    cp -pP -- "$state_source" "$STATE_SNAPSHOT/$state_name"
-    state_snapshot_path="$STATE_SNAPSHOT/$state_name"
-    if [[ -L "$state_snapshot_path" || ! -f "$state_snapshot_path" ]]; then
-      echo "Private state changed while its snapshot was created." >&2
+ARCHIVE_SHA256="$(shasum -a 256 "$CODE_ARCHIVE" | awk '{print $1}')"
+if [[ ! "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Could not resolve a canonical SHA-256 release archive identity." >&2
+  exit 78
+fi
+RELEASE_ID="$DEPLOY_COMMIT-$ARCHIVE_SHA256"
+RELEASE_HELPER="$SYNC_SOURCE/deploy/pi_release.sh"
+SNAPSHOT_TOKEN="${SNAPSHOT_ROOT##*.}"
+UPLOAD_TOKEN="$DEPLOY_COMMIT.$$.$SNAPSHOT_TOKEN"
+if [[
+  ! "$UPLOAD_TOKEN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$
+  || "$UPLOAD_TOKEN" == *".."*
+]]; then
+  echo "Could not create a safe release operation token." >&2
+  exit 78
+fi
+
+if [[ "${SYNC_DELETE:-0}" == "1" ]]; then
+  echo "SYNC_DELETE=1 is obsolete for clean versioned releases and has no effect." >&2
+fi
+
+run_remote_release_action() {
+  local remote_command="bash -s --"
+  local remote_argument
+  local quoted_argument
+  for remote_argument in "$@"; do
+    if [[ ! "$remote_argument" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+      echo "Unsafe remote release argument was rejected." >&2
       exit 78
     fi
-    chmod 600 "$state_snapshot_path"
-    STATE_PATHS+=("$state_snapshot_path")
+    printf -v quoted_argument '%q' "$remote_argument"
+    remote_command+=" $quoted_argument"
   done
+  ssh -- "$PI_TARGET" "$remote_command" < "$RELEASE_HELPER"
+}
+
+if [[ -n "$ROLLBACK_RELEASE" ]]; then
+  echo "Requesting verified rollback to $ROLLBACK_RELEASE"
+  run_remote_release_action \
+    rollback "$PI_DIR" "$ROLLBACK_RELEASE" "$UPLOAD_TOKEN"
+  echo "Rollback selected release $ROLLBACK_RELEASE; no service was restarted."
+  exit 0
 fi
 
-DELETE_ARG=""
-if [[ "${SYNC_DELETE:-0}" == "1" ]]; then
-  DELETE_ARG="--delete"
+echo "Preparing owner-read-only, reverified release $RELEASE_ID"
+EXPECTED_GENERATION="$(
+  run_remote_release_action prepare "$PI_DIR" "$UPLOAD_TOKEN"
+)"
+if [[
+  "$EXPECTED_GENERATION" != "missing"
+  && ! "$EXPECTED_GENERATION" =~ ^[0-9a-f]{64}$
+]]; then
+  echo "Remote prepare did not return a canonical current generation." >&2
+  exit 78
 fi
+rsync -az -- \
+  "$CODE_ARCHIVE" \
+  "$PI_TARGET:$PI_DIR/incoming/$UPLOAD_TOKEN.tar"
+run_remote_release_action \
+  install "$PI_DIR" "$RELEASE_ID" "$DEPLOY_COMMIT" \
+  "$ARCHIVE_SHA256" "$UPLOAD_TOKEN"
 
-echo "Syncing immutable commit $DEPLOY_COMMIT"
-ssh -- "$PI_TARGET" "mkdir -p '$PI_DIR'"
-
-rsync -az ${DELETE_ARG:+"$DELETE_ARG"} \
-  --include 'live_trading/dashboard_template.html' \
-  --exclude '.git/' \
-  --exclude '.venv/' \
-  --exclude 'venv/' \
-  --exclude '.direnv/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  --exclude '.DS_Store' \
-  --exclude 'logs/' \
-  --exclude 'daily_log/' \
-  --exclude 'executed_order_tracker/' \
-  --exclude '_option_data_legacy_backup/' \
-  --exclude 'backtest_cache/' \
-  --exclude 'backtest_logs/' \
-  --exclude 'audit_plots/' \
-  --exclude 's_and_p_data/' \
-  --exclude 'regime_review_2025/' \
-  --exclude 'option_value_plot/' \
-  --exclude 'python_client.log*' \
-  --exclude 'server_log.txt' \
-  --exclude 'ngrok.log' \
-  --exclude 'dashboard_requests.log' \
-  --exclude '.etrade_oauth*' \
-  --exclude 'etrade_session.json*' \
-  --exclude '.etrade_session.json*' \
-  --exclude 'config.ini*' \
-  --exclude 'credentials.json*' \
-  --exclude '.netrc' \
-  --exclude '.pypirc' \
-  --exclude '.aws/' \
-  --exclude '.ssh/' \
-  --exclude '*.key*' \
-  --exclude '*.pem*' \
-  --exclude '*.p12*' \
-  --exclude '*.pfx*' \
-  --exclude '.env*' \
-  --exclude '*.env*' \
-  --exclude '*.db*' \
-  --exclude '*.sqlite*' \
-  --exclude '*.pkl*' \
-  --exclude '*.pickle*' \
-  --exclude '*.numbers*' \
-  --exclude '*.parquet*' \
-  --exclude '*.json*' \
-  --exclude '*.csv*' \
-  --exclude '*.png' \
-  --exclude '*.html' \
-  --exclude '*.log*' \
-  --exclude '*.bak*' \
-  --exclude '*.backup' \
-  --exclude '*.old' \
-  --exclude '*.tmp*' \
-  --exclude '*.swp*' \
-  --exclude '*.swo*' \
-  --exclude '*.save*' \
-  --exclude '*~' \
-  --exclude 'backtesting/reports/' \
-  --exclude 'backtesting/.engine_snapshots/' \
-  -- \
-  "$SYNC_SOURCE/" "$PI_TARGET:$PI_DIR/"
-
-if [[ "$SYNC_STATE" == "1" ]]; then
-  if [[ "${#STATE_PATHS[@]}" -gt 0 ]]; then
-    rsync -az -- "${STATE_PATHS[@]}" "$PI_TARGET:$PI_DIR/"
-  else
-    echo "No private runtime state files found to sync."
-  fi
-fi
+run_remote_release_action \
+  activate "$PI_DIR" "$RELEASE_ID" "$EXPECTED_GENERATION" "$UPLOAD_TOKEN"
+echo "Activated release $RELEASE_ID; no service was restarted."

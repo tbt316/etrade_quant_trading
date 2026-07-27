@@ -204,6 +204,48 @@ def test_temp_repository_reports_sorted_index_violations(
     assert captured.err.splitlines() == expected_lines
 
 
+def test_exact_tree_scan_allows_safe_json_and_redacts_secret_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _init_repo(tmp_path)
+    _git(repo, "config", "user.email", "hygiene@example.invalid")
+    _git(repo, "config", "user.name", "Hygiene Test")
+    _write(
+        repo,
+        ".gitignore",
+        "application/docs/*.json\napplication/.env\n",
+    )
+    _write(repo, "application/docs/review_protocol.json", "{}\n")
+    _write(repo, "application/.env", "SECRET_VALUE=do-not-print\n")
+    _git(repo, "add", "--force", ".")
+    _git(repo, "commit", "--quiet", "-m", "exact tree fixture")
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    result = hygiene.scan_tree(repo, commit, prefix="application")
+
+    assert result.tracked_path_count == 2
+    assert tuple(item.path for item in result.diagnostics) == (
+        "application/.env",
+    )
+    assert hygiene.main(
+        [
+            "--start",
+            str(repo),
+            "--tree",
+            commit,
+            "--tree-prefix",
+            "application",
+            "--redact-paths",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert ".env" not in captured.err
+    assert "do-not-print" not in captured.err
+    assert "violating paths are redacted" in captured.err
+
+
 def test_symbolic_link_index_mode_is_rejected(
     tmp_path: Path,
 ) -> None:

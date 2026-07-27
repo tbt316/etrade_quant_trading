@@ -86,10 +86,11 @@ Python source. Raw broker mutation remains permitted only in the hardened
 transport and exact transport calls only in the gateway. Service installation
 and remote restart are suspended.
 The current local dashboard settings are intentionally rejected until stronger
-credentials are provisioned. GitHub reports the repository as public on
-2026-07-26, and OAuth keys retained in its public history must be treated as
-compromised: external revoke/rotate is required, followed by a coordinated
-history purge and downstream cleanup. No live service restart, deployment,
+credentials are provisioned. The user reports that the repository was made
+private on 2026-07-26, and authenticated SSH pushes now succeed. Privacy limits
+future visibility but does not undo prior public exposure: OAuth keys retained
+in Git history must be treated as compromised, requiring external revoke/rotate
+followed by a coordinated history purge and downstream cleanup. No live service restart, deployment,
 E*TRADE mutation, deployed restart, or exact deployed-dashboard verification
 has been performed. The exact broker-isolated local handler and signed
 positions artifact were inspected at desktop and mobile widths for R8e-B,
@@ -901,8 +902,9 @@ operation. Its PR #28 clean CI job passed 134 tests.
 
 R6/R7f have not restarted or inspected the deployed dashboard, called E*TRADE, or
 exercised a live/sandbox mutation. Current-source credential removal also does
-not establish secret hygiene while the repository remains public and the old
-keys remain in Git history. External revoke/rotate, coordinated history purge,
+not establish secret hygiene merely because the repository is now reported
+private while the old keys remain in Git history. External revoke/rotate,
+coordinated history purge,
 strong local credential reprovisioning, the remaining R7
 partial/complex-state protocols, durable-gateway composition, and deployment
 verification remain required. The isolated R7 stack has focused deterministic

@@ -14,13 +14,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "deploy" / "install_pi_service.sh"
 BOOTSTRAP = REPO_ROOT / "deploy" / "pi_bootstrap.sh"
 SYNC = REPO_ROOT / "deploy" / "sync_to_pi.sh"
+RELEASE_HELPER = REPO_ROOT / "deploy" / "pi_release.sh"
+HYGIENE_CHECKER = REPO_ROOT / "scripts" / "check_repo_hygiene.py"
 
 
 def _write_probe(bin_dir: Path, name: str, marker: Path) -> None:
     probe = bin_dir / name
+    prepare_result = ""
+    if name == "ssh":
+        prepare_result = (
+            "if [[ \"$*\" == *\" prepare \"* ]]; then\n"
+            "  printf '%s\\n' missing\n"
+            "fi\n"
+        )
     probe.write_text(
         "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' {shlex.quote(name)} >> {shlex.quote(str(marker))}\n",
+        f"printf '%s\\n' {shlex.quote(name)} >> {shlex.quote(str(marker))}\n"
+        f"{prepare_result}",
         encoding="utf-8",
     )
     probe.chmod(probe.stat().st_mode | stat.S_IXUSR)
@@ -62,6 +72,18 @@ def _clean_sync_fixture(tmp_path: Path) -> tuple[Path, Path]:
     script = application / "deploy" / "sync_to_pi.sh"
     script.parent.mkdir(parents=True)
     script.write_text(SYNC.read_text(encoding="utf-8"), encoding="utf-8")
+    release_helper = application / "deploy" / "pi_release.sh"
+    release_helper.write_text(
+        RELEASE_HELPER.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    release_helper.chmod(release_helper.stat().st_mode | stat.S_IXUSR)
+    hygiene_checker = application / "scripts" / "check_repo_hygiene.py"
+    hygiene_checker.parent.mkdir()
+    hygiene_checker.write_text(
+        HYGIENE_CHECKER.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     (application / "safe.py").write_text("committed = True\n", encoding="utf-8")
     (repository / ".gitignore").write_text(
         "etrade_python_client/.env\n",
@@ -82,27 +104,15 @@ def _write_snapshot_rsync_probe(
     required_name: str,
     forbidden_names: tuple[str, ...],
     expected_delete_count: int = 0,
-    required_excludes: tuple[str, ...] = (),
 ) -> None:
     probe = bin_dir / "rsync"
     forbidden_checks = "\n".join(
         (
-            f"if [[ -e \"$source_dir/{name}\" ]]; then "
+            f"if tar -tf \"$source_archive\" | grep -Fqx {shlex.quote(name)}; then "
             f"echo forbidden:{shlex.quote(name)} >> {shlex.quote(str(marker))}; "
             "exit 91; fi"
         )
         for name in forbidden_names
-    )
-    exclude_checks = "\n".join(
-        (
-            "exclude_found=0\n"
-            "for argument in \"${args[@]}\"; do\n"
-            f"  if [[ \"$argument\" == {shlex.quote(pattern)} ]]; then "
-            "exclude_found=1; fi\n"
-            "done\n"
-            "test \"$exclude_found\" -eq 1"
-        )
-        for pattern in required_excludes
     )
     probe.write_text(
         "#!/usr/bin/env bash\n"
@@ -118,50 +128,11 @@ def _write_snapshot_rsync_probe(
         "done\n"
         f"test \"$delete_count\" -eq {expected_delete_count}\n"
         "test \"$separator_count\" -eq 1\n"
-        f"{exclude_checks}\n"
-        "source_dir=\"${args[${#args[@]}-2]%/}\"\n"
-        f"test -f \"$source_dir/{required_name}\"\n"
+        "source_archive=\"${args[${#args[@]}-2]}\"\n"
+        "test -f \"$source_archive\"\n"
+        f"tar -tf \"$source_archive\" | grep -Fqx {shlex.quote(required_name)}\n"
         f"{forbidden_checks}\n"
         f"printf '%s\\n' rsync >> {shlex.quote(str(marker))}\n",
-        encoding="utf-8",
-    )
-    probe.chmod(probe.stat().st_mode | stat.S_IXUSR)
-
-
-def _write_state_rsync_probe(
-    bin_dir: Path,
-    marker: Path,
-    *,
-    allowed_names: tuple[str, ...],
-) -> None:
-    probe = bin_dir / "rsync"
-    allowed_cases = "|".join(allowed_names)
-    probe.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        "args=(\"$@\")\n"
-        "source_candidate=\"${args[${#args[@]}-2]%/}\"\n"
-        "if [[ -d \"$source_candidate\" ]]; then\n"
-        "  test -f \"$source_candidate/safe.py\"\n"
-        f"  printf '%s\\n' rsync-code >> {shlex.quote(str(marker))}\n"
-        "  exit 0\n"
-        "fi\n"
-        "after_separator=0\n"
-        "state_count=0\n"
-        "for ((index=0; index < ${#args[@]} - 1; index++)); do\n"
-        "  argument=\"${args[$index]}\"\n"
-        "  if [[ \"$argument\" == \"--\" ]]; then\n"
-        "    after_separator=1\n"
-        "    continue\n"
-        "  fi\n"
-        "  if [[ \"$after_separator\" == \"1\" ]]; then\n"
-        "    name=\"${argument##*/}\"\n"
-        f"    case \"$name\" in {allowed_cases}) ;; *) exit 94 ;; esac\n"
-        f"    printf 'state:%s\\n' \"$name\" >> {shlex.quote(str(marker))}\n"
-        "    state_count=$((state_count + 1))\n"
-        "  fi\n"
-        "done\n"
-        f"test \"$state_count\" -eq {len(allowed_names)}\n",
         encoding="utf-8",
     )
     probe.chmod(probe.stat().st_mode | stat.S_IXUSR)
@@ -251,22 +222,6 @@ def test_sync_uses_only_the_clean_committed_snapshot(tmp_path: Path) -> None:
         marker,
         required_name="safe.py",
         forbidden_names=(".env", "scratch/rogue.py"),
-        required_excludes=(
-            ".etrade_oauth*",
-            "config.ini*",
-            ".netrc",
-            ".aws/",
-            "*.key*",
-            "*.db*",
-            "*.sqlite*",
-            "*.json*",
-            "*.parquet*",
-            "*.log*",
-            "*.bak*",
-            "*.backup",
-            "*.old",
-            "*~",
-        ),
     )
 
     completed = subprocess.run(
@@ -280,21 +235,73 @@ def test_sync_uses_only_the_clean_committed_snapshot(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     commands = marker.read_text(encoding="utf-8").splitlines()
-    assert commands == ["ssh", "rsync"]
-    assert "Syncing immutable commit" in completed.stdout
+    assert commands == ["ssh", "rsync", "ssh", "ssh"]
+    assert "Preparing owner-read-only, reverified release" in completed.stdout
+    assert "no service was restarted" in completed.stdout
     assert list(snapshot_tmp.glob("etrade-code-snapshot.*")) == []
 
 
-def test_sync_delete_flag_is_passed_exactly_once(tmp_path: Path) -> None:
+def test_sync_rejects_a_tracked_secret_before_remote_actions_without_naming_it(
+    tmp_path: Path,
+) -> None:
     application, script = _clean_sync_fixture(tmp_path)
+    secret_path = application / ".env"
+    secret_value = "API_SECRET=must-not-leak"
+    secret_path.write_text(f"{secret_value}\n", encoding="utf-8")
+    _git(
+        application.parent,
+        "add",
+        "--force",
+        "etrade_python_client/.env",
+    )
+    _git(application.parent, "commit", "--quiet", "-m", "secret fixture")
     environment, marker = _probe_environment(tmp_path)
-    environment["SYNC_DELETE"] = "1"
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        cwd=application,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 78
+    assert "failed deployment hygiene" in completed.stderr
+    assert "violating paths are redacted" in completed.stderr
+    assert secret_path.name not in combined_output
+    assert secret_value not in combined_output
+    assert not marker.exists()
+
+
+def test_sync_allows_safe_tracked_json_even_when_ignore_rules_match(
+    tmp_path: Path,
+) -> None:
+    application, script = _clean_sync_fixture(tmp_path)
+    safe_json = application / "docs" / "review_protocol.json"
+    safe_json.parent.mkdir()
+    safe_json.write_text('{"status":"safe-static-contract"}\n', encoding="utf-8")
+    gitignore = application.parent / ".gitignore"
+    gitignore.write_text(
+        gitignore.read_text(encoding="utf-8")
+        + "etrade_python_client/docs/*.json\n",
+        encoding="utf-8",
+    )
+    _git(
+        application.parent,
+        "add",
+        "--force",
+        ".gitignore",
+        "etrade_python_client/docs/review_protocol.json",
+    )
+    _git(application.parent, "commit", "--quiet", "-m", "safe JSON fixture")
+    environment, marker = _probe_environment(tmp_path)
     _write_snapshot_rsync_probe(
         tmp_path / "bin",
         marker,
-        required_name="safe.py",
+        required_name="docs/review_protocol.json",
         forbidden_names=(),
-        expected_delete_count=1,
     )
 
     completed = subprocess.run(
@@ -307,7 +314,45 @@ def test_sync_delete_flag_is_passed_exactly_once(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert marker.read_text(encoding="utf-8").splitlines() == ["ssh", "rsync"]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "ssh",
+        "rsync",
+        "ssh",
+        "ssh",
+    ]
+
+
+def test_sync_delete_compatibility_flag_cannot_mutate_a_clean_release(
+    tmp_path: Path,
+) -> None:
+    application, script = _clean_sync_fixture(tmp_path)
+    environment, marker = _probe_environment(tmp_path)
+    environment["SYNC_DELETE"] = "1"
+    _write_snapshot_rsync_probe(
+        tmp_path / "bin",
+        marker,
+        required_name="safe.py",
+        forbidden_names=(),
+        expected_delete_count=0,
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        cwd=application,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "ssh",
+        "rsync",
+        "ssh",
+        "ssh",
+    ]
+    assert "obsolete" in completed.stderr
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -448,7 +493,7 @@ def test_sync_rejects_symbolic_link_state_before_remote_actions(
     )
 
     assert completed.returncode == 78
-    assert "Refusing symbolic-link state file" in completed.stderr
+    assert "state sync is suspended" in completed.stderr
     assert not marker.exists()
 
 
@@ -469,7 +514,7 @@ def test_sync_rejects_non_regular_state_before_remote_actions(
     )
 
     assert completed.returncode == 78
-    assert "Refusing non-regular state path" in completed.stderr
+    assert "state sync is suspended" in completed.stderr
     assert not marker.exists()
 
 
@@ -493,7 +538,7 @@ def test_sync_rejects_committed_code_symlink_before_remote_actions(
     )
 
     assert completed.returncode == 78
-    assert "contains a symbolic link" in completed.stderr
+    assert "contains an unsafe file type" in completed.stderr
     assert not marker.exists()
 
 
@@ -522,25 +567,25 @@ def test_sync_rejects_git_attribute_archive_omission_before_remote_actions(
     assert not marker.exists()
 
 
-def test_sync_state_transfers_only_regular_allowlisted_files(
+def test_sync_rejects_git_attribute_export_substitution_before_remote_actions(
     tmp_path: Path,
 ) -> None:
     application, script = _clean_sync_fixture(tmp_path)
-    (application / "config.ini").write_text("local config\n", encoding="utf-8")
-    (application / "nudge_state.json").write_text("{}\n", encoding="utf-8")
-    (application / "unlisted_state.json").write_text(
-        "{}\n",
+    (application / "safe.py").write_text(
+        "commit = '$Format:%H$'\n",
+        encoding="utf-8",
+    )
+    _git(application.parent, "add", "etrade_python_client/safe.py")
+    _git(application.parent, "commit", "--quiet", "-m", "add format marker")
+    attributes = application.parent / ".git" / "info" / "attributes"
+    attributes.write_text(
+        "etrade_python_client/safe.py export-subst\n",
         encoding="utf-8",
     )
     environment, marker = _probe_environment(tmp_path)
-    _write_state_rsync_probe(
-        tmp_path / "bin",
-        marker,
-        allowed_names=("config.ini", "nudge_state.json"),
-    )
 
     completed = subprocess.run(
-        ["bash", str(script), "--state"],
+        ["bash", str(script)],
         cwd=application,
         env=environment,
         text=True,
@@ -548,13 +593,96 @@ def test_sync_state_transfers_only_regular_allowlisted_files(
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert marker.read_text(encoding="utf-8").splitlines() == [
-        "ssh",
-        "rsync-code",
-        "state:config.ini",
-        "state:nudge_state.json",
-    ]
+    assert completed.returncode == 78
+    assert "export-subst deployment path" in completed.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation_command", "expected_message"),
+    [
+        (
+            "printf '%s\\n' 'archive_mutation = True' "
+            '> "$mutation_root/safe.py"',
+            "differs from an exact Git blob",
+        ),
+        (
+            'chmod 755 "$mutation_root/safe.py"',
+            "changed a tracked executable mode",
+        ),
+        (
+            "printf '%s\\n' 'ambient = True' "
+            '> "$mutation_root/ambient.py"',
+            "contains an untracked file",
+        ),
+    ],
+)
+def test_sync_rejects_an_archive_tree_that_differs_from_exact_git(
+    tmp_path: Path,
+    mutation_command: str,
+    expected_message: str,
+) -> None:
+    application, script = _clean_sync_fixture(tmp_path)
+    environment, marker = _probe_environment(tmp_path)
+    actual_git = shutil.which("git")
+    assert actual_git is not None
+    git_probe = tmp_path / "bin" / "git"
+    git_probe.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "is_archive=0\n"
+        "archive_path=''\n"
+        "for argument in \"$@\"; do\n"
+        "  if [[ \"$argument\" == archive ]]; then is_archive=1; fi\n"
+        "  if [[ \"$argument\" == --output=* ]]; then\n"
+        "    archive_path=\"${argument#--output=}\"\n"
+        "  fi\n"
+        "done\n"
+        f"{shlex.quote(actual_git)} \"$@\"\n"
+        "if [[ \"$is_archive\" == 1 ]]; then\n"
+        "  mutation_root=\"$(mktemp -d)\"\n"
+        "  trap 'rm -rf -- \"$mutation_root\"' EXIT\n"
+        "  tar -xf \"$archive_path\" -C \"$mutation_root\"\n"
+        f"  {mutation_command}\n"
+        "  tar -cf \"$archive_path\" -C \"$mutation_root\" .\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    git_probe.chmod(git_probe.stat().st_mode | stat.S_IXUSR)
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        cwd=application,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert expected_message in completed.stderr
+    assert not marker.exists()
+
+
+def test_sync_state_is_suspended_before_git_snapshot_or_remote_actions(
+    tmp_path: Path,
+) -> None:
+    environment, marker = _probe_environment(tmp_path)
+    for command in ("git", "tar", "mktemp"):
+        _write_probe(tmp_path / "bin", command, marker)
+
+    completed = subprocess.run(
+        ["bash", str(SYNC), "--state"],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert "state sync is suspended" in completed.stderr
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -647,7 +775,7 @@ def test_archive_failure_cleans_snapshot_before_any_remote_action(
 
 
 def test_deployment_scripts_are_valid_bash() -> None:
-    for script in (INSTALLER, BOOTSTRAP, SYNC):
+    for script in (INSTALLER, BOOTSTRAP, SYNC, RELEASE_HELPER):
         completed = subprocess.run(
             ["bash", "-n", str(script)],
             cwd=REPO_ROOT,

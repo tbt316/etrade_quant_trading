@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Fail when generated, runtime, or local-secret state is tracked by Git.
 
-The checker examines only the repository index. It deliberately does not walk
-the working tree or inspect file contents, so ignored local credentials and
-runtime artifacts neither leak into diagnostics nor make the result depend on
-workstation state.
+The default checker examines only the repository index. Deployment callers may
+instead select one exact Git tree and an optional literal path prefix. Neither
+mode walks the working tree or inspects file contents.
 """
 
 from __future__ import annotations
@@ -209,6 +208,34 @@ def tracked_paths(root: Path) -> tuple[str, ...]:
     return _decode_git_paths(payload, description="Git index")
 
 
+def tracked_tree_paths(
+    root: Path,
+    object_id: str,
+    *,
+    prefix: str = "",
+) -> tuple[str, ...]:
+    """Return regular path names from one exact Git object tree."""
+
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id):
+        raise RepositoryConfigurationError(
+            "exact-tree scan requires a canonical Git object identity"
+        )
+    arguments = ["ls-tree", "-r", "-z", "--name-only", object_id]
+    if prefix:
+        pure_prefix = PurePosixPath(prefix)
+        if (
+            pure_prefix.is_absolute()
+            or ".." in pure_prefix.parts
+            or str(pure_prefix) != prefix
+        ):
+            raise RepositoryConfigurationError(
+                "exact-tree prefix must be a normalized relative path"
+            )
+        arguments.extend(("--", f":(literal){prefix}"))
+    payload = _run_git(arguments, cwd=root)
+    return _decode_git_paths(payload, description="exact Git tree")
+
+
 def tracked_ignored_paths(root: Path) -> tuple[str, ...]:
     """Return indexed paths that also match Git's standard ignore rules."""
 
@@ -403,6 +430,31 @@ def scan_repository(start: Path) -> ScanResult:
     )
 
 
+def scan_tree(
+    start: Path,
+    object_id: str,
+    *,
+    prefix: str = "",
+) -> ScanResult:
+    """Scan semantic release policy against one exact resolved Git tree."""
+
+    _validate_git_environment()
+    root = resolve_git_root(start)
+    paths = tracked_tree_paths(root, object_id, prefix=prefix)
+    diagnostics = tuple(
+        sorted(
+            Diagnostic(path, "FORBIDDEN_PATH", reason)
+            for path in paths
+            if (reason := semantic_forbidden_reason(path)) is not None
+        )
+    )
+    return ScanResult(
+        root=root,
+        tracked_path_count=len(paths),
+        diagnostics=diagnostics,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -416,24 +468,75 @@ def _parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="path inside the repository (default: current working directory)",
     )
+    parser.add_argument(
+        "--tree",
+        help="scan one exact 40- or 64-hex Git object identity instead of the index",
+    )
+    parser.add_argument(
+        "--tree-prefix",
+        default="",
+        help="literal repository-relative prefix used only with --tree",
+    )
+    parser.add_argument(
+        "--redact-paths",
+        action="store_true",
+        help="do not print violating path names or configuration details",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.tree_prefix and not args.tree:
+        if args.redact_paths:
+            print(
+                "repository hygiene configuration error; details redacted.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "repository hygiene configuration error: "
+                "--tree-prefix requires --tree",
+                file=sys.stderr,
+            )
+        return 2
     try:
-        result = scan_repository(args.start)
+        if args.tree:
+            result = scan_tree(
+                args.start,
+                args.tree,
+                prefix=args.tree_prefix,
+            )
+        else:
+            result = scan_repository(args.start)
     except RepositoryConfigurationError as exc:
-        print(f"repository hygiene configuration error: {exc}", file=sys.stderr)
+        if args.redact_paths:
+            print(
+                "repository hygiene configuration error; details redacted.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"repository hygiene configuration error: {exc}", file=sys.stderr)
         return 2
 
     if result.diagnostics:
-        for diagnostic in result.diagnostics:
-            print(diagnostic.render(), file=sys.stderr)
+        if args.redact_paths:
+            print(
+                "repository hygiene policy rejected the selected Git tree; "
+                "violating paths are redacted.",
+                file=sys.stderr,
+            )
+        else:
+            for diagnostic in result.diagnostics:
+                print(diagnostic.render(), file=sys.stderr)
         print(
             (
-                "repository index hygiene failed with "
-                f"{len(result.diagnostics)} violation(s)."
+                (
+                    "selected Git tree hygiene failed with "
+                    if args.tree
+                    else "repository index hygiene failed with "
+                )
+                + f"{len(result.diagnostics)} violation(s)."
             ),
             file=sys.stderr,
         )
@@ -441,8 +544,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         (
-            "repository index hygiene passed for "
-            f"{result.tracked_path_count} tracked path(s)."
+            (
+                "selected Git tree hygiene passed for "
+                if args.tree
+                else "repository index hygiene passed for "
+            )
+            + f"{result.tracked_path_count} tracked path(s)."
         )
     )
     return 0
