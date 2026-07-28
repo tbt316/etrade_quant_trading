@@ -867,11 +867,15 @@ class ContractReferenceClientTruthTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     def _client(self, *, offline_only: bool = False) -> MassiveAPIClient:
-        return MassiveAPIClient(
-            self.cache,
-            api_key="test-secret-key",
-            offline_only=offline_only,
-        )
+        with patch.dict(
+            massive_client_module.os.environ,
+            {"MASSIVE_OFFLINE_ONLY": "0"},
+        ):
+            return MassiveAPIClient(
+                self.cache,
+                api_key="placeholder",
+                offline_only=offline_only,
+            )
 
     def _only_attempt(self) -> dict:
         row = self.cache._meta().execute(
