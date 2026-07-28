@@ -91,6 +91,44 @@ def require_nyse_session_index(index) -> None:
         )
 
 
+def require_open_nyse_session(check_datetime: datetime) -> datetime:
+    """Return the exact close of the containing NYSE regular session."""
+
+    if (
+        type(check_datetime) is not datetime
+        or check_datetime.tzinfo is not timezone.utc
+    ):
+        raise MarketSessionUnavailable(
+            "INVALID_NYSE_SESSION_TIMESTAMP"
+        )
+    try:
+        schedule = _nyse_schedule(
+            start_date=check_datetime.date(),
+            end_date=check_datetime.date(),
+        )
+    except MarketSessionUnavailable as exc:
+        if exc.code == "NYSE_SESSION_UNAVAILABLE":
+            raise MarketSessionUnavailable(
+                "NYSE_REGULAR_SESSION_CLOSED"
+            ) from exc
+        raise
+    if len(schedule.index) != 1:
+        raise MarketSessionUnavailable(
+            "NYSE_REGULAR_SESSION_CLOSED"
+        )
+    market_open = schedule.iloc[0][
+        "market_open"
+    ].to_pydatetime().astimezone(timezone.utc)
+    market_close = schedule.iloc[0][
+        "market_close"
+    ].to_pydatetime().astimezone(timezone.utc)
+    if not market_open <= check_datetime < market_close:
+        raise MarketSessionUnavailable(
+            "NYSE_REGULAR_SESSION_CLOSED"
+        )
+    return market_close
+
+
 def latest_nyse_session_before(cutoff_date) -> str:
     """Return the final NYSE session strictly before a calendar date."""
 

@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -29,6 +29,7 @@ from live_trading.etrade_broker_transport import (
     SelectedBrokerAccount,
     _ExchangeResult,
 )
+from live_trading.order_domain import OptionContractId
 from live_trading.order_intent_ledger import (
     BrokerReadResponseEvidence,
     OrderIntentLedger,
@@ -459,6 +460,43 @@ def one_page_scan(buying_power: str) -> list[Reply]:
     ]
 
 
+def opening_quote_reply(
+    contracts: tuple[OptionContractId, OptionContractId],
+    *,
+    quote_status: str = "REALTIME",
+) -> Reply:
+    rows = []
+    for index, contract in enumerate(contracts):
+        rows.append(
+            {
+                "dateTimeUTC": "1785168000",
+                "quoteStatus": quote_status,
+                "Product": {
+                    "symbol": contract.symbol,
+                    "securityType": "OPTN",
+                    "callPut": contract.call_put,
+                    "expiryYear": str(contract.expiry.year),
+                    "expiryMonth": str(contract.expiry.month),
+                    "expiryDay": str(contract.expiry.day),
+                    "strikePrice": str(contract.strike),
+                },
+                "All": {
+                    "adjustedFlag": False,
+                    "bid": "1.75" if index == 0 else "0.40",
+                    "ask": "1.75" if index == 0 else "0.60",
+                    "openInterest": "500",
+                    "totalVolume": "50",
+                },
+                "Option": {
+                    "osiKey": contract.osi_key,
+                    "optionMultiplier": "100",
+                    "optionGreeks": {"delta": "-0.20"},
+                },
+            }
+        )
+    return Reply.json({"QuoteResponse": {"QuoteData": rows}})
+
+
 class ETradeBrokerReaderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cases: list[ReaderCase] = []
@@ -546,6 +584,114 @@ class ETradeBrokerReaderTests(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         return json.loads(rows[0]["canonical_result_json"])
+
+    def test_exact_two_leg_quote_read_is_origin_pinned_and_durable(
+        self,
+    ) -> None:
+        contracts = (
+            OptionContractId(
+                symbol="SPY",
+                expiry=date(2026, 8, 21),
+                call_put="PUT",
+                strike=Decimal("505"),
+                osi_key="SPY---260821P00505000",
+                multiplier=Decimal("100"),
+                adjusted=False,
+                deliverables=None,
+            ),
+            OptionContractId(
+                symbol="SPY",
+                expiry=date(2026, 8, 21),
+                call_put="PUT",
+                strike=Decimal("500"),
+                osi_key="SPY---260821P00500000",
+                multiplier=Decimal("100"),
+                adjusted=False,
+                deliverables=None,
+            ),
+        )
+        case = self.case([opening_quote_reply(contracts)])
+
+        result = case.reader.read_opening_quotes(
+            case.account, contracts
+        )
+
+        self.assertTrue(result.snapshot.complete)
+        self.assertEqual(
+            {quote.contract for quote in result.snapshot.quotes},
+            set(contracts),
+        )
+        self.assertEqual(
+            [(quote.bid_cents, quote.ask_cents)
+             for quote in result.snapshot.quotes],
+            [(40, 60), (175, 175)],
+        )
+        self.assertEqual(len(case.adapter.calls), 1)
+        prepared, timeout_seconds = case.adapter.calls[0]
+        parsed = urlsplit(prepared.url)
+        self.assertEqual(
+            f"{parsed.scheme}://{parsed.netloc}", ORIGIN
+        )
+        self.assertTrue(parsed.path.startswith("/v1/market/quote/"))
+        self.assertEqual(
+            parse_qs(parsed.query),
+            {
+                "detailFlag": ["ALL"],
+                "overrideSymbolCount": ["false"],
+                "skipMiniOptionsCheck": ["true"],
+            },
+        )
+        self.assertEqual(timeout_seconds, 15.0)
+        rows = self.rows(
+            case,
+            """
+            SELECT receipt_sha256, raw_response_sha256, http_status
+            FROM opening_quote_receipts
+            """,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["receipt_sha256"], result.receipt.receipt_sha256)
+        self.assertEqual(rows[0]["http_status"], 200)
+        self.assertEqual(len(rows[0]["raw_response_sha256"]), 64)
+
+    def test_unusable_quote_status_is_not_retained_or_retried(self) -> None:
+        contracts = (
+            OptionContractId(
+                "SPY",
+                date(2026, 8, 21),
+                "PUT",
+                Decimal("505"),
+                "SPY---260821P00505000",
+                Decimal("100"),
+                False,
+                None,
+            ),
+            OptionContractId(
+                "SPY",
+                date(2026, 8, 21),
+                "PUT",
+                Decimal("500"),
+                "SPY---260821P00500000",
+                Decimal("100"),
+                False,
+                None,
+            ),
+        )
+        case = self.case(
+            [opening_quote_reply(contracts, quote_status="CLOSING")]
+        )
+
+        with self.assertRaises(ETradeBrokerReaderIntegrityError):
+            case.reader.read_opening_quotes(case.account, contracts)
+
+        self.assertEqual(len(case.adapter.calls), 1)
+        self.assertEqual(
+            self.rows(
+                case,
+                "SELECT * FROM opening_quote_receipts",
+            ),
+            [],
+        )
 
     def test_get_is_origin_pinned_and_an_ineligible_response_is_not_retried(
         self,

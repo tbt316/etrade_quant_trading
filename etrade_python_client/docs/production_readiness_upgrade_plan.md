@@ -1,6 +1,7 @@
 # E*TRADE System Production-Readiness Review and Upgrade Plan
 
-**Audit date:** 2026-07-25
+**Audit baseline:** 2026-07-25
+**Current-source addendum:** 2026-07-27
 
 **Scope:** live E*TRADE trading, dashboard/API, historical options backtesting,
 market-regime/EV research, packaging, security, CI/CD, deployment, and operations.
@@ -12,11 +13,18 @@ root.
 The repository is **not ready for unattended live trading**. Source-level
 containment now provides exact account/arm checks, durable intent identity,
 restart-safe opening/closing/cancellation state machines, a pure fail-closed
-pre-trade policy, and a static legacy-mutation quarantine. Those components are
-deliberately not composed into the live process. Complete independent portfolio,
-quote, open-order, and aggregate-risk evidence; complex broker-state procedures;
-credential remediation; and deployment/operations acceptance remain stop-ship
-gates.
+pre-trade policy, and a static legacy-mutation quarantine. One deliberately
+narrow capability is now composed into the legacy live process: a supervised
+operator may open a SPY/SPX `PUT` or `CALL` two-leg net-credit vertical through
+a signed short-lived server proposal, independent action-PIN confirmation, and
+the durable gateway. Proposal issuance now requires an open NYSE regular
+session and exact retained, origin-pinned, two-leg `REALTIME` E*TRADE quote
+evidence; final submit obtains fresh account capacity. No repricing, close,
+neutralize, cancel, or automatic worker is restored. The full pure pretrade
+Greeks, concentration, marked-P&L, and regime-authorization policy is not
+composed. Complex broker-state procedures, credential remediation,
+sandbox/live lifecycle proof, and deployment/operations acceptance remain
+stop-ship gates.
 
 Existing regime-aware backtest results are also **not eligible for investment
 claims**. The maintained path now records the five-field causal protocol,
@@ -47,8 +55,9 @@ backtest validity gates exit, regime-aware reports should be labeled
 
 R5 / PR #28 established a clean dependency/import baseline and passed 134 tests
 in clean CI. R6 implements the first live-startup containment slice, and
-R7a–R7f add an isolated durable execution core plus a repository-wide legacy
-mutation quarantine:
+R7a–R7f add a durable execution core plus a repository-wide legacy mutation
+quarantine. The subsequent supervised manual-open restoration composes only a
+narrow opening capability:
 
 - `sandbox` or `production` must be selected explicitly; missing or conflicting
   mode input fails before OAuth construction.
@@ -58,10 +67,29 @@ mutation quarantine:
 - The selected identity and unexpired arm are checked at startup and on account
   refresh. Compatibility-client broker mutations are no longer operative.
 - The dashboard binds to loopback, does not launch ngrok automatically, and
-  does not grant wildcard CORS. It is permanently read-only: auto-open is
-  forced off, execution controls and mutation queue call sites are removed, and
-  retained historical execution routes reject before body parsing or side
-  effects.
+  does not grant wildcard CORS. Auto-open stays forced off. Retained historical
+  execute, close, and neutralize routes reject before body parsing or side
+  effects. The normal preview response may carry one signed executable
+  proposal, and a separate `/api/manual_open` confirmation route can be enabled
+  for supervised SPY/SPX two-leg net-credit opening only.
+- The manual-open route is unavailable unless schema 2 explicitly opts in and
+  the independent runtime environment, exact account, and production arm
+  checks pass. Confirmation requires dashboard authentication, the action PIN,
+  and a current server-signed proposal bound to the exact economics. The
+  service exposes one durable opening submission and no repricing.
+- Proposal issuance treats the legacy option-chain result as candidate identity
+  only. During an open NYSE regular session, it retains one origin-pinned
+  E*TRADE response for both exact OSI contracts and requires `REALTIME` status,
+  usable NBBOs, exchange timestamps, freshness, and at most five seconds of
+  leg skew before deriving the signed midpoint credit. It does not read
+  account capacity until final submission.
+- Schema 18 added independent account-capacity and New York calendar-day
+  authorization budgets. Schema 19 replaces its V1 arithmetic with policy V2:
+  fresh capacity never adds represented managed risk to raw broker buying
+  power and subtracts external plus represented managed filled risk from the
+  immutable account budget. V1 is replay-only. Migration fails/releases only
+  pristine untraced V1 reservations; traced work becomes
+  `SUBMISSION_UNKNOWN` and retains risk.
 - Hardcoded OAuth credentials were removed from the current versions of two
   legacy utilities in favor of local configuration or environment variables.
 - Shared client logs use owner-only files and retain only redacted headers plus
@@ -81,8 +109,9 @@ source/file freshness, has no writer or broker capability, and pins its iframe
 to the SHA-256 reported by status so an intervening replacement returns a
 fail-closed conflict rather than mixed data.
 
-The subsequent production-readiness slices extend that baseline with schema-17
-durable closing and per-intent cancellation, crash-safe one-send fences,
+The subsequent production-readiness slices extend that baseline with the
+schema-19 ledger (including historical schema-17 durable closing/cancellation
+records), crash-safe one-send fences,
 terminal capacity absorption, a deterministic pre-trade risk domain,
 append-only non-authorizing opening-risk evidence, replayable quote/capacity
 lineage, exact current-content secret gates, contract-reference cache truth,
@@ -90,24 +119,28 @@ strict multi-leg historical NBBO mark evidence, prefix-causal feature
 preparation, and a typed causal regime/backtest bridge. Raw HMM states may
 select only taxonomy-matched resolved return buckets. The final stress overlay
 may only veto new risk or reduce existing exposure. None of these research or
-isolated execution components grants broker-mutation authority.
+advisory components grants broker-mutation authority.
 
 These changes do **not** satisfy Phase 0 or make the repository production
-ready. R7a–R7e preserve the arm/account check and add isolated durable intent identity,
+ready. R7a–R7e preserve the arm/account check and add durable intent identity,
 capacity reservations, mutation fencing, direct known-order reconciliation,
-raw read provenance, and exact zero/full terminal-risk absorption, but no live
-caller is composed through that stack. R7f makes 30 legacy mutation surfaces
-exact unconditional tombstones, removes the gateway's public transport
-property, and adds a deterministic AST gate across every tracked application
-Python source. Raw broker mutation remains permitted only in the hardened
-transport and exact transport calls only in the gateway. Service installation
-and remote restart are suspended.
-The current local dashboard settings are intentionally rejected until stronger
-credentials are provisioned. The GitHub repository is currently public. Making
-it private is an external release gate and will not undo prior exposure: OAuth
-keys retained in Git history must be treated as compromised, requiring external
-revoke/rotate followed by a coordinated history purge and downstream clone,
-fork, cache, and build cleanup. No live service restart, deployment,
+raw read provenance, and exact zero/full terminal-risk absorption. The reviewed
+`execution_runtime.py` root now constructs that stack only for
+`ManualOpenService`, which can submit one signed, PIN-confirmed SPY/SPX opening
+proposal. R7f's 30 legacy mutation surfaces remain exact unconditional
+tombstones, the gateway has no public transport property, and a deterministic
+AST gate covers every tracked application Python source. Raw broker mutation
+remains permitted only in the hardened transport and exact transport calls only
+in the gateway. Service installation and remote restart are suspended.
+The current dashboard source rejects weak credentials, rotates an invalid
+legacy authentication master, separately throttles login and PIN failures,
+bounds JSON bodies, domain-separates session/proposal keys, and pins one
+protocol-matched HTML generation per process. Current GitHub repository
+visibility was not externally verified in this review. Making a repository
+private does not undo any prior exposure: OAuth keys that were ever published
+must be treated as compromised, requiring external revoke/rotate followed by a
+coordinated history purge and downstream clone, fork, cache, and build cleanup.
+No live service restart, deployment,
 E*TRADE mutation, deployed restart, or exact deployed-dashboard verification
 has been performed. The exact broker-isolated local handler and signed
 positions artifact were inspected at desktop and mobile widths for R8e-B,
@@ -124,9 +157,10 @@ mount namespace.
 Adjusted or non-100-multiplier options are rejected from the display artifact;
 accepted options bind and show their exact standard-contract OSI identity.
 Standalone collection, hardened service activation, atomic release/rollback
-drills, full risk policy, and live gateway composition remain open. Exact
-closing and per-intent cancellation are implemented only inside the isolated
-durable stack; no live caller can reach them.
+drills, full independent risk policy, and unattended live composition remain
+open. Exact closing and per-intent cancellation are implemented only inside
+the broader durable stack; the supervised dashboard capability cannot reach
+them.
 
 ## What is worth preserving
 
@@ -172,10 +206,15 @@ flowchart LR
     READS --> SCREEN["Portfolio / option screening / EV / GEX"]
     SCREEN --> FILES
     FILES --> HTTP
+    HTTP -->|"schema-2 opt-in; candidate identity"| PROPOSAL["Signed short-lived SPY/SPX proposal"]
+    READS -->|"origin-pinned two-leg REALTIME quote"| PROPOSAL
+    PROPOSAL -->|"login + PIN-confirmed exact economics"| SERVICE["ManualOpenService"]
+    SAFETY["Independent environment / account / production arm"] --> SERVICE
+    SERVICE -->|"one submit_opening; fresh capacity"| CORE["Schema-19 ledger / reader / gateway / transport"]
+    CORE -->|"fenced no-retry opening"| BROKER["E*TRADE"]
     HTTP --> BLOCK["Execution routes reject before body parsing"]
-    LEGACY["Legacy order / close / nudge methods"] --> BLOCK
+    LEGACY["Legacy execute / close / neutralize / auto / nudge methods"] --> BLOCK
     STATIC["Tracked-source mutation gate"] --> LEGACY
-    CORE["R7 durable gateway stack"] -.->|"isolated; not composed"| BROKER["E*TRADE"]
 ```
 
 Historically, most of this flow resided in the 5,787-line
@@ -184,9 +223,11 @@ dashboard, scheduling, market reads, generated HTML, global state, model
 diagnostics, and retained historical order code. `accounts/accounts_bo.py`
 (7,821 lines) combines broker access, option screening, payload construction,
 and dashboard rendering. R7f removes the operative dashboard/scheduler broker
-mutation call sites and tombstones the legacy order methods, so this path is
-now read-only. The monolith remains a maintainability and data-integrity risk,
-but it cannot be treated as an execution service.
+mutation call sites and tombstones the legacy order methods. The process is
+read-only except for the explicitly reviewed supervised manual-open capability;
+it does not restore an automatic scheduler, repricer, close, or neutralize
+worker. The monolith remains a maintainability and data-integrity risk and
+cannot be treated as an unattended production execution service.
 
 ### Backtest and regime path
 
@@ -256,8 +297,9 @@ more advanced but does not close the release gates:
 
 - P0-L1/L2/L4/L5 are source-contained; P0-L3 has a pure typed decision domain;
   P0-L8 has a typed fail-closed model contract. They remain live stop-ships
-  because complete independent evidence and the reviewed live composition root
-  do not exist.
+  because complete independent evidence and a fully authorized unattended live
+  composition do not exist. The narrow supervised manual-open root does not
+  close those gates.
 - P0-L7 has exact index/tree/archive current-content scanning. External
   revoke/rotate, all-ref history remediation, downstream cleanup, and strong
   runtime credential provisioning remain open.
@@ -269,13 +311,16 @@ more advanced but does not close the release gates:
   branch, but merge protection, signed release provenance, and deployment
   acceptance are external gates.
 
-The current source contains a durable centralized gateway and pure risk domain,
-but no live caller can reach them. Release conditions remain open: independent
-authorization-grade inputs and complex-state procedures are incomplete;
-affected OAuth keys have not been revoked or rotated; public history has not
-been purged; and no deployed process has been verified. P0-L1 through P0-L8
-therefore remain release gates even where their isolated source components are
-delivered.
+The current source contains a durable centralized gateway and pure risk domain.
+One live caller reaches the gateway only through the proposal-bound supervised
+SPY/SPX opening service; it does not consume the complete pure-risk evidence
+lineage or expose other gateway mutations. Release conditions remain open:
+independent authorization-grade inputs and complex-state procedures are
+incomplete; affected OAuth keys have not been revoked or rotated; public
+or otherwise distributed history has not been purged; and no deployed process
+or E*TRADE lifecycle has
+been verified. P0-L1 through P0-L8 therefore remain release gates even where
+source components are delivered.
 
 P0-B1/P0-B2 now have an executable containment slice. The backtest requests
 Massive reference contracts by exact trade date, expiration, and option type;
@@ -411,22 +456,28 @@ flowchart TB
 - Strategy, data, model, execution, and risk policies are separate typed
   sections; unknown keys and invalid ranges are errors.
 
-The exact schema-version-1 contract, four-mode capability table, immutable path
-rules, and service-environment/local-fallback secret boundary are documented in
-[`runtime_configuration.md`](runtime_configuration.md). Version 1 deliberately
-grants no broker-mutation authority in any mode. In particular, `live` is an
-unarmed startup declaration and configuration cannot replace the independent
-short-lived production arm.
+The exact schema-version-1/2 contract, four-mode capability table, immutable
+path rules, and service-environment/local-fallback secret boundary are
+documented in [`runtime_configuration.md`](runtime_configuration.md). Version 1
+deliberately grants no broker-mutation capability in any mode. Version 2 may
+opt into supervised manual opening only for an enabled SPY/SPX strategy in
+`sandbox` or `live`, with `model.required_for_entry=false`. That opt-in is not
+authority: `live` remains an unarmed startup declaration, and configuration
+cannot replace the independent runtime arm, exact account proof, dashboard
+authentication/PIN, current signed proposal, or durable gateway checks.
 
 R6 implements a narrow compatibility boundary around the existing monolith:
 explicit environment selection; exact production account identity; a
 versioned, signed arm document with a maximum 15-minute lifetime; refresh-time
-and order-call revalidation; strong dashboard credential validation; and
-owner-only local files. It does not yet provide the complete typed
-configuration model or an OS secret-store integration. The isolated R7
-gateway, transport, reader, and ledger now provide stable intent identity and
-durable reconciliation evidence, but live composition and static enforcement
-must still replace the compatibility order paths.
+and order-call revalidation; strong dashboard credential validation; separate
+login/PIN throttles; bounded JSON bodies; rotation of invalid or
+credential-stale dashboard master secrets; domain-separated session/proposal
+keys; one process-pinned protocol template; and owner-only local files. The
+later typed configuration and static boundary are implemented. The gateway,
+transport, reader, and schema-19 ledger provide stable intent identity and
+durable reconciliation evidence; the reviewed composition root exposes only
+supervised manual opening. Complete independent risk evidence, OS secret-store
+integration, process decomposition, and broader live composition remain open.
 
 ### Boundary 2: E*TRADE gateway
 
@@ -500,12 +551,14 @@ Risk overlays may reduce exposure or block a trade. A crisis/panic state must no
 increase exposure.
 
 Implementation status: `live_trading/pretrade_risk.py` provides the pure typed
-decision and exhaustive fail-closed reason domain. Schema-17 lineage persists
-non-authorizing decisions and replayable quote/capacity evidence. Current
-evidence remains `INDEPENDENT_EVIDENCE_PENDING`; it cannot reserve capacity or
-authorize broker I/O because complete existing-position/open-order aggregates,
-Greeks, marked daily P&L, session counters, and a reviewed live collector are
-not composed.
+decision and exhaustive fail-closed reason domain. Historical schema-16
+lineage, retained in schema 19, persists non-authorizing decisions and
+replayable quote/capacity evidence. Current lineage remains
+`INDEPENDENT_EVIDENCE_PENDING`; it cannot reserve capacity or authorize broker
+I/O because complete existing-position/open-order aggregates, Greeks,
+concentration, marked daily P&L, session counters, and regime authorization are
+not composed. The manual path's reviewed two-leg quote collector proves only
+the signed proposal economics and does not promote that full pure-risk lineage.
 
 ### Boundary 5: durable order state machine
 
@@ -527,13 +580,43 @@ intent, idempotency key, preview, broker IDs, price budget, every transition,
 actor, timestamps, retries, and reconciliation generation. Repricing has one
 owner and absolute slippage/debit/credit/time limits.
 
-Implementation status: schema 17 supports isolated opening and closing
+Implementation status: schema 19 supports isolated opening and closing
 verticals, opening price-only reprice, and one-shot cancellation flows with
 `INTENT`, `CLAIMED`, `FAILED`,
 `SUBMISSION_UNKNOWN`, `SUBMITTED`, and terminal states. Terminal-fill
 absorption is limited to exact zero fills or complete balanced fills with newer
 order-bound position lots or exact closing position deltas;
-partial/replacement/assignment states stay blocked. Live composition remains a
+partial/replacement/assignment states stay blocked. A narrow composition now
+creates one proposal-bound, PIN-confirmed opening command. Proposal issuance
+requires an open NYSE regular session and an exact origin-pinned two-leg
+`REALTIME` quote; final submit obtains fresh capacity.
+
+Schema 18 introduced account-capacity policy V1 and a separate New York
+calendar-day authorization budget. Schema 19 policy V2 uses:
+
+```text
+min(
+  raw broker buying power,
+  max(0, account budget
+         - external position risk
+         - external order risk
+         - represented managed filled risk)
+)
+```
+
+Active local reservations are checked separately. The daily budget counts
+newly authorized maximum loss, not P&L, and a later failure does not refund an
+existing reservation's authorization. V1 is replay-only: pristine untraced V1
+reservations fail/release during migration, while traced work becomes
+`SUBMISSION_UNKNOWN` and retains risk.
+
+The signed `proposal_id` is durable idempotency; the UUID `request_id` is HTTP
+correlation only. The browser uses a 30-second abort, clears recovery state only
+for an exact correlated `NOT_ATTEMPTED`, and treats every malformed,
+mismatched, or ambiguous result as unknown. Periodic status reads local ledger
+state and never polls E*TRADE orders, retries, resubmits, or reprices. The
+service does not expose the isolated repricing, closing, or cancellation flows.
+Full independently evidenced and unattended live composition remains a
 fail-closed release gate.
 
 ### Boundary 6: deterministic backtesting
@@ -593,6 +676,15 @@ fields. Artifacts are written atomically and authenticity-checked before load.
 - Build once, deploy a signed/versioned wheel or image, health-check the new
   version, atomically switch, and retain one-command rollback.
 
+Implementation status: the supervised dashboard now bounds all JSON bodies,
+throttles login and PIN failures, clears/requires the action PIN for exact
+confirmation, rotates its strict 256-bit hex master when legacy settings or
+credentials change, domain-separates session and proposal HMAC keys, and pins
+one protocol-matched HTML template generation at process start. Password
+hashing/SSO, a completed trusted reverse-proxy/TLS deployment, process
+decomposition, `/readyz`, metrics, and deployed activation/rollback drills
+remain open.
+
 ## Sequenced migration
 
 Estimates assume one or two engineers and are planning ranges, not delivery
@@ -628,17 +720,21 @@ Exit gate:
 - The complete maintained offline suite and all static/content gates remain
   green.
 
-R6/R7f status: explicit mode, exact identity, short-lived signed arm,
+R6/R7f plus supervised-manual-open status: explicit mode, exact identity,
+short-lived signed arm,
 refresh-time revalidation, loopback dashboard, restrictive CORS, strong local
 credential checks, owner-only/redacted client logging, unconditional legacy
-mutation tombstones, read-only UI/routes, a tracked-source mutation gate, and
-deployment install/restart suspension are implemented in source. Phase 0
-remains open because no durable gateway is composed into a production process,
-complete independent authorization-grade evidence is unavailable, exposed keys
-still require external revoke/rotate and coordinated history cleanup, the
-current local settings fail the new policy, and no deployed service has been
-restarted or verified. Closing and cancellation now pass deterministic
-restart/crash contracts inside the isolated stack only.
+mutation tombstones, a tracked-source mutation gate, and deployment
+install/restart suspension are implemented in source. The UI remains read-only
+except for the conditional signed-proposal/PIN-confirmed SPY/SPX manual-opening
+flow, which reaches the durable gateway through one narrow service. Phase 0
+remains open because complete independent authorization-grade evidence is
+unavailable, exposed keys still require external revoke/rotate and coordinated
+history cleanup, private settings/service provisioning have not been
+revalidated against the current policy, no E*TRADE sandbox/live lifecycle has
+been exercised, and no deployed service has been restarted or verified.
+Closing, cancellation, and repricing remain unexposed even though their
+isolated contracts have focused deterministic coverage.
 
 ### Phase 1 — reproducible repository baseline (week 1)
 
@@ -693,12 +789,13 @@ resolved relative to the configuration file rather than the process working
 directory. Its packaged example is a valid disabled `paper` configuration and
 contains no credentials. Operational configuration, secret fallbacks, OAuth
 state, arms, databases, and logs remain excluded from release artifacts. R8d
-does not compose the durable gateway and does not change the R7f mutation
-quarantine.
+originally did not compose the durable gateway or change the R7f mutation
+quarantine. The later schema-2/manual-open slice adds an explicit opt-in and a
+separate narrow composition root; it does not weaken the legacy tombstones.
 
 R8e-A composes the first supported process from that contract: a standalone
 read-only operator plane that validates directories before secrets, reads only
-three dashboard environment variables, retains no broker credentials or
+four dashboard environment variables, retains no broker credentials or
 action PIN, and imports no OAuth, broker, provider, or order client. It binds
 only numeric IPv4 loopback, rate-limits login, signs password-bound sessions,
 emits redacted structured request logs, and serves bounded
@@ -714,7 +811,9 @@ writes the legacy CWD position artifact, and that renderer contains scripts
 which the static read-only frame correctly blocks. R8e-B must provide a pure
 static publisher targeting `RuntimePaths.positions_artifact_file`, with atomic
 owner-only writes and exact served-artifact visual verification. No order
-gateway or live service is composed by R8e-A.
+gateway or live service is composed by the standalone R8e-A process. The
+separate supervised manual-open composition belongs to the authenticated
+legacy monitor/dashboard process, not `read_only_dashboard.py`.
 
 Deliver:
 
@@ -747,8 +846,9 @@ Status: partially delivered. R7b–R7e provide the isolated bounded mutation
 transport, strict origin-bound reader, durable raw/parser receipts, explicit
 pagination, lot-aware two-scan capacity manifests, and exact terminal order
 evidence. Shared OAuth recovery, general snapshot read models,
-health/readiness, graceful shutdown, metrics, and live composition remain
-open.
+health/readiness, graceful shutdown, metrics, and full independently evidenced
+live composition remain open. The narrow manual-opening root is not a
+substitute for those foundations.
 
 Deliver:
 
@@ -770,8 +870,8 @@ Exit gate:
 
 ### Phase 3 — durable live control plane (weeks 3–5)
 
-Status: partially delivered. The R7 stack now provides the schema-17 ledger,
-stable opening and closing intent identity, outbox-style send claims,
+Status: partially delivered. The R7 execution stack now runs on the schema-19
+ledger, with stable opening and closing intent identity, outbox-style send claims,
 reconciliation, margin and exact-contract capacity reservations, one isolated
 opening reprice owner, one-shot opening/closing cancellation, and exact
 zero/full terminal-risk absorption. Filled opening margin remains counted, and
@@ -779,8 +879,14 @@ filled closing capacity requires an exact post-position delta before release.
 R7f also removes all current legacy mutation call sites and makes future
 bypasses fail CI. The pure risk decision domain is delivered; independent
 authorization-grade aggregates, partial/complex terminal procedures, process
-decomposition, a single reviewed composition root, dashboard command creation,
-and hardened live deployment remain open.
+decomposition, general dashboard command coverage, and hardened live deployment
+remain open. One reviewed composition root and dashboard command flow now exist
+only for signed, short-lived, PIN-confirmed SPY/SPX credit-spread opening.
+Repricing, closing, neutralization, cancellation, and automated workers remain
+uncomposed. The account and New York calendar-day authorization budgets are
+independent, fresh reservations require capacity policy V2, and the manual
+proposal is backed by exact two-leg `REALTIME` evidence before final-submit
+capacity is read.
 
 Deliver:
 
@@ -892,8 +998,10 @@ branch now contains a cohesive, dependency-ordered integration slice:
 
 1. reproducible packaging, exact-content hygiene, offline artifact CI, and
    strict runtime configuration;
-2. legacy mutation quarantine, durable schema-17 intent/gateway/reader/
-   transport domains, closing/cancellation, and pre-trade evidence lineage;
+2. legacy mutation quarantine, the durable schema-19
+   intent/gateway/reader/transport domains (including the historical
+   schema-17 closing/cancellation slice), pre-trade evidence lineage, and the
+   narrow supervised manual-opening composition;
 3. point-in-time contract containment, cache truth, and strict historical mark
    evidence;
 4. causal Regime V2 shadow infrastructure, prefix-causal HMM preparation,
@@ -903,7 +1011,7 @@ After the exact full gate is green, merge this branch through **one integration
 PR** so CI evaluates the composition as a unit. Do not create twelve stacked
 PRs retroactively. Subsequent changes should again be small and independently
 reviewable, grouped by the remaining gates: provider/entitlement evidence,
-pure simulator and registry, reviewed live composition/complex-state
+pure simulator and registry, complete independent live risk/complex-state
 procedures, and hardened deployment/operations.
 
 The legacy monoliths remain behind reject-only compatibility boundaries.
@@ -911,7 +1019,8 @@ Remove them only after golden tests, shadow/paper evidence, and supervised
 operational acceptance prove the intended replacement behavior.
 
 The current stacked delivery names the source-level startup containment slice
-R6. R7 implements an isolated schema-17 execution core: strict vertical-spread
+R6. R7 originally delivered the isolated execution core through schema 17:
+strict vertical-spread
 validation, stable intent/client identity, durable margin and exact-contract
 capacity reservations, monotonic submission/amendment/cancellation fences,
 exact immutable outbound authorization, a no-retry mutation transport,
@@ -922,14 +1031,20 @@ capacity or reconciliation can use only a semantically complete
 content-addressed manifest. R7f quarantines the old execution system: 30 fixed
 mutation surfaces are reject-only tombstones, raw mutation I/O is statically
 confined to the transport, the gateway exposes no transport, dashboard mutation
-routes and controls are inert, and install/restart tooling fails closed. No
-live caller instantiates the durable stack.
+routes except the reviewed manual-open confirmation are inert, and
+install/restart tooling fails closed. Schema 18 added account and calendar-day
+authorization budgets; schema 19 installs capacity policy V2 and safely
+migrates V1 reservations. The later supervised manual-open slice adds an exact
+two-leg quote-backed signed proposal to the normal spread preview and one new
+confirmation route rather than reviving those surfaces. After independent PIN
+confirmation, it reaches only one durable SPY/SPX `submit_opening` call. It
+exposes no repricing or automatic retry.
 
 Closing-position capacity and per-intent cancellation now pass deterministic
-restart/crash tests. A reviewed live composition root still cannot be enabled
-until complete independent risk evidence, complex-state procedures,
-deployment, and staged sandbox gates pass. The direct-legacy mutation
-prohibition must remain green.
+restart/crash tests, but the dashboard cannot reach them. Broader unattended
+live composition still cannot be enabled until complete independent risk
+evidence, complex-state procedures, deployment, and staged sandbox gates pass.
+The direct-legacy mutation prohibition must remain green.
 See `docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
@@ -972,33 +1087,35 @@ This review used static source/configuration inspection and the existing focused
 offline reliability tests. It did not call E*TRADE, Massive, Yahoo, or Cboe; did
 not submit or alter orders; did not run a full historical backtest; did not
 inspect the deployed Pi; and did not restart the user's deployed dashboard.
-On 2026-07-27 the maintained offline source suite passed **968 tests with one
-skip** under `ETRADE_TEST_NETWORK=deny` and `MASSIVE_OFFLINE_ONLY=1`; that is
-source-level evidence, not provider, deployment, execution, or model-promotion
-evidence. A generated Plotly backtest report was inspected as source, but exact
-browser/canvas visual verification remains incomplete because the available
-in-app browser rejected local-file navigation. No HTML-facing fix is claimed
-from that report.
-R5 later added an isolated browser verification of the actual dashboard handler
-and source template for both a sealed synthetic advisory and the missing-signal
-failure state. That proves the code/HTML path, not deployment or live provider
-operation. Its PR #28 clean CI job passed 134 tests.
+The final maintained offline source-suite result for this integration used
+local Python 3.10:
+`env PYTHONPATH=. ../venv/bin/pytest -q -p no:cacheprovider tests` completed
+with `1052 passed, 2 skipped, 4 warnings` in 172.96 seconds. Source tests and
+local browser inspection of the source-served dashboard are not provider,
+deployment, execution, or model-promotion evidence. Historical R5 verification
+separately inspected the actual local
+dashboard handler/template for a sealed synthetic advisory and a missing-signal
+failure state; its PR #28 clean CI job passed 134 tests. That dated result does
+not cover the current schema-19/manual-open change.
 
-R6/R7f have not restarted or inspected the deployed dashboard, called E*TRADE,
-or exercised a live/sandbox mutation. Current-source credential removal and
-exact-content scanning do not remediate old keys in Git history. The repository
-is currently public; making it private limits future visibility but is not
-credential remediation. External revoke/rotate, coordinated history purge,
+R6/R7f and the supervised manual-open restoration have not restarted or
+inspected the deployed dashboard, called E*TRADE through the restored path, or
+exercised a live/sandbox mutation. Current-source credential removal and
+exact-content scanning do not remediate old keys in Git history. Current
+GitHub visibility was not checked as part of this source review; making a
+repository private may reduce future visibility but is not credential
+remediation. External revoke/rotate, coordinated history purge,
 strong local credential reprovisioning, the remaining R7
-partial/complex-state protocols, durable-gateway composition, and deployment
-verification remain required. The isolated R7 stack has focused deterministic
-coverage and independent causal/security review, including exact closing,
-cancellation, and zero/full terminal absorption, but it has no production call
-site and is not live-execution evidence. R7f was rendered through an isolated
-real local handler and generated positions artifact at desktop and mobile
-widths, and its disabled endpoint returned the fixed `503` schema; this does
-not verify the user's deployed artifact. The remaining actions belong to the
-staged acceptance gates above.
+partial/complex-state protocols, complete independent risk evidence, and
+deployment verification remain required. The R7 stack has focused
+deterministic coverage and independent causal/security review, including exact
+closing, cancellation, and zero/full terminal absorption. Its new production
+call site is deliberately limited to supervised SPY/SPX manual opening and is
+not live-execution evidence. R7f was rendered through an isolated real local
+handler and generated positions artifact at desktop and mobile widths. The
+current manual-open source/template is subject to the same local visual
+verification contract, but neither local result verifies the user's deployed
+artifact. The remaining actions belong to the staged acceptance gates above.
 
 The working tree began heavily modified and contains important untracked local
 work. R8a leaves those files in place and removes only the audited generated

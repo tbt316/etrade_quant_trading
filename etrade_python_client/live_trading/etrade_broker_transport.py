@@ -156,6 +156,7 @@ class BoundBrokerRequest:
     client_order_id: str = field(repr=False)
     target_broker_order_id: str | None = field(repr=False)
     preview_id: str | None = field(repr=False)
+    not_after: datetime | None = field(repr=False)
     authorization_payload_digest: str
     final_xml_bytes: bytes = field(repr=False)
     final_xml_sha256: str
@@ -197,6 +198,13 @@ class BoundBrokerRequest:
             )
         if self.preview_id is not None:
             _broker_numeric_text(self.preview_id, "preview id")
+        if self.not_after is not None and (
+            type(self.not_after) is not datetime
+            or self.not_after.tzinfo is not timezone.utc
+        ):
+            raise ETradeBrokerTransportError(
+                "bound request deadline must use exact UTC"
+            )
         _sha256(self.authorization_payload_digest, "authorization payload digest")
         if type(self.final_xml_bytes) is not bytes or not self.final_xml_bytes:
             raise ETradeBrokerTransportError("bound XML must be non-empty exact bytes")
@@ -552,7 +560,12 @@ class ETradeBrokerTransport:
             self._selected_account.runtime_mapping(), now=now
         )
 
-    def preview(self, authorization: OutboundAuthorization) -> BrokerReply:
+    def preview(
+        self,
+        authorization: OutboundAuthorization,
+        *,
+        not_after: datetime | None = None,
+    ) -> BrokerReply:
         request = self._build_request(
             authorization=authorization,
             expected_authorization_operation="SUBMIT",
@@ -560,11 +573,16 @@ class ETradeBrokerTransport:
             http_method="POST",
             target_broker_order_id=None,
             preview_id=None,
+            not_after=not_after,
         )
         return self._execute(request, authorization)
 
     def place(
-        self, authorization: OutboundAuthorization, preview: BrokerReply
+        self,
+        authorization: OutboundAuthorization,
+        preview: BrokerReply,
+        *,
+        not_after: datetime | None = None,
     ) -> BrokerReply:
         preview_id = self._preview_id(
             preview, authorization, expected_operation="SUBMIT_PREVIEW"
@@ -576,6 +594,7 @@ class ETradeBrokerTransport:
             http_method="POST",
             target_broker_order_id=None,
             preview_id=preview_id,
+            not_after=not_after,
         )
         return self._execute(request, authorization)
 
@@ -591,6 +610,7 @@ class ETradeBrokerTransport:
                 target_broker_order_id, "target broker order id"
             ),
             preview_id=None,
+            not_after=None,
         )
         return self._execute(request, authorization)
 
@@ -612,6 +632,7 @@ class ETradeBrokerTransport:
                 target_broker_order_id, "target broker order id"
             ),
             preview_id=preview_id,
+            not_after=None,
         )
         return self._execute(request, authorization)
 
@@ -836,7 +857,15 @@ class ETradeBrokerTransport:
         http_method: Literal["POST", "PUT"],
         target_broker_order_id: str | None,
         preview_id: str | None,
+        not_after: datetime | None = None,
     ) -> BoundBrokerRequest:
+        if not_after is not None and (
+            type(not_after) is not datetime
+            or not_after.tzinfo is not timezone.utc
+        ):
+            raise ETradeBrokerTransportError(
+                "broker request deadline must use exact UTC"
+            )
         order = _authorized_vertical(authorization, expected_authorization_operation)
         xml_bytes = _order_xml(
             order,
@@ -869,6 +898,7 @@ class ETradeBrokerTransport:
             "client_order_id": authorization.client_order_id,
             "target_broker_order_id": target_broker_order_id,
             "preview_id": preview_id,
+            "not_after": not_after,
             "authorization_payload_digest": authorization.payload_digest,
             "final_xml_bytes": xml_bytes,
             "final_xml_sha256": hashlib.sha256(xml_bytes).hexdigest(),
@@ -905,6 +935,13 @@ class ETradeBrokerTransport:
             runtime_safety.verify_account(
                 selected_account.runtime_mapping(), now=now
             )
+            if (
+                trusted_request.not_after is not None
+                and now >= trusted_request.not_after
+            ):
+                raise ETradeBrokerTransportError(
+                    "broker request deadline expired before wire send"
+                )
             evidence = _transport_evidence(trusted_request)
             self._ledger.claim_transport_send(evidence, authorization)
             now = self._now()
@@ -1135,6 +1172,7 @@ def _copy_bound_request(request: BoundBrokerRequest) -> BoundBrokerRequest:
         client_order_id=request.client_order_id,
         target_broker_order_id=request.target_broker_order_id,
         preview_id=request.preview_id,
+        not_after=request.not_after,
         authorization_payload_digest=request.authorization_payload_digest,
         final_xml_bytes=request.final_xml_bytes,
         final_xml_sha256=request.final_xml_sha256,
@@ -1646,6 +1684,7 @@ def _bound_request_material(value: Any) -> bytes:
         "client_order_id",
         "target_broker_order_id",
         "preview_id",
+        "not_after",
         "authorization_payload_digest",
         "final_xml_sha256",
     )
@@ -1655,6 +1694,16 @@ def _bound_request_material(value: Any) -> bytes:
         document = {name: getattr(value, name) for name in names}
     else:
         raise ETradeBrokerTransportError("bound request material is invalid")
+    if document["not_after"] is not None:
+        deadline = document["not_after"]
+        if (
+            type(deadline) is not datetime
+            or deadline.tzinfo is not timezone.utc
+        ):
+            raise ETradeBrokerTransportError(
+                "bound request deadline must use exact UTC"
+            )
+        document["not_after"] = deadline.isoformat()
     return json.dumps(
         document,
         sort_keys=True,

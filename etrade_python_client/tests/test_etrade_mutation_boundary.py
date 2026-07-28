@@ -4,9 +4,15 @@ import subprocess
 from pathlib import Path
 
 from scripts.check_etrade_mutation_boundary import (
+    ALLOWED_TRANSPORT_IMPORTS,
     APPLICATION_ROOT,
     Diagnostic,
+    EXECUTION_COMPOSITION_PATH,
+    GATEWAY_PATH,
+    MANUAL_OPEN_PATH,
+    NON_OPENING_GATEWAY_MUTATION_METHODS,
     NON_HTTP_MUTATION_REFERENCES,
+    READER_PATH,
     REQUIRED_TOMBSTONES,
     TombstoneSpec,
     TRANSPORT_INTERNAL_CAPABILITIES,
@@ -161,6 +167,268 @@ def test_mutation_capability_policy_cannot_silently_drift() -> None:
     assert set(TRANSPORT_MUTATION_METHODS) == (
         EXPECTED_TRANSPORT_MUTATION_METHODS
     )
+    assert set(NON_OPENING_GATEWAY_MUTATION_METHODS) == {
+        "cancel_closing",
+        "cancel_opening",
+        "reprice_opening",
+        "submit_closing",
+    }
+    assert ALLOWED_TRANSPORT_IMPORTS == {
+        GATEWAY_PATH: frozenset(
+            {
+                "BrokerReply",
+                "CancelBrokerReply",
+                "ETradeBrokerTransport",
+                "ETradeBrokerTransportError",
+                "SelectedBrokerAccount",
+            }
+        ),
+        READER_PATH: frozenset(
+            {
+                "SelectedBrokerAccount",
+                "_ExchangeResult",
+                "_isolated_get_exchange",
+            }
+        ),
+        EXECUTION_COMPOSITION_PATH: frozenset(
+            {
+                "ETradeBrokerTransport",
+                "SelectedBrokerAccount",
+            }
+        ),
+    }
+
+
+def test_transport_construction_is_allowed_only_in_exact_composition_root(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from live_trading.etrade_broker_transport import "
+        "ETradeBrokerTransport, SelectedBrokerAccount\n\n"
+        "def build_manual_open_service():\n"
+        "    account = SelectedBrokerAccount('id', 'key', 'BROKERAGE')\n"
+        "    transport = ETradeBrokerTransport(account)\n"
+        "    gateway = EtradeOrderGateway(transport=transport)\n"
+        "    return ManualOpenService(gateway=gateway)\n"
+    )
+    _write_sources(
+        tmp_path,
+        {
+            EXECUTION_COMPOSITION_PATH: source,
+            "live_trading/not_execution_runtime.py": source,
+        },
+    )
+
+    allowed = scan_paths(
+        tmp_path,
+        [EXECUTION_COMPOSITION_PATH],
+        required_tombstones={},
+    )
+    rejected = scan_paths(
+        tmp_path,
+        ["live_trading/not_execution_runtime.py"],
+        required_tombstones={},
+    )
+
+    assert allowed == []
+    assert {
+        "TRANSPORT_IMPORT",
+        "TRANSPORT_CONSTRUCTION",
+    }.issubset(set(_codes(rejected)))
+
+
+def test_composition_rejects_transport_alias_construction_and_return(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            EXECUTION_COMPOSITION_PATH: (
+                "from live_trading.etrade_broker_transport import "
+                "ETradeBrokerTransport, SelectedBrokerAccount\n\n"
+                "def build_manual_open_service():\n"
+                "    constructor = ETradeBrokerTransport\n"
+                "    transport = constructor()\n"
+                "    return transport\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        [EXECUTION_COMPOSITION_PATH],
+        required_tombstones={},
+    )
+    codes = set(_codes(diagnostics))
+
+    assert "TRANSPORT_REFERENCE" in codes
+    assert "EXECUTION_CAPABILITY_EXPOSURE" in codes
+    assert "EXECUTION_TRANSPORT_EXPOSURE" in codes
+
+
+def test_transport_class_cannot_be_reexported_for_alias_construction(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            "live_trading/bad.py": (
+                "from live_trading.execution_runtime import "
+                "ETradeBrokerTransport as Factory\n"
+                "transport = Factory()\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        ["live_trading/bad.py"],
+        required_tombstones={},
+    )
+
+    assert "TRANSPORT_IMPORT" in _codes(diagnostics)
+
+
+def test_composition_rejects_direct_transport_exposure(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            EXECUTION_COMPOSITION_PATH: (
+                "from live_trading.etrade_broker_transport import "
+                "ETradeBrokerTransport, SelectedBrokerAccount\n\n"
+                "def build_manual_open_service():\n"
+                "    transport = ETradeBrokerTransport()\n"
+                "    return {'transport': transport}\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        [EXECUTION_COMPOSITION_PATH],
+        required_tombstones={},
+    )
+    codes = set(_codes(diagnostics))
+
+    assert "EXECUTION_CAPABILITY_EXPOSURE" in codes
+    assert "EXECUTION_TRANSPORT_EXPOSURE" in codes
+
+
+def test_manual_open_service_allows_only_exact_gateway_opening_hop(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            MANUAL_OPEN_PATH: (
+                "class ManualOpenService:\n"
+                "    def __init__(self, gateway):\n"
+                "        self._gateway = gateway\n"
+                "    def submit(self, command):\n"
+                "        return self._gateway.submit_opening(command)\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        [MANUAL_OPEN_PATH],
+        required_tombstones={},
+    )
+
+    assert diagnostics == []
+
+
+def test_manual_open_service_cannot_expose_its_private_gateway(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            MANUAL_OPEN_PATH: (
+                "class ManualOpenService:\n"
+                "    def __init__(self, gateway):\n"
+                "        self._gateway = gateway\n"
+                "    @property\n"
+                "    def gateway(self):\n"
+                "        return self._gateway\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        [MANUAL_OPEN_PATH],
+        required_tombstones={},
+    )
+
+    assert "MANUAL_OPEN_GATEWAY_ACCESS" in _codes(diagnostics)
+
+
+def test_application_cannot_escape_through_manual_open_private_gateway(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            "live_trading/dashboard.py": (
+                "executor = globals().get('MANUAL_OPEN_EXECUTOR')\n"
+                "executor._gateway.submit_closing(command)\n"
+                "gateway = getattr(executor, '_gateway')\n"
+                "hidden = executor.__dict__['_gateway']\n"
+                "hidden = vars(executor).get('_gateway')\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        ["live_trading/dashboard.py"],
+        required_tombstones={},
+    )
+    codes = set(_codes(diagnostics))
+
+    assert "MANUAL_OPEN_GATEWAY_ACCESS" in codes
+    assert "MANUAL_OPEN_GATEWAY_REFLECTION" in codes
+    assert "MANUAL_OPEN_GATEWAY_LOOKUP" in codes
+    assert "MANUAL_OPEN_GATEWAY_LITERAL" in codes
+    assert "GATEWAY_NON_OPENING_MUTATION_CALL" in codes
+
+
+def test_global_executor_cannot_reach_non_opening_gateway_mutations(
+    tmp_path: Path,
+) -> None:
+    _write_sources(
+        tmp_path,
+        {
+            "live_trading/dashboard.py": (
+                "MANUAL_OPEN_EXECUTOR.reprice_opening(command)\n"
+                "callback = MANUAL_OPEN_EXECUTOR.cancel_closing\n"
+                "getattr("
+                "MANUAL_OPEN_EXECUTOR, 'cancel_opening'"
+                ")(command)\n"
+                "callback = MANUAL_OPEN_EXECUTOR.__dict__['submit_closing']\n"
+                "callback = vars(MANUAL_OPEN_EXECUTOR).get("
+                "'reprice_opening'"
+                ")\n"
+            )
+        },
+    )
+
+    diagnostics = scan_paths(
+        tmp_path,
+        ["live_trading/dashboard.py"],
+        required_tombstones={},
+    )
+    codes = set(_codes(diagnostics))
+
+    assert "GATEWAY_NON_OPENING_MUTATION_CALL" in codes
+    assert "GATEWAY_NON_OPENING_MUTATION_REFERENCE" in codes
+    assert "GATEWAY_NON_OPENING_MUTATION_REFLECTION" in codes
+    assert "GATEWAY_NON_OPENING_MUTATION_LOOKUP" in codes
+    assert "GATEWAY_NON_OPENING_MUTATION_LITERAL" in codes
 
 
 def test_exact_call_only_tombstone_is_accepted(tmp_path: Path) -> None:

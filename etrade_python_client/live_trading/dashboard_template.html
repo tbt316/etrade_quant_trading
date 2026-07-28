@@ -3,14 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="etrade-dashboard-protocol" content="manual-open-dashboard.v2">
     <meta name="theme-color" content="#ffffff">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <meta name="apple-mobile-web-app-title" content="Antigravity Trader">
     <title>E*TRADE Live Dashboard</title>
     <link rel="manifest" href="/manifest.webmanifest">
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script
+        nonce="__DASHBOARD_CSP_NONCE__"
+        src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+        integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+        crossorigin="anonymous"></script>
     <style>
         :root {
             --bg: #ffffff;
@@ -29,7 +33,7 @@
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-            font-family: 'Outfit', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         }
 
         body {
@@ -466,6 +470,18 @@
             text-transform: uppercase;
         }
 
+        .read-only-banner.execution-enabled {
+            border-color: rgba(16, 185, 129, 0.5);
+            background: rgba(16, 185, 129, 0.12);
+            color: var(--success);
+        }
+
+        .read-only-banner.execution-pending {
+            border-color: rgba(245, 158, 11, 0.5);
+            background: rgba(245, 158, 11, 0.12);
+            color: var(--warning);
+        }
+
         .read-only-label {
             display: block;
             margin-top: 8px;
@@ -478,6 +494,31 @@
             font-weight: 700;
             text-align: center;
             text-transform: uppercase;
+        }
+
+        .execution-note {
+            min-height: 34px;
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            line-height: 1.35;
+            text-align: center;
+        }
+
+        .preview-actions {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 8px;
+            align-items: stretch;
+        }
+
+        .preview-actions .btn {
+            margin-top: 8px;
+        }
+
+        .preview-actions .btn-secondary {
+            width: auto;
+            padding-inline: 12px;
         }
 
         .toast {
@@ -498,36 +539,113 @@
 
         .last-update { font-size: 0.75rem; color: var(--text-muted); margin-top: 10px; text-align: center; }
 
-        .confirm-dialog {
+        .confirm-overlay {
             position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
+            inset: 0;
+            z-index: 3900;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(15, 23, 42, 0.58);
+            backdrop-filter: blur(4px);
+        }
+
+        .confirm-dialog {
             background: var(--bg);
-            padding: 30px;
+            padding: 24px;
             border-radius: 24px;
             border: 1px solid var(--accent);
             z-index: 4000;
-            width: 90%;
-            max-width: 400px;
-            box-shadow: 0 0 50px rgba(0,0,0,0.8);
+            width: min(100%, 560px);
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            box-shadow: 0 24px 70px rgba(15, 23, 42, 0.35);
+        }
+
+        .confirm-grid {
+            display: grid;
+            grid-template-columns: minmax(140px, 0.8fr) minmax(0, 1.2fr);
+            gap: 9px 14px;
+            margin: 18px 0;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: #f8fafc;
+            font-size: 0.86rem;
+        }
+
+        .confirm-grid dt {
+            color: var(--text-muted);
+        }
+
+        .confirm-grid dd {
+            margin: 0;
+            color: var(--text);
+            font-weight: 600;
+            text-align: right;
+            overflow-wrap: anywhere;
+        }
+
+        .confirm-warning {
+            padding: 12px;
+            border: 1px solid rgba(245, 158, 11, 0.4);
+            border-radius: 10px;
+            background: rgba(245, 158, 11, 0.1);
+            color: #92400e;
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }
+
+        .confirm-warning.success {
+            border-color: rgba(16, 185, 129, 0.4);
+            background: rgba(16, 185, 129, 0.1);
+            color: #047857;
+        }
+
+        .confirm-warning.failed {
+            border-color: rgba(239, 68, 68, 0.4);
+            background: rgba(239, 68, 68, 0.1);
+            color: #b91c1c;
+        }
+
+        .confirm-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        @media (max-width: 520px) {
+            .confirm-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .confirm-grid dd {
+                margin-bottom: 5px;
+                text-align: left;
+            }
+
+            .confirm-actions {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <form id="auth-overlay" onsubmit="event.preventDefault(); verifyPin();">
+    <form id="auth-overlay">
         <h2 style="color: var(--text);">Enter Dashboard PIN</h2>
-        <input type="password" id="pin-field" name="dashboard-pin" aria-label="Dashboard PIN" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" autocapitalize="off" spellcheck="false" style="width: 240px; text-align: center; font-size: 2rem; letter-spacing: 0.35em;" minlength="8" maxlength="64">
-        <div style="color: var(--text-muted); font-size: 0.85rem;">Use the dashboard PIN (at least 8 digits), not your device passcode.</div>
+        <input type="password" id="pin-field" name="dashboard-pin" aria-label="Dashboard PIN" autocomplete="off" enterkeyhint="done" autocapitalize="off" spellcheck="false" style="width: 240px; text-align: center; font-size: 2rem; letter-spacing: 0.35em;" minlength="8" maxlength="64">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Use the dashboard PIN (at least 8 characters), not your device passcode.</div>
         <div id="pin-error" role="alert" style="min-height: 20px; color: var(--danger); font-weight: 600;"></div>
         <button id="pin-submit" class="btn" type="submit" style="width: 200px;">Unlock</button>
     </form>
 
     <div class="container">
-        <div class="read-only-banner" role="status">Read only — all E*TRADE order actions are disabled</div>
+        <div id="execution-banner" class="read-only-banner execution-pending" role="status" aria-live="polite">Manual opening unavailable — waiting for server capability status. Auto-open, close, and neutralize remain disabled.</div>
         <div id="server-status-warning" class="hidden" style="background: var(--danger); color: white; padding: 10px; border-radius: 12px; margin-bottom: 15px; text-align: center; font-weight: 600;"></div>
         <div id="manual-order-status" class="manual-order-status hidden">
-            <strong>Manual Order Status</strong>
+            <strong>Supervised Manual Open Status</strong>
             <div id="manual-order-status-body"></div>
         </div>
 
@@ -553,8 +671,8 @@
                 <div id="account-info" style="font-size: 0.85rem; color: var(--text-muted); background: var(--accent-glow); padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border);">Account: --</div>
                 <div id="target-exp" style="font-size: 0.85rem; color: var(--text-muted);">Exp: --</div>
                 <div id="market-status" class="status-badge">Loading...</div>
-                <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem;" onclick="clearPin()" title="Lock Dashboard">🔒</button>
-                <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem; background: var(--accent-glow); border-color: rgba(2, 132, 199, 0.2);" onclick="window.location.href='/logout'" title="Logout Session">🚪 Logout</button>
+                <button id="dashboard-lock-btn" class="btn btn-secondary" type="button" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem;" title="Lock Dashboard">🔒</button>
+                <button id="dashboard-logout-btn" class="btn btn-secondary" type="button" style="width: auto; margin: 0; padding: 6px 12px; font-size: 0.85rem; background: var(--accent-glow); border-color: rgba(2, 132, 199, 0.2);" title="Logout Session">🚪 Logout</button>
             </div>
         </header>
 
@@ -571,35 +689,44 @@
                 <div id="settings-form">
                     <div class="form-group">
                         <label>Target Delta <span id="delta-val">0.13</span></label>
-                        <input type="range" id="target_delta" step="0.01" min="0.01" max="0.50" value="0.13" oninput="updateRangeLabel('target_delta', 'delta-val'); debouncedPreview();">
+                        <input type="range" id="target_delta" step="0.01" min="0.01" max="0.50" value="0.13">
                     </div>
                     <div class="form-group">
                         <label>SPY Spread Width ($)</label>
-                        <input type="number" id="spy_hedge_spread" step="1" onchange="debouncedPreview()">
+                        <input type="number" id="spy_hedge_spread" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>SPY Contracts</label>
+                        <input type="number" id="spy_pair_quantity" min="1" step="1" value="1">
                     </div>
                     <div class="form-group">
                         <label>SPX Spread Width ($)</label>
-                        <input type="number" id="spx_hedge_spread" step="1" onchange="debouncedPreview()">
+                        <input type="number" id="spx_hedge_spread" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label>SPX Contracts</label>
+                        <input type="number" id="spx_pair_quantity" min="1" step="1" value="1">
                     </div>
                     <div class="form-group">
                         <label>Trading Side</label>
-                        <select id="trade_side" onchange="debouncedPreview()">
+                        <select id="trade_side">
                             <option value="PUT">Put Credit Spread</option>
                             <option value="CALL">Call Credit Spread</option>
-                            <option value="BOTH">Iron Condor (Both)</option>
+                            <option value="BOTH">Iron Condor (supervised opening unavailable)</option>
                         </select>
+                        <p style="font-size: 0.72rem; color: var(--text-muted); margin-top: 7px; line-height: 1.4;">Manual opening supports one PUT or CALL vertical per confirmation. Supervised BOTH/iron-condor opening is unavailable.</p>
                     </div>
                     <div class="form-group">
                         <label>Target Weeks <span id="weeks-val">6</span></label>
-                        <input type="range" id="target_weeks" step="1" min="1" max="12" value="6" oninput="updateRangeLabel('target_weeks', 'weeks-val'); debouncedPreview();">
+                        <input type="range" id="target_weeks" step="1" min="1" max="12" value="6">
                     </div>
                     <div class="form-group">
                         <label>SPY Target Expiration</label>
-                        <select id="spy_target_expiration" onchange="debouncedPreview()"></select>
+                        <select id="spy_target_expiration"></select>
                     </div>
                     <div class="form-group">
                         <label>SPX Target Expiration</label>
-                        <select id="spx_target_expiration" onchange="debouncedPreview()"></select>
+                        <select id="spx_target_expiration"></select>
                     </div>
 
                     <div class="form-group" style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 20px;">
@@ -623,7 +750,11 @@
                             <div class="preview-label">Delta:</div><div class="preview-value" id="spy-pre-delta">--</div>
                             <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spy-pre-otm">--</div>
                         </div>
-                        <span class="read-only-label">Preview only — order submission disabled</span>
+                        <div class="preview-actions">
+                            <button id="spy-manual-open-btn" class="btn" type="button" disabled>Execute SPY Spread</button>
+                            <button id="spy-preview-refresh-btn" class="btn btn-secondary" type="button" aria-label="Refresh SPY and SPX signed previews">Refresh</button>
+                        </div>
+                        <div id="spy-execution-note" class="execution-note">Awaiting a signed executable server preview.</div>
                     </div>
 
                     <div class="preview-card" style="margin-top: 15px;">
@@ -638,10 +769,18 @@
                             <div class="preview-label">Delta:</div><div class="preview-value" id="spx-pre-delta">--</div>
                             <div class="preview-label">Short Leg OTM:</div><div class="preview-value" id="spx-pre-otm">--</div>
                         </div>
-                        <span class="read-only-label">Preview only — order submission disabled</span>
+                        <div class="preview-actions">
+                            <button id="spx-manual-open-btn" class="btn" type="button" disabled>Execute SPX Spread</button>
+                            <button id="spx-preview-refresh-btn" class="btn btn-secondary" type="button" aria-label="Refresh SPY and SPX signed previews">Refresh</button>
+                        </div>
+                        <div id="spx-execution-note" class="execution-note">Awaiting a signed executable server preview.</div>
                     </div>
 
-                    <button class="btn btn-secondary" style="margin-top: 15px;" onclick="saveSettings()">Save Configuration</button>
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label for="settings-confirm-pin">Re-enter dashboard PIN to save configuration</label>
+                        <input id="settings-confirm-pin" type="password" autocomplete="off" minlength="8" maxlength="64" autocapitalize="off" spellcheck="false">
+                    </div>
+                    <button id="settings-save-btn" class="btn btn-secondary" type="button">Save Configuration</button>
                     <div class="last-update" id="last-save">Settings loaded</div>
                 </div>
             </div>
@@ -651,7 +790,7 @@
                 <div id="high-gain-card" class="card hidden">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                         <h2 style="color: var(--success); margin: 0;">🎯 High Gain Spread Watchlist</h2>
-                        <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshHighGain()">Force Update</button>
+                        <button id="high-gain-refresh-btn" class="btn btn-secondary" type="button" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;">Force Update</button>
                     </div>
                     <div id="high-gain-list" style="overflow-x: auto;">
                         <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
@@ -673,7 +812,7 @@
                 <div id="neutralize-card" class="card hidden">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                         <h2 style="color: var(--warning); margin: 0;">Assignment Risk Analysis</h2>
-                        <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="forceRefreshNeutralize()">Force Update</button>
+                        <button id="neutralize-refresh-btn" class="btn btn-secondary" type="button" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;">Force Update</button>
                     </div>
                     <div id="neutralize-list" style="overflow-x: auto;">
                         <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
@@ -702,7 +841,7 @@
                         <h2 style="color: var(--accent); margin: 0;">📊 SPY Gamma Exposure (GEX) Profile</h2>
                         <div style="display: flex; gap: 10px; align-items: center;">
                             <span id="gex-badge" style="font-size: 0.7rem; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: uppercase;">LOADING GEX</span>
-                            <button class="btn btn-secondary" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;" onclick="fetchGexData()">Refresh GEX</button>
+                            <button id="gex-refresh-btn" class="btn btn-secondary" type="button" style="width: auto; margin: 0; padding: 4px 12px; font-size: 0.75rem;">Refresh GEX</button>
                         </div>
                     </div>
 
@@ -782,9 +921,7 @@
                         <h2>Active Portfolio</h2>
                         <div class="portfolio-tools" style="display: flex; gap: 10px;">
                             <span id="portfolio-status" style="font-size: 0.75rem; color: var(--accent);"></span>
-                            <form action="/refresh" method="post" target="refresh-fallback-frame"
-                                  onsubmit="if (typeof triggerRefresh === 'function') { triggerRefresh(); return false; }"
-                                  style="margin: 0;">
+                            <form id="portfolio-refresh-form" action="/refresh" method="post" target="refresh-fallback-frame" style="margin: 0;">
                                 <button type="submit" class="btn btn-secondary" style="width: auto; margin: 0; padding: 8px 16px;">Refresh Data</button>
                             </form>
                             <iframe name="refresh-fallback-frame" title="Refresh request status" hidden></iframe>
@@ -802,10 +939,38 @@
         </div>
     </div>
 
+    <div id="manual-open-confirm-overlay" class="confirm-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="manual-open-confirm-title">
+        <div class="confirm-dialog">
+            <h2 id="manual-open-confirm-title" style="margin-bottom: 8px;">Confirm Credit Spread</h2>
+            <p style="color: var(--text-muted); font-size: 0.84rem; line-height: 1.45;">Verify the signed server preview below. Submission is attempted once, with no automatic retry or repricing.</p>
+            <dl class="confirm-grid">
+                <dt>Account</dt><dd id="manual-open-confirm-account">--</dd>
+                <dt>Environment</dt><dd id="manual-open-confirm-environment">--</dd>
+                <dt>Order</dt><dd id="manual-open-confirm-order">--</dd>
+                <dt>Broker symbol</dt><dd id="manual-open-confirm-broker-symbol">--</dd>
+                <dt>Expiration</dt><dd id="manual-open-confirm-expiration">--</dd>
+                <dt>Short leg</dt><dd id="manual-open-confirm-short-leg">--</dd>
+                <dt>Long leg</dt><dd id="manual-open-confirm-long-leg">--</dd>
+                <dt>Limit net credit</dt><dd id="manual-open-confirm-credit">--</dd>
+                <dt>Quantity</dt><dd id="manual-open-confirm-quantity">--</dd>
+                <dt>Total opening credit</dt><dd id="manual-open-confirm-total-credit">--</dd>
+                <dt>Maximum loss</dt><dd id="manual-open-confirm-max-loss">--</dd>
+                <dt>Proposal expires</dt><dd id="manual-open-confirm-expires">--</dd>
+                <dt>Request ID</dt><dd id="manual-open-confirm-request-id">--</dd>
+            </dl>
+            <div id="manual-open-confirm-message" class="confirm-warning" role="status" aria-live="polite">Submitting can create a live E*TRADE order. Confirm only after checking every leg, the credit, quantity, and maximum loss.</div>
+            <label for="manual-open-confirm-pin" style="display: block; margin-top: 14px; color: var(--text); font-size: 0.84rem; font-weight: 600;">Re-enter dashboard PIN to authorize this order</label>
+            <input id="manual-open-confirm-pin" type="password" autocomplete="off" minlength="8" maxlength="64" autocapitalize="off" spellcheck="false" style="width: 100%; margin-top: 7px;">
+            <div class="confirm-actions">
+                <button id="manual-open-cancel-btn" class="btn btn-secondary" type="button">Cancel</button>
+                <button id="manual-open-submit-btn" class="btn btn-danger" type="button">Submit Once</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast" class="toast">Settings Saved</div>
 
-    <script>
-        let currentPin = '';
+    <script nonce="__DASHBOARD_CSP_NONCE__">
         let previewTimer = null;
         let currentNeutralizeData = [];
         let settingsInitialized = false;
@@ -913,19 +1078,89 @@
                 portfolioMobileQuery.addListener(syncPortfolioFrameHeight);
             }
 
+            document.getElementById('auth-overlay').addEventListener(
+                'submit',
+                (event) => {
+                    event.preventDefault();
+                    void verifyPin();
+                }
+            );
+            document.getElementById('dashboard-lock-btn').addEventListener(
+                'click', clearPin
+            );
+            document.getElementById('dashboard-logout-btn').addEventListener(
+                'click', () => void logoutDashboard()
+            );
+            document.getElementById('target_delta').addEventListener(
+                'input',
+                () => {
+                    updateRangeLabel('target_delta', 'delta-val');
+                    debouncedPreview();
+                }
+            );
+            ['spy_hedge_spread', 'spx_hedge_spread', 'trade_side',
+                'spy_target_expiration', 'spx_target_expiration'].forEach(
+                (id) => document.getElementById(id).addEventListener(
+                    'change', debouncedPreview
+                )
+            );
+            ['spy_pair_quantity', 'spx_pair_quantity'].forEach(
+                (id) => document.getElementById(id).addEventListener(
+                    'input', manualOpenQuantityChanged
+                )
+            );
+            document.getElementById('target_weeks').addEventListener(
+                'input',
+                () => {
+                    updateRangeLabel('target_weeks', 'weeks-val');
+                    debouncedPreview();
+                }
+            );
+            document.getElementById('spy-manual-open-btn').addEventListener(
+                'click', () => beginManualOpen('SPY')
+            );
+            document.getElementById('spx-manual-open-btn').addEventListener(
+                'click', () => beginManualOpen('SPX')
+            );
+            ['spy-preview-refresh-btn', 'spx-preview-refresh-btn'].forEach(
+                (id) => document.getElementById(id).addEventListener(
+                    'click', fetchPreview
+                )
+            );
+            document.getElementById('settings-save-btn').addEventListener(
+                'click', () => void saveSettings()
+            );
+            document.getElementById('high-gain-refresh-btn').addEventListener(
+                'click', forceRefreshHighGain
+            );
+            document.getElementById('neutralize-refresh-btn').addEventListener(
+                'click', forceRefreshNeutralize
+            );
+            document.getElementById('gex-refresh-btn').addEventListener(
+                'click', fetchGexData
+            );
+            document.getElementById('portfolio-refresh-form').addEventListener(
+                'submit',
+                (event) => {
+                    event.preventDefault();
+                    void triggerRefresh();
+                }
+            );
+            document.getElementById('manual-open-cancel-btn').addEventListener(
+                'click', closeManualOpenConfirmation
+            );
+            document.getElementById('manual-open-submit-btn').addEventListener(
+                'click', () => void submitConfirmedManualOpen()
+            );
             localStorage.removeItem('dashboard_pin');
-            const savedPin = sessionStorage.getItem('dashboard_pin');
-            if (savedPin) {
-                document.getElementById('pin-field').value = savedPin;
-                verifyPin();
-            }
+            sessionStorage.removeItem('dashboard_pin');
         });
 
         async function verifyPin() {
             const pinField = document.getElementById('pin-field');
             const pinError = document.getElementById('pin-error');
             const pinSubmit = document.getElementById('pin-submit');
-            const pin = pinField.value;
+            let pin = pinField.value;
             pinError.textContent = '';
 
             if (!pin) {
@@ -934,36 +1169,34 @@
                 return false;
             }
             if (pin.length < 8) {
-                pinError.textContent = 'Enter at least 8 digits for the dashboard PIN.';
+                pinError.textContent = 'Enter at least 8 characters for the dashboard PIN.';
                 pinField.focus();
                 return false;
             }
 
             pinSubmit.disabled = true;
             pinSubmit.textContent = 'Checking…';
+            const requestBody = JSON.stringify({ pin });
+            pin = '';
+            pinField.value = '';
             try {
                 const response = await fetch('/api/verify_pin', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ pin })
+                    body: requestBody
                 });
                 if (response.status === 401) {
                     window.location.href = '/login';
                     return false;
                 }
                 if (!response.ok) {
-                    currentPin = '';
-                    window.currentDashboardPin = '';
-                    sessionStorage.removeItem('dashboard_pin');
-                    pinError.textContent = 'Incorrect dashboard PIN. This is not your iPhone passcode.';
+                    pinError.textContent = response.status === 429
+                        ? 'Too many failed PIN attempts. Wait before retrying.'
+                        : 'Incorrect dashboard PIN. This is not your iPhone passcode.';
                     pinField.focus();
-                    pinField.select();
                     return false;
                 }
 
-                currentPin = pin;
-                window.currentDashboardPin = pin;
-                sessionStorage.setItem('dashboard_pin', pin);
                 document.getElementById('auth-overlay').classList.add('hidden');
                 loadData();
                 return true;
@@ -978,13 +1211,85 @@
         }
 
         function clearPin() {
+            if (manualOpenSubmissionInFlight) {
+                showToast(
+                    'One order request is still in flight. Wait for its durable result before locking.'
+                );
+                return;
+            }
             localStorage.removeItem('dashboard_pin');
             sessionStorage.removeItem('dashboard_pin');
-            currentPin = '';
-            window.currentDashboardPin = '';
+            manualOpenCapabilityEnabled = false;
+            manualOpenCapabilityReason = 'Dashboard locked.';
+            closeManualOpenConfirmation();
+            renderManualOpenCapability({});
             document.getElementById('pin-field').value = '';
+            document.getElementById('settings-confirm-pin').value = '';
+            document.getElementById('manual-open-confirm-pin').value = '';
             document.getElementById('pin-error').textContent = '';
             document.getElementById('auth-overlay').classList.remove('hidden');
+        }
+
+        async function logoutDashboard() {
+            localStorage.removeItem('dashboard_pin');
+            sessionStorage.removeItem('dashboard_pin');
+            document.getElementById('pin-field').value = '';
+            document.getElementById('settings-confirm-pin').value = '';
+            document.getElementById('manual-open-confirm-pin').value = '';
+            manualOpenCapabilityEnabled = false;
+            manualOpenCapabilityReason = 'Dashboard logged out.';
+            if (!manualOpenSubmissionInFlight) {
+                closeManualOpenConfirmation();
+            }
+            try {
+                await fetch('/api/logout', {
+                    method: 'POST',
+                    credentials: 'same-origin'
+                });
+            } catch (_error) {
+                // Local secrets are cleared even when the server is offline.
+            } finally {
+                window.location.replace('/login');
+            }
+        }
+
+        function appendTableCell(row, text, options = {}) {
+            const cell = document.createElement('td');
+            cell.style.padding = '10px';
+            if (options.weight) cell.style.fontWeight = options.weight;
+            if (options.color) cell.style.color = options.color;
+            if (text !== null && text !== undefined) {
+                cell.textContent = String(text);
+            }
+            row.appendChild(cell);
+            return cell;
+        }
+
+        function appendMutedLine(parent, text) {
+            parent.appendChild(document.createElement('br'));
+            const detail = document.createElement('span');
+            detail.style.color = 'var(--text-muted)';
+            detail.style.fontSize = '0.75rem';
+            detail.textContent = String(text);
+            parent.appendChild(detail);
+        }
+
+        function appendReadOnlyStatus(cell, hasOpenOrder) {
+            const status = document.createElement('span');
+            status.textContent = hasOpenOrder
+                ? 'Order In Flight' : 'Read only';
+            if (hasOpenOrder) {
+                status.style.color = 'var(--warning)';
+                status.style.fontWeight = '600';
+                status.style.fontSize = '0.8rem';
+                status.style.padding = '6px 10px';
+                status.style.background = 'rgba(245, 158, 11, 0.1)';
+                status.style.borderRadius = '6px';
+            } else {
+                status.className = 'read-only-label';
+                status.style.margin = '0';
+            }
+            cell.appendChild(status);
         }
 
         async function fetchHighGainSpreads() {
@@ -998,23 +1303,35 @@
 
                     if (data.length > 0) {
                         card.classList.remove('hidden');
-                        body.innerHTML = '';
+                        body.replaceChildren();
                         data.forEach((p) => {
                             const row = document.createElement('tr');
                             row.style.borderBottom = '1px solid var(--border)';
-
-                            const statusCell = p.has_open_order
-                                ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
-                                : `<span class="read-only-label" style="margin: 0;">Read only</span>`;
-
-                            row.innerHTML = `
-                                <td style="padding: 10px; font-weight: 600;">${p.ticker}</td>
-                                <td style="padding: 10px;">${p.expiration}</td>
-                                <td style="padding: 10px;">${p.short_strike}/${p.long_strike} (${p.call_put})</td>
-                                <td style="padding: 10px; color: var(--success); font-weight: 600;">${p.gain_pct.toFixed(1)}%</td>
-                                <td style="padding: 10px;">$${Math.abs(p.midpoint).toFixed(2)}</td>
-                                <td style="padding: 10px;">${statusCell}</td>
-                            `;
+                            appendTableCell(row, p.ticker, {
+                                weight: '600'
+                            });
+                            appendTableCell(row, p.expiration);
+                            appendTableCell(
+                                row,
+                                `${p.short_strike}/${p.long_strike} (${p.call_put})`
+                            );
+                            appendTableCell(
+                                row,
+                                `${Number(p.gain_pct).toFixed(1)}%`,
+                                {
+                                    color: 'var(--success)',
+                                    weight: '600'
+                                }
+                            );
+                            appendTableCell(
+                                row,
+                                `$${Math.abs(Number(p.midpoint)).toFixed(2)}`
+                            );
+                            const statusCell = appendTableCell(row, null);
+                            appendReadOnlyStatus(
+                                statusCell,
+                                p.has_open_order === true
+                            );
                             body.appendChild(row);
                         });
                     } else {
@@ -1027,7 +1344,7 @@
         function renderNeutralizeRisk() {
             const body = document.getElementById('neutralize-body');
             const card = document.getElementById('neutralize-card');
-            body.innerHTML = '';
+            body.replaceChildren();
 
             if (currentNeutralizeData.length > 0) {
                 card.classList.remove('hidden');
@@ -1035,47 +1352,121 @@
                     const row = document.createElement('tr');
                     row.style.borderBottom = '1px solid var(--border)';
 
-                    const statusCell = p.has_open_order
-                        ? `<span style="color: var(--warning); font-weight: 600; font-size: 0.8rem; padding: 6px 10px; background: rgba(245, 158, 11, 0.1); border-radius: 6px;">Order In Flight</span>`
-                        : `<span class="read-only-label" style="margin: 0;">Read only</span>`;
-
-                    let triggerHtml = '';
-                    if (p.trigger) {
-                        const triggers = p.trigger.split(' & ');
-                        triggerHtml = '<div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;">' +
-                            triggers.map(t => {
-                                let bg = 'rgba(239, 68, 68, 0.1)';
-                                let color = '#ef4444';
-                                let border = '1px solid rgba(239, 68, 68, 0.2)';
-                                if (t.includes('Orphan')) {
-                                    bg = 'rgba(139, 92, 246, 0.1)';
-                                    color = '#8b5cf6';
-                                    border = '1px solid rgba(139, 92, 246, 0.2)';
-                                }
-                                return `<span style="padding: 2px 6px; font-size: 0.65rem; font-weight: 600; background: ${bg}; color: ${color}; border: ${border}; border-radius: 4px; text-transform: uppercase; display: inline-block;">${t}</span>`;
-                            }).join('') + '</div>';
-                    }
-
                     const offset = p.offset || null;
-                    const offsetCell = offset
-                        ? `${offset.call_put} ${offset.short_strike}/${offset.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${offset.expiration}<br>Credit $${Number(offset.credit).toFixed(2)} / Target $${Number(offset.target_credit || offset.target_delta || 0).toFixed(3)}</span>`
-                        : `<span style="color: var(--text-muted);">No call leg</span>`;
-                    const targetCell = offset
-                        ? `${p.replacement.expiration}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Offset ${offset.expiration}</span>`
-                        : `${p.replacement.expiration}<br><span style="color: var(--text-muted); font-size: 0.75rem;">No offset</span>`;
-
-                    row.innerHTML = `
-                        <td style="padding: 10px; font-weight: 600;">${p.ticker}</td>
-                        <td style="padding: 10px;">${p.original.call_put} ${p.original.short_strike}/${p.original.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${p.original.expiration}</span>${triggerHtml}</td>
-                        <td style="padding: 10px;">Δ ${Number(p.original.delta).toFixed(3)}<br><span style="color: var(--text-muted); font-size: 0.75rem;">${p.original.dte} DTE</span></td>
-                        <td style="padding: 10px;">$${Math.abs(Number(p.original.midpoint_debit)).toFixed(2)}</td>
-                        <td style="padding: 10px;">${p.replacement.call_put} ${p.replacement.short_strike}/${p.replacement.long_strike}<br><span style="color: var(--text-muted); font-size: 0.75rem;">Exp ${p.replacement.expiration}<br>Credit $${Number(p.replacement.credit).toFixed(2)}</span></td>
-                        <td style="padding: 10px;">${offsetCell}</td>
-                        <td style="padding: 10px;">${targetCell}</td>
-                        <td style="padding: 10px; color: ${Number(p.estimated_net_credit) >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 600;">$${Number(p.estimated_net_credit).toFixed(2)}</td>
-                        <td style="padding: 10px;">${p.qty}</td>
-                        <td style="padding: 10px;">${statusCell}</td>
-                    `;
+                    appendTableCell(row, p.ticker, { weight: '600' });
+                    const originalCell = appendTableCell(
+                        row,
+                        `${p.original.call_put} ${p.original.short_strike}/${p.original.long_strike}`
+                    );
+                    appendMutedLine(
+                        originalCell,
+                        `Exp ${p.original.expiration}`
+                    );
+                    if (p.trigger) {
+                        const triggerList = document.createElement('div');
+                        triggerList.style.display = 'flex';
+                        triggerList.style.flexWrap = 'wrap';
+                        triggerList.style.gap = '4px';
+                        triggerList.style.marginTop = '4px';
+                        String(p.trigger).split(' & ').forEach((trigger) => {
+                            const badge = document.createElement('span');
+                            const orphan = trigger.includes('Orphan');
+                            badge.textContent = trigger;
+                            badge.style.padding = '2px 6px';
+                            badge.style.fontSize = '0.65rem';
+                            badge.style.fontWeight = '600';
+                            badge.style.background = orphan
+                                ? 'rgba(139, 92, 246, 0.1)'
+                                : 'rgba(239, 68, 68, 0.1)';
+                            badge.style.color = orphan
+                                ? '#8b5cf6' : '#ef4444';
+                            badge.style.border = orphan
+                                ? '1px solid rgba(139, 92, 246, 0.2)'
+                                : '1px solid rgba(239, 68, 68, 0.2)';
+                            badge.style.borderRadius = '4px';
+                            badge.style.textTransform = 'uppercase';
+                            badge.style.display = 'inline-block';
+                            triggerList.appendChild(badge);
+                        });
+                        originalCell.appendChild(triggerList);
+                    }
+                    const riskCell = appendTableCell(
+                        row,
+                        `Δ ${Number(p.original.delta).toFixed(3)}`
+                    );
+                    appendMutedLine(
+                        riskCell,
+                        `${p.original.dte} DTE`
+                    );
+                    appendTableCell(
+                        row,
+                        `$${Math.abs(
+                            Number(p.original.midpoint_debit)
+                        ).toFixed(2)}`
+                    );
+                    const replacementCell = appendTableCell(
+                        row,
+                        `${p.replacement.call_put} ${p.replacement.short_strike}/${p.replacement.long_strike}`
+                    );
+                    appendMutedLine(
+                        replacementCell,
+                        `Exp ${p.replacement.expiration}`
+                    );
+                    appendMutedLine(
+                        replacementCell,
+                        `Credit $${Number(
+                            p.replacement.credit
+                        ).toFixed(2)}`
+                    );
+                    const offsetCell = appendTableCell(
+                        row,
+                        offset
+                            ? `${offset.call_put} ${offset.short_strike}/${offset.long_strike}`
+                            : null
+                    );
+                    if (offset) {
+                        appendMutedLine(
+                            offsetCell,
+                            `Exp ${offset.expiration}`
+                        );
+                        appendMutedLine(
+                            offsetCell,
+                            `Credit $${Number(offset.credit).toFixed(2)} / Target $${Number(
+                                offset.target_credit
+                                || offset.target_delta
+                                || 0
+                            ).toFixed(3)}`
+                        );
+                    } else {
+                        offsetCell.textContent = 'No call leg';
+                        offsetCell.style.color = 'var(--text-muted)';
+                    }
+                    const targetCell = appendTableCell(
+                        row,
+                        p.replacement.expiration
+                    );
+                    appendMutedLine(
+                        targetCell,
+                        offset
+                            ? `Offset ${offset.expiration}`
+                            : 'No offset'
+                    );
+                    const netCredit = Number(p.estimated_net_credit);
+                    appendTableCell(
+                        row,
+                        `$${netCredit.toFixed(2)}`,
+                        {
+                            color: netCredit >= 0
+                                ? 'var(--success)' : 'var(--danger)',
+                            weight: '600'
+                        }
+                    );
+                    appendTableCell(row, p.qty);
+                    const statusCell = appendTableCell(row, null);
+                    appendReadOnlyStatus(
+                        statusCell,
+                        p.has_open_order === true
+                    );
                     body.appendChild(row);
                 });
             } else {
@@ -1184,88 +1575,955 @@
 
         function debouncedPreview() {
             clearTimeout(previewTimer);
+            invalidateSpreadPreviews('Inputs changed. Waiting for a fresh signed preview.');
             previewTimer = setTimeout(fetchPreview, 800);
         }
 
         let spyPreviewData = null;
         let spxPreviewData = null;
+        let previewGeneration = 0;
+        let proposalExpiryTimer = null;
+        let manualOpenCapabilityEnabled = false;
+        let manualOpenCapabilityReason = 'Waiting for server capability status.';
+        let currentAccountId = 'N/A';
+        let currentManualOpenEnvironment = '';
+        let currentManualOpenConfigSha256 = '';
+        let pendingManualOpen = null;
+        let manualOpenSubmissionInFlight = false;
+        let latestDurableManualOpenResult = null;
+        let manualOpenRecoveryBlocked = false;
+        const MANUAL_OPEN_ATTEMPT_STORAGE_KEY = 'manual_open_attempt.v2';
+        const LEGACY_MANUAL_OPEN_ATTEMPT_STORAGE_KEY = 'manual_open_attempt.v1';
+        const manualOpenRequestIds = new Map();
+        const consumedManualOpenProposals = new Set();
+
+        function previewDataForTicker(ticker) {
+            return ticker === 'SPX' ? spxPreviewData : spyPreviewData;
+        }
+
+        function setPreviewDataForTicker(ticker, data) {
+            if (ticker === 'SPX') spxPreviewData = data;
+            else spyPreviewData = data;
+        }
+
+        function manualOpenQuantity(ticker) {
+            const value = Number(document.getElementById(`${ticker.toLowerCase()}_pair_quantity`)?.value);
+            return Number.isInteger(value) && value > 0 ? value : null;
+        }
+
+        function previewEconomics(data, quantity) {
+            const sellStrike = Number(data?.sell_strike);
+            const buyStrike = Number(data?.buy_strike);
+            const limitCredit = Number(data?.limit_credit);
+            const width = Math.abs(sellStrike - buyStrike);
+            if (
+                !Number.isFinite(sellStrike)
+                || !Number.isFinite(buyStrike)
+                || !Number.isFinite(limitCredit)
+                || !Number.isInteger(quantity)
+                || quantity < 1
+                || limitCredit <= 0
+                || width <= limitCredit
+            ) {
+                return null;
+            }
+            return {
+                width,
+                limitCredit,
+                creditPerContract: limitCredit * 100,
+                totalCredit: limitCredit * 100 * quantity,
+                maxLoss: (width - limitCredit) * 100 * quantity
+            };
+        }
+
+        function manualOpenEligibility(ticker) {
+            const side = String(document.getElementById('trade_side')?.value || '').toUpperCase();
+            const data = previewDataForTicker(ticker);
+            const quantity = manualOpenQuantity(ticker);
+
+            if (!manualOpenCapabilityEnabled) {
+                return { allowed: false, reason: manualOpenCapabilityReason };
+            }
+            if (manualOpenRecoveryBlocked) {
+                return {
+                    allowed: false,
+                    reason: 'A durable manual-open submission is unresolved. DO NOT RETRY until reconciliation is complete.'
+                };
+            }
+            if (!currentAccountId.trim() || currentAccountId.trim().toUpperCase() === 'N/A') {
+                return { allowed: false, reason: 'The server did not provide one exact E*TRADE account for confirmation.' };
+            }
+            if (!['PUT', 'CALL'].includes(side)) {
+                return { allowed: false, reason: 'Supervised BOTH/iron-condor opening is unavailable. Select PUT or CALL.' };
+            }
+            if (!data) {
+                return { allowed: false, reason: 'Awaiting a fresh signed executable server preview.' };
+            }
+            if (
+                data.execution_enabled !== true
+                || typeof data.proposal_token !== 'string'
+                || !data.proposal_token
+                || typeof data.proposal_id !== 'string'
+                || !data.proposal_id
+            ) {
+                return {
+                    allowed: false,
+                    reason: data.execution_unavailable_reason || 'The server did not provide a durable signed proposal for execution.'
+                };
+            }
+            if (
+                !/^[0-9a-f]{64}$/.test(
+                    String(data.quote_receipt_sha256 || '')
+                )
+                || !/^[0-9a-f]{64}$/.test(
+                    String(data.quote_snapshot_sha256 || '')
+                )
+                || !Number.isFinite(
+                    Date.parse(String(data.quote_observed_at || ''))
+                )
+            ) {
+                return {
+                    allowed: false,
+                    reason: 'The signed preview is missing durable E*TRADE quote evidence.'
+                };
+            }
+            if (
+                String(data.ticker || '').toUpperCase() !== ticker
+                || String(data.side || '').toUpperCase() !== side
+            ) {
+                return { allowed: false, reason: 'The signed preview no longer matches the selected ticker and side.' };
+            }
+            if (String(data.execution_account_id || '') !== currentAccountId) {
+                return { allowed: false, reason: 'The signed preview is bound to another E*TRADE account.' };
+            }
+            if (
+                String(data.execution_environment || '')
+                !== currentManualOpenEnvironment
+                || String(data.runtime_config_sha256 || '')
+                !== currentManualOpenConfigSha256
+            ) {
+                return {
+                    allowed: false,
+                    reason: 'The signed preview is bound to another runtime environment or configuration.'
+                };
+            }
+            if (
+                !['sandbox', 'production'].includes(
+                    currentManualOpenEnvironment
+                )
+                || !/^[0-9a-f]{64}$/.test(
+                    currentManualOpenConfigSha256
+                )
+            ) {
+                return {
+                    allowed: false,
+                    reason: 'The durable history binding is unavailable. No order can be recovered safely after a reload.'
+                };
+            }
+            const brokerSymbol = String(data.broker_symbol || '').toUpperCase();
+            if (
+                (ticker === 'SPY' && brokerSymbol !== 'SPY')
+                || (ticker === 'SPX' && !['SPX', 'SPXW'].includes(brokerSymbol))
+            ) {
+                return { allowed: false, reason: 'The signed preview is missing the exact E*TRADE broker symbol.' };
+            }
+            if (data.is_mock === true) {
+                return { allowed: false, reason: 'Test data can never authorize an E*TRADE order.' };
+            }
+            if (consumedManualOpenProposals.has(data.proposal_token)) {
+                return { allowed: false, reason: 'This proposal was already submitted once. Refresh before considering another order.' };
+            }
+            const expiresAt = Date.parse(String(data.proposal_expires_at || ''));
+            if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+                return { allowed: false, reason: 'The signed proposal expired. Refresh the preview before continuing.' };
+            }
+            const maxQuantity = Number(data.max_quantity);
+            if (!Number.isInteger(quantity)) {
+                return { allowed: false, reason: 'Enter a whole-number contract quantity of at least 1.' };
+            }
+            if (!Number.isInteger(maxQuantity) || maxQuantity < 1 || quantity > maxQuantity) {
+                return {
+                    allowed: false,
+                    reason: Number.isInteger(maxQuantity) && maxQuantity > 0
+                        ? `Quantity exceeds the signed maximum of ${maxQuantity}.`
+                        : 'The signed preview did not include a valid quantity limit.'
+                };
+            }
+            const economics = previewEconomics(data, quantity);
+            if (!economics) {
+                return { allowed: false, reason: 'The signed spread economics are incomplete or invalid.' };
+            }
+            return {
+                allowed: true,
+                data,
+                quantity,
+                economics,
+                expiresAt,
+                reason: `Signed preview valid until ${new Date(expiresAt).toLocaleTimeString()} · maximum ${maxQuantity} contract${maxQuantity === 1 ? '' : 's'}.`
+            };
+        }
+
+        function updateManualOpenControls() {
+            ['SPY', 'SPX'].forEach((ticker) => {
+                const eligibility = manualOpenEligibility(ticker);
+                const prefix = ticker.toLowerCase();
+                const button = document.getElementById(`${prefix}-manual-open-btn`);
+                const note = document.getElementById(`${prefix}-execution-note`);
+                if (button) button.disabled = !eligibility.allowed || manualOpenSubmissionInFlight;
+                if (note) {
+                    note.textContent = manualOpenSubmissionInFlight
+                        ? 'A manual-open submission is in flight. No second request will be sent.'
+                        : eligibility.reason;
+                    note.style.color = eligibility.allowed ? 'var(--success)' : 'var(--text-muted)';
+                }
+            });
+        }
+
+        function manualOpenQuantityChanged() {
+            updateManualOpenControls();
+        }
+
+        function clearPreviewCard(ticker, message) {
+            const prefix = ticker.toLowerCase();
+            setPreviewDataForTicker(ticker, null);
+            document.getElementById(`${prefix}-preview-title`).textContent = `${ticker} LIVE PREVIEW`;
+            document.getElementById(`${prefix}-pre-strikes`).textContent = message || '-- / --';
+            document.getElementById(`${prefix}-pre-expiry`).textContent = '--';
+            document.getElementById(`${prefix}-pre-credit`).textContent = '--';
+            document.getElementById(`${prefix}-pre-delta`).textContent = '--';
+            document.getElementById(`${prefix}-pre-otm`).textContent = '--';
+            document.getElementById(`${prefix}-mock-badge`).classList.add('hidden');
+        }
+
+        function invalidateSpreadPreviews(reason) {
+            previewGeneration += 1;
+            if (proposalExpiryTimer) {
+                clearTimeout(proposalExpiryTimer);
+                proposalExpiryTimer = null;
+            }
+            clearPreviewCard('SPY', 'Refreshing preview…');
+            clearPreviewCard('SPX', 'Refreshing preview…');
+            ['spy-execution-note', 'spx-execution-note'].forEach((id) => {
+                const note = document.getElementById(id);
+                if (note) note.textContent = reason;
+            });
+            updateManualOpenControls();
+        }
+
+        function renderSpreadPreview(ticker, data) {
+            const prefix = ticker.toLowerCase();
+            const side = String(data?.side || document.getElementById('trade_side')?.value || '').toUpperCase();
+            const premium = Number(
+                data?.execution_enabled === true
+                    ? data?.limit_credit
+                    : data?.premium
+            );
+            const delta = Number(data?.delta);
+            const otmPct = Number(data?.otm_pct);
+            setPreviewDataForTicker(ticker, data);
+            document.getElementById(`${prefix}-pre-strikes`).textContent = `${data?.sell_strike ?? '--'} / ${data?.buy_strike ?? '--'}`;
+            document.getElementById(`${prefix}-pre-expiry`).textContent = data?.expiration || 'N/A';
+            document.getElementById(`${prefix}-pre-credit`).textContent = Number.isFinite(premium) ? `$${premium.toFixed(2)}` : '--';
+            document.getElementById(`${prefix}-pre-delta`).textContent = Number.isFinite(delta) ? delta.toFixed(3) : '--';
+            document.getElementById(`${prefix}-pre-otm`).textContent = Number.isFinite(otmPct) ? `${otmPct.toFixed(2)}%` : '--';
+            document.getElementById(`${prefix}-preview-title`).textContent = `${ticker} LIVE PREVIEW (${side} SPREAD)`;
+            document.getElementById(`${prefix}-mock-badge`).classList.toggle('hidden', data?.is_mock !== true);
+        }
+
+        function scheduleProposalExpiryCheck() {
+            if (proposalExpiryTimer) clearTimeout(proposalExpiryTimer);
+            const futureExpirations = [spyPreviewData, spxPreviewData]
+                .map(data => Date.parse(String(data?.proposal_expires_at || '')))
+                .filter(timestamp => Number.isFinite(timestamp) && timestamp > Date.now());
+            if (!futureExpirations.length) {
+                proposalExpiryTimer = null;
+                updateManualOpenControls();
+                return;
+            }
+            const delay = Math.min(
+                Math.max(25, Math.min(...futureExpirations) - Date.now() + 25),
+                2147483647
+            );
+            proposalExpiryTimer = setTimeout(() => {
+                proposalExpiryTimer = null;
+                updateManualOpenControls();
+                if (pendingManualOpen && !manualOpenSubmissionInFlight) {
+                    const eligibility = manualOpenEligibility(pendingManualOpen.ticker);
+                    if (!eligibility.allowed) {
+                        const submitButton = document.getElementById('manual-open-submit-btn');
+                        const message = document.getElementById('manual-open-confirm-message');
+                        submitButton.disabled = true;
+                        message.className = 'confirm-warning failed';
+                        message.textContent = eligibility.reason;
+                    }
+                }
+                scheduleProposalExpiryCheck();
+            }, delay);
+        }
+
+        async function fetchTickerPreview(ticker, requestValues, generation) {
+            const params = new URLSearchParams({
+                ticker,
+                delta: requestValues.delta,
+                width: ticker === 'SPX' ? requestValues.spxWidth : requestValues.spyWidth,
+                weeks: requestValues.weeks,
+                expiration: ticker === 'SPX' ? requestValues.spxExpiry : requestValues.spyExpiry,
+                side: requestValues.side
+            });
+            try {
+                const response = await fetch(`/api/preview_spread?${params.toString()}`, {
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                });
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                const payload = await response.json().catch(() => ({}));
+                if (generation !== previewGeneration) return;
+                if (!response.ok) {
+                    clearPreviewCard(ticker, payload.error || 'Live data unavailable');
+                    return;
+                }
+                renderSpreadPreview(ticker, payload);
+            } catch (error) {
+                if (generation !== previewGeneration) return;
+                console.error(`${ticker} preview error`, error);
+                clearPreviewCard(ticker, 'Preview connection failed');
+            }
+        }
 
         async function fetchPreview() {
-            const delta = document.getElementById('target_delta').value;
-            const spyWidth = document.getElementById('spy_hedge_spread').value;
-            const spxWidth = document.getElementById('spx_hedge_spread').value;
-            const weeks = document.getElementById('target_weeks').value;
-            const spyExpiry = document.getElementById('spy_target_expiration').value;
-            const spxExpiry = document.getElementById('spx_target_expiration').value;
-            const side = document.getElementById('trade_side').value;
-
-            // Fetch SPY Preview
-            try {
-                const res = await fetch(`/api/preview_spread?ticker=SPY&delta=${delta}&width=${spyWidth}&weeks=${weeks}&expiration=${spyExpiry}&side=${side}`);
-                if (res.status === 401) { window.location.href = '/login'; return; }
-                if (res.ok) {
-                    const data = await res.json();
-                    spyPreviewData = data;
-                    document.getElementById('spy-pre-strikes').innerText = `${data.sell_strike} / ${data.buy_strike}`;
-                    document.getElementById('spy-pre-expiry').innerText = data.expiration || "N/A";
-                    document.getElementById('spy-pre-credit').innerText = data.premium != null ? `$${data.premium.toFixed(2)}` : "--";
-                    document.getElementById('spy-pre-delta').innerText = data.delta != null ? data.delta.toFixed(3) : "--";
-                    document.getElementById('spy-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
-
-                    document.getElementById('spy-preview-title').innerText = `SPY LIVE PREVIEW (${side} SPREAD)`;
-
-                    if (data.is_mock) {
-                        document.getElementById('spy-mock-badge').classList.remove('hidden');
-                    } else {
-                        document.getElementById('spy-mock-badge').classList.add('hidden');
-                    }
-                } else {
-                    const err = await res.json().catch(() => ({}));
-                    spyPreviewData = null;
-                    document.getElementById('spy-pre-strikes').innerText = err.error || "Live data unavailable";
-                    document.getElementById('spy-pre-expiry').innerText = "--";
-                    document.getElementById('spy-pre-credit').innerText = "--";
-                    document.getElementById('spy-pre-delta').innerText = "--";
-                    document.getElementById('spy-pre-otm').innerText = "--";
-                    document.getElementById('spy-mock-badge').classList.add('hidden');
-                }
-            } catch (err) {
-                console.error("SPY Preview Error:", err);
+            clearTimeout(previewTimer);
+            if (pendingManualOpen && !manualOpenSubmissionInFlight) {
+                closeManualOpenConfirmation();
+            }
+            const generation = previewGeneration + 1;
+            previewGeneration = generation;
+            if (proposalExpiryTimer) {
+                clearTimeout(proposalExpiryTimer);
+                proposalExpiryTimer = null;
             }
 
-            // Fetch SPX Preview
-            try {
-                const res = await fetch(`/api/preview_spread?ticker=SPX&delta=${delta}&width=${spxWidth}&weeks=${weeks}&expiration=${spxExpiry}&side=${side}`);
-                if (res.status === 401) { window.location.href = '/login'; return; }
-                if (res.ok) {
-                    const data = await res.json();
-                    spxPreviewData = data;
-                    document.getElementById('spx-pre-strikes').innerText = `${data.sell_strike} / ${data.buy_strike}`;
-                    document.getElementById('spx-pre-expiry').innerText = data.expiration || "N/A";
-                    document.getElementById('spx-pre-credit').innerText = data.premium != null ? `$${data.premium.toFixed(2)}` : "--";
-                    document.getElementById('spx-pre-delta').innerText = data.delta != null ? data.delta.toFixed(3) : "--";
-                    document.getElementById('spx-pre-otm').innerText = data.otm_pct != null ? `${data.otm_pct.toFixed(2)}%` : "--";
+            const requestValues = {
+                delta: document.getElementById('target_delta').value,
+                spyWidth: document.getElementById('spy_hedge_spread').value,
+                spxWidth: document.getElementById('spx_hedge_spread').value,
+                weeks: document.getElementById('target_weeks').value,
+                spyExpiry: document.getElementById('spy_target_expiration').value,
+                spxExpiry: document.getElementById('spx_target_expiration').value,
+                side: String(document.getElementById('trade_side').value || '').toUpperCase()
+            };
 
-                    document.getElementById('spx-preview-title').innerText = `SPX LIVE PREVIEW (${side} SPREAD)`;
+            clearPreviewCard('SPY', 'Loading signed preview…');
+            clearPreviewCard('SPX', 'Loading signed preview…');
+            updateManualOpenControls();
 
-                    if (data.is_mock) {
-                        document.getElementById('spx-mock-badge').classList.remove('hidden');
-                    } else {
-                        document.getElementById('spx-mock-badge').classList.add('hidden');
-                    }
-                } else {
-                    const err = await res.json().catch(() => ({}));
-                    spxPreviewData = null;
-                    document.getElementById('spx-pre-strikes').innerText = err.error || "Live data unavailable";
-                    document.getElementById('spx-pre-expiry').innerText = "--";
-                    document.getElementById('spx-pre-credit').innerText = "--";
-                    document.getElementById('spx-pre-delta').innerText = "--";
-                    document.getElementById('spx-pre-otm').innerText = "--";
-                    document.getElementById('spx-mock-badge').classList.add('hidden');
-                }
-            } catch (err) {
-                console.error("SPX Preview Error:", err);
+            if (!['PUT', 'CALL'].includes(requestValues.side)) {
+                clearPreviewCard('SPY', 'Select PUT or CALL');
+                clearPreviewCard('SPX', 'Select PUT or CALL');
+                updateManualOpenControls();
+                return;
             }
+            if (
+                !requestValues.delta
+                || !requestValues.spyWidth
+                || !requestValues.spxWidth
+                || !requestValues.weeks
+            ) {
+                clearPreviewCard('SPY', 'Complete the spread settings');
+                clearPreviewCard('SPX', 'Complete the spread settings');
+                updateManualOpenControls();
+                return;
+            }
+
+            await Promise.all([
+                fetchTickerPreview('SPY', requestValues, generation),
+                fetchTickerPreview('SPX', requestValues, generation)
+            ]);
+            if (generation !== previewGeneration) return;
+            updateManualOpenControls();
+            scheduleProposalExpiryCheck();
+        }
+
+        function setConfirmationText(id, value) {
+            const element = document.getElementById(id);
+            if (element) element.textContent = String(value);
+        }
+
+        function beginManualOpen(ticker) {
+            const normalizedTicker = String(ticker || '').toUpperCase();
+            const eligibility = manualOpenEligibility(normalizedTicker);
+            if (!eligibility.allowed) {
+                showToast(eligibility.reason);
+                updateManualOpenControls();
+                return;
+            }
+            if (!window.crypto || typeof window.crypto.randomUUID !== 'function') {
+                renderManualOpenSubmission({
+                    state: 'FAILED',
+                    reason_code: 'SECURE_REQUEST_ID_UNAVAILABLE',
+                    message: 'This browser cannot create a secure request ID. No order was sent.'
+                }, false);
+                return;
+            }
+
+            const requestKey = `${eligibility.data.proposal_token}:${eligibility.quantity}`;
+            let requestId = manualOpenRequestIds.get(requestKey);
+            if (!requestId) {
+                requestId = window.crypto.randomUUID();
+                manualOpenRequestIds.set(requestKey, requestId);
+            }
+
+            pendingManualOpen = {
+                ticker: normalizedTicker,
+                data: eligibility.data,
+                quantity: eligibility.quantity,
+                economics: eligibility.economics,
+                requestId,
+                attempted: false
+            };
+            manualOpenSubmissionInFlight = false;
+
+            const side = String(eligibility.data.side).toUpperCase();
+            setConfirmationText('manual-open-confirm-account', eligibility.data.execution_account_id || 'N/A');
+            setConfirmationText(
+                'manual-open-confirm-environment',
+                String(
+                    eligibility.data.execution_environment || 'UNKNOWN'
+                ).toUpperCase()
+            );
+            setConfirmationText('manual-open-confirm-order', `${normalizedTicker} ${side} credit spread`);
+            setConfirmationText('manual-open-confirm-broker-symbol', eligibility.data.broker_symbol);
+            setConfirmationText('manual-open-confirm-expiration', eligibility.data.expiration);
+            setConfirmationText('manual-open-confirm-short-leg', `SELL ${side} ${eligibility.data.sell_strike}`);
+            setConfirmationText('manual-open-confirm-long-leg', `BUY ${side} ${eligibility.data.buy_strike}`);
+            setConfirmationText(
+                'manual-open-confirm-credit',
+                `$${eligibility.economics.limitCredit.toFixed(2)} limit ($${eligibility.economics.creditPerContract.toFixed(2)} per contract)`
+            );
+            setConfirmationText('manual-open-confirm-quantity', eligibility.quantity);
+            setConfirmationText(
+                'manual-open-confirm-total-credit',
+                `$${eligibility.economics.totalCredit.toFixed(2)} before fees`
+            );
+            setConfirmationText(
+                'manual-open-confirm-max-loss',
+                `$${eligibility.economics.maxLoss.toFixed(2)} before fees`
+            );
+            setConfirmationText('manual-open-confirm-expires', eligibility.data.proposal_expires_at);
+            setConfirmationText('manual-open-confirm-request-id', requestId);
+
+            const message = document.getElementById('manual-open-confirm-message');
+            message.className = 'confirm-warning';
+            message.textContent = 'Submitting can create a live E*TRADE order. Confirm only after checking every leg, the credit, quantity, and maximum loss.';
+            const submitButton = document.getElementById('manual-open-submit-btn');
+            submitButton.disabled = false;
+            submitButton.textContent = 'Submit Once';
+            const cancelButton = document.getElementById('manual-open-cancel-btn');
+            cancelButton.disabled = false;
+            cancelButton.textContent = 'Cancel';
+            const confirmationPin = document.getElementById(
+                'manual-open-confirm-pin'
+            );
+            confirmationPin.value = '';
+            document.getElementById('manual-open-confirm-overlay').classList.remove('hidden');
+            confirmationPin.focus();
+            scheduleProposalExpiryCheck();
+        }
+
+        function closeManualOpenConfirmation() {
+            if (manualOpenSubmissionInFlight) return;
+            document.getElementById('manual-open-confirm-overlay').classList.add('hidden');
+            document.getElementById('manual-open-confirm-pin').value = '';
+            pendingManualOpen = null;
+        }
+
+        function storedManualOpenAttempt() {
+            let raw;
+            try {
+                raw = sessionStorage.getItem(
+                    MANUAL_OPEN_ATTEMPT_STORAGE_KEY
+                );
+                if (!raw) {
+                    const legacy = sessionStorage.getItem(
+                        LEGACY_MANUAL_OPEN_ATTEMPT_STORAGE_KEY
+                    );
+                    if (!legacy) return null;
+                    return {
+                        invalid: true,
+                        reason_code: 'LEGACY_RECOVERY_MARKER_UNBOUND'
+                    };
+                }
+                const parsed = JSON.parse(raw);
+                const expectedFields = [
+                    'account_id',
+                    'created_at',
+                    'environment',
+                    'proposal_id',
+                    'request_id',
+                    'runtime_config_sha256',
+                    'schema_version'
+                ];
+                const actualFields = (
+                    parsed && typeof parsed === 'object'
+                ) ? Object.keys(parsed).sort() : [];
+                if (
+                    actualFields.length !== expectedFields.length
+                    || !actualFields.every(
+                        (field, index) => field === expectedFields[index]
+                    )
+                    || parsed.schema_version !== 2
+                    || !/^[1-9][0-9]*$/.test(parsed.account_id)
+                    || !['sandbox', 'production'].includes(parsed.environment)
+                    || !/^[0-9a-f]{64}$/.test(
+                        parsed.runtime_config_sha256
+                    )
+                    || typeof parsed.proposal_id !== 'string'
+                    || !parsed.proposal_id
+                    || typeof parsed.request_id !== 'string'
+                    || !parsed.request_id
+                    || !Number.isFinite(Date.parse(parsed.created_at))
+                ) {
+                    return {
+                        invalid: true,
+                        reason_code: 'RECOVERY_MARKER_INVALID'
+                    };
+                }
+                return { ...parsed, invalid: false };
+            } catch (_error) {
+                return {
+                    invalid: true,
+                    reason_code: 'RECOVERY_MARKER_INVALID'
+                };
+            }
+        }
+
+        function persistManualOpenAttempt(manualOpen) {
+            const proposalId = String(manualOpen?.data?.proposal_id || '');
+            const requestId = String(manualOpen?.requestId || '');
+            const accountId = String(
+                manualOpen?.data?.execution_account_id || ''
+            );
+            if (
+                !proposalId
+                || !requestId
+                || !/^[1-9][0-9]*$/.test(accountId)
+                || !['sandbox', 'production'].includes(
+                    currentManualOpenEnvironment
+                )
+                || !/^[0-9a-f]{64}$/.test(
+                    currentManualOpenConfigSha256
+                )
+            ) return false;
+            try {
+                sessionStorage.setItem(
+                    MANUAL_OPEN_ATTEMPT_STORAGE_KEY,
+                    JSON.stringify({
+                        schema_version: 2,
+                        proposal_id: proposalId,
+                        request_id: requestId,
+                        account_id: accountId,
+                        environment: currentManualOpenEnvironment,
+                        runtime_config_sha256:
+                            currentManualOpenConfigSha256,
+                        created_at: new Date().toISOString()
+                    })
+                );
+                return true;
+            } catch (_error) {
+                return false;
+            }
+        }
+
+        function clearStoredManualOpenAttempt(proposalId) {
+            const stored = storedManualOpenAttempt();
+            if (
+                !stored
+                || stored.invalid
+                || stored.proposal_id !== proposalId
+            ) return;
+            try {
+                sessionStorage.removeItem(MANUAL_OPEN_ATTEMPT_STORAGE_KEY);
+            } catch (_error) {
+                // A storage failure cannot authorize a retry.
+            }
+        }
+
+        function manualOpenDisplayState(result) {
+            return String(
+                result?.status
+                || result?.state
+                || result?.durable_state
+                || 'UNKNOWN'
+            ).toUpperCase();
+        }
+
+        function isValidatedManualOpenResponse(payload, requestId) {
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                return false;
+            }
+            const state = String(payload.state || '').toUpperCase();
+            if (
+                payload.request_id !== requestId
+                || !['SUBMITTED', 'SUBMISSION_UNKNOWN', 'FAILED'].includes(state)
+                || typeof payload.intent_id !== 'string'
+                || payload.intent_id.length < 1
+                || payload.intent_id.length > 256
+                || typeof payload.created !== 'boolean'
+                || !(
+                    payload.broker_order_id === null
+                    || (
+                        typeof payload.broker_order_id === 'string'
+                        && /^[1-9][0-9]{0,18}$/.test(
+                            payload.broker_order_id
+                        )
+                    )
+                )
+                || !(
+                    payload.reason_code === null
+                    || (
+                        typeof payload.reason_code === 'string'
+                        && payload.reason_code.length <= 256
+                    )
+                )
+            ) {
+                return false;
+            }
+            if (
+                state === 'SUBMITTED'
+                && payload.broker_order_id === null
+            ) {
+                return false;
+            }
+            if (
+                state === 'FAILED'
+                && payload.broker_order_id !== null
+            ) {
+                return false;
+            }
+            return true;
+        }
+
+        function manualOpenRequiresReconciliation(result) {
+            const state = manualOpenDisplayState(result);
+            const durableState = String(
+                result?.durable_state || ''
+            ).toUpperCase();
+            return (
+                ['SUBMISSION_UNKNOWN', 'DO_NOT_RETRY', 'INTENT', 'CLAIMED'].includes(state)
+                || ['SUBMISSION_UNKNOWN', 'INTENT', 'CLAIMED', 'STATUS_NOT_FOUND'].includes(durableState)
+            );
+        }
+
+        function manualOpenOutcomeMessage(result) {
+            const state = manualOpenDisplayState(result);
+            const durableState = String(result?.durable_state || '').toUpperCase();
+            const reason = result?.reason_code ? ` Reason: ${result.reason_code}.` : '';
+            const brokerOrder = result?.broker_order_id ? ` Broker order ID: ${result.broker_order_id}.` : '';
+            if (
+                ['SUBMITTED', 'BROKER_ACKNOWLEDGED'].includes(state)
+                || ['SUBMITTED', 'BROKER_ACKNOWLEDGED', 'ACKNOWLEDGED'].includes(durableState)
+            ) {
+                return `SUBMITTED / BROKER ACKNOWLEDGED — the durable order submission was acknowledged.${brokerOrder} This is not a fill confirmation. Do not submit this proposal again; monitor its broker lifecycle separately.`;
+            }
+            if (
+                ['SUBMISSION_UNKNOWN', 'DO_NOT_RETRY', 'INTENT', 'CLAIMED'].includes(state)
+                || ['SUBMISSION_UNKNOWN', 'INTENT', 'CLAIMED'].includes(durableState)
+            ) {
+                return `${state.replaceAll('_', ' ')} — the durable submission state is unresolved.${reason} DO NOT RETRY this proposal. Reconciliation is required before any new attempt.`;
+            }
+            if (state === 'FAILED' || durableState === 'FAILED') {
+                return `FAILED — durable submission processing stopped.${reason} This does not automatically mean E*TRADE rejected the order. No automatic retry occurred; review the durable record before any deliberate new proposal.`;
+            }
+            if (state === 'FILLED' || durableState === 'FILLED') {
+                return `FILLED — durable reconciliation recorded a complete fill.${brokerOrder} This status came from the local durable ledger; the dashboard did not poll broker orders.`;
+            }
+            if (state === 'REJECTED' || durableState === 'REJECTED') {
+                return `REJECTED — durable broker evidence recorded rejection.${reason} Do not resubmit the same proposal.`;
+            }
+            if (
+                ['CANCELLED', 'EXPIRED'].includes(state)
+                || ['CANCELLED', 'EXPIRED'].includes(durableState)
+            ) {
+                return `${state} — the durable order lifecycle is terminal.${reason} Do not resubmit the same proposal.`;
+            }
+            return `${state.replaceAll('_', ' ')} — the durable state needs operator review.${reason} DO NOT RETRY until it is reconciled.`;
+        }
+
+        function renderManualOpenSubmission(result, persist = true) {
+            const box = document.getElementById('manual-order-status');
+            const body = document.getElementById('manual-order-status-body');
+            if (!box || !body) return;
+            const state = manualOpenDisplayState(result);
+            const durableState = String(result?.durable_state || '').toUpperCase();
+            if (persist) latestDurableManualOpenResult = { ...result };
+            manualOpenRecoveryBlocked = manualOpenRequiresReconciliation(
+                result
+            );
+            const stateClass = (
+                ['SUBMITTED', 'BROKER_ACKNOWLEDGED'].includes(state)
+                || ['SUBMITTED', 'BROKER_ACKNOWLEDGED', 'ACKNOWLEDGED'].includes(durableState)
+                || state === 'FILLED'
+                || durableState === 'FILLED'
+            )
+                ? 'success'
+                : (
+                    ['SUBMISSION_UNKNOWN', 'DO_NOT_RETRY', 'INTENT', 'CLAIMED'].includes(state)
+                    || ['SUBMISSION_UNKNOWN', 'INTENT', 'CLAIMED'].includes(durableState)
+                )
+                    ? 'pending'
+                    : 'failed';
+
+            box.classList.remove('hidden', 'failed', 'success', 'pending');
+            box.classList.add(stateClass);
+            body.replaceChildren();
+
+            const row = document.createElement('div');
+            row.className = `manual-order-row ${stateClass}`;
+            const title = document.createElement('strong');
+            title.textContent = state.replaceAll('_', ' ');
+            const message = document.createElement('span');
+            message.className = 'manual-order-meta';
+            message.textContent = manualOpenOutcomeMessage(result);
+            row.append(title, message);
+
+            [
+                result?.proposal_id ? `Proposal ${result.proposal_id}` : null,
+                result?.request_id ? `Request ${result.request_id}` : null,
+                result?.intent_id ? `Intent ${result.intent_id}` : null,
+                result?.durable_state ? `Durable state ${result.durable_state}` : null,
+                result?.updated_at ? `Updated ${result.updated_at}` : null
+            ].filter(Boolean).forEach((value) => {
+                const metadata = document.createElement('span');
+                metadata.className = 'manual-order-meta';
+                metadata.textContent = `| ${value}`;
+                row.appendChild(metadata);
+            });
+            body.appendChild(row);
+            updateManualOpenControls();
+        }
+
+        function showManualOpenOutcome(result) {
+            const state = manualOpenDisplayState(result);
+            const durableState = String(result?.durable_state || '').toUpperCase();
+            const acknowledged = (
+                ['SUBMITTED', 'BROKER_ACKNOWLEDGED'].includes(state)
+                || ['SUBMITTED', 'BROKER_ACKNOWLEDGED', 'ACKNOWLEDGED'].includes(durableState)
+            );
+            const doNotRetry = (
+                ['SUBMISSION_UNKNOWN', 'DO_NOT_RETRY', 'INTENT', 'CLAIMED'].includes(state)
+                || ['SUBMISSION_UNKNOWN', 'INTENT', 'CLAIMED'].includes(durableState)
+            );
+            const message = document.getElementById('manual-open-confirm-message');
+            message.className = acknowledged
+                ? 'confirm-warning success'
+                : doNotRetry
+                    ? 'confirm-warning'
+                    : 'confirm-warning failed';
+            message.textContent = manualOpenOutcomeMessage(result);
+
+            const submitButton = document.getElementById('manual-open-submit-btn');
+            submitButton.disabled = true;
+            submitButton.textContent = acknowledged
+                ? 'Submitted'
+                : doNotRetry
+                    ? 'Do Not Retry'
+                    : 'Failed — No Auto-Retry';
+            const cancelButton = document.getElementById('manual-open-cancel-btn');
+            cancelButton.disabled = false;
+            cancelButton.textContent = 'Close';
+            renderManualOpenSubmission(result);
+        }
+
+        async function submitConfirmedManualOpen() {
+            if (!pendingManualOpen || pendingManualOpen.attempted || manualOpenSubmissionInFlight) return;
+            const eligibility = manualOpenEligibility(pendingManualOpen.ticker);
+            if (
+                !eligibility.allowed
+                || eligibility.data.proposal_token !== pendingManualOpen.data.proposal_token
+                || eligibility.quantity !== pendingManualOpen.quantity
+            ) {
+                const message = document.getElementById('manual-open-confirm-message');
+                message.className = 'confirm-warning failed';
+                message.textContent = eligibility.reason || 'The signed preview changed. No order was sent.';
+                document.getElementById('manual-open-submit-btn').disabled = true;
+                return;
+            }
+
+            const confirmationPin = document.getElementById(
+                'manual-open-confirm-pin'
+            );
+            let pin = confirmationPin.value;
+            if (pin.length < 8 || pin.length > 64) {
+                const message = document.getElementById(
+                    'manual-open-confirm-message'
+                );
+                message.className = 'confirm-warning failed';
+                message.textContent = (
+                    'Re-enter the dashboard PIN to authorize this exact '
+                    + 'order. No order was sent.'
+                );
+                confirmationPin.focus();
+                return;
+            }
+            if (typeof window.AbortController !== 'function') {
+                pin = '';
+                confirmationPin.value = '';
+                const message = document.getElementById(
+                    'manual-open-confirm-message'
+                );
+                message.className = 'confirm-warning failed';
+                message.textContent = (
+                    'This browser cannot enforce the bounded submission '
+                    + 'timeout. No order was sent.'
+                );
+                document.getElementById(
+                    'manual-open-submit-btn'
+                ).disabled = true;
+                return;
+            }
+
+            if (!persistManualOpenAttempt(pendingManualOpen)) {
+                pin = '';
+                confirmationPin.value = '';
+                const result = {
+                    state: 'FAILED',
+                    proposal_id: pendingManualOpen.data.proposal_id,
+                    request_id: pendingManualOpen.requestId,
+                    reason_code: 'RECOVERY_MARKER_UNAVAILABLE'
+                };
+                const message = document.getElementById('manual-open-confirm-message');
+                message.className = 'confirm-warning failed';
+                message.textContent = 'The browser could not save the durable proposal and request IDs for recovery. No order was sent.';
+                document.getElementById('manual-open-submit-btn').disabled = true;
+                renderManualOpenSubmission(result, false);
+                return;
+            }
+
+            pendingManualOpen.attempted = true;
+            manualOpenSubmissionInFlight = true;
+            consumedManualOpenProposals.add(pendingManualOpen.data.proposal_token);
+            updateManualOpenControls();
+
+            const submitButton = document.getElementById('manual-open-submit-btn');
+            const cancelButton = document.getElementById('manual-open-cancel-btn');
+            const message = document.getElementById('manual-open-confirm-message');
+            submitButton.disabled = true;
+            submitButton.textContent = 'Submitting Once…';
+            cancelButton.disabled = true;
+            message.className = 'confirm-warning';
+            message.textContent = 'One request is in flight. The dashboard will not retry it automatically.';
+
+            const requestBody = {
+                pin,
+                proposal_token: pendingManualOpen.data.proposal_token,
+                quantity: pendingManualOpen.quantity,
+                request_id: pendingManualOpen.requestId
+            };
+            const encodedRequestBody = JSON.stringify(requestBody);
+            requestBody.pin = '';
+            pin = '';
+            confirmationPin.value = '';
+
+            let result;
+            const submissionController = new window.AbortController();
+            const submissionTimeout = setTimeout(
+                () => submissionController.abort(),
+                30000
+            );
+            try {
+                const response = await fetch('/api/manual_open', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Manual-Open-Request-Id':
+                            pendingManualOpen.requestId
+                    },
+                    credentials: 'same-origin',
+                    body: encodedRequestBody,
+                    signal: submissionController.signal
+                });
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                const payload = await response.json().catch(() => null);
+                const definitivelyNotAttempted = (
+                    !response.ok
+                    && payload?.submission_disposition === 'NOT_ATTEMPTED'
+                    && payload?.request_id === pendingManualOpen.requestId
+                );
+                if (definitivelyNotAttempted) {
+                    result = {
+                        state: 'FAILED',
+                        proposal_id: pendingManualOpen.data.proposal_id,
+                        request_id: pendingManualOpen.requestId,
+                        durable_state: 'NOT_SENT',
+                        reason_code:
+                            payload?.code || 'NOT_ATTEMPTED'
+                    };
+                    clearStoredManualOpenAttempt(
+                        pendingManualOpen.data.proposal_id
+                    );
+                    manualOpenSubmissionInFlight = false;
+                    showManualOpenOutcome(result);
+                    if (response.status === 403) clearPin();
+                    return;
+                }
+
+                const responseState = String(payload?.state || '').toUpperCase();
+                if (
+                    isValidatedManualOpenResponse(
+                        payload,
+                        pendingManualOpen.requestId
+                    )
+                ) {
+                    result = {
+                        ...payload,
+                        proposal_id: payload?.proposal_id || pendingManualOpen.data.proposal_id,
+                        state: responseState
+                    };
+                } else {
+                    result = {
+                        state: 'SUBMISSION_UNKNOWN',
+                        proposal_id: pendingManualOpen.data.proposal_id,
+                        request_id: pendingManualOpen.requestId,
+                        intent_id: (
+                            typeof payload?.intent_id === 'string'
+                                ? payload.intent_id : undefined
+                        ),
+                        broker_order_id: (
+                            typeof payload?.broker_order_id === 'string'
+                                ? payload.broker_order_id : undefined
+                        ),
+                        reason_code: (
+                            payload?.request_id
+                            && payload.request_id
+                                !== pendingManualOpen.requestId
+                        )
+                            ? 'RESPONSE_REQUEST_ID_MISMATCH'
+                            : (
+                                payload?.code
+                                || `UNVERIFIED_HTTP_${response.status}`
+                            )
+                    };
+                }
+            } catch (error) {
+                console.error('Manual-open submission outcome is unknown', error);
+                result = {
+                    state: 'SUBMISSION_UNKNOWN',
+                    proposal_id: pendingManualOpen.data.proposal_id,
+                    request_id: pendingManualOpen.requestId,
+                    reason_code: 'NETWORK_OUTCOME_UNKNOWN'
+                };
+            } finally {
+                clearTimeout(submissionTimeout);
+                manualOpenSubmissionInFlight = false;
+                updateManualOpenControls();
+            }
+
+            showManualOpenOutcome(result);
         }
 
         const PORTFOLIO_REFRESH_INTERVAL_MS = 300000;
@@ -1293,6 +2551,76 @@
             });
         }
 
+        function renderManualOpenCapability(status) {
+            const banner = document.getElementById('execution-banner');
+            const previousAccountId = currentAccountId;
+            const previousCapability = manualOpenCapabilityEnabled;
+            const previousEnvironment = currentManualOpenEnvironment;
+            const previousConfigSha256 =
+                currentManualOpenConfigSha256;
+            const reportedAccountId = String(status?.account_id || '').trim();
+            const executorAccountId = String(status?.manual_open_account_id || '').trim();
+            const historyAccountId = String(
+                status?.manual_open_history_account_id || ''
+            ).trim();
+            const historyEnvironment = String(
+                status?.manual_open_history_environment || ''
+            ).trim();
+            const historyConfigSha256 = String(
+                status?.manual_open_history_config_sha256 || ''
+            ).trim();
+            const hasExactAccount = (
+                /^[1-9][0-9]*$/.test(reportedAccountId)
+                && executorAccountId === reportedAccountId
+                && historyAccountId === reportedAccountId
+            );
+            const hasExactHistoryBinding = (
+                hasExactAccount
+                && ['sandbox', 'production'].includes(historyEnvironment)
+                && /^[0-9a-f]{64}$/.test(historyConfigSha256)
+            );
+            const serverEnabled = status?.manual_open_enabled === true;
+            manualOpenCapabilityEnabled = (
+                serverEnabled && hasExactHistoryBinding
+            );
+            currentAccountId = hasExactAccount ? executorAccountId : 'N/A';
+            currentManualOpenEnvironment = hasExactHistoryBinding
+                ? historyEnvironment : '';
+            currentManualOpenConfigSha256 = hasExactHistoryBinding
+                ? historyConfigSha256 : '';
+            manualOpenCapabilityReason = serverEnabled && !hasExactHistoryBinding
+                ? 'The status account or durable history binding does not match the exact executor runtime.'
+                : manualOpenCapabilityEnabled
+                    ? ''
+                    : String(
+                    status?.manual_open_reason
+                    || 'Supervised manual opening is not authorized by the server.'
+                );
+
+            banner.classList.remove('execution-enabled', 'execution-pending');
+            if (manualOpenCapabilityEnabled) {
+                banner.classList.add('execution-enabled');
+                banner.textContent = `Supervised manual opening enabled for account ${currentAccountId} in ${currentManualOpenEnvironment.toUpperCase()}. PUT/CALL credit spreads require a fresh signed preview and one explicit confirmation. Auto-open, close, and neutralize remain disabled.`;
+            } else {
+                banner.textContent = `Manual opening unavailable — ${manualOpenCapabilityReason} Auto-open, close, and neutralize remain disabled.`;
+            }
+            if (
+                (previousAccountId !== currentAccountId
+                    || previousCapability !== manualOpenCapabilityEnabled
+                    || previousEnvironment
+                        !== currentManualOpenEnvironment
+                    || previousConfigSha256
+                        !== currentManualOpenConfigSha256)
+                && (spyPreviewData || spxPreviewData)
+            ) {
+                invalidateSpreadPreviews(
+                    'Account, environment, configuration, or server capability changed. Waiting for a fresh signed preview.'
+                );
+            } else {
+                updateManualOpenControls();
+            }
+        }
+
         async function loadData(forceIframe = false) {
             // Prevent multiple rapid calls
             if (window.isLoadingData) return;
@@ -1315,18 +2643,30 @@
                 const status = await statusRes.json();
                 const positionsVersion = await positionsVersionRes.json();
                 latestMarketStatus = status.market_status || null;
+                renderManualOpenCapability(status);
                 if (!lastPortfolioRefreshRequested) {
                     const generatedAt = Number(positionsVersion.positions_version) / 1e6;
                     lastPortfolioRefreshRequested = Number.isFinite(generatedAt) && generatedAt > 0 ? generatedAt : 0;
                 }
 
                 const serverBadge = document.getElementById('server-status');
+                const serverDot = document.createElement('div');
+                serverDot.style.width = '8px';
+                serverDot.style.height = '8px';
+                serverDot.style.borderRadius = '50%';
+                serverDot.style.background = 'currentColor';
                 if (Object.keys(status).length > 0) {
                     serverBadge.className = 'status-badge status-open';
-                    serverBadge.innerHTML = '<div style="width:8px; height:8px; border-radius:50%; background:currentColor;"></div> Server: Connected';
+                    serverBadge.replaceChildren(
+                        serverDot,
+                        document.createTextNode(' Server: Connected')
+                    );
                 } else {
                     serverBadge.className = 'status-badge status-closed';
-                    serverBadge.innerHTML = '<div style="width:8px; height:8px; border-radius:50%; background:currentColor;"></div> Server: Unreachable';
+                    serverBadge.replaceChildren(
+                        serverDot,
+                        document.createTextNode(' Server: Unreachable')
+                    );
                 }
 
                 if (Object.keys(settings).length === 0) {
@@ -1388,6 +2728,7 @@
                 document.getElementById('server-status-warning')?.classList.add('hidden');
             } catch (err) {
                 console.error("Failed to load data", err);
+                renderManualOpenCapability({});
                 // Show warning if fetch fails
                 const warn = document.getElementById('server-status-warning');
                 if (warn) {
@@ -1401,20 +2742,33 @@
         }
 
         async function saveSettings() {
-            const keys = ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'target_weeks', 'spy_target_expiration', 'spx_target_expiration', 'trade_side', 'dashboard_user', 'dashboard_pass'];
-            const data = { pin: currentPin };
+            const keys = ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'spy_pair_quantity', 'spx_pair_quantity', 'target_weeks', 'spy_target_expiration', 'spx_target_expiration', 'trade_side', 'dashboard_user', 'dashboard_pass'];
+            const pinField = document.getElementById(
+                'settings-confirm-pin'
+            );
+            let pin = pinField.value;
+            if (pin.length < 8 || pin.length > 64) {
+                showToast('Re-enter the dashboard PIN before saving.');
+                pinField.focus();
+                return;
+            }
+            const data = { pin };
+            pin = '';
+            pinField.value = '';
             keys.forEach(key => {
                 const el = document.getElementById(key);
                 if (!el) return;
                 if (el.type === 'checkbox') data[key] = el.checked;
                 else data[key] = isNaN(el.value) || el.value === "" ? el.value : parseFloat(el.value);
             });
+            const settingsRequestBody = JSON.stringify(data);
+            data.pin = '';
 
             try {
                 const res = await fetch('/api/settings', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
+                    body: settingsRequestBody
                 });
 
                 if (res.status === 401) { window.location.href = '/login'; return; }
@@ -1434,38 +2788,95 @@
             } catch (err) { alert("Failed to save: " + err); }
         }
 
-        async function pollManualOrderStatus(requestId) {
-            for (let i = 0; i < 90; i++) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                try {
-                    const res = await fetch('/api/status');
-                    if (res.status === 401) { window.location.href = '/login'; return; }
-                    if (!res.ok) continue;
-                    const status = await res.json();
-                    const requests = status.manual_orders?.requests || [];
-                    const manual = requests.find(r => r.request_id === requestId) || status.manual_order || {};
-                    if (manual.request_id !== requestId) continue;
-                    renderManualOrderStatus(status);
-
-                    if (manual.status === 'failed') {
-                        alert("Manual order failed: " + (manual.message || "Unknown error"));
-                        return;
-                    }
-                    if (manual.status === 'placed' || manual.status === 'filled') {
-                        showToast(manual.message || "Manual order submitted");
-                        return;
-                    }
-                } catch (err) {
-                    console.error("Manual order status poll failed", err);
+        function recoveredManualOpenResult(statusPayload) {
+            const recent = Array.isArray(statusPayload?.manual_open_recent)
+                ? statusPayload.manual_open_recent.filter(
+                    item => item && typeof item === 'object'
+                )
+                : [];
+            const stored = storedManualOpenAttempt();
+            if (stored) {
+                if (stored.invalid) {
+                    return {
+                        status: 'SUBMISSION_UNKNOWN',
+                        durable_state: 'STATUS_NOT_FOUND',
+                        reason_code: stored.reason_code
+                    };
                 }
+                const historyAccountId = String(
+                    statusPayload?.manual_open_history_account_id || ''
+                );
+                const historyEnvironment = String(
+                    statusPayload?.manual_open_history_environment || ''
+                );
+                const historyConfigSha256 = String(
+                    statusPayload?.manual_open_history_config_sha256 || ''
+                );
+                if (
+                    historyAccountId !== stored.account_id
+                    || historyEnvironment !== stored.environment
+                    || historyConfigSha256
+                        !== stored.runtime_config_sha256
+                ) {
+                    return {
+                        proposal_id: stored.proposal_id,
+                        request_id: stored.request_id,
+                        status: 'SUBMISSION_UNKNOWN',
+                        durable_state: 'STATUS_NOT_FOUND',
+                        reason_code: 'RECOVERY_RUNTIME_BINDING_MISMATCH'
+                    };
+                }
+                const matched = recent.find(
+                    item => String(item?.proposal_id || '') === stored.proposal_id
+                );
+                if (matched) {
+                    return {
+                        ...matched,
+                        request_id: stored.request_id
+                    };
+                }
+                return {
+                    proposal_id: stored.proposal_id,
+                    request_id: stored.request_id,
+                    status: 'SUBMISSION_UNKNOWN',
+                    durable_state: 'STATUS_NOT_FOUND',
+                    reason_code: 'DURABLE_STATUS_NOT_VISIBLE'
+                };
             }
-            showToast("Order status still pending. Check dashboard logs.");
+            if (!recent.length) return null;
+            return recent.reduce((latest, candidate) => {
+                const latestTimestamp = Date.parse(
+                    String(latest?.updated_at || latest?.created_at || '')
+                );
+                const candidateTimestamp = Date.parse(
+                    String(candidate?.updated_at || candidate?.created_at || '')
+                );
+                return (
+                    Number.isFinite(candidateTimestamp)
+                    && (
+                        !Number.isFinite(latestTimestamp)
+                        || candidateTimestamp > latestTimestamp
+                    )
+                ) ? candidate : latest;
+            });
         }
 
         function renderManualOrderStatus(statusPayload) {
             const box = document.getElementById('manual-order-status');
             const body = document.getElementById('manual-order-status-body');
             if (!box || !body) return;
+            const recovered = recoveredManualOpenResult(statusPayload);
+            if (recovered) {
+                latestDurableManualOpenResult = { ...recovered };
+                renderManualOpenSubmission(
+                    recovered,
+                    false
+                );
+                return;
+            }
+            latestDurableManualOpenResult = null;
+            manualOpenRecoveryBlocked = false;
+            updateManualOpenControls();
 
             const todayPrefix = String(statusPayload?.server_time || new Date().toISOString()).slice(0, 10);
             const requests = statusPayload?.manual_orders?.today
@@ -1475,9 +2886,6 @@
                 return;
             }
 
-            const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
-                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-            }[ch]));
             const statusClass = (statusValue) => {
                 const status = String(statusValue || 'unknown').toLowerCase();
                 if (status === 'failed' || status === 'rejected' || status === 'cancelled') return 'failed';
@@ -1494,27 +2902,51 @@
             };
 
             box.classList.remove('hidden', 'failed', 'success', 'pending');
-            body.innerHTML = `<div class="manual-order-list">${
-                requests.map(order => {
-                    const labelParts = [
-                        order.ticker,
-                        order.side,
-                        order.request_type ? order.request_type.toUpperCase() : null
-                    ].filter(Boolean);
-                    const label = labelParts.length ? labelParts.join(' ') : 'Manual order';
-                    const message = order.message || 'Waiting for backend update';
-                    const quantity = order.quantity != null ? `Qty ${order.quantity}` : '';
-                    const orderIds = order.order_ids?.length ? `Order ID ${order.order_ids.join(', ')}` : 'No order ID yet';
-                    const updatedAt = order.updated_at ? `Updated ${order.updated_at}` : '';
-                    return `<div class="manual-order-row ${statusClass(order.status)}">
-                        <strong>${escapeHtml(label)}: ${escapeHtml(statusLabel(order.status))}</strong>
-                        <span class="manual-order-meta">- ${escapeHtml(message)}</span>
-                        ${quantity ? `<span class="manual-order-meta">| ${escapeHtml(quantity)}</span>` : ''}
-                        <span class="manual-order-meta">| ${escapeHtml(orderIds)}</span>
-                        ${updatedAt ? `<span class="manual-order-meta">| ${escapeHtml(updatedAt)}</span>` : ''}
-                    </div>`;
-                }).join('')
-            }</div>`;
+            body.replaceChildren();
+            const orderList = document.createElement('div');
+            orderList.className = 'manual-order-list';
+            requests.forEach((order) => {
+                const labelParts = [
+                    order.ticker,
+                    order.side,
+                    order.request_type
+                        ? String(order.request_type).toUpperCase()
+                        : null
+                ].filter(Boolean);
+                const label = labelParts.length
+                    ? labelParts.join(' ') : 'Manual order';
+                const message = order.message
+                    || 'Waiting for backend update';
+                const quantity = order.quantity != null
+                    ? `Qty ${order.quantity}` : '';
+                const orderIds = order.order_ids?.length
+                    ? `Order ID ${order.order_ids.join(', ')}`
+                    : 'No order ID yet';
+                const updatedAt = order.updated_at
+                    ? `Updated ${order.updated_at}` : '';
+                const row = document.createElement('div');
+                row.className = (
+                    `manual-order-row ${statusClass(order.status)}`
+                );
+                const title = document.createElement('strong');
+                title.textContent = (
+                    `${label}: ${statusLabel(order.status)}`
+                );
+                row.appendChild(title);
+                [
+                    `- ${message}`,
+                    quantity ? `| ${quantity}` : null,
+                    `| ${orderIds}`,
+                    updatedAt ? `| ${updatedAt}` : null
+                ].filter(Boolean).forEach((value) => {
+                    const metadata = document.createElement('span');
+                    metadata.className = 'manual-order-meta';
+                    metadata.textContent = value;
+                    row.appendChild(metadata);
+                });
+                orderList.appendChild(row);
+            });
+            body.appendChild(orderList);
         }
 
         async function triggerRefresh(silent = false) {
@@ -1626,6 +3058,19 @@
             return `${(num * 100).toFixed(0)}%`;
         }
 
+        function renderMetricLines(element, primary, secondary) {
+            element.replaceChildren();
+            element.appendChild(
+                document.createTextNode(String(primary))
+            );
+            element.appendChild(document.createElement('br'));
+            const detail = document.createElement('span');
+            detail.style.fontSize = '0.75rem';
+            detail.style.color = 'var(--text-muted)';
+            detail.textContent = String(secondary);
+            element.appendChild(detail);
+        }
+
         function renderRegimeStatus(regime) {
             const regimeEl = document.getElementById('hmm-regime');
             const rawEl = document.getElementById('hmm-raw-state');
@@ -1645,14 +3090,30 @@
             const rawLabel = regime.raw_hmm_label || `State ${regime.raw_hmm_state ?? '--'}`;
             const sourceSuffix = regime.stale ? ' (stale)' : '';
 
-            regimeEl.innerHTML = `${finalLabel}<br><span style="font-size: 0.75rem; color: var(--text-muted);">${regime.stress_overlay || 'none'}${sourceSuffix}</span>`;
+            renderMetricLines(
+                regimeEl,
+                finalLabel,
+                `${regime.stress_overlay || 'none'}${sourceSuffix}`
+            );
             regimeEl.style.color = regimeColor(finalLabel);
 
-            rawEl.innerHTML = `${rawLabel}<br><span style="font-size: 0.75rem; color: var(--text-muted);">state ${regime.raw_hmm_state ?? '--'}</span>`;
+            renderMetricLines(
+                rawEl,
+                rawLabel,
+                `state ${regime.raw_hmm_state ?? '--'}`
+            );
             rawEl.style.color = regimeColor(rawLabel);
 
-            confidenceEl.innerHTML = `${formatPercent(regime.raw_hmm_confidence)}<br><span style="font-size: 0.75rem; color: var(--text-muted);">raw posterior</span>`;
-            signalDateEl.innerHTML = `${regime.as_of_date || '--'}<br><span style="font-size: 0.75rem; color: var(--text-muted);">${regime.signal_timestamp || 'close_T_for_next_session'}</span>`;
+            renderMetricLines(
+                confidenceEl,
+                formatPercent(regime.raw_hmm_confidence),
+                'raw posterior'
+            );
+            renderMetricLines(
+                signalDateEl,
+                regime.as_of_date || '--',
+                regime.signal_timestamp || 'close_T_for_next_session'
+            );
         }
 
         function renderRegimeV2ShadowStatus(payload) {
@@ -1761,7 +3222,11 @@
 
                     document.getElementById('zero-gamma-level').innerText = `$${Number(data.zero_gamma).toFixed(2)}`;
                     document.getElementById('spy-spot-price').innerText = `$${Number(data.spot_price).toFixed(2)}`;
-                    document.getElementById('gex-walls').innerHTML = `Call: $${Number(data.call_wall).toFixed(0)}<br>Put: $${Number(data.put_wall).toFixed(0)}`;
+                    renderMetricLines(
+                        document.getElementById('gex-walls'),
+                        `Call: $${Number(data.call_wall).toFixed(0)}`,
+                        `Put: $${Number(data.put_wall).toFixed(0)}`
+                    );
                     renderRegimeStatus(data.regime);
 
                     document.getElementById('gex-last-update').innerText = `Last updated: ${data.timestamp}`;
@@ -1840,25 +3305,25 @@
                         x: {
                             grid: { display: false },
                             ticks: {
-                                font: { family: 'Outfit', size: 10 },
+                                font: { size: 10 },
                                 maxTicksLimit: 20
                             },
                             title: {
                                 display: true,
                                 text: 'Strike Price ($)',
-                                font: { family: 'Outfit', size: 11, weight: 'bold' }
+                                font: { size: 11, weight: 'bold' }
                             }
                         },
                         y: {
                             grid: { color: 'rgba(0, 0, 0, 0.05)' },
                             ticks: {
-                                font: { family: 'Outfit', size: 10 },
+                                font: { size: 10 },
                                 callback: function(value) { return value + 'M'; }
                             },
                             title: {
                                 display: true,
                                 text: 'Exposure ($ Millions)',
-                                font: { family: 'Outfit', size: 11, weight: 'bold' }
+                                font: { size: 11, weight: 'bold' }
                             }
                         }
                     }
@@ -1867,7 +3332,7 @@
         }
 
         document.getElementById('pin-field').addEventListener('input', (event) => {
-            event.target.value = event.target.value.replace(/\D/g, '').slice(0, 64);
+            event.target.value = event.target.value.slice(0, 64);
             document.getElementById('pin-error').textContent = '';
         });
         setInterval(() => maybeAutoRefreshPortfolio(false), 30000);

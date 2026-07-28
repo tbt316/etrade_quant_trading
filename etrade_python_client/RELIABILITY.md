@@ -81,13 +81,30 @@ For every reliability incident:
   environment, and canonical economic terms match the authorization.
 - Account opening capacity must use an immutable gateway/operator risk ceiling,
   not a strategy-command value. Incomplete, stale, unstable, or non-durable
-  balance/position/open-order evidence cannot authorize exposure.
+  balance/position/open-order evidence cannot authorize exposure. Fresh
+  schema-19 policy V2 must cap at raw broker buying power and subtract external
+  position risk, external order risk, and represented managed filled risk from
+  the account budget; it must never add represented risk back to buying power.
+  Active local reservations are applied separately.
+- Account opening risk and daily authorization are independent limits. The
+  field named `max_daily_loss_cents` is a New York calendar-day budget for
+  newly authorized maximum loss, not realized/marked P&L or a trading-day
+  counter. Once a reservation is created, later failure or release must not
+  refund that daily authorization.
+- An executable manual proposal must be issued only during the open NYSE
+  regular session and bind a retained, origin-pinned E*TRADE response for both
+  exact OSI contracts. Both rows must be `REALTIME`, fresh, usable,
+  non-crossed, and exchange-timestamped with bounded leg skew. A scanner or
+  browser timestamp is not quote evidence.
 - An order-capable dashboard binds to loopback by default. Public tunneling is a
   separately supervised operator action, and wildcard CORS is forbidden.
-- Dashboard credentials must reject defaults and weak values. Settings, arm
-  documents, OAuth state, and touched local logs must be owner-only regular
-  files and must not expose credentials, OAuth verifiers, full account
-  responses, order payloads, or account-bearing URLs.
+- Dashboard credentials must reject defaults and weak values. Login and action
+  PIN failures must be throttled, JSON bodies must be bounded, session and
+  proposal keys must be domain-separated, and credential changes must rotate
+  the authentication master. Settings, arm documents, OAuth state, and touched
+  local logs must be owner-only regular files and must not expose credentials,
+  OAuth verifiers, full account responses, order payloads, or account-bearing
+  URLs.
 - Removing a credential from the current source does not remediate a public Git
   history. Any published key must be treated as compromised, revoked and
   rotated at its issuer, then removed from history through a coordinated rewrite
@@ -96,6 +113,9 @@ For every reliability incident:
 ### Delivery and verification
 
 - The live service must be restarted or reloaded after backend changes.
+- One backend process must serve the exact protocol-matched dashboard template
+  generation it validated at startup; editing a template on disk must not mix
+  a new frontend with an old backend.
 - Regenerate the production HTML through the same endpoint used by the user.
 - Confirm cache headers/generations and reload the exact served artifact.
 - For charts, inspect the actual canvas at the user's time span and viewport.
@@ -128,7 +148,8 @@ truth. A source patch is not live until this whole path has been exercised.
 | INC-2026-07-17-03 | Resolved | Mobile view fragmented each SPX position into separate cards, making portfolio-level action thresholds hard to scan. | Layout was organized around individual position cards instead of decision-making by underlying. | One responsive table per ticker, pair-level gain/loss, DTE, strikes, and action emphasis. |
 | INC-2026-07-18-01 | Resolved | A weekend Refresh Data request changed the live portfolio value and margin budget to zero. | The E*TRADE portfolio request returned 401 after OAuth expiry. `portfolio()` silently converted the failed response to an empty list, and the dashboard writer treated it as a confirmed empty portfolio and overwrote the production HTML. | Retry an expired-token portfolio request through the shared auth callback, and require every dashboard-producing portfolio fetch to succeed before replacing the served artifact. |
 | INC-2026-07-24-01 | Resolved | The orange VIX line in the one-month benchmark chart stopped after July 6 while SPY and option-value data continued through July 24. | Market-history refresh checked only SPY and SPX for missing cached dates, so a VIX-only gap never triggered a download. Yahoo also returned malformed responses when the corrected refresh attempted the backfill. | Include VIX in independent missing-date detection and fall back to Cboe's official daily VIX history when Yahoo does not return the requested closes. |
-| INC-2026-07-26-02 | Open | The live process could enter production without an explicit environment, bind a mutable account-list position, and expose an order-capable dashboard beyond loopback; OAuth credentials were also embedded in tracked source. | Environment, arming, account identity, dashboard exposure, local file permissions, and credential sourcing were independent conventions rather than one fail-closed startup boundary. The repository is public, so removing values from the current source cannot revoke copies retained in Git history. | R6 adds explicit environment resolution, exact production identity, a signed short-lived arm, placement-time revalidation, loopback-only dashboard service, strong local credentials, owner-only files, and guarded client logs. Keep this incident open until external keys are revoked/rotated, history is purged, R7 replaces compatibility paths with a durable single mutation owner, and the deployed service is verified. |
+| INC-2026-07-26-02 | Open | The live process could enter production without an explicit environment, bind a mutable account-list position, and expose an order-capable dashboard beyond loopback; OAuth credentials were also embedded in tracked source. | Environment, arming, account identity, dashboard exposure, local file permissions, and credential sourcing were independent conventions rather than one fail-closed startup boundary. Historical review recorded repository publication; current visibility is unverified, and removing values from current source cannot revoke copies retained in Git history or elsewhere. | R6 adds explicit environment resolution, exact production identity, a signed short-lived arm, placement-time revalidation, loopback-only dashboard service, strong local credentials, owner-only files, and guarded client logs. Keep this incident open until external keys are revoked/rotated, history is purged, R7 replaces compatibility paths with a durable single mutation owner, and the deployed service is verified. |
+| INC-2026-07-27-01 | Open | The mobile dashboard required at least eight digits even though the configured dashboard PIN was still four digits, locking the operator out. | The source-served HTML was updated independently of the running Python generation and private settings. The new form rejected short PINs before contacting the old handler, while no credential migration or atomic source/runtime activation occurred. | Accept strong 8–64 character PINs consistently, migrate the owner-only setting explicitly, and prohibit mixed-generation delivery. Keep this incident open until the fail-closed service configuration is reprovisioned, restarted, and verified through the exact external endpoint. |
 
 ## INC-2026-07-17-01 — Recent cash-flow history regressed
 
@@ -457,10 +478,11 @@ created with owner-only protections, and the existing local dashboard
 credentials do not meet the new minimum-strength policy.
 
 Two tracked legacy E*TRADE utilities also contained hardcoded OAuth credentials.
-Those literals have been removed from the current source, but the repository is
-currently public. The affected keys must therefore be treated as compromised;
-their presence in Git history is security evidence, not a resolved source-only
-finding.
+Those literals have been removed from the current source. Historical review
+recorded the repository as public; current GitHub visibility was not rechecked
+for this source update. The affected keys must therefore be treated as
+compromised regardless of current visibility; their presence in Git history is
+security evidence, not a resolved source-only finding.
 
 ### Implementation
 
@@ -475,7 +497,7 @@ finding.
     and reads the signing secret only from
     `ETRADE_PRODUCTION_ARMING_SECRET`.
   - Rejects default dashboard usernames, passwords shorter than 16 characters,
-    and action PINs shorter than eight digits.
+    and action PINs shorter than eight characters.
 - `accounts/accounts_bo.py` and
   `live_trading/etrade_cover_call_new.py`
   - Select production accounts by exact identity rather than list position.
@@ -518,13 +540,16 @@ finding.
     containing two complete economically identical account scans.
     Reconciliation uses only a direct query for the already durable broker
     order ID.
-  - Schema 12 releases terminal opening reservations only for an exact
-    zero-fill terminal or a complete balanced fill proven by newer position
-    lots carrying the same broker order and leg identities. Absorbed full-fill
-    margin remains counted in account utilization.
-  - Remain intentionally disconnected from the live agent until the remaining
-    position, closing, cancellation, composition, and operational migration
-    gates below are complete.
+  - At the R7e checkpoint, schema 12 released terminal opening reservations
+    only for an exact zero-fill terminal or a complete balanced fill proven by
+    newer position lots carrying the same broker order and leg identities.
+    Absorbed full-fill margin remained counted in account utilization. The
+    later supervised-manual-open note below records the current schema-19
+    capacity policy and narrow composition.
+  - Initially remained intentionally disconnected from the live agent. The
+    later source change composes only the narrow `ManualOpenService`; closing,
+    cancellation, repricing, and automatic strategy capabilities remain
+    uncomposed.
 - `live_trading/etrade_cover_call_new.py`,
   `live_trading/dashboard_template.html`, and `accounts/accounts_bo.py`
   - Remove the live monolith's order-worker call sites, automatic close,
@@ -532,9 +557,10 @@ finding.
   - Force persisted auto-open off and return a fixed authenticated
     `503 LEGACY_EXECUTION_DISABLED` response from every retained historical
     execution route before reading a request body or touching a collaborator.
-  - Remove execute, close, and neutralize controls/fetches from the dashboard
-    and generated position rows. Both views permanently identify themselves as
-    read-only.
+  - At the R7f containment checkpoint, removed execute, close, and neutralize
+    controls/fetches from the dashboard and generated position rows. The later
+    source change restores only the separately reviewed supervised manual-open
+    control described below.
   - Reject missing, oversized, or pre-containment generated position artifacts
     with a fixed read-only `503` fallback. The served iframe response disables
     scripts, network connections, and form actions through a restrictive CSP.
@@ -583,30 +609,33 @@ finding.
 
 ### Remaining risk
 
-This is containment in the current source, not production readiness. Legacy
-mutation methods no longer own an operative call path; they fail closed, and CI
-rejects their reintroduction. The isolated R7a–R7e stack provides a schema-12
-intent ledger, hardened mutation transport, origin-bound durable reader,
-opening/reprice coordinator, and exact zero/full terminal-risk absorption, but
-no live code instantiates it.
+This is containment and one narrow source composition, not production
+readiness. Legacy mutation methods no longer own an operative call path; they
+fail closed, and CI rejects their reintroduction. The schema-19 ledger,
+hardened transport, origin-bound durable reader, and gateway are now
+instantiated only behind `ManualOpenService` for supervised SPY/SPX credit
+vertical opening. The dashboard does not receive the gateway or transport and
+cannot reach their closing, cancellation, or repricing methods.
 
-Partial/replacement/assignment recovery, closing capacity, durable per-intent
-cancellation, the pure full risk policy, and a single production composition
-root remain required. The static ban on direct legacy mutation is delivered
-and must remain green.
+Partial/replacement/assignment recovery, closing capacity, durable operator
+cancellation, and the complete pure pretrade policy remain required. In
+particular, account Greeks, concentration, marked P&L, and regime
+authorization are not composed into the manual-open path. The static ban on
+direct legacy mutation is delivered and must remain green.
 
 The exposed OAuth keys still require external revocation and rotation. A later
 coordinated history purge must remove them from all refs and arrange cleanup of
 downstream clones, forks, caches, and build artifacts; making the repository
-private now would not undo prior exposure. The repository remains public.
+private now would not undo prior exposure. Current repository visibility was
+not verified during this source review.
 
-The current local dashboard settings intentionally fail the new credential
-policy and must be reprovisioned before startup. No live service has been
-restarted and no E*TRADE session or order path has been exercised. R7f was
-rendered through an isolated real local handler and generated positions
-artifact at desktop and mobile widths. That inspection found and fixed a
-same-origin iframe header conflict and a four-digit client-side PIN truncation;
-it does not verify the exact deployed dashboard.
+Private dashboard settings were not re-audited during this source update and
+must pass the current credential policy before startup. No live service has
+been restarted and no E*TRADE session or order path has been exercised. R7f
+was rendered through an isolated real local handler and generated positions
+artifact at desktop and mobile widths. Later manual-open work was also checked
+only through source/local rendering. Neither inspection verifies the exact
+deployed dashboard.
 
 R8b establishes a reproducible package and dependency input but does not by
 itself certify a release artifact. R8c must still build from an exact committed
@@ -623,30 +652,29 @@ against the installed wheel with source imports unavailable.
   files, guarded response/request logging, order calls without a boundary,
   placement-time arm expiry, dashboard credential rejection, and loopback/CORS
   behavior.
-- The current R7 ledger/reader/transport/coordinator focused suite includes 153
-  deterministic tests for immutable identity, exact authorization/XML,
-  transport deadlines, send fencing, parsed receipts, crash/timeout recovery,
-  capacity arithmetic, gateway-owned risk ceilings, environment/account
-  binding, strict raw-response replay, pagination/marker completeness,
-  lot-aware two-scan stability, exact order/fill reconciliation, amendment
-  replay, terminal absorption, retained filled risk, and additive schema
-  8→9→10→11→12 migration.
+- The pre-schema-19 R7 ledger/reader/transport/coordinator focused checkpoint
+  included 153 deterministic tests for immutable identity, exact
+  authorization/XML, transport deadlines, send fencing, parsed receipts,
+  crash/timeout recovery, capacity arithmetic, gateway-owned risk ceilings,
+  environment/account binding, strict raw-response replay,
+  pagination/marker completeness, lot-aware two-scan stability, exact
+  order/fill reconciliation, amendment replay, terminal absorption, retained
+  filled risk, and additive schema 8→9→10→11→12 migration.
   Independent adversarial review found and closed fail-open handling for
   replacement-linked and partially filled terminal orders; both now remain
   unresolved. The review explicitly retains a no-go on live wiring until the
   remaining partial/complex terminal, closing, cancellation, and composition
   protocols are delivered.
-- The maintained `tests/` suite passes 467 tests in the clean Python 3.10
-  environment. An unscoped repository-root pytest invocation still
-  mis-collects two legacy `scratch/test_delta_*` research scripts and triggers
-  import-time market-data behavior; the reproducible-build/CI gate must
-  constrain collection and remove those import side effects.
-- The current mutation-boundary checker passes across all 170 tracked
-  application Python sources,
-  including tracked scratch. Focused tests cover exact reject-only tombstones,
-  fixed route schemas and side-effect ordering, read-only HTML, same-origin
-  positions framing, gateway privacy, mutation bypass attacks, and
-  install/restart containment.
+- Final maintained-suite result for the current schema-19/manual-open source:
+  local Python 3.10 command
+  `env PYTHONPATH=. ../venv/bin/pytest -q -p no:cacheprovider tests`
+  completed with `1052 passed, 2 skipped, 4 warnings` in 172.96 seconds.
+- At the R7f checkpoint, the mutation-boundary checker passed across 170
+  tracked application Python sources, including tracked scratch. Focused tests
+  covered exact reject-only tombstones, fixed route schemas and side-effect
+  ordering, read-only HTML, same-origin positions framing, gateway privacy,
+  mutation bypass attacks, and install/restart containment. The current
+  boundary and suite still require their final recorded run.
 - The R8a repository/deployment containment suites pass 110 focused tests,
   including ignored and semantic secret variants, unsafe Git modes and index
   overrides, immutable-snapshot completeness, Git-attribute omissions,
@@ -662,6 +690,137 @@ against the installed wheel with source imports unavailable.
 - Deployment verification is deliberately recorded as incomplete. This
   incident remains open until the remaining-risk conditions above are
   satisfied.
+
+### 2026-07-27 supervised manual-open restoration note
+
+This later source change deliberately supersedes only the incident's
+“permanently read-only” description; it does not close the incident or weaken
+the legacy quarantine.
+
+- The normal spread-preview response may now carry a server-signed short-lived
+  executable proposal, and one new reviewed `/api/manual_open` confirmation
+  route restores the familiar supervised SPY/SPX `PUT` or `CALL` two-leg
+  net-credit vertical opening workflow. Proposal issuance is allowed only
+  during an open NYSE regular session. It retains one origin-pinned E*TRADE
+  response for the two exact standard, unadjusted 100x OSI contracts and
+  requires both rows to be `REALTIME`, usable and non-crossed, with
+  exchange-origin timestamps inside the configured age and at most five
+  seconds apart. The executable credit is derived from those two NBBO
+  midpoints; scanner economics are not quote authority. The signature binds
+  the configuration hash, environment, exact account, contract identities,
+  both NBBOs and timestamps, quote receipt/snapshot hashes, derived credit,
+  oldest observation time, and expiry. That expiry is capped fifteen seconds
+  before the exact NYSE session close and is enforced again before broker
+  preview and placement.
+- Confirmation requires an authenticated dashboard session, the independent
+  action PIN, a valid current proposal, bounded quantity and per-order loss,
+  and a stable request shape. `proposal_id` is the durable idempotency identity;
+  the browser's UUIDv4 `request_id` only correlates one HTTP response and cannot
+  create a second order for the same proposal. The private composition root
+  returns only `ManualOpenService`, which can issue exactly one durable
+  `EtradeOrderGateway.submit_opening` command for the reviewed proposal.
+- Proposal issuance does not reserve account capacity. Final submission obtains
+  a fresh capacity-v3 snapshot and may fail safely before broker mutation.
+  Under schema-19 `OPENING_MAX_LOSS_V2`, the usable account cap is the lesser
+  of raw broker buying power and the configured account budget after
+  subtracting external position risk, external open-order risk, and represented
+  managed filled risk. Represented risk is never added back to raw buying
+  power; active local reservations are applied separately.
+- The account and daily authorization ceilings are independent. The field
+  `max_daily_loss_cents` counts maximum loss newly authorized during the New
+  York calendar day; it is not realized/marked P&L or a trading-session
+  counter. Once a reservation is created, later failure or release does not
+  refund that daily authorization.
+- Historical `OPENING_MAX_LOSS_V1` evidence is replay-only. Schema-19 migration
+  releases only a pristine, untraced V1 `INTENT`; a traced V1 request becomes
+  `SUBMISSION_UNKNOWN` and retains risk. Neither form can authorize a fresh
+  reservation or claim.
+- The browser clears the PIN before sending and requires re-entry for another
+  confirmation. It aborts the HTTP wait after 30 seconds without resubmitting.
+  A recovery marker is cleared only by an exact, request-ID-correlated
+  `NOT_ATTEMPTED`; a timeout, malformed response, mismatched identity, or other
+  uncertain result is treated as `SUBMISSION_UNKNOWN` with **DO NOT RETRY**.
+  Status refresh reads the local ledger only—it does not poll broker orders,
+  retry, resubmit, or reprice.
+- Login and PIN failures have separate bounded throttles, JSON bodies are
+  bounded, and the dashboard authentication master is a strict generated
+  256-bit lowercase-hex secret that rotates when legacy material is invalid or
+  credentials change. Session and proposal HMAC keys are domain-separated.
+  The backend pins one protocol-matched bounded template and its digest at
+  startup so a disk edit cannot mix frontend and backend generations.
+- Schema-2 `execution.broker_mutations_enabled=true` is only an opt-in
+  prerequisite. The independent runtime environment, exact account identity,
+  and production arm must still match; configuration is not mutation
+  authority.
+- The legacy execute, close, neutralize, queue/fast-worker, automatic strategy,
+  automatic-close, cancellation, margin-release, and repricing/nudging paths
+  remain tombstoned or uncomposed. The manual-open service exposes no
+  repricing.
+
+This is source-level restoration with local visual evidence only. No E*TRADE
+sandbox or live preview/place/fill/reconciliation/restart lifecycle has been
+exercised through the restored path, and the deployed service has not been
+restarted or visually verified with it. The complete pure pretrade engine
+(account Greeks, concentration, marked P&L, and regime authorization) is not
+composed. Partial fills, replacement chains, assignment/exercise, supported
+operator cancellation/closing, operational migration, and unattended
+production readiness remain blocked or unverified.
+INC-2026-07-26-02 therefore stays open.
+
+## INC-2026-07-27-01 — PIN policy changed without credential migration
+
+### Evidence
+
+The authenticated mobile dashboard displayed “at least 8 digits,” while the
+owner-only `live_trading_settings.json` still contained a four-character PIN
+last modified on July 14. Git history showed that the dashboard had previously
+required exactly four digits. Runtime hardening added the eight-character
+policy on July 26, and the source-served HTML enforced it on July 27 without
+migrating the private setting.
+
+The launchd process began before those changes and remained on the old Python
+generation. `RefreshHandler` opens `dashboard_template.html` for every request,
+so the process served the new form from disk while continuing to use its
+already-loaded backend code. The same live inspection found a pre-containment
+generated positions artifact with legacy Close controls beneath the new
+read-only dashboard shell, confirming that delivery was not generation-atomic.
+
+### Implementation
+
+- `live_trading/dashboard_template.html`
+  - Accepts 8–64 characters instead of deleting every non-digit character.
+  - Describes the requirement as characters rather than digits.
+- `live_trading/runtime_safety.py`
+  - Accepts strong 8–64 character PINs while retaining explicit weak/default
+    rejection.
+- `tests/test_runtime_safety.py` and
+  `tests/test_dashboard_read_only_containment.py`
+  - Cover a mixed-character PIN and prevent numeric-only client filtering from
+    returning.
+- The local owner-only settings file was updated explicitly without logging or
+  exposing the new PIN.
+
+### Remaining risk
+
+The launch agent was not restarted. Its installed production command lacks the
+signed production arm and exact account identity required by the current
+runtime, and the configured dashboard password is shorter than the current
+minimum. Forcing a restart would leave launchd in a fail-closed restart loop.
+The prior ngrok endpoint reported `ERR_NGROK_3200` and could not be used for
+external verification. The mixed-generation process and pre-containment
+generated positions artifact therefore remain deployment blockers covered by
+INC-2026-07-26-02.
+
+### Verification record
+
+- Focused runtime-safety and read-only-dashboard suites: 41 tests passed.
+- Exact local live handler: logged in through the real `/login` route at a
+  591×1280 mobile viewport. The rendered PIN field had no numeric input mode or
+  digit-only pattern, retained the mixed-character PIN, and unlocked without an
+  error. The authentication overlay became hidden and the read-only banner was
+  visibly present.
+- Restart and exact external-endpoint verification remain incomplete. This
+  incident stays open.
 
 ## Checklist for future dashboard incidents
 

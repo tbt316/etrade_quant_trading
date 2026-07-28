@@ -73,7 +73,7 @@ def canonical_read_json(value):
 
 def capacity_state_sha256(value):
     return hashlib.sha256(
-        b"etrade-capacity-state.v1\0"
+        b"etrade-capacity-state.v3\0"
         + canonical_read_json(value).encode("utf-8")
     ).hexdigest()
 
@@ -97,7 +97,7 @@ def provision_durable_capacity(
         "account_type": "INDIVIDUAL",
     }
     economic_state = {
-        "schema": "etrade-capacity.v1",
+        "schema": "etrade-capacity.v3",
         "account_status": "ACTIVE",
         "account_mode": "MARGIN",
         "account_type": "INDIVIDUAL",
@@ -153,7 +153,7 @@ def provision_durable_capacity(
                     f"/v1/accounts/{encoded_account}/portfolio.json",
                     (
                         ("count", "50"),
-                        ("lotsRequired", "false"),
+                        ("lotsRequired", "true"),
                         ("marketSession", "REGULAR"),
                         ("pageNumber", "1"),
                         ("sortBy", "SYMBOL"),
@@ -565,6 +565,20 @@ class ETradeBrokerTransportTests(unittest.TestCase):
         )
         self.cases.append(result)
         return result
+
+    def test_expired_quote_deadline_blocks_before_wire_send(self):
+        case = self.case([preview_response()])
+
+        with self.assertRaisesRegex(
+            ETradeBrokerTransportError,
+            "deadline expired before wire send",
+        ):
+            case.transport.preview(
+                case.authorization,
+                not_after=datetime.now(timezone.utc)
+                - timedelta(seconds=1),
+            )
+        self.assertEqual(case.adapter.calls, [])
 
     def amendment_case(self, outcomes):
         case = self.case(outcomes)

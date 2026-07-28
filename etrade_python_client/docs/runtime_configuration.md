@@ -12,28 +12,37 @@ configuration and contains no credentials or account identity.
 
 ## Safety status
 
-Schema version 1 recognizes four explicit modes:
+Schema versions 1 and 2 recognize four explicit modes:
 
-| Mode | Broker environment | Exact account required | Broker mutation authority |
-|---|---|---:|---:|
-| `paper` | None | No; account settings are forbidden | Never |
-| `sandbox` | E*TRADE sandbox | Yes | Never in schema version 1 |
-| `shadow` | E*TRADE production, read-only | Yes | Never |
-| `live` | E*TRADE production | Yes | Starts unarmed; never from configuration |
+| Mode | Broker environment | Exact account required | Schema-1 mutation capability | Schema-2 mutation capability |
+|---|---|---:|---:|---:|
+| `paper` | None | No; account settings are forbidden | Never | Never |
+| `sandbox` | E*TRADE sandbox | Yes | Never | Supervised manual open, opt-in only |
+| `shadow` | E*TRADE production, read-only | Yes | Never | Never |
+| `live` | E*TRADE production | Yes | Never | Supervised manual open, opt-in only |
 
-`live` is an explicit operational intent, not an authorization. The
-configuration field `execution.broker_mutations_enabled` must be `false` in
-schema version 1. An `armed` field is not part of the schema. A future live
-composition root may accept the existing independently signed, short-lived
-production arm only after the cancellation, closing, and complete risk-policy
-gates are delivered. R8d does not compose the broker reader, transport, ledger,
-or order gateway.
+Schema 1 remains permanently read-only. Schema 2 may set
+`execution.broker_mutations_enabled=true` only in `sandbox` or `live` mode, and
+only for the supervised SPY/SPX two-leg credit-spread opening flow. That field
+records operator intent; it is not broker authority.
+
+Every order-capable startup must separately pass the exact runtime environment
+and account boundary. Production additionally requires the independently
+signed, short-lived runtime arm. Each submission also requires an authenticated
+dashboard session, a freshly re-entered action PIN, a current server-signed
+proposal backed by an origin-pinned two-leg `REALTIME` E*TRADE quote, an open
+NYSE regular session, and the durable gateway's fresh capacity validation. No
+configuration field can replace any of those checks.
+
+This narrow composition does not enable legacy execute, close, neutralize, or
+automatic workers, and it exposes no repricing path. Full unattended
+production readiness and the live/sandbox order lifecycle remain unverified.
 
 The configuration is also distinct from the historical strategy YAML under
 `backtesting/strategies/`. Those research inputs remain subject to the separate
 typed `BacktestSpec` and causal-validity work in Phase 4.
 
-## Schema version 1
+## Schema versions 1 and 2
 
 Every field is required. Unknown keys, duplicate JSON keys, implicit defaults,
 wrong types, and invalid ranges are errors.
@@ -93,19 +102,61 @@ match:
 Account identifiers are not OAuth credentials, but they should still be
 handled as private operational metadata and must never be logged in full.
 
+Schema 2 uses the same exact document shape. To opt into the supervised manual
+opening capability, the document must use:
+
+```json
+{
+  "schema_version": 2,
+  "mode": "sandbox",
+  "strategy": {
+    "enabled": true,
+    "strategy_id": "supervised-credit-spreads",
+    "symbols": ["SPY", "SPX"]
+  },
+  "model": {
+    "enabled": false,
+    "required_for_entry": false,
+    "max_signal_age_seconds": 86400
+  },
+  "execution": {
+    "selected_account_id_key": "opaque-etrade-account-key",
+    "account_allowlist": [
+      {
+        "account_id": "12345678",
+        "account_id_key": "opaque-etrade-account-key",
+        "institution_type": "BROKERAGE"
+      }
+    ],
+    "broker_mutations_enabled": true
+  }
+}
+```
+
+This excerpt is not a complete configuration; all fields from the schema-1
+example remain required. Positive risk limits are mandatory when the strategy
+is enabled. `risk.max_quote_age_seconds` also bounds the lifetime of a signed
+manual-open proposal to at most 300 seconds. The proposal expires from its
+oldest per-leg broker quote timestamp, not from a browser or scanner timestamp.
+
 ## Validation rules
 
-- `schema_version` is the exact integer `1`; booleans and numeric strings are
-  rejected.
+- `schema_version` is the exact integer `1` or `2`; booleans and numeric
+  strings are rejected.
 - `mode` is exactly `sandbox`, `shadow`, `paper`, or `live`.
 - `paper` forbids a selected account and requires an empty account allowlist.
   The other modes require one selected identity from a non-empty allowlist.
 - Account keys are unique, and the selected key must match exactly one
   allowlisted account.
 - `model.required_for_entry=true` requires `model.enabled=true`.
-- `data.require_complete_snapshots` must remain `true` in version 1.
+- `data.require_complete_snapshots` must remain `true` in both versions.
 - An enabled strategy requires a non-empty, unique symbol list and positive
   risk limits.
+- Schema 1 rejects `execution.broker_mutations_enabled=true`.
+- In schema 2, broker mutations require `sandbox` or `live`, an enabled
+  strategy whose symbols are a non-empty subset of `SPY` and `SPX`, and
+  `model.required_for_entry=false`. The selected `account_id` must also be the
+  exact positive numeric E*TRADE account ID accepted by the broker transport.
 - Monetary limits are integer cents rather than binary floating-point values.
   Boolean values are not accepted as integers.
 - `max_order_loss_cents` cannot exceed
@@ -159,7 +210,7 @@ outside the source checkout and installed package before use:
 ```bash
 install -d -m 700 /path/to/private/etrade
 install -m 600 \
-  /path/to/runtime_config.example.json \
+  /path/to/repo/live_trading/runtime_config.example.json \
   /path/to/private/etrade/runtime_config.json
 ```
 
@@ -243,13 +294,26 @@ all modes, including `paper`; `paper` still returns
 Do not auto-load `.env`, accept passwords through command-line arguments, or
 copy local secret/state files through the code-deployment path.
 
+The supervised legacy dashboard has an additional owner-only
+`dashboard_auth_secret` setting used as a local master key. Its exact accepted
+format is 64 lowercase hexadecimal characters representing 32 bytes, with
+low-diversity/default patterns rejected. Invalid legacy values are replaced
+with a new `secrets.token_hex(32)` value when settings load. Dashboard session
+signatures and manual-open proposal signatures use distinct HMAC derivation
+domains, so they do not reuse the master key directly. Changing the dashboard
+username or password rotates this master key and invalidates existing browser
+sessions. This legacy setting is not a substitute for
+`ETRADE_PRODUCTION_ARMING_SECRET` or
+`ETRADE_POSITIONS_ARTIFACT_HMAC_KEY`.
+
 ## Operator checks
 
 Configuration validation is offline and must complete before OAuth or any
 broker collaborator is constructed. A valid result establishes only that the
 static document is well-formed. It does not establish broker readiness,
 production arming, current account identity, fresh data, reconciliation, or a
-passing risk decision.
+passing risk decision. In particular, a valid schema-2 mutation opt-in is not
+authority to submit an order.
 
 Validate the static document:
 
@@ -289,6 +353,81 @@ The release gate verifies that the credential-free example is present in both
 the wheel and source distribution, matches the committed bytes, parses through
 the installed runtime module, and produces no working-directory state.
 
+## Supervised manual-open composition
+
+`live_trading/etrade_cover_call_new.py` may construct the order-capable runtime
+only after schema 2 opts in and the independent runtime safety boundary is
+already armed for the exact environment and account. The reviewed
+`live_trading/execution_runtime.py` composition root creates the private
+ledger, broker reader, no-retry transport, and durable order gateway, then
+returns only the narrow `ManualOpenService` capability.
+
+The dashboard supports the familiar operator-reviewed SPY/SPX `PUT` or `CALL`
+vertical workflow:
+
+1. During an open NYSE regular session, the server treats the scanner result as
+   candidate identity only and obtains one retained, origin-pinned E*TRADE
+   response for the exact two OSI contracts. Both rows must be
+   `quoteStatus=REALTIME`, have usable non-crossed bid/ask values, carry
+   exchange timestamps no more than five seconds apart, and be fresh under
+   `max_quote_age_seconds`.
+2. The server derives the exact two-leg midpoint credit and creates a
+   short-lived proposal bound to the quote receipt/snapshot hashes, per-leg
+   values/timestamps, runtime, environment, exact account, and configuration.
+   Its deadline is capped fifteen seconds before the exact session close and
+   is enforced again before broker preview and placement. Proposal issuance
+   does not read or reserve account capacity.
+3. The authenticated operator reviews the exact two-leg net-credit economics
+   and re-enters the action PIN for that confirmation.
+4. The server validates the proposal, quantity, quote age, per-order loss
+   ceiling, and request correlation before issuing exactly one durable opening
+   command. Final submission obtains fresh capacity-v3 account evidence, so a
+   valid proposal may still fail safely without a broker send.
+
+The browser cannot rewrite the signed economics at confirmation. The service
+passes `max_account_open_risk_cents` and `max_daily_loss_cents` to the gateway
+as two independent limits:
+
+- the account limit bounds current opening risk. Under schema-19
+  `OPENING_MAX_LOSS_V2`, fresh capacity is the lesser of raw broker buying
+  power and the non-negative account budget after external position risk,
+  external order risk, and represented managed filled risk; active local
+  reservations are subtracted separately when the new reservation is created;
+- the daily limit is a New York calendar-day ceiling on newly authorized
+  maximum loss. Despite its compatibility name, it is not realized or marked
+  P&L, does not reset by NYSE trading-session boundaries, and is not refunded
+  when work fails after a reservation was created.
+
+Historical V1 capacity decisions are replay-only. They cannot authorize a
+fresh reservation or claim; schema-19 migration fails/releases only pristine
+untraced V1 reservations and moves traced work to `SUBMISSION_UNKNOWN` while
+retaining risk.
+
+The signed `proposal_id` is the durable idempotency key. The UUID
+`request_id` is only HTTP correlation. The browser writes a non-secret recovery
+marker before sending, clears the PIN, aborts the request after 30 seconds, and
+clears that marker only for an exact correlated `NOT_ATTEMPTED` response. Any
+unrecognized, malformed, mismatched, or network-ambiguous result is shown as
+`SUBMISSION_UNKNOWN` with no automatic retry. Periodic dashboard status reads
+the local ledger; it does not poll E*TRADE orders, resubmit, or reprice.
+
+Login and PIN failures are separately throttled with bounded failure windows
+and lockouts, and dashboard JSON requests use an exact bounded-body reader.
+The handler loads one bounded, regular, UTF-8 dashboard template at process
+start, verifies its protocol marker/nonce contract, and serves that pinned
+generation with its SHA-256. These controls prevent a new HTML file from being
+mixed with an already-running backend generation.
+
+The full pure pretrade engine is not composed into this manual workflow:
+complete account Greeks, concentration, marked P&L, and regime authorization
+remain readiness gaps.
+
+The service does not expose repricing, closing, neutralization, cancellation,
+or automatic execution. The historical execute/close/neutralize routes and
+automatic workers remain reject-only tombstones. Source composition is not
+proof of a successful E*TRADE preview, placement, fill, reconciliation, or
+restart cycle; those sandbox/live lifecycle checks are still outstanding.
+
 ## Read-only composition
 
 The supported operator-plane composition is
@@ -307,4 +446,5 @@ capability.
 
 See [`read_only_dashboard.md`](read_only_dashboard.md) for provisioning,
 startup, endpoint, and artifact-integrity details. This read-only service does
-not make the isolated durable order stack live-ready.
+not construct the manual-open service and does not make the durable order stack
+live-ready.

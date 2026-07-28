@@ -22,12 +22,18 @@ APPLICATION_ROOT = Path(__file__).resolve().parents[1]
 TRANSPORT_PATH = "live_trading/etrade_broker_transport.py"
 GATEWAY_PATH = "live_trading/etrade_order_gateway.py"
 READER_PATH = "live_trading/etrade_broker_reader.py"
+EXECUTION_COMPOSITION_PATH = "live_trading/execution_runtime.py"
+MANUAL_OPEN_PATH = "live_trading/manual_open.py"
 ORDER_PROTOCOL_PATH = "live_trading/etrade_order_protocol.py"
 RUNTIME_SAFETY_PATH = "live_trading/runtime_safety.py"
 CHECKER_PATH = "scripts/check_etrade_mutation_boundary.py"
 RUNTIME_SAFETY_MODULE = "live_trading.runtime_safety"
 TRANSPORT_MODULE = "live_trading.etrade_broker_transport"
 CENTRAL_REJECTOR = "live_trading.runtime_safety.reject_legacy_execution"
+MANUAL_OPEN_BUILD_SCOPE = (
+    "live_trading.execution_runtime.build_manual_open_service"
+)
+MANUAL_OPEN_SERVICE_SCOPE = "live_trading.manual_open.ManualOpenService"
 
 TRANSPORT_MUTATION_METHODS = frozenset(
     {"preview", "place", "preview_change", "place_change", "cancel"}
@@ -44,6 +50,14 @@ TRANSPORT_INTERNAL_CAPABILITIES = frozenset(
         "_reconstruct_prepared_request",
         "_run_isolated_exchange",
         "_serialized_prepared_request",
+    }
+)
+NON_OPENING_GATEWAY_MUTATION_METHODS = frozenset(
+    {
+        "cancel_closing",
+        "cancel_opening",
+        "reprice_opening",
+        "submit_closing",
     }
 )
 GATEWAY_MUTATION_CALLERS = {
@@ -163,6 +177,12 @@ ALLOWED_TRANSPORT_IMPORTS = {
             "SelectedBrokerAccount",
             "_ExchangeResult",
             "_isolated_get_exchange",
+        }
+    ),
+    EXECUTION_COMPOSITION_PATH: frozenset(
+        {
+            "ETradeBrokerTransport",
+            "SelectedBrokerAccount",
         }
     ),
 }
@@ -472,6 +492,60 @@ class _SourceVisitor(ast.NodeVisitor):
         if node.returns is not None:
             self.visit(node.returns)
 
+    def _is_exact_transport_constructor_reference(
+        self, node: ast.Name
+    ) -> bool:
+        parent = self.parents.get(node)
+        return (
+            self.relative_path == EXECUTION_COMPOSITION_PATH
+            and self.qualified_scope == MANUAL_OPEN_BUILD_SCOPE
+            and isinstance(parent, ast.Call)
+            and parent.func is node
+        )
+
+    def _is_exact_gateway_transport_injection(
+        self, node: ast.Name
+    ) -> bool:
+        keyword = self.parents.get(node)
+        call = self.parents.get(keyword) if keyword is not None else None
+        return (
+            self.relative_path == EXECUTION_COMPOSITION_PATH
+            and self.qualified_scope == MANUAL_OPEN_BUILD_SCOPE
+            and isinstance(keyword, ast.keyword)
+            and keyword.arg == "transport"
+            and keyword.value is node
+            and isinstance(call, ast.Call)
+            and _dotted_name(call.func) == "EtradeOrderGateway"
+        )
+
+    def _is_allowed_manual_gateway_reference(
+        self, node: ast.Attribute
+    ) -> bool:
+        if (
+            self.relative_path != MANUAL_OPEN_PATH
+            or self.qualified_scope
+            not in {
+                f"{MANUAL_OPEN_SERVICE_SCOPE}.__init__",
+                f"{MANUAL_OPEN_SERVICE_SCOPE}.submit",
+            }
+            or _dotted_name(node) != "self._gateway"
+        ):
+            return False
+        parent = self.parents.get(node)
+        if self.qualified_scope == f"{MANUAL_OPEN_SERVICE_SCOPE}.__init__":
+            return (
+                isinstance(node.ctx, ast.Store)
+                and isinstance(parent, (ast.Assign, ast.AnnAssign))
+            )
+        call = self.parents.get(parent) if parent is not None else None
+        return (
+            isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr == "submit_opening"
+            and isinstance(call, ast.Call)
+            and call.func is parent
+        )
+
     def _validate_required_tombstone(
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -724,6 +798,17 @@ class _SourceVisitor(ast.NodeVisitor):
         module = _resolved_import_module(
             self.relative_path, self.module_name, node
         )
+        if module != TRANSPORT_MODULE and any(
+            alias.name == "ETradeBrokerTransport" for alias in node.names
+        ):
+            self.add(
+                node,
+                "TRANSPORT_IMPORT",
+                (
+                    "the mutation transport class may not be imported through "
+                    "an intermediate module"
+                ),
+            )
         if module == "pyetrade" or module.startswith("pyetrade."):
             for alias in node.names:
                 if (
@@ -855,15 +940,83 @@ class _SourceVisitor(ast.NodeVisitor):
                     ),
                 )
 
+            allowed_transport_construction = (
+                self.relative_path == EXECUTION_COMPOSITION_PATH
+                and self.qualified_scope == MANUAL_OPEN_BUILD_SCOPE
+                and call_name == "ETradeBrokerTransport"
+            )
             if call_name == "ETradeBrokerTransport":
+                parent = self.parents.get(node)
+                exact_binding = (
+                    isinstance(parent, ast.Assign)
+                    and parent.value is node
+                    and len(parent.targets) == 1
+                    and isinstance(parent.targets[0], ast.Name)
+                    and parent.targets[0].id == "transport"
+                )
+                if not allowed_transport_construction or not exact_binding:
+                    self.add(
+                        node,
+                        "TRANSPORT_CONSTRUCTION",
+                        (
+                            "the mutation transport must be constructed only "
+                            "as the exact `transport = "
+                            "ETradeBrokerTransport(...)` binding inside "
+                            f"{MANUAL_OPEN_BUILD_SCOPE}"
+                        ),
+                    )
+
+            if final_name == "submit_opening":
+                if not (
+                    self.relative_path == MANUAL_OPEN_PATH
+                    and self.qualified_scope
+                    == f"{MANUAL_OPEN_SERVICE_SCOPE}.submit"
+                    and call_name == "self._gateway.submit_opening"
+                ):
+                    self.add(
+                        node,
+                        "GATEWAY_OPENING_MUTATION_CALL",
+                        (
+                            "submit_opening() is allowed only through the "
+                            "narrow ManualOpenService.submit boundary"
+                        ),
+                    )
+
+            if (
+                final_name in NON_OPENING_GATEWAY_MUTATION_METHODS
+                and self.relative_path != GATEWAY_PATH
+            ):
                 self.add(
                     node,
-                    "TRANSPORT_CONSTRUCTION",
-                    "production code must not construct the mutation transport here",
+                    "GATEWAY_NON_OPENING_MUTATION_CALL",
+                    (
+                        f"gateway mutation {final_name}() is not exposed to "
+                        "application code"
+                    ),
                 )
 
             self._check_reflection_call(node, call_name)
 
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if (
+            self.relative_path == EXECUTION_COMPOSITION_PATH
+            and self.qualified_scope == MANUAL_OPEN_BUILD_SCOPE
+        ):
+            value = node.value
+            if not (
+                isinstance(value, ast.Call)
+                and _dotted_name(value.func) == "ManualOpenService"
+            ):
+                self.add(
+                    node,
+                    "EXECUTION_CAPABILITY_EXPOSURE",
+                    (
+                        "the execution composition root may return only a "
+                        "directly constructed ManualOpenService"
+                    ),
+                )
         self.generic_visit(node)
 
     def _check_reflection_call(
@@ -940,6 +1093,24 @@ class _SourceVisitor(ast.NodeVisitor):
                     "LEGACY_MUTATION_REFLECTION",
                     "reflective legacy mutation access is forbidden",
                 )
+            if "_gateway" in reflected_attribute_names:
+                self.add(
+                    node,
+                    "MANUAL_OPEN_GATEWAY_REFLECTION",
+                    "reflective ManualOpenService gateway access is forbidden",
+                )
+            if any(
+                value in NON_OPENING_GATEWAY_MUTATION_METHODS
+                for value in reflected_attribute_names
+            ):
+                self.add(
+                    node,
+                    "GATEWAY_NON_OPENING_MUTATION_REFLECTION",
+                    (
+                        "reflective access to a non-opening gateway mutation "
+                        "is forbidden"
+                    ),
+                )
             if any(
                 value in VENDOR_MUTATION_CAPABILITIES
                 or value in VENDOR_MUTATION_METHODS
@@ -970,6 +1141,15 @@ class _SourceVisitor(ast.NodeVisitor):
         if self.relative_path != TRANSPORT_PATH:
             dotted = _dotted_name(node)
             if (
+                node.attr == "_gateway"
+                and not self._is_allowed_manual_gateway_reference(node)
+            ):
+                self.add(
+                    node,
+                    "MANUAL_OPEN_GATEWAY_ACCESS",
+                    "ManualOpenService private gateway access is forbidden",
+                )
+            if (
                 self.relative_path == GATEWAY_PATH
                 and dotted is not None
                 and (
@@ -997,6 +1177,32 @@ class _SourceVisitor(ast.NodeVisitor):
                     node,
                     "TRANSPORT_MUTATION_REFERENCE",
                     f"reference to transport mutation {node.attr!r} is forbidden",
+                )
+            if (
+                node.attr == "submit_opening"
+                and not is_direct_call
+                and self.relative_path != GATEWAY_PATH
+            ):
+                self.add(
+                    node,
+                    "GATEWAY_OPENING_MUTATION_REFERENCE",
+                    (
+                        "reference to submit_opening is forbidden outside the "
+                        "gateway implementation"
+                    ),
+                )
+            if (
+                node.attr in NON_OPENING_GATEWAY_MUTATION_METHODS
+                and not is_direct_call
+                and self.relative_path != GATEWAY_PATH
+            ):
+                self.add(
+                    node,
+                    "GATEWAY_NON_OPENING_MUTATION_REFERENCE",
+                    (
+                        f"reference to non-opening gateway mutation "
+                        f"{node.attr!r} is forbidden"
+                    ),
                 )
             if (
                 node.attr in HTTP_MUTATION_METHODS
@@ -1071,12 +1277,24 @@ class _SourceVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         if (
-            self.relative_path not in {
-                TRANSPORT_PATH,
-                GATEWAY_PATH,
-                READER_PATH,
-            }
-            and node.id == "ETradeBrokerTransport"
+            self.relative_path == EXECUTION_COMPOSITION_PATH
+            and node.id == "transport"
+            and isinstance(node.ctx, ast.Load)
+            and not self._is_exact_gateway_transport_injection(node)
+        ):
+            self.add(
+                node,
+                "EXECUTION_TRANSPORT_EXPOSURE",
+                (
+                    "the composed transport may only be injected into the "
+                    "gateway's exact transport keyword"
+                ),
+            )
+        if (
+            node.id == "ETradeBrokerTransport"
+            and self.relative_path
+            not in {TRANSPORT_PATH, GATEWAY_PATH, READER_PATH}
+            and not self._is_exact_transport_constructor_reference(node)
         ):
             self.add(
                 node,
@@ -1111,14 +1329,39 @@ class _SourceVisitor(ast.NodeVisitor):
                 and key.value
                 in {
                     "_transport",
+                    "_gateway",
+                    "ETradeBrokerTransport",
                     *TRANSPORT_INTERNAL_CAPABILITIES,
+                    *NON_OPENING_GATEWAY_MUTATION_METHODS,
                 }
             ):
-                self.add(
-                    node,
-                    "TRANSPORT_CAPABILITY_LOOKUP",
-                    "dictionary-style transport capability access is forbidden",
-                )
+                if key.value == "_gateway":
+                    self.add(
+                        node,
+                        "MANUAL_OPEN_GATEWAY_LOOKUP",
+                        (
+                            "dictionary-style ManualOpenService gateway "
+                            "access is forbidden"
+                        ),
+                    )
+                elif key.value in NON_OPENING_GATEWAY_MUTATION_METHODS:
+                    self.add(
+                        node,
+                        "GATEWAY_NON_OPENING_MUTATION_LOOKUP",
+                        (
+                            "dictionary-style non-opening gateway mutation "
+                            "access is forbidden"
+                        ),
+                    )
+                else:
+                    self.add(
+                        node,
+                        "TRANSPORT_CAPABILITY_LOOKUP",
+                        (
+                            "dictionary-style transport capability access "
+                            "is forbidden"
+                        ),
+                    )
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
@@ -1134,6 +1377,27 @@ class _SourceVisitor(ast.NodeVisitor):
             text = value
         else:
             return
+        if text == "_gateway" and self.relative_path != MANUAL_OPEN_PATH:
+            self.add(
+                node,
+                "MANUAL_OPEN_GATEWAY_LITERAL",
+                (
+                    "dynamic ManualOpenService private gateway access is "
+                    "forbidden"
+                ),
+            )
+        if (
+            text in NON_OPENING_GATEWAY_MUTATION_METHODS
+            and self.relative_path != GATEWAY_PATH
+        ):
+            self.add(
+                node,
+                "GATEWAY_NON_OPENING_MUTATION_LITERAL",
+                (
+                    "dynamic access to a non-opening gateway mutation is "
+                    "forbidden"
+                ),
+            )
         if MUTATION_LITERAL.search(text):
             self.add(
                 node,

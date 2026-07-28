@@ -1,44 +1,148 @@
-# E*TRADE Read-Only Runtime
+# E*TRADE supervised trading runtime
 
 ## Current status
 
-The live runtime is under an R7f mutation quarantine. It may read broker and
-market data and render local analytics, but this repository currently provides
-**no supported path for placing, changing, cancelling, closing, or
-neutralizing an E*TRADE order**.
+The dashboard supports one narrow broker mutation: an authenticated operator
+may manually open a server-selected SPY or SPX two-leg `PUT` or `CALL` credit
+spread. This is an improved restoration of the previous Execute workflow, not
+a restoration of the legacy mutation code.
 
-Do not use the historical `--trade` flag as a live-trading instruction. The
-flag remains in the legacy entry point while the runtime is being decomposed,
-but it cannot re-enable quarantined mutation methods or routes. Service
-installation and remote restart are also suspended by the deployment scripts.
+The normal flow remains familiar:
 
-This is source-level containment, not a production-readiness claim. No live
-service was restarted and no broker mutation was exercised while verifying
-R7f.
+1. Select ticker, side, width, expiration, delta, and quantity.
+2. Refresh the live spread preview.
+3. Click **Execute SPY Spread** or **Execute SPX Spread**.
+4. Review the exact account, broker symbol, expiration, legs, limit credit,
+   quantity, total credit, maximum loss, proposal expiry, proposal ID, and
+   request ID.
+5. Re-enter the dashboard PIN and click **Submit Once**.
 
-## Retained read-only capabilities
+The PIN is never stored in browser storage and must be re-entered for the exact
+final confirmation. A broker acknowledgement means only that E*TRADE
+acknowledged the submission; it is **not** a fill confirmation.
 
-- Authenticated, loopback-only dashboard delivery.
-- Explicit sandbox/production environment resolution and exact account
-  identity checks before E*TRADE construction.
-- Portfolio, balance, quote, option-chain, order-history, and position reads.
-- On-demand portfolio refresh and generated position HTML.
-- Position, cash-flow, margin, quote-freshness, GEX, and risk-monitoring
-  analytics.
-- Preview-only spread and neutralization calculations. A preview is not an
-  authorization or an executable order.
-- Redacted V2 background/shock regime advisory. It is shadow-only and cannot
-  authorize execution.
-- Owner-only handling for settings, OAuth state, and touched local logs.
+Auto-open, closing, neutralization, cancellation, repricing, and automatic
+retry remain unavailable from the dashboard. The V2 background/shock regime
+display is advisory-only and cannot authorize an order.
 
-Auto-open is forced off. The dashboard and generated position view contain no
-execute, close, or neutralize controls and identify themselves as read-only.
+## Safety boundary
 
-## Fixed disabled-route contract
+The browser and legacy scanner never supply authoritative order economics. The
+scanner selects only candidate contract identity. During an open NYSE regular
+session, the manual service makes one origin-pinned, no-retry E*TRADE quote
+read for the exact two OSI contracts. Both quote rows must be
+`quoteStatus=REALTIME`, unadjusted standard 100-share options, usable
+non-crossed NBBOs, fresh under the configured age limit, and timestamped no
+more than five seconds apart. The server derives the exact two-leg midpoint
+credit and creates a short-lived HMAC-signed proposal bound to:
 
-After authentication, each retained historical execution route returns HTTP
-`503` with the same fail-closed payload before reading the request body,
-changing files, queueing work, or invoking a collaborator:
+- the exact account and broker environment;
+- the immutable runtime-configuration digest;
+- ticker, broker symbol, side, expiration, strikes, and raw OSI identities;
+- the retained quote receipt/snapshot hashes, both bid/ask pairs, and both
+  exchange timestamps;
+- the server-derived midpoint limit credit and oldest quote timestamp; and
+- an expiry no later than the configured quote-age ceiling.
+
+The executable preview and confirmation render the proposal projection, not
+the scanner payload: exact contracts, strikes, expiry, and limit credit are
+overwritten from the signed broker-quote result. Scanner delta and OTM remain
+advisory selection context only. The dashboard banner and final confirmation
+show `SANDBOX` or `PRODUCTION`, and a preview bound to another environment or
+runtime configuration is disabled.
+
+Confirmation sends only that signed proposal, a bounded quantity, a canonical
+request ID, and the freshly entered action PIN. The signed `proposal_id` is the
+durable idempotency key; the UUID `request_id` correlates only this HTTP
+request/response. Changing the request ID cannot turn one proposal into a
+second durable order. The server verifies the PIN and proposal before invoking
+the sole reviewed mutation composition:
+
+```text
+dashboard
+  -> ManualOpenService
+  -> EtradeOrderGateway
+  -> OrderIntentLedger
+  -> ETradeBrokerTransport
+  -> E*TRADE
+```
+
+Before a proposal can be issued, the runtime must have:
+
+- schema-2 `sandbox` or `live` opt-in;
+- one exact allowlisted account;
+- a current environment/account runtime arm;
+- readable, structurally valid durable history;
+- no unresolved placement, cancellation, closing, amendment, or terminal
+  absorption blocker;
+- an open NYSE regular session; and
+- the exact two-leg broker quote evidence described above.
+
+The signed proposal deadline is also capped fifteen seconds before that
+session's exact NYSE close. The same deadline is enforced again before broker
+preview and placement, preventing a near-close request from being staged for
+the next session.
+
+Proposal issuance does not read or reserve account capacity. Final submission
+does, so a valid proposal can still fail safely before broker I/O. That fresh
+capacity-v3 decision enforces two independent limits:
+
+- `max_account_open_risk_cents` bounds current opening risk. Schema-19 policy
+  V2 caps it at raw broker buying power and subtracts external position risk,
+  external order risk, and represented managed filled risk from the immutable
+  account budget; active local reservations are subtracted separately.
+- `max_daily_loss_cents` is a New York calendar-day budget for newly authorized
+  maximum loss. It is not trading P&L, is not tied to NYSE session boundaries,
+  and is not refunded after a reservation exists, even if later processing
+  fails.
+
+Unsupported, adjusted, naked, ambiguous, or incompletely identified broker
+positions or active orders fail closed. Capacity is never inferred from an
+unverified browser value. Historical capacity-policy V1 decisions remain
+replay-only; only V2 can authorize a new reservation or submission claim.
+
+## No automatic retry
+
+The browser writes a non-secret recovery marker before sending the request,
+clears the confirmation PIN, and aborts its wait after 30 seconds. The marker
+contains only proposal/request identity plus account, environment, and
+configuration bindings. It is cleared only when the server returns an exact
+matching `request_id` with `submission_disposition=NOT_ATTEMPTED`. A malformed,
+unrecognized, mismatched, timed-out, or otherwise uncorrelated response is
+treated as `SUBMISSION_UNKNOWN`, even if its HTTP status is below 500. On
+reload:
+
+- a matching durable record is displayed;
+- `SUBMITTED` is labelled broker-acknowledged, not filled;
+- an unresolved or missing record displays **DO NOT RETRY** and disables every
+  manual-open button; and
+- no request is resubmitted automatically.
+
+The durable ledger owns idempotency and ambiguous-outcome handling. Network
+timeouts, malformed responses, crashes, and post-capable lease expiry cannot
+turn an uncertain submission back into a retryable browser action.
+The UI refreshes the local ledger status periodically (nominally every 30
+seconds); this is not broker-order polling. It never queries E*TRADE order
+state, retries, resubmits, or reprices.
+
+## Dashboard authentication and generation
+
+Login and PIN failures use separate bounded process-local throttles. Login,
+PIN verification, settings, and manual-open JSON bodies are content-type and
+size bounded. The owner-only dashboard authentication master is a generated
+256-bit lowercase-hex value; invalid legacy values rotate on load, and
+credential changes rotate it again to revoke current sessions. Session and
+proposal signatures use separate HMAC derivation domains.
+
+At process start the backend pins one bounded, regular UTF-8 template whose
+protocol marker and nonce placeholders match its own protocol version. It
+serves those pinned bytes with their SHA-256, preventing a newly edited HTML
+file from being mixed with an already-running backend generation.
+
+## Legacy mutation quarantine
+
+These historical routes remain fixed `503` tombstones after authentication and
+cannot read the request body or reach legacy collaborators:
 
 | Route |
 |---|
@@ -48,52 +152,47 @@ changing files, queueing work, or invoking a collaborator:
 | `/api/close_position` |
 | `/api/execute_close_order` |
 
-```json
-{
-  "code": "LEGACY_EXECUTION_DISABLED",
-  "error": "Trading actions are disabled.",
-  "read_only": true,
-  "execution_enabled": false
-}
-```
+The old queue/fast-worker, execute, close, neutralize, automatic strategy,
+automatic-close, cancel, change, margin-release, and repricing paths remain
+reject-only or uncomposed. No environment variable, action PIN, or dashboard
+setting can revive them.
 
-Legacy preview/place/change/cancel/reprice/close methods outside the reviewed
-R7 stack are unconditional tombstones. There is no environment variable,
-configuration setting, production arm, action PIN, or operator override that
-can re-enable them.
+## Operator and deployment requirements
+
+Do not enable live mutations by editing `live_trading_settings.json`. Use the
+schema-versioned runtime configuration and independently signed runtime arm
+described in [runtime_configuration.md](../docs/runtime_configuration.md).
+Keep the dashboard bound to loopback behind the reviewed authenticated tunnel,
+use owner-only runtime directories/files, and rotate any credentials that
+previously appeared in repository history.
+
+After an upgrade, run migration and recovery drills against a copied ledger
+before activating the service. If the dashboard reports an unresolved durable
+state, stop and reconcile it; do not create a replacement proposal merely
+because no broker order is visible in the browser.
 
 ## Verification
 
-Run the tracked-source mutation gate before tests:
+Run the mutation boundary before the maintained tests:
 
 ```bash
 python scripts/check_etrade_mutation_boundary.py
 pytest -q tests
 ```
 
-The checker parses tracked application Python sources, including tracked
-scratch files. It rejects raw broker mutation I/O, mutation-capable imports and
-reflection, E*TRADE mutation literals, access to the hardened transport outside
-its allowlist, legacy mutation calls, and drift in required tombstones.
+The checker confines raw mutation I/O to the reviewed transport, transport
+construction to the reviewed composition root, and transport calls to the
+durable gateway. Dashboard-facing changes additionally require rendering the
+served HTML at desktop and mobile widths and exercising lock, preview,
+confirmation, durable result, and reload-recovery states.
 
-R7f was also rendered through an isolated instance of the real local handler
-and generated positions artifact at desktop and mobile widths. That inspection
-did not start the trading loop, create an E*TRADE session, restart a deployed
-service, or prove the state of the deployed Pi.
-
-## Future live architecture
-
-The intended live mutation path is a single composition root around:
-
-1. `order_intent_ledger.py` for durable intent, reservation, authorization,
-   send, response, and reconciliation evidence.
-2. `etrade_broker_reader.py` for bounded, origin-pinned, durable broker reads.
-3. `etrade_order_gateway.py` for account-bound coordination and the immutable
-   risk ceiling.
-4. `etrade_broker_transport.py` as the only reviewed mutation adapter.
-
-Those components are implemented in isolation and are not instantiated by the
-live runtime. Partial/replacement/assignment recovery, durable cancellation,
-closing capacity, a pure full pre-trade risk policy, the single production
-composition root, operational migration, and deployed verification remain
-required before any live wiring is supported.
+This source boundary is not evidence of a completed live deployment. A full
+E*TRADE sandbox and live preview/place/fill/reconciliation/restart lifecycle,
+service rollout/rollback drill, credential rotation, and exact deployed
+endpoint verification remain required before calling the deployed system
+production-ready or using it for unattended trading. The complete pure
+pretrade engine—account Greeks, concentration, marked P&L, and regime
+authorization—is not composed into this manual path. Partial fills,
+replacement chains, assignment/exercise, and related recovery also remain
+blocked. Verification to date is source/local visual verification, not an
+E*TRADE or deployed-service lifecycle.

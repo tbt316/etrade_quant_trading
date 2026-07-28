@@ -1,7 +1,10 @@
 """Strict, side-effect-free runtime configuration for live services.
 
-Configuration describes operational intent.  It is never authority to mutate
-an E*TRADE account: schema version 1 rejects mutation enablement in every mode.
+Configuration describes operational intent.  It is never sufficient authority
+to mutate an E*TRADE account.  Schema version 1 is permanently read-only;
+schema version 2 may opt into supervised manual opening, which still requires
+the independent runtime arm, exact account, dashboard confirmation, and durable
+order gateway.
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ from pathlib import Path, PurePath
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_SCHEMA_VERSION = 1
+MIN_CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
 SECRET_SCHEMA_VERSION = 1
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_PATH_LENGTH = 4096
@@ -83,6 +87,7 @@ _SECRET_FIELDS = frozenset(
 _SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9.-]{0,14}")
 _STRATEGY_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_BROKER_ACCOUNT_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
 _INSTITUTION_PATTERN = re.compile(r"[A-Z][A-Z0-9_ -]{0,63}")
 _PLACEHOLDER_SECRETS = frozenset(
     {
@@ -669,7 +674,7 @@ def _parse_data(value: Any) -> DataConfig:
         "data.require_complete_snapshots",
     )
     if not complete:
-        raise RuntimeConfigError("schema v1 requires complete snapshots")
+        raise RuntimeConfigError("runtime requires complete snapshots")
     return DataConfig(
         require_complete_snapshots=complete,
         max_snapshot_age_seconds=_integer(
@@ -730,7 +735,11 @@ def _parse_account(value: Any, index: int) -> AccountIdentity:
     )
 
 
-def _parse_execution(value: Any, mode: str) -> ExecutionConfig:
+def _parse_execution(
+    value: Any,
+    mode: str,
+    schema_version: int,
+) -> ExecutionConfig:
     raw = _object(value, _EXECUTION_FIELDS, "execution")
     selected_key = _optional_text(
         raw["selected_account_id_key"],
@@ -751,8 +760,12 @@ def _parse_execution(value: Any, mode: str) -> ExecutionConfig:
         raw["broker_mutations_enabled"],
         "execution.broker_mutations_enabled",
     )
-    if mutations:
+    if mutations and schema_version == 1:
         raise RuntimeConfigError("schema v1 never authorizes broker mutations")
+    if mutations and mode not in {"sandbox", "live"}:
+        raise RuntimeConfigError(
+            "broker mutations require sandbox or live mode"
+        )
     if mode == "paper":
         if selected_key is not None or accounts:
             raise RuntimeConfigError("paper mode may not select a broker account")
@@ -804,7 +817,7 @@ def _parse_risk(value: Any) -> RiskConfig:
 
 
 def load_runtime_config(path: str | Path) -> RuntimeConfig:
-    """Load and validate one immutable schema-v1 configuration document.
+    """Load and validate one immutable runtime configuration document.
 
     Loading reads only ``path``.  It does not create runtime directories,
     resolve secrets, import a broker client, or touch the network.
@@ -823,7 +836,7 @@ def load_runtime_config(path: str | Path) -> RuntimeConfig:
     schema_version = _integer(
         document["schema_version"],
         "schema_version",
-        CONFIG_SCHEMA_VERSION,
+        MIN_CONFIG_SCHEMA_VERSION,
         CONFIG_SCHEMA_VERSION,
     )
     mode = _text(document["mode"], "mode", maximum=16)
@@ -833,7 +846,11 @@ def load_runtime_config(path: str | Path) -> RuntimeConfig:
     strategy = _parse_strategy(document["strategy"])
     data = _parse_data(document["data"])
     model = _parse_model(document["model"])
-    execution = _parse_execution(document["execution"], mode)
+    execution = _parse_execution(
+        document["execution"],
+        mode,
+        schema_version,
+    )
     risk = _parse_risk(document["risk"])
     if risk.max_order_loss_cents > risk.max_account_open_risk_cents:
         raise RuntimeConfigError(
@@ -846,6 +863,40 @@ def load_runtime_config(path: str | Path) -> RuntimeConfig:
         or risk.max_daily_loss_cents == 0
     ):
         raise RuntimeConfigError("enabled strategy requires positive risk limits")
+    if execution.broker_mutations_enabled:
+        if not strategy.enabled:
+            raise RuntimeConfigError(
+                "supervised manual opening requires an enabled strategy"
+            )
+        if (
+            not strategy.symbols
+            or not set(strategy.symbols).issubset({"SPY", "SPX"})
+        ):
+            raise RuntimeConfigError(
+                "supervised manual opening supports only SPY and SPX"
+            )
+        if model.required_for_entry:
+            raise RuntimeConfigError(
+                "supervised manual opening cannot satisfy a required model"
+            )
+        selected_account = next(
+            account
+            for account in execution.account_allowlist
+            if account.account_id_key
+            == execution.selected_account_id_key
+        )
+        if (
+            _BROKER_ACCOUNT_ID_PATTERN.fullmatch(
+                selected_account.account_id
+            )
+            is None
+            or int(selected_account.account_id)
+            > MAX_SIGNED_SQLITE_INTEGER
+        ):
+            raise RuntimeConfigError(
+                "supervised manual opening requires the exact numeric "
+                "E*TRADE account id"
+            )
     return RuntimeConfig(
         schema_version=schema_version,
         mode=mode,

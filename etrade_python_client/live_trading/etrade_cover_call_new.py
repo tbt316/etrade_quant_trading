@@ -15,6 +15,7 @@ import sys
 import stat
 import traceback
 import random
+import re
 import secrets
 import tempfile
 import hmac
@@ -26,6 +27,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import timedelta
 from datetime import datetime, date, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import logging
 import pandas as pd
@@ -55,7 +57,7 @@ import configparser
 import multiprocessing
 from typing import List
 from queue import Queue
-from uuid import uuid4
+from uuid import UUID, uuid4
 from backtesting import option_limit_backtest
 from data_and_research.polygonio_improvequery import get_earnings_dates
 from data_and_research.option_assign_probability import calculate_probability
@@ -88,9 +90,19 @@ from live_trading.runtime_safety import (
     reject_legacy_execution,
     secure_append_text,
     secure_lock_file,
+    validate_dashboard_auth_secret,
     validate_dashboard_credentials,
     write_owner_only_json,
 )
+from live_trading.execution_runtime import build_manual_open_service
+from live_trading.etrade_order_gateway import EtradeOrderGatewayError
+from live_trading.manual_open import (
+    ManualOpenError,
+    ManualOpenUnavailable,
+    ManualOpenValidationError,
+    ManualSpreadPreview,
+)
+from live_trading.order_intent_ledger import OrderIntentLedgerError
 from live_trading.spy_position_tracker import update_spy_daily_snapshot, record_closed_spy_gain
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -102,6 +114,7 @@ DASHBOARD_LOG_FILE = "dashboard_requests.log"
 AUDIT_LOG_FILE = "order_audit_log.csv"
 MANUAL_TRADE_STATUS_FILE = "manual_order_status.json"
 ETRADE_SESSION_REFRESH_LOCK = threading.RLock()
+MANUAL_OPEN_CONFIG_LOCK = threading.RLock()
 REGIME_V2_SHADOW_PATH = (
     Path(__file__).resolve().parent
     / "runtime"
@@ -130,6 +143,13 @@ DISABLED_DASHBOARD_EXECUTION_PATHS = frozenset({
     "/api/close_position",
     "/api/execute_close_order",
 })
+MANUAL_OPEN_DASHBOARD_PATH = "/api/manual_open"
+MAX_MANUAL_OPEN_REQUEST_BYTES = 16 * 1024
+MAX_DASHBOARD_JSON_REQUEST_BYTES = 16 * 1024
+MANUAL_OPEN_EXECUTOR = None
+MANUAL_OPEN_UNAVAILABLE_REASON = (
+    "Supervised manual opening is disabled by runtime configuration."
+)
 POSITIONS_READ_ONLY_MARKER = (
     "Read only — all E*TRADE order actions are disabled"
 )
@@ -144,6 +164,314 @@ POSITIONS_FRAME_CSP = (
     "script-src 'none'; connect-src 'none'; frame-ancestors 'self'; "
     "base-uri 'none'; form-action 'none'"
 )
+
+
+def _manual_open_capability_payload() -> dict:
+    executor = globals().get("MANUAL_OPEN_EXECUTOR")
+    try:
+        account_id = getattr(executor, "account_id", None)
+        enabled = (
+            executor is not None
+            and getattr(executor, "execution_enabled", False) is True
+            and type(account_id) is str
+            and account_id.isascii()
+            and account_id.isdigit()
+            and not account_id.startswith("0")
+        )
+    except Exception:
+        enabled = False
+        account_id = None
+    if enabled:
+        return {
+            "manual_open_enabled": True,
+            "manual_open_reason": None,
+            "manual_open_account_id": account_id,
+        }
+    return {
+        "manual_open_enabled": False,
+        "manual_open_reason": (
+            globals().get("MANUAL_OPEN_UNAVAILABLE_REASON")
+            or (
+                "Supervised manual opening is unavailable or its "
+                "runtime arm is no longer current."
+            )
+        ),
+        "manual_open_account_id": None,
+    }
+
+
+def _manual_open_status_payload() -> dict:
+    """Return the redacted durable manual-open read model.
+
+    This reads only the local intent ledger through the narrow manual-open
+    service.  It must never query E*TRADE order state.
+    """
+
+    capability = _manual_open_capability_payload()
+    payload = {
+        **capability,
+        "manual_open_recent": [],
+        "manual_open_history_account_id": None,
+        "manual_open_history_environment": None,
+        "manual_open_history_config_sha256": None,
+    }
+    executor = globals().get("MANUAL_OPEN_EXECUTOR")
+    if executor is None:
+        return payload
+
+    history_binding = {
+        "manual_open_history_account_id": None,
+        "manual_open_history_environment": None,
+        "manual_open_history_config_sha256": None,
+    }
+    try:
+        history_account_id = getattr(executor, "account_id", None)
+        history_environment = getattr(executor, "environment", None)
+        history_config_sha256 = getattr(
+            executor, "runtime_config_sha256", None
+        )
+        if (
+            type(history_account_id) is not str
+            or not history_account_id.isascii()
+            or not history_account_id.isdigit()
+            or history_account_id.startswith("0")
+            or history_environment not in {"sandbox", "production"}
+            or type(history_config_sha256) is not str
+            or len(history_config_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in history_config_sha256
+            )
+        ):
+            raise ValueError("invalid manual-open history binding")
+        history_binding = {
+            "manual_open_history_account_id": history_account_id,
+            "manual_open_history_environment": history_environment,
+            "manual_open_history_config_sha256": history_config_sha256,
+        }
+        payload.update(history_binding)
+        submissions = executor.recent_submissions(limit=25)
+        if type(submissions) not in {list, tuple} or len(submissions) > 25:
+            raise ValueError("invalid recent manual-open collection")
+
+        recent = []
+        allowed_fields = {
+            "proposal_id",
+            "intent_id",
+            "status",
+            "durable_state",
+            "broker_order_id",
+            "reason_code",
+            "created_at",
+            "updated_at",
+            "ticker",
+            "side",
+            "expiration",
+            "sell_strike",
+            "buy_strike",
+            "limit_credit",
+            "quantity",
+        }
+        for submission in submissions:
+            dashboard_payload = submission.dashboard_payload()
+            if (
+                type(dashboard_payload) is not dict
+                or set(dashboard_payload) != allowed_fields
+            ):
+                raise ValueError("invalid recent manual-open projection")
+            if any(
+                type(dashboard_payload[field]) is not str
+                or not dashboard_payload[field]
+                for field in (
+                    "proposal_id",
+                    "intent_id",
+                    "status",
+                    "durable_state",
+                    "created_at",
+                    "updated_at",
+                )
+            ):
+                raise ValueError("invalid recent manual-open identity")
+            if (
+                dashboard_payload["broker_order_id"] is not None
+                and (
+                    type(dashboard_payload["broker_order_id"]) is not str
+                    or not dashboard_payload["broker_order_id"]
+                )
+            ):
+                raise ValueError("invalid recent manual-open broker order id")
+            if (
+                dashboard_payload["reason_code"] is not None
+                and (
+                    type(dashboard_payload["reason_code"]) is not str
+                    or not dashboard_payload["reason_code"]
+                )
+            ):
+                raise ValueError("invalid recent manual-open reason")
+            # Take a primitive deep copy and reject NaN/Infinity or any
+            # accidental non-JSON object before it reaches the browser.
+            recent.append(
+                json.loads(
+                    json.dumps(
+                        {
+                            field: dashboard_payload[field]
+                            for field in sorted(allowed_fields)
+                        },
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                )
+            )
+        payload["manual_open_recent"] = recent
+        return payload
+    except Exception as exc:
+        print(
+            "⚠️ Durable manual-open status failed closed: "
+            f"{type(exc).__name__}"
+        )
+        return {
+            "manual_open_enabled": False,
+            "manual_open_reason": (
+                "Durable manual-open status integrity could not be "
+                "verified. No new order may be submitted."
+            ),
+            "manual_open_account_id": None,
+            "manual_open_recent": [],
+            **history_binding,
+        }
+
+
+def _configure_manual_open_executor(authenticated_session) -> None:
+    """Rebuild the gateway after startup or OAuth-token replacement."""
+
+    global MANUAL_OPEN_EXECUTOR, MANUAL_OPEN_UNAVAILABLE_REASON
+    with MANUAL_OPEN_CONFIG_LOCK:
+        MANUAL_OPEN_EXECUTOR = None
+        configured_runtime = globals().get("runtime_config")
+        safety = globals().get("runtime_safety")
+        settings = globals().get("live_settings")
+        if (
+            configured_runtime is None
+            or not configured_runtime.execution.broker_mutations_enabled
+        ):
+            MANUAL_OPEN_UNAVAILABLE_REASON = (
+                "Supervised manual opening is disabled by runtime configuration."
+            )
+            return
+        if settings is None:
+            MANUAL_OPEN_UNAVAILABLE_REASON = (
+                "Dashboard settings are unavailable for manual opening."
+            )
+            return
+        try:
+            MANUAL_OPEN_EXECUTOR = build_manual_open_service(
+                session=authenticated_session,
+                runtime_config=configured_runtime,
+                runtime_safety=safety,
+                proposal_secret=_manual_open_proposal_secret(settings),
+            )
+        except Exception as exc:
+            MANUAL_OPEN_UNAVAILABLE_REASON = (
+                "Durable manual opening is unavailable; inspect the "
+                "local operator log before retrying."
+            )
+            print(
+                "⚠️ Manual opening remained fail-closed during "
+                f"composition: {type(exc).__name__}"
+            )
+            return
+        MANUAL_OPEN_UNAVAILABLE_REASON = ""
+        print(
+            "✅ Supervised dashboard manual opening is available through "
+            "the durable E*TRADE gateway."
+        )
+
+
+def _decode_manual_open_request(payload: bytes) -> dict:
+    """Parse the exact, non-authoritative dashboard confirmation envelope."""
+
+    if type(payload) is not bytes or not payload:
+        raise ManualOpenValidationError(
+            "manual opening request body is required"
+        )
+
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if type(key) is not str or key in result:
+                raise ManualOpenValidationError(
+                    "manual opening request contains duplicate fields"
+                )
+            result[key] = value
+        return result
+
+    try:
+        request = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=object_pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ManualOpenValidationError(
+                    "manual opening request contains an invalid number"
+                )
+            ),
+        )
+    except ManualOpenValidationError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise ManualOpenValidationError(
+            "manual opening request must be valid JSON"
+        ) from exc
+    if type(request) is not dict or set(request) != {
+        "pin",
+        "proposal_token",
+        "quantity",
+        "request_id",
+    }:
+        raise ManualOpenValidationError(
+            "manual opening request fields are invalid"
+        )
+    if (
+        type(request["pin"]) is not str
+        or type(request["proposal_token"]) is not str
+        or type(request["quantity"]) is not int
+        or type(request["request_id"]) is not str
+    ):
+        raise ManualOpenValidationError(
+            "manual opening request field types are invalid"
+        )
+    return request
+
+
+def _manual_open_request_id_header(headers) -> str | None:
+    value = headers.get("X-Manual-Open-Request-Id")
+    if type(value) is not str or not value:
+        return None
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    if parsed.version != 4 or str(parsed) != value:
+        return None
+    return value
+
+
+def _manual_open_not_attempted_payload(
+    code: str,
+    error: str,
+    request_id: str | None,
+) -> dict:
+    payload = {
+        "code": code,
+        "error": error,
+        "submission_disposition": "NOT_ATTEMPTED",
+    }
+    if request_id is not None:
+        payload["request_id"] = request_id
+    return payload
 
 
 def _read_only_positions_fallback() -> str:
@@ -1054,6 +1382,159 @@ def send_extrinsic_value_alert(alerts):
 LIVE_SETTINGS_FILE = "live_trading_settings.json"
 DASHBOARD_SESSION_COOKIE = "etrade_dashboard_session"
 DASHBOARD_SESSION_DAYS = 7
+DASHBOARD_CSP_NONCE_PLACEHOLDER = "__DASHBOARD_CSP_NONCE__"
+DASHBOARD_PROTOCOL_VERSION = "manual-open-dashboard.v2"
+DASHBOARD_PROTOCOL_MARKER = (
+    '<meta name="etrade-dashboard-protocol" '
+    f'content="{DASHBOARD_PROTOCOL_VERSION}">'
+)
+DASHBOARD_TEMPLATE_MAX_BYTES = 2 * 1024 * 1024
+DASHBOARD_LOGIN_MAX_FAILURES = 5
+DASHBOARD_PIN_MAX_FAILURES = 5
+DASHBOARD_AUTH_FAILURE_WINDOW_SECONDS = 300
+DASHBOARD_AUTH_LOCKOUT_SECONDS = 300
+
+
+def _load_pinned_dashboard_template():
+    """Load one protocol-matched template generation for this process."""
+
+    path = Path(__file__).resolve().parent / "dashboard_template.html"
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > DASHBOARD_TEMPLATE_MAX_BYTES
+        ):
+            raise RuntimeSafetyError(
+                "dashboard template is not a bounded regular file"
+            )
+        raw = path.read_bytes()
+        html = raw.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeSafetyError(
+            "dashboard template could not be pinned"
+        ) from exc
+    if (
+        html.count(DASHBOARD_PROTOCOL_MARKER) != 1
+        or html.count(DASHBOARD_CSP_NONCE_PLACEHOLDER) != 2
+    ):
+        raise RuntimeSafetyError(
+            "dashboard template protocol generation is incompatible"
+        )
+    return html, hashlib.sha256(raw).hexdigest()
+
+
+(
+    PINNED_DASHBOARD_TEMPLATE,
+    PINNED_DASHBOARD_TEMPLATE_SHA256,
+) = _load_pinned_dashboard_template()
+
+
+class _DashboardFailureLimiter:
+    """Process-local brute-force fence for the loopback/tunnel dashboard."""
+
+    def __init__(
+        self,
+        *,
+        max_failures,
+        window_seconds,
+        lockout_seconds,
+        clock=None,
+    ):
+        self._max_failures = int(max_failures)
+        self._window_seconds = float(window_seconds)
+        self._lockout_seconds = float(lockout_seconds)
+        self._clock = clock or t.monotonic
+        self._lock = threading.Lock()
+        self._failures = []
+        self._blocked_until = 0.0
+        if (
+            self._max_failures < 1
+            or self._window_seconds <= 0
+            or self._lockout_seconds <= 0
+        ):
+            raise ValueError("invalid dashboard failure limiter")
+
+    def _prune(self, now):
+        cutoff = now - self._window_seconds
+        self._failures = [
+            timestamp
+            for timestamp in self._failures
+            if timestamp > cutoff
+        ]
+        if self._blocked_until <= now:
+            self._blocked_until = 0.0
+
+    def retry_after(self):
+        with self._lock:
+            now = float(self._clock())
+            self._prune(now)
+            if self._blocked_until <= now:
+                return 0
+            return max(1, int(self._blocked_until - now + 0.999))
+
+    def record_failure(self):
+        with self._lock:
+            now = float(self._clock())
+            self._prune(now)
+            if self._blocked_until > now:
+                return max(
+                    1,
+                    int(self._blocked_until - now + 0.999),
+                )
+            self._failures.append(now)
+            if len(self._failures) < self._max_failures:
+                return 0
+            self._failures.clear()
+            self._blocked_until = now + self._lockout_seconds
+            return max(1, int(self._lockout_seconds + 0.999))
+
+    def record_success(self):
+        with self._lock:
+            self._failures.clear()
+            self._blocked_until = 0.0
+
+
+DASHBOARD_LOGIN_FAILURE_LIMITER = _DashboardFailureLimiter(
+    max_failures=DASHBOARD_LOGIN_MAX_FAILURES,
+    window_seconds=DASHBOARD_AUTH_FAILURE_WINDOW_SECONDS,
+    lockout_seconds=DASHBOARD_AUTH_LOCKOUT_SECONDS,
+)
+DASHBOARD_PIN_FAILURE_LIMITER = _DashboardFailureLimiter(
+    max_failures=DASHBOARD_PIN_MAX_FAILURES,
+    window_seconds=DASHBOARD_AUTH_FAILURE_WINDOW_SECONDS,
+    lockout_seconds=DASHBOARD_AUTH_LOCKOUT_SECONDS,
+)
+
+
+def _dashboard_page_csp(nonce):
+    if (
+        type(nonce) is not str
+        or not nonce
+        or not nonce.isascii()
+        or any(
+            character
+            not in (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz"
+                "0123456789-_"
+            )
+            for character in nonce
+        )
+    ):
+        raise RuntimeSafetyError("invalid dashboard CSP nonce")
+    return (
+        "default-src 'self'; "
+        f"script-src 'nonce-{nonce}' 'strict-dynamic' "
+        "https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; frame-src 'self'; "
+        "object-src 'none'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'"
+    )
 
 
 def _validate_live_settings_parent():
@@ -1123,7 +1604,11 @@ def load_live_settings():
                 if 'spx_target_expiration' not in settings:
                     settings['spx_target_expiration'] = settings.get('target_expiration')
                     modified = True
-                if 'dashboard_auth_secret' not in settings:
+                try:
+                    validate_dashboard_auth_secret(
+                        settings.get("dashboard_auth_secret")
+                    )
+                except RuntimeSafetyError:
                     settings['dashboard_auth_secret'] = secrets.token_hex(32)
                     modified = True
                 if settings.get('auto_open_enabled') is not False:
@@ -1211,9 +1696,29 @@ def _dashboard_auth_configured(settings=None):
 
 
 def _dashboard_session_signature(settings, username, expires_at):
-    secret = settings.get('dashboard_auth_secret') or ''
+    secret = _dashboard_derived_secret(
+        settings, b"etrade-dashboard-session.v1"
+    )
     payload = f"{username}|{expires_at}"
-    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _dashboard_derived_secret(settings, purpose):
+    master = settings.get("dashboard_auth_secret")
+    validate_dashboard_auth_secret(master)
+    if type(purpose) is not bytes or not purpose:
+        raise RuntimeSafetyError(
+            "dashboard secret derivation purpose is invalid"
+        )
+    return hmac.new(
+        bytes.fromhex(master), purpose, hashlib.sha256
+    ).digest()
+
+
+def _manual_open_proposal_secret(settings):
+    return _dashboard_derived_secret(
+        settings, b"etrade-manual-open-proposal.v1"
+    ).hex()
 
 
 def _create_dashboard_session_cookie(settings, username, secure=False):
@@ -1250,8 +1755,8 @@ def _is_valid_dashboard_session(headers, settings):
         return False
 
 
-def _dashboard_login_html():
-    return """<!doctype html>
+def _dashboard_login_html(nonce):
+    html = """<!doctype html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -1275,7 +1780,7 @@ def _dashboard_login_html():
         <button type="submit">Sign In</button>
         <div id="error" class="error"></div>
     </form>
-    <script>
+    <script nonce="__DASHBOARD_CSP_NONCE__">
         document.getElementById('login-form').addEventListener('submit', async (event) => {
             event.preventDefault();
             const error = document.getElementById('error');
@@ -1297,6 +1802,9 @@ def _dashboard_login_html():
     </script>
 </body>
 </html>"""
+    if html.count(DASHBOARD_CSP_NONCE_PLACEHOLDER) != 1:
+        raise RuntimeSafetyError("dashboard login CSP nonce marker is invalid")
+    return html.replace(DASHBOARD_CSP_NONCE_PLACEHOLDER, nonce)
 
 
 def _dashboard_manifest():
@@ -2354,7 +2862,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"⚠️ Error sending response: {e}")
 
-    def _send_private_json_response(self, code, content):
+    def _send_private_json_response(self, code, content, headers=None):
         """Send authenticated same-origin JSON without permissive CORS."""
 
         try:
@@ -2373,7 +2881,11 @@ class RefreshHandler(BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Vary", "Authorization, Cookie")
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
@@ -2381,6 +2893,457 @@ class RefreshHandler(BaseHTTPRequestHandler):
             pass
         except Exception:
             print("⚠️ Error sending private dashboard response.")
+
+    def _send_dashboard_rate_limit(
+        self, retry_after, *, request_id=None
+    ):
+        retry_after = max(1, int(retry_after))
+        payload = {
+            "code": "DASHBOARD_AUTH_RATE_LIMITED",
+            "error": (
+                "Too many failed authentication attempts. "
+                "Wait before retrying."
+            ),
+        }
+        if request_id is not None:
+            payload.update(
+                {
+                    "request_id": request_id,
+                    "submission_disposition": "NOT_ATTEMPTED",
+                }
+            )
+        self._send_private_json_response(
+            429,
+            payload,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    def _read_bounded_json_request(self):
+        """Read one exact, bounded JSON object or send a fixed rejection."""
+
+        content_type = (
+            self.headers.get("Content-Type", "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if content_type != "application/json":
+            self._send_private_json_response(
+                415,
+                {
+                    "code": "DASHBOARD_JSON_CONTENT_TYPE",
+                    "error": "Content-Type must be application/json.",
+                },
+            )
+            return None
+
+        get_all = getattr(self.headers, "get_all", None)
+        if callable(get_all):
+            length_values = get_all("Content-Length") or []
+        else:
+            length_value = self.headers.get("Content-Length")
+            length_values = (
+                [] if length_value is None else [length_value]
+            )
+        if not length_values:
+            self._send_private_json_response(
+                411,
+                {
+                    "code": "DASHBOARD_JSON_LENGTH_REQUIRED",
+                    "error": "A bounded Content-Length is required.",
+                },
+            )
+            return None
+        if len(length_values) != 1:
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_INVALID_LENGTH",
+                    "error": "Content-Length must be one exact byte count.",
+                },
+            )
+            return None
+
+        length_text = length_values[0]
+        if (
+            type(length_text) is not str
+            or not length_text
+            or not length_text.isascii()
+            or not length_text.isdigit()
+        ):
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_INVALID_LENGTH",
+                    "error": "Content-Length must be a non-negative integer.",
+                },
+            )
+            return None
+        maximum_length_text = str(
+            MAX_DASHBOARD_JSON_REQUEST_BYTES
+        )
+        if (
+            len(length_text) > len(maximum_length_text)
+            or (
+                len(length_text) == len(maximum_length_text)
+                and length_text > maximum_length_text
+            )
+        ):
+            self._send_private_json_response(
+                413,
+                {
+                    "code": "DASHBOARD_JSON_BODY_TOO_LARGE",
+                    "error": "JSON request body exceeds the allowed size.",
+                },
+            )
+            return None
+        content_length = int(length_text, 10)
+        if content_length == 0:
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_EMPTY_BODY",
+                    "error": "A JSON request body is required.",
+                },
+            )
+            return None
+        raw_request = self.rfile.read(content_length)
+        if len(raw_request) != content_length:
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_INCOMPLETE_BODY",
+                    "error": "JSON request body was incomplete.",
+                },
+            )
+            return None
+        try:
+            request = json.loads(raw_request.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_INVALID_BODY",
+                    "error": "Request body must be one valid JSON object.",
+                },
+            )
+            return None
+        if type(request) is not dict:
+            self._send_private_json_response(
+                400,
+                {
+                    "code": "DASHBOARD_JSON_INVALID_BODY",
+                    "error": "Request body must be one valid JSON object.",
+                },
+            )
+            return None
+        return request
+
+    def _handle_manual_open_post(self):
+        """Confirm one signed proposal through the durable gateway."""
+
+        request_id_header = _manual_open_request_id_header(
+            self.headers
+        )
+        retry_after = DASHBOARD_PIN_FAILURE_LIMITER.retry_after()
+        if retry_after:
+            self._send_dashboard_rate_limit(
+                retry_after,
+                request_id=request_id_header,
+            )
+            return
+
+        content_type = (
+            self.headers.get("Content-Type", "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if content_type != "application/json":
+            self._send_private_json_response(
+                415,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_CONTENT_TYPE",
+                    "Content-Type must be application/json.",
+                    request_id_header,
+                ),
+            )
+            return
+        get_all = getattr(self.headers, "get_all", None)
+        if callable(get_all):
+            length_values = get_all("Content-Length") or []
+        else:
+            length_value = self.headers.get("Content-Length")
+            length_values = (
+                [] if length_value is None else [length_value]
+            )
+        if len(length_values) != 1:
+            self._send_private_json_response(
+                411 if not length_values else 400,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_LENGTH_REQUIRED",
+                    "One bounded Content-Length is required.",
+                    request_id_header,
+                ),
+            )
+            return
+        length_text = length_values[0]
+        maximum_length_text = str(MAX_MANUAL_OPEN_REQUEST_BYTES)
+        if (
+            type(length_text) is not str
+            or not length_text
+            or not length_text.isascii()
+            or not length_text.isdigit()
+        ):
+            self._send_private_json_response(
+                400,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_LENGTH_INVALID",
+                    "Content-Length must be one exact byte count.",
+                    request_id_header,
+                ),
+            )
+            return
+        if (
+            len(length_text) > len(maximum_length_text)
+            or (
+                len(length_text) == len(maximum_length_text)
+                and length_text > maximum_length_text
+            )
+        ):
+            self._send_private_json_response(
+                413,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_BODY_SIZE",
+                    (
+                        "Manual opening request body is outside "
+                        "the allowed size."
+                    ),
+                    request_id_header,
+                ),
+            )
+            return
+        content_length = int(length_text, 10)
+        if content_length == 0:
+            self._send_private_json_response(
+                400,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_BODY_SIZE",
+                    "Manual opening request body is empty.",
+                    request_id_header,
+                ),
+            )
+            return
+        raw_request = self.rfile.read(content_length)
+        if len(raw_request) != content_length:
+            self._send_private_json_response(
+                400,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_INCOMPLETE_BODY",
+                    "Manual opening request body was incomplete.",
+                    request_id_header,
+                ),
+            )
+            return
+        try:
+            request = _decode_manual_open_request(raw_request)
+        except ManualOpenValidationError as exc:
+            self._send_private_json_response(
+                400,
+                _manual_open_not_attempted_payload(
+                    exc.code,
+                    str(exc),
+                    request_id_header,
+                ),
+            )
+            return
+        if request_id_header != request["request_id"]:
+            self._send_private_json_response(
+                400,
+                _manual_open_not_attempted_payload(
+                    "MANUAL_OPEN_REQUEST_ID_MISMATCH",
+                    (
+                        "The request correlation header does not "
+                        "match the signed confirmation envelope."
+                    ),
+                    request_id_header,
+                ),
+            )
+            return
+
+        try:
+            settings = load_live_settings()
+        except Exception:
+            self._send_private_json_response(
+                503,
+                {
+                    "code": "MANUAL_OPEN_SETTINGS_UNAVAILABLE",
+                    "error": (
+                        "Manual opening settings are unavailable. "
+                        "No order was submitted."
+                    ),
+                    "request_id": request["request_id"],
+                    "submission_disposition": "NOT_ATTEMPTED",
+                },
+            )
+            return
+        configured_pin = str(settings.get("pin") or "")
+        if (
+            not request["pin"]
+            or not configured_pin
+            or not hmac.compare_digest(
+                request["pin"], configured_pin
+            )
+        ):
+            retry_after = DASHBOARD_PIN_FAILURE_LIMITER.record_failure()
+            log_dashboard_request(
+                MANUAL_OPEN_DASHBOARD_PATH,
+                {
+                    "event": "manual_open_pin_rejected",
+                    "request_id": request["request_id"],
+                },
+            )
+            if retry_after:
+                self._send_dashboard_rate_limit(
+                    retry_after,
+                    request_id=request["request_id"],
+                )
+            else:
+                self._send_private_json_response(
+                    403,
+                    {
+                        "code": "MANUAL_OPEN_PIN_REJECTED",
+                        "error": "Invalid PIN.",
+                        "request_id": request["request_id"],
+                        "submission_disposition": "NOT_ATTEMPTED",
+                    },
+                )
+            return
+        DASHBOARD_PIN_FAILURE_LIMITER.record_success()
+
+        executor = globals().get("MANUAL_OPEN_EXECUTOR")
+        manual_open_status = _manual_open_status_payload()
+        if not manual_open_status["manual_open_enabled"]:
+            self._send_private_json_response(
+                503,
+                {
+                    "code": ManualOpenUnavailable.code,
+                    "error": (
+                        "Supervised manual opening is unavailable. "
+                        "No order was submitted."
+                    ),
+                    "manual_open_enabled": False,
+                    "manual_open_reason": manual_open_status[
+                        "manual_open_reason"
+                    ],
+                    "manual_open_account_id": None,
+                    "request_id": request["request_id"],
+                    "submission_disposition": "NOT_ATTEMPTED",
+                },
+            )
+            return
+        try:
+            submission = executor.submit(
+                proposal_token=request["proposal_token"],
+                quantity=request["quantity"],
+                request_id=request["request_id"],
+            )
+        except ManualOpenValidationError as exc:
+            self._send_private_json_response(
+                400,
+                {
+                    "code": exc.code,
+                    "error": str(exc),
+                    "request_id": request["request_id"],
+                    "submission_disposition": "NOT_ATTEMPTED",
+                },
+            )
+            return
+        except (
+            ManualOpenError,
+            EtradeOrderGatewayError,
+            OrderIntentLedgerError,
+            RuntimeSafetyError,
+        ) as exc:
+            print(
+                "⚠️ Durable manual opening failed closed: "
+                f"{type(exc).__name__}"
+            )
+            self._send_private_json_response(
+                503,
+                {
+                    "code": "MANUAL_OPEN_FAILED_CLOSED",
+                    "error": (
+                        "Durable manual opening is unavailable. "
+                        "No retry was attempted."
+                    ),
+                },
+            )
+            return
+        except Exception as exc:
+            print(
+                "⚠️ Unexpected manual opening failure: "
+                f"{type(exc).__name__}"
+            )
+            self._send_private_json_response(
+                500,
+                {
+                    "code": "MANUAL_OPEN_INTERNAL_ERROR",
+                    "error": (
+                        "Manual opening failed without an automatic retry."
+                    ),
+                },
+            )
+            return
+
+        response_code = {
+            "SUBMITTED": 200,
+            "SUBMISSION_UNKNOWN": 202,
+            "FAILED": 422,
+        }.get(submission.state)
+        if response_code is None:
+            self._send_private_json_response(
+                503,
+                {
+                    "code": "MANUAL_OPEN_INVALID_STATE",
+                    "error": (
+                        "Durable order state is unavailable. "
+                        "Do not submit another order."
+                    ),
+                },
+            )
+            return
+        message = {
+            "SUBMITTED": (
+                "Credit spread submission was acknowledged and durably "
+                "recorded. This is not a fill confirmation."
+            ),
+            "SUBMISSION_UNKNOWN": (
+                "Submission outcome is uncertain. Do not create another "
+                "request; reconciliation is required."
+            ),
+            "FAILED": (
+                "Durable submission processing failed. This is not "
+                "automatic proof that E*TRADE rejected the order."
+            ),
+        }[submission.state]
+        response = {
+            **submission.dashboard_payload(),
+            **_manual_open_capability_payload(),
+            "automatic_execution_enabled": False,
+            "message": message,
+        }
+        log_dashboard_request(
+            MANUAL_OPEN_DASHBOARD_PATH,
+            {
+                "event": "manual_open_result",
+                "request_id": submission.request_id,
+                "intent_id": submission.intent_id,
+                "state": submission.state,
+                "created": submission.created,
+            },
+        )
+        self._send_private_json_response(response_code, response)
 
     def do_OPTIONS(self):
         """Reject cross-origin preflight for this same-origin dashboard."""
@@ -2390,26 +3353,42 @@ class RefreshHandler(BaseHTTPRequestHandler):
             pass
     
     def check_auth(self, auth_header):
-        """Verify Basic Auth credentials against settings."""
+        """Return ``(authorized, retry_after)`` for dashboard authentication."""
         settings = load_live_settings()
         user = settings.get('dashboard_user')
         password = settings.get('dashboard_pass')
         
         if not user or not password:
-            return False
+            return False, 0
 
         if _is_valid_dashboard_session(self.headers, settings):
-            return True
+            return True, 0
             
         if not auth_header or not auth_header.startswith('Basic '):
-            return False
+            return False, 0
+
+        retry_after = DASHBOARD_LOGIN_FAILURE_LIMITER.retry_after()
+        if retry_after:
+            return False, retry_after
             
         try:
-            auth_decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+            auth_decoded = base64.b64decode(
+                auth_header[6:], validate=True
+            ).decode('utf-8')
             u, p = auth_decoded.split(':', 1)
-            return u == user and p == password
+            authorized = (
+                hmac.compare_digest(u, str(user))
+                and hmac.compare_digest(p, str(password))
+            )
         except Exception:
-            return False
+            authorized = False
+        if authorized:
+            DASHBOARD_LOGIN_FAILURE_LIMITER.record_success()
+            return True, 0
+        return (
+            False,
+            DASHBOARD_LOGIN_FAILURE_LIMITER.record_failure(),
+        )
 
     def _send_unauthorized(self):
         self._send_safe_response(401, {"error": "Authentication required"})
@@ -2426,17 +3405,34 @@ class RefreshHandler(BaseHTTPRequestHandler):
             self._send_safe_response(500, {"error": str(e)})
 
     def _do_POST_logic(self):
-        if self.path.startswith('/api/login'):
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length) if content_length else b'{}'
-            data = json.loads(post_data.decode('utf-8'))
+        request_path = self.path.split("?", 1)[0]
+        if request_path == '/api/login':
+            retry_after = DASHBOARD_LOGIN_FAILURE_LIMITER.retry_after()
+            if retry_after:
+                self._send_dashboard_rate_limit(retry_after)
+                return
+            data = self._read_bounded_json_request()
+            if data is None:
+                return
             settings = load_live_settings()
             if not _dashboard_auth_configured(settings):
                 self._send_safe_response(400, {"error": "Dashboard username/password are not configured."})
                 return
             username = str(data.get('username') or '')
             password = str(data.get('password') or '')
-            if username == settings.get('dashboard_user') and password == settings.get('dashboard_pass'):
+            configured_username = str(
+                settings.get('dashboard_user') or ''
+            )
+            configured_password = str(
+                settings.get('dashboard_pass') or ''
+            )
+            if (
+                username
+                and password
+                and hmac.compare_digest(username, configured_username)
+                and hmac.compare_digest(password, configured_password)
+            ):
+                DASHBOARD_LOGIN_FAILURE_LIMITER.record_success()
                 self._send_safe_response(
                     200,
                     {"status": "ok", "session_days": DASHBOARD_SESSION_DAYS},
@@ -2445,10 +3441,17 @@ class RefreshHandler(BaseHTTPRequestHandler):
                     )}
                 )
                 return
-            self._send_safe_response(403, {"error": "Invalid username or password"})
+            retry_after = DASHBOARD_LOGIN_FAILURE_LIMITER.record_failure()
+            if retry_after:
+                self._send_dashboard_rate_limit(retry_after)
+            else:
+                self._send_safe_response(
+                    403,
+                    {"error": "Invalid username or password"},
+                )
             return
 
-        if self.path.startswith('/api/logout'):
+        if request_path == '/api/logout':
             self._send_safe_response(
                 200,
                 {"status": "ok"},
@@ -2459,11 +3462,16 @@ class RefreshHandler(BaseHTTPRequestHandler):
             return
 
         # Security: Check Basic Auth
-        if not self.check_auth(self.headers.get('Authorization')):
+        authorized, retry_after = self.check_auth(
+            self.headers.get('Authorization')
+        )
+        if retry_after:
+            self._send_dashboard_rate_limit(retry_after)
+            return
+        if not authorized:
             self._send_unauthorized()
             return
 
-        request_path = self.path.split("?", 1)[0]
         if request_path in DISABLED_DASHBOARD_EXECUTION_PATHS:
             try:
                 reject_legacy_execution(f"legacy dashboard endpoint {request_path}")
@@ -2477,6 +3485,10 @@ class RefreshHandler(BaseHTTPRequestHandler):
                         "execution_enabled": False,
                     },
                 )
+            return
+
+        if request_path == MANUAL_OPEN_DASHBOARD_PATH:
+            self._handle_manual_open_post()
             return
 
         if request_path == '/refresh':
@@ -2493,34 +3505,77 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 "refresh_generation": refresh_generation,
             })
 
-        elif self.path == '/api/verify_pin':
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length) if content_length else b'{}'
-            data = json.loads(post_data.decode('utf-8'))
+        elif request_path == '/api/verify_pin':
+            retry_after = DASHBOARD_PIN_FAILURE_LIMITER.retry_after()
+            if retry_after:
+                self._send_dashboard_rate_limit(retry_after)
+                return
+            data = self._read_bounded_json_request()
+            if data is None:
+                return
             settings = load_live_settings()
             submitted_pin = str(data.get('pin') or '')
             configured_pin = str(settings.get('pin') or '')
             if not submitted_pin or not hmac.compare_digest(submitted_pin, configured_pin):
-                self._send_safe_response(403, {"error": "Invalid PIN"})
+                retry_after = DASHBOARD_PIN_FAILURE_LIMITER.record_failure()
+                if retry_after:
+                    self._send_dashboard_rate_limit(retry_after)
+                else:
+                    self._send_safe_response(403, {"error": "Invalid PIN"})
                 return
+            DASHBOARD_PIN_FAILURE_LIMITER.record_success()
             self._send_safe_response(200, {"status": "ok"})
         
-        elif self.path.startswith('/api/settings'):
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            new_settings = json.loads(post_data.decode('utf-8'))
+        elif request_path == '/api/settings':
+            retry_after = DASHBOARD_PIN_FAILURE_LIMITER.retry_after()
+            if retry_after:
+                self._send_dashboard_rate_limit(retry_after)
+                return
+            new_settings = self._read_bounded_json_request()
+            if new_settings is None:
+                return
             current_settings = load_live_settings()
             
-            if new_settings.get('pin') != current_settings.get('pin'):
+            submitted_pin = str(new_settings.get('pin') or '')
+            configured_pin = str(current_settings.get('pin') or '')
+            if (
+                not submitted_pin
+                or not configured_pin
+                or not hmac.compare_digest(
+                    submitted_pin, configured_pin
+                )
+            ):
+                retry_after = DASHBOARD_PIN_FAILURE_LIMITER.record_failure()
                 log_dashboard_request(self.path, {"error": "Invalid PIN attempt"})
-                self._send_safe_response(403, {"error": "Invalid PIN"})
+                if retry_after:
+                    self._send_dashboard_rate_limit(retry_after)
+                else:
+                    self._send_safe_response(403, {"error": "Invalid PIN"})
                 return
+            DASHBOARD_PIN_FAILURE_LIMITER.record_success()
             
             log_dashboard_request(self.path, new_settings)
 
+            dashboard_credentials_changed = False
             for key in ['target_delta', 'hedge_spread', 'spy_hedge_spread', 'spx_hedge_spread', 'trade_start_time', 'trade_end_time', 'auto_close_midpoint_threshold', 'auto_close_gain_threshold', 'pair_quantity', 'spy_pair_quantity', 'spx_pair_quantity', 'target_weeks', 'target_expiration', 'spy_target_expiration', 'spx_target_expiration', 'trade_side', 'dashboard_user', 'dashboard_pass']:
                 if key in new_settings:
+                    if (
+                        key == "dashboard_pass"
+                        and new_settings[key] == ""
+                    ):
+                        continue
+                    if (
+                        key in {"dashboard_user", "dashboard_pass"}
+                        and current_settings.get(key) != new_settings[key]
+                    ):
+                        dashboard_credentials_changed = True
                     current_settings[key] = new_settings[key]
+            if dashboard_credentials_changed:
+                # Session signatures derive from this root.  Rotating it
+                # immediately revokes every existing browser session.
+                current_settings["dashboard_auth_secret"] = (
+                    secrets.token_hex(32)
+                )
             current_settings['auto_open_enabled'] = False
             
             if save_live_settings(current_settings):
@@ -2557,11 +3612,25 @@ class RefreshHandler(BaseHTTPRequestHandler):
             return
 
         if request_path == '/login':
-            self._send_safe_response(200, _dashboard_login_html(), 'text/html')
+            nonce = secrets.token_urlsafe(24)
+            self._send_safe_response(
+                200,
+                _dashboard_login_html(nonce),
+                'text/html',
+                headers={
+                    "Content-Security-Policy": _dashboard_page_csp(nonce),
+                },
+            )
             return
 
         # Security: Check Basic Auth
-        if not self.check_auth(self.headers.get('Authorization')):
+        authorized, retry_after = self.check_auth(
+            self.headers.get('Authorization')
+        )
+        if retry_after:
+            self._send_dashboard_rate_limit(retry_after)
+            return
+        if not authorized:
             if request_path == "/api/regime_v2_shadow":
                 self._send_private_json_response(
                     401,
@@ -2582,26 +3651,33 @@ class RefreshHandler(BaseHTTPRequestHandler):
             return
         
         elif request_path == '/dashboard':
-            template_path = os.path.join(os.path.dirname(__file__), "dashboard_template.html")
-            if not os.path.exists(template_path):
-                template_path = "live_trading/dashboard_template.html"
-            
-            with open(template_path, "r") as f:
-                html = f.read()
-            self._send_safe_response(200, html, 'text/html')
+            nonce = secrets.token_urlsafe(24)
+            html = PINNED_DASHBOARD_TEMPLATE.replace(
+                DASHBOARD_CSP_NONCE_PLACEHOLDER, nonce
+            )
+            self._send_safe_response(
+                200,
+                html,
+                'text/html',
+                headers={
+                    "Content-Security-Policy": _dashboard_page_csp(nonce),
+                    "X-Dashboard-Build-SHA256":
+                        PINNED_DASHBOARD_TEMPLATE_SHA256,
+                },
+            )
 
         elif request_path == "/api/regime_v2_shadow":
             payload = calculate_regime_v2_shadow_status()
             status = 200 if payload.get("available") else 503
             self._send_private_json_response(status, payload)
 
-        elif self.path.startswith('/api/settings'):
+        elif request_path == '/api/settings':
             settings = load_live_settings()
             hidden_settings = {'pin', 'dashboard_pass', 'dashboard_auth_secret'}
             display_settings = {k: v for k, v in settings.items() if k not in hidden_settings}
             self._send_safe_response(200, display_settings)
 
-        elif self.path.startswith('/api/status'):
+        elif request_path == '/api/status':
             is_open, market_status, _, _ = is_market_open()
             trade_status = load_trade_status()
             settings = load_live_settings()
@@ -2636,23 +3712,9 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"⚠️ Failed to get SPX expirations: {e}")
 
-            broker_open_orders = []
-            broker_executed_orders = []
-            broker_cancelled_orders = []
-            if 'etrade_instance' in globals() and etrade_instance is not None:
-                try:
-                    broker_open_orders = etrade_instance.order.get_open_orders()
-                except Exception as e:
-                    print(f"[Manual Order Status] Warning: Could not fetch open broker orders: {e}")
-                try:
-                    broker_executed_orders = etrade_instance.order.get_executed_orders(today.strftime("%Y-%m-%d"))
-                except Exception as e:
-                    print(f"[Manual Order Status] Warning: Could not fetch executed broker orders: {e}")
-                try:
-                    broker_cancelled_orders = etrade_instance.order.get_cancelled_orders(today.strftime("%Y-%m-%d"))
-                except Exception as e:
-                    print(f"[Manual Order Status] Warning: Could not fetch cancelled broker orders: {e}")
-            manual_orders_snapshot = get_manual_trade_status_snapshot(broker_open_orders, broker_executed_orders, broker_cancelled_orders)
+            # Dashboard status is a local projection.  Polling this endpoint
+            # must never trigger broker order queries or infer execution state.
+            manual_orders_snapshot = get_manual_trade_status_snapshot()
             status = {
                 "market_status": market_status,
                 "is_open": is_open,
@@ -2666,11 +3728,12 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "account_id": accounts.account.get('accountId', 'N/A') if accounts and accounts.account else 'N/A',
                 "manual_order": manual_orders_snapshot.get("latest", {}),
-                "manual_orders": manual_orders_snapshot
+                "manual_orders": manual_orders_snapshot,
+                **_manual_open_status_payload(),
             }
-            self._send_safe_response(200, status)
+            self._send_private_json_response(200, status)
 
-        elif self.path.startswith('/api/preview_spread'):
+        elif request_path == '/api/preview_spread':
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             settings = load_live_settings()
@@ -2725,6 +3788,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 target_delta=target_delta,
                 target_expiration=selected_expiration
             )
+            spread_observed_at = datetime.now(timezone.utc)
             
             if spread:
                 sell_leg = spread.get('sell_option')
@@ -2752,6 +3816,99 @@ class RefreshHandler(BaseHTTPRequestHandler):
                     "side": side.upper(),
                     "is_mock": False
                 }
+                capability = _manual_open_status_payload()
+                res.update(
+                    {
+                        "execution_enabled": False,
+                        "execution_unavailable_reason": (
+                            capability["manual_open_reason"]
+                            or "This preview cannot be executed."
+                        ),
+                    }
+                )
+                executor = globals().get("MANUAL_OPEN_EXECUTOR")
+                if (
+                    capability["manual_open_enabled"]
+                    and executor is not None
+                    and side.upper() in {"PUT", "CALL"}
+                ):
+                    try:
+                        if sell_leg is None or buy_leg is None:
+                            raise ManualOpenValidationError(
+                                "an executable spread requires exactly two legs"
+                            )
+                        sell_symbol = str(
+                            getattr(sell_leg, "symbol", "") or ""
+                        ).upper()
+                        buy_symbol = str(
+                            getattr(buy_leg, "symbol", "") or ""
+                        ).upper()
+                        if sell_symbol != buy_symbol:
+                            raise ManualOpenValidationError(
+                                "spread legs use different broker symbols"
+                            )
+                        sell_expiration = getattr(
+                            sell_leg, "expiration_date", None
+                        )
+                        buy_expiration = getattr(
+                            buy_leg, "expiration_date", None
+                        )
+                        if sell_expiration != buy_expiration:
+                            raise ManualOpenValidationError(
+                                "spread legs use different expirations"
+                            )
+                        if (
+                            str(
+                                getattr(sell_leg, "call_put", "")
+                            ).upper()
+                            != side.upper()
+                            or str(
+                                getattr(buy_leg, "call_put", "")
+                            ).upper()
+                            != side.upper()
+                        ):
+                            raise ManualOpenValidationError(
+                                "spread legs do not match the selected side"
+                            )
+                        proposal = executor.issue_proposal(
+                            ManualSpreadPreview(
+                                ticker=ticker,
+                                broker_symbol=sell_symbol,
+                                side=side.upper(),
+                                expiration=sell_expiration,
+                                sell_strike=Decimal(
+                                    str(sell_leg.strike_price)
+                                ),
+                                buy_strike=Decimal(
+                                    str(buy_leg.strike_price)
+                                ),
+                                sell_osi_key=getattr(
+                                    sell_leg, "osi_key", None
+                                ),
+                                buy_osi_key=getattr(
+                                    buy_leg, "osi_key", None
+                                ),
+                                limit_credit=Decimal(
+                                    str(spread.get("profit"))
+                                ),
+                                observed_at=spread_observed_at,
+                            )
+                        )
+                    except (
+                        ManualOpenError,
+                        InvalidOperation,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        print(
+                            "⚠️ Spread preview remained non-executable: "
+                            f"{type(exc).__name__}"
+                        )
+                    else:
+                        res.update(proposal.dashboard_payload())
+                        res.pop(
+                            "execution_unavailable_reason", None
+                        )
             else:
                 self._send_safe_response(
                     503,
@@ -2766,7 +3923,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 return
             self._send_safe_response(200, res)
 
-        elif self.path.startswith('/api/positions_version'):
+        elif request_path == '/api/positions_version':
             positions_version = None
             updated_at = None
             if os.path.exists("screened_option_pairs.html"):
@@ -2779,7 +3936,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 "refresh": _portfolio_refresh_snapshot(),
             })
 
-        elif self.path.startswith('/api/positions'):
+        elif request_path == '/api/positions':
             if os.path.exists("screened_option_pairs.html"):
                 try:
                     with open(
@@ -2811,7 +3968,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                     },
                 )
 
-        elif self.path.startswith('/api/high_gain_spreads'):
+        elif request_path == '/api/high_gain_spreads':
             clean_proposals = []
             for p in CURRENT_CLOSE_PROPOSALS:
                 cp = p.copy()
@@ -2819,7 +3976,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 cp['has_open_order'] = cp.get('proposal_id') in ACTIVE_DASHBOARD_ORDERS
                 clean_proposals.append(cp)
             self._send_safe_response(200, clean_proposals)
-        elif self.path.startswith('/api/neutralize_risk'):
+        elif request_path == '/api/neutralize_risk':
             clean_proposals = []
             for p in CURRENT_NEUTRALIZE_PROPOSALS:
                 cp = p.copy()
@@ -2827,7 +3984,7 @@ class RefreshHandler(BaseHTTPRequestHandler):
                 cp['has_open_order'] = cp.get('proposal_id') in ACTIVE_DASHBOARD_ORDERS
                 clean_proposals.append(cp)
             self._send_safe_response(200, clean_proposals)
-        elif self.path.startswith('/api/gex'):
+        elif request_path == '/api/gex':
             if 'accounts' not in globals() or accounts is None:
                 self._send_safe_response(503, {"error": "Engine loading..."})
                 return
@@ -3888,7 +5045,17 @@ def _refresh_etrade_session(reason="E*TRADE request"):
             safety.verify_account(etrade.account.account)
 
         _attach_etrade_auth_refresh_callbacks()
+        _configure_manual_open_executor(new_session)
         return new_session, new_base_url
+
+
+def _renew_etrade_session_if_due(now, previous_renewal):
+    """Use the same fully composed refresh path for scheduled renewal."""
+
+    if (now - previous_renewal) < timedelta(minutes=60):
+        return None
+    print("Renewing session...", now)
+    return _refresh_etrade_session("scheduled renewal")
 
 
 if __name__ == "__main__":
@@ -4083,6 +5250,7 @@ if __name__ == "__main__":
         _select_runtime_account(accounts)
         market = Market(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
         _attach_etrade_auth_refresh_callbacks()
+        _configure_manual_open_executor(session)
 
 
 
@@ -4188,25 +5356,19 @@ if __name__ == "__main__":
             last_trade_date = trade_status.get("last_trade_date")
     
             # Renew session if needed (every 60 minutes)
-            if (now - last_renewal_time) >= timedelta(minutes=60):
-                print("Renewing session...", now)
-                try:
-                    session, base_url = oauth(use_sandbox)
-                    last_renewal_time = datetime.now()
-                    accounts = Accounts(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
-                    market = Market(session, base_url, use_sandbox=use_sandbox, consumer_key=runtime_consumer_key)
-                    _select_runtime_account(accounts)
-                    if start_trade and not bypass_etrade:
-                        etrade_instance.refresh_session(session, base_url)
-                        runtime_safety.verify_account(etrade_instance.account.account)
-                    _attach_etrade_auth_refresh_callbacks()
-                except LoginFailureException as e:
-                    logging.error(f"Failed to renew session (LoginFailure): {e}")
-                    send_login_failure_notification(f"Session renewal failed: {e}", e.screenshot_path)
-                except Exception as e:
-                    logging.error(f"Failed to renew session: {e}")
-                    send_login_failure_notification(f"Session renewal encountered an unexpected error: {e}")
-                    # We'll continue and hope the next tick works or the main loop catch handles it
+            try:
+                renewed_session = _renew_etrade_session_if_due(
+                    now, last_renewal_time
+                )
+                if renewed_session is not None:
+                    session, base_url = renewed_session
+            except LoginFailureException as e:
+                logging.error(f"Failed to renew session (LoginFailure): {e}")
+                send_login_failure_notification(f"Session renewal failed: {e}", e.screenshot_path)
+            except Exception as e:
+                logging.error(f"Failed to renew session: {e}")
+                send_login_failure_notification(f"Session renewal encountered an unexpected error: {e}")
+                # We'll continue and hope the next tick works or the main loop catch handles it
     
             # ── Market status gate (checked BEFORE any portfolio/order API calls) ──
             is_open, market_status, market_open_time, market_close_time = is_market_open()

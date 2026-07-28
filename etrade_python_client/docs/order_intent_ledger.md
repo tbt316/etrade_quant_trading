@@ -1,10 +1,15 @@
 # Durable Order Intent Ledger
 
-**Delivery status:** R7 durable execution core plus schema-17 non-authorizing
-opening-risk evidence lineage, crash-safe cancellation, exact closing-capacity
-reservations, terminal absorption, and legacy mutation quarantine, isolated
+**Delivery status:** schema-19 durable execution core, including the historical
+schema-16 non-authorizing opening-risk lineage, schema-17 collision guards,
+schema-18 account/daily-capacity policy, schema-19 capacity-policy V2,
+crash-safe cancellation, exact closing-capacity reservations, terminal
+absorption, legacy mutation quarantine, and one narrow supervised
+manual-opening composition
 
-**Production status:** not connected to live E*TRADE mutation paths
+**Production status:** SPY/SPX manual credit-spread opening is source-composed
+but has not completed a live or sandbox E*TRADE lifecycle; unattended
+production trading is not ready
 
 `live_trading/order_intent_ledger.py` is the durable, broker-agnostic state
 machine for order identity, capacity reservation, fencing, and ambiguous broker
@@ -14,12 +19,22 @@ origin-bound GET surface, and `etrade_order_gateway.py` coordinates opening and
 closing submissions, opening price-only amendments, per-order cancellation,
 and restart reconciliation. The gateway has no public transport property, and
 the static mutation boundary confines each exact transport call to one reviewed
-private gateway method. The live agent still instantiates none of these
-components. Every known legacy mutation path is an unconditional tombstone, so
-the current source remains read-only rather than silently falling back around
-the durable stack.
+private gateway method.
+
+`live_trading/execution_runtime.py` is the sole order-capable composition root.
+After schema-2 opt-in and an independently valid environment/account/runtime
+safety boundary, it constructs the private ledger, reader, transport, and
+gateway, reconciles the gateway, and returns only `ManualOpenService`. That
+service can issue a signed short-lived proposal and submit one reviewed
+SPY/SPX opening command. It does not expose the transport or the gateway's
+closing, cancellation, or repricing methods. Every legacy execute, close,
+neutralize, queue/fast-worker, and automatic-strategy path remains an
+unconditional tombstone.
 
 ## Supported scope
+
+The durable gateway's isolated domain is broader than the capability composed
+into the dashboard:
 
 - Explicit `sandbox` or `production` environment and exact account identity.
 - Two-leg vertical option spreads with one buy leg and one sell leg.
@@ -43,11 +58,39 @@ the durable stack.
 - No equity orders, naked options, arbitrary multi-leg spreads, closing
   amendments, or bulk cancellation. Unsupported operations fail closed.
 
+The currently composed dashboard capability is narrower:
+
+- only `SPY` or `SPX` (`SPX`/`SPXW` broker symbols), `PUT` or `CALL`;
+- exactly two standard option legs, `SELL_OPEN` plus `BUY_OPEN`, as a
+  `NET_CREDIT`, `GOOD_FOR_DAY` vertical;
+- proposal issuance only during an open NYSE regular session;
+- one retained, origin-pinned E*TRADE quote response whose two exact contracts
+  both have `quoteStatus=REALTIME`, usable non-crossed bid/ask values, exchange
+  timestamps no more than five seconds apart, and age within the configured
+  quote limit;
+- a limit credit derived from the exact two-leg midpoint and sealed, together
+  with the quote receipt/snapshot hashes and per-leg timestamps, into an
+  HMAC-signed proposal whose expiry is bounded by the oldest quote;
+- authenticated operator confirmation with the independent action PIN,
+  quantity and per-order loss checks, and proposal-bound durable idempotency;
+  and
+- exactly one `submit_opening` call through the durable gateway, where a fresh
+  account-capacity read is obtained before reservation and may still deny the
+  order without broker mutation.
+
+Debit openings, closes, neutralization, cancellation, and price changes are
+not exposed by this service. In particular, the gateway's isolated
+price-amendment machinery does not make repricing available to the dashboard.
+The signed `proposal_id` is the durable idempotency key. The browser-generated
+UUID `request_id` only correlates one HTTP request/response and cannot create a
+second durable order for the same proposal.
+
 ## State and crash boundary
 
 ```mermaid
 stateDiagram-v2
     [*] --> INTENT
+    INTENT --> FAILED: trace-free pre-reservation failure
     INTENT --> CLAIMED: fenced lease
     CLAIMED --> FAILED: definitive pre-POST failure
     CLAIMED --> SUBMISSION_UNKNOWN: exact semantic bytes persisted
@@ -84,11 +127,47 @@ remains blocked rather than guessed or retried.
 - `BEGIN IMMEDIATE` serializes account-capacity decisions and state
   transitions. New account mutations stop while any submission or amendment is
   unresolved.
-- Legacy opening reservations use fresh, typed quote, portfolio, and
-  buying-power evidence. Their caller-asserted maximum loss cannot be below the
-  exposure derived from strike width, price, contract multiplier, and
-  quantity. They remain outside the new pure-risk proof and no production
-  composition root uses either path.
+- Fresh schema-19 opening reservations require an exact allowed
+  `OPENING_MAX_LOSS_V2` capacity decision. For an otherwise supported
+  capacity-v3 account snapshot, the usable account cap is:
+
+  ```text
+  min(
+    raw broker buying power,
+    max(
+      0,
+      immutable account budget
+        - external position risk
+        - external order risk
+        - represented managed filled risk
+    )
+  )
+  ```
+
+  Active local reservations are not folded into that formula; `reserve_margin`
+  subtracts them separately and atomically when deciding whether the new
+  reservation fits. The policy never adds represented risk back to broker
+  buying power. Unsupported or ambiguous positions, orders, or managed states
+  produce a zero cap.
+- The immutable account budget and daily budget are independent checks.
+  `max_account_open_risk_cents` bounds current account opening exposure.
+  `max_daily_loss_cents` is retained under its compatibility name but means a
+  New York calendar-day ceiling on newly authorized maximum loss. It is not
+  realized or marked P&L, is not a “trading-day” counter, and is not reduced to
+  the lesser of the account budget. Every reservation created during that
+  calendar-day window consumes daily authorization; a later failed, rejected,
+  cancelled, or released reservation does not refund it.
+- Opening reservations use fresh, typed quote, portfolio, and buying-power
+  evidence. Their caller-asserted maximum loss cannot be below the exposure
+  derived from strike width, price, contract multiplier, and quantity. The
+  supervised manual-open composition first validates its signed exact
+  two-leg quote proposal, quantity, and per-order loss ceiling, then asks the
+  gateway for fresh capacity at final submit. Proposal issuance itself does
+  not read capacity, and an apparently valid confirmation may therefore fail
+  safely before any broker send. This path remains outside the complete
+  pure-risk proof: full portfolio Greeks, concentration, marked daily P&L, and
+  regime authorization are not composed, and schema-2 opt-in plus operator
+  confirmation do not fill that evidence gap.
 - Schema 15 can atomically persist an exact allowed `RiskDecision`, its
   request/policy/aggregate and component evidence hashes, exact standard
   vertical payload/economics, account identity, capacity decision/manifest,
@@ -114,6 +193,11 @@ remains blocked rather than guessed or retried.
   conflicts, and the ledger's currently retained reservation/claim subset.
   These are diagnostics, not placement authority. The row is append-only and
   can only be `INDEPENDENT_EVIDENCE_PENDING`.
+- The current manual proposal path separately composes the reviewed broker
+  reader and the same strict retained-byte quote parser to authorize only the
+  proposal's two-leg economics. That does not upgrade a historical schema-16
+  pure-risk prerequisite, prove the missing portfolio aggregates below, or
+  make the V2 regime advisory an execution authorization.
 - The following policy inputs still cannot be completely reconstructed from
   the retained E*TRADE fields: risk of pre-existing broker positions, risk of
   active broker opening orders, full portfolio and symbol delta, marked daily
@@ -216,29 +300,42 @@ latter is acquired, updated, and deleted through its lease protocol.
 ## Schema policy
 
 Schema 16 added append-only `opening_quote_receipts` and
-`opening_risk_lineages`, while retaining schema 15
-`opening_risk_prerequisites` and exact intent,
-capacity-decision, and manifest cross-binding guards. These rows are
-persistence prerequisites, never placement authority or capacity claims.
-Schema 17 adds collision guards for the complete immutable/durable inventory
-and makes current-schema trigger loss a startup error. It retains schema 14
-immutable closing reservations, pre-place void receipts,
-and terminal closing-absorption receipts; schema 13 cancellation records;
-schema 12 opening terminal-absorption receipts; schema 11 raw broker-read
-receipts and semantic manifests; and the existing durable capacity decisions.
-Additive schema 8→9→10→11→12→13→14→15→16→17 migration is one explicit SQLite
-transaction and verifies required columns, foreign keys, append-only triggers,
-journal mode, foreign-key integrity, and `quick_check` before version
-promotion. Unknown or malformed schemas fail closed. A production operator
-must still take an atomic private backup and complete a rollback drill before
-migration.
+`opening_risk_lineages`, while retaining schema-15
+`opening_risk_prerequisites` and exact intent, capacity-decision, and manifest
+cross-binding guards. These rows are persistence prerequisites, never
+placement authority or capacity claims. Schema 17 added collision guards for
+the complete immutable/durable inventory and made current-schema trigger loss
+a startup error.
 
-Fresh schema 17 and genuine schema 8–16 migrations install the complete exact
-trigger set. This explicit version step lets a valid pre-change schema-16
-database acquire the additive guards without treating it as tampered. An
-already-versioned schema-17 database with a missing or altered required trigger
-is treated as tampered and refuses startup; initialization does not silently
-repair current-schema evidence guards.
+Schema 18 added the capacity-v3 account-wide policy record: independent
+account and New York calendar-day authorization budgets, replayable policy
+inputs, external position/order risk, represented managed risk, and immutable
+policy/decision hashes. Its original `OPENING_MAX_LOSS_V1` arithmetic is now
+superseded because it could add represented managed risk back to broker buying
+power and did not subtract that represented risk from the account budget.
+
+Schema 19 makes `OPENING_MAX_LOSS_V2` the only policy that can authorize a
+fresh reservation or submission claim. V1 rows remain immutable and are
+accepted only for exact historical replay and reconciliation. During the
+18→19 migration:
+
+- a V1 opening reservation in `INTENT` with no fence, broker ID, lease,
+  authorization, send attempt, preview/response receipt, broker-order history,
+  or other submission trace is moved to `FAILED` and released with explicit
+  schema-19 migration provenance; and
+- any V1 reservation with a submission trace is moved to
+  `SUBMISSION_UNKNOWN`, keeps its risk reserved, and requires reconciliation.
+
+No migration guesses that a traced request was not sent. Fresh schema 19 and
+genuine schema 8–18 migrations install and verify the complete exact trigger
+set. Additive migration is one explicit SQLite transaction and verifies
+required columns, foreign keys, append-only triggers, journal mode,
+foreign-key integrity, and `quick_check` before version promotion. Unknown or
+malformed schemas fail closed. An already-versioned schema-19 database with a
+missing or altered required trigger is treated as tampered and refuses
+startup; initialization does not silently repair current-schema evidence
+guards. A production operator must still take an atomic private backup and
+complete a rollback drill before migration.
 
 Schema 8/9 opening intents that predate durable reservations are migrated with
 a conservative reservation equal to their immutable maximum exposure. Live
@@ -248,24 +345,27 @@ stays blocked, while a fresh exact zero-fill terminal can still release risk.
 
 ## Remaining production release gates
 
-The isolated R7 stack must not be used as evidence that live execution is
-production-ready. The following remain required before any order-capable
-process is enabled:
+The narrow supervised composition must not be used as evidence that unattended
+live execution is production-ready. The following remain required before that
+broader production claim:
 
 1. Partial fills, replacements, transformed lots, and assignment/exercise
    remain unsupported and blocked; supervised recovery procedures are still
    required for those states.
 2. Bulk cancellation and closing-order repricing remain disabled. Their absence
    must be explicit in the operator UI and runbook.
-3. The live composition root must construct the exact ledger, reader,
-   transport, and coordinator. R7f already rejects direct legacy mutation,
-   transport bypass, reflection, and tombstone drift across all tracked
-   application Python in CI; the future root must preserve that gate.
-4. Opening placement still needs the missing schema-16 aggregate sources named
-   above. A later schema must keep both historical records immutable,
-   revalidate fresh complete evidence, and atomically create a separate
-   authorization plus capacity reservation before any send can become
-   eligible.
+3. The reviewed composition root now constructs the exact ledger, reader,
+   transport, and coordinator only for supervised manual opening, while
+   returning the narrow service rather than its collaborators. Static
+   containment must continue to reject transport bypass, reflection, legacy
+   mutation, and tombstone drift.
+4. Full opening authorization still needs the missing independent aggregate
+   sources named above. Schema 19 safely caps the narrower manual path, but it
+   does not compose the full pure policy for Greeks, concentration, marked
+   P&L, or regime authorization. A later promotion must keep historical
+   records immutable, revalidate fresh complete evidence, and atomically
+   create a separate authorization plus capacity reservation before the
+   repository can claim independently evidenced unattended entry.
 5. Sandbox restart/crash fixtures must cover pagination drift, stale evidence,
    every nonterminal/terminal broker status, replacement chains, cancellation,
    closing, and process death at each durable/I/O boundary.
@@ -279,5 +379,8 @@ rollback, exact payload/fill reconciliation, terminal absorption, retained
 filled risk, closing-contract capacity, one-shot cancellation, mutation
 fencing, and crash/timeout behavior. R7f adds mutation-boundary, dashboard,
 legacy-tombstone, deployment-containment, and real local-handler visual
-verification. This is source verification only; partial/complex terminal
-states, live composition, and operational migration gates above remain open.
+verification. This is source verification only. The supervised manual-open
+composition has not been proven through an E*TRADE sandbox or live
+preview/place/fill/reconciliation/restart cycle; partial/complex terminal
+states, complete independent risk evidence, and operational migration gates
+above remain open.

@@ -1049,6 +1049,7 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             max_loss_amount=Decimal("400"),
             collateral_amount=Decimal("500"),
             quote_observed_at=self.clock.now,
+            quote_valid_until=self.clock.now + timedelta(seconds=30),
             quote_digest="f" * 64,
             owner=OWNER,
             lease_seconds=lease_seconds,
@@ -2630,12 +2631,14 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             _ = self.gateway.transport
 
     def test_no_id_timeout_is_durable_and_cannot_be_auto_reconciled(self):
+        self.assertTrue(self.gateway.execution_ready)
         self.harness.add(preview_result(), _ExchangeResult("TIMEOUT"))
 
         result = self.gateway.submit_opening(self.command())
 
         self.assertEqual(result.state, "SUBMISSION_UNKNOWN")
         self.assertEqual(result.reason_code, "TIMEOUT")
+        self.assertFalse(self.gateway.execution_ready)
         with self.assertRaises(GatewayReconciliationRequired):
             self.gateway.submit_opening(self.command())
         restarted, _, reader = self.restart()
@@ -2759,128 +2762,82 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         )
         self.assertEqual(len(self.harness.calls), mutation_calls)
 
-    def test_start_processes_multiple_pending_reservations_in_order(self):
+    def test_active_opening_prevents_a_second_pending_reservation(self):
         first = self.submit_named_order(
             key="terminal-first",
             decision="terminal-first-decision",
             broker_order_id="94",
         )
         self.clock.advance(1)
-        second = self.submit_named_order(
-            key="terminal-second",
-            decision="terminal-second-decision",
-            broker_order_id="95",
-        )
-        self.terminalize(first, "94", "CANCELLED")
-        self.terminalize(second, "95", "FILLED")
-        mutation_calls = len(self.harness.calls)
-        reader = FakeReader(self.clock, self.account)
-        reader.query_behaviors.update(
-            {
-                "94": BrokerOrderSnapshot(
-                    self.account,
-                    "sandbox",
-                    "94",
-                    "CANCELLED",
-                    self.clock.now,
-                    200,
-                    "6" * 64,
-                    order_payload_hash(),
-                    True,
-                ),
-                "95": BrokerOrderSnapshot(
-                    self.account,
-                    "sandbox",
-                    "95",
-                    "FILLED",
-                    self.clock.now,
-                    200,
-                    "7" * 64,
-                    order_payload_hash(),
-                    True,
-                ),
-            }
-        )
-        reader.capacity_order_ids = ("95",)
-        restarted, ledger, reader = self.restart(reader=reader)
-
-        restarted.start()
+        with self.assertRaises(OrderIntentReservationError):
+            self.submit_named_order(
+                key="terminal-second",
+                decision="terminal-second-decision",
+                broker_order_id="95",
+            )
 
         self.assertEqual(
-            reader.query_calls,
-            [(self.account, "94"), (self.account, "95")],
-        )
-        self.assertEqual(reader.capacity_calls, [self.account])
-        self.assertEqual(
-            ledger.get_margin_reservation(first.intent_id).state,
-            "RELEASED",
+            self.ledger.get_intent(first.intent_id).state, "SUBMITTED"
         )
         self.assertEqual(
-            ledger.get_margin_reservation(second.intent_id).state,
-            "RELEASED",
+            self.ledger.active_reserved_margin(
+                ACCOUNT_ID, "sandbox"
+            ),
+            Decimal("400"),
         )
-        self.assertEqual(len(self.harness.calls), mutation_calls)
+        self.assertEqual(self.harness.count("/orders/place"), 1)
 
-    def test_start_reuses_one_capacity_scan_for_multiple_full_fills(self):
+    def test_full_fill_must_be_absorbed_before_next_opening(self):
         first = self.submit_named_order(
             key="full-fill-first",
             decision="full-fill-first-decision",
             broker_order_id="94",
         )
         self.clock.advance(1)
-        second = self.submit_named_order(
-            key="full-fill-second",
-            decision="full-fill-second-decision",
-            broker_order_id="95",
-        )
         self.terminalize(first, "94", "FILLED")
-        self.terminalize(second, "95", "FILLED")
-        mutation_calls = len(self.harness.calls)
+        with self.assertRaises(GatewayReconciliationRequired):
+            self.gateway.submit_opening(
+                self.command(
+                    key="full-fill-second-blocked",
+                    decision="full-fill-second-blocked-decision",
+                )
+            )
+
         reader = FakeReader(self.clock, self.account)
-        reader.query_behaviors.update(
-            {
-                broker_order_id: BrokerOrderSnapshot(
-                    self.account,
-                    "sandbox",
-                    broker_order_id,
-                    "FILLED",
-                    self.clock.now,
-                    200,
-                    digest * 64,
-                    order_payload_hash(),
-                    True,
-                )
-                for broker_order_id, digest in (
-                    ("94", "6"),
-                    ("95", "7"),
-                )
-            }
+        reader.query_behaviors["94"] = BrokerOrderSnapshot(
+            self.account,
+            "sandbox",
+            "94",
+            "FILLED",
+            self.clock.now,
+            200,
+            "6" * 64,
+            order_payload_hash(),
+            True,
         )
-        reader.capacity_order_ids = ("94", "95")
+        reader.capacity_order_ids = ("94",)
         restarted, ledger, reader = self.restart(reader=reader)
 
         restarted.start()
 
         self.assertEqual(
-            reader.query_calls,
-            [(self.account, "94"), (self.account, "95")],
-        )
-        self.assertEqual(reader.capacity_calls, [self.account])
-        self.assertEqual(
             ledger.get_margin_reservation(first.intent_id).state,
             "RELEASED",
         )
-        self.assertEqual(
-            ledger.get_margin_reservation(second.intent_id).state,
-            "RELEASED",
+        self.clock.advance(1)
+        self.harness.add(
+            preview_result(preview_id="1020563295"),
+            place_result(order_id="95"),
         )
-        self.assertEqual(
-            ledger.active_reserved_margin(ACCOUNT_ID, "sandbox"),
-            Decimal("1000"),
+        second = restarted.submit_opening(
+            self.command(
+                key="full-fill-second",
+                decision="full-fill-second-decision",
+            )
         )
-        self.assertEqual(len(self.harness.calls), mutation_calls)
+        self.assertEqual(second.state, "SUBMITTED")
 
-    def test_unavailable_pending_does_not_prevent_later_safe_absorption(
+    def test_unavailable_pending_keeps_execution_blocked(
         self,
     ):
         first = self.submit_named_order(
@@ -2888,29 +2845,11 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             decision="unavailable-first-decision",
             broker_order_id="94",
         )
-        self.clock.advance(1)
-        second = self.submit_named_order(
-            key="safe-second",
-            decision="safe-second-decision",
-            broker_order_id="95",
-        )
         self.terminalize(first, "94", "FILLED")
-        self.terminalize(second, "95", "CANCELLED")
         mutation_calls = len(self.harness.calls)
         reader = FakeReader(self.clock, self.account)
         reader.query_behaviors["94"] = ETradeBrokerReaderUnavailable(
             "simulated read outage"
-        )
-        reader.query_behaviors["95"] = BrokerOrderSnapshot(
-            self.account,
-            "sandbox",
-            "95",
-            "CANCELLED",
-            self.clock.now,
-            200,
-            "8" * 64,
-            order_payload_hash(),
-            True,
         )
         restarted, ledger, reader = self.restart(reader=reader)
 
@@ -2918,16 +2857,11 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             restarted.start()
 
         self.assertEqual(
-            reader.query_calls,
-            [(self.account, "94"), (self.account, "95")],
+            reader.query_calls, [(self.account, "94")]
         )
         self.assertEqual(
             ledger.get_margin_reservation(first.intent_id).state,
             "FILLED_PENDING_ABSORPTION",
-        )
-        self.assertEqual(
-            ledger.get_margin_reservation(second.intent_id).state,
-            "RELEASED",
         )
         self.assertEqual(len(self.harness.calls), mutation_calls)
 
@@ -2995,7 +2929,7 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         )
         self.assertEqual(len(self.harness.calls), mutation_calls)
 
-    def test_known_hold_reconciles_open_and_allows_next_opening(self):
+    def test_known_hold_reconciles_open_and_blocks_next_opening(self):
         self.harness.add(
             preview_result(),
             place_result(
@@ -3025,14 +2959,11 @@ class EtradeOrderGatewayTests(unittest.TestCase):
 
         self.clock.advance(1)
         reader.capacity_digest = "5" * 64
-        self.harness.add(
-            preview_result(preview_id="1020563280"),
-            place_result(order_id="95"),
-        )
-        result = restarted.submit_opening(
-            self.command(key="order-2", decision="decision-2")
-        )
-        self.assertEqual(result.state, "SUBMITTED")
+        with self.assertRaises(OrderIntentReservationError):
+            restarted.submit_opening(
+                self.command(key="order-2", decision="decision-2")
+            )
+        self.assertEqual(self.harness.count("/orders/place"), 1)
 
     def test_process_crash_after_place_claim_is_never_retried(self):
         self.harness.add(
@@ -3123,6 +3054,28 @@ class EtradeOrderGatewayTests(unittest.TestCase):
         self.assertEqual(self.harness.count("/orders/place"), 0)
         self.assertEqual(
             ledger.active_reserved_margin(ACCOUNT_ID, "production"),
+            Decimal("0"),
+        )
+
+    def test_quote_expiry_after_preview_fails_before_place(self):
+        command = replace(
+            self.command(),
+            quote_valid_until=self.clock.now + timedelta(seconds=1),
+        )
+
+        def expire_quote_after_preview():
+            self.reader.selected_hook = lambda: self.clock.advance(2)
+            return preview_result()
+
+        self.harness.add(expire_quote_after_preview)
+        with self.assertRaisesRegex(
+            GatewayValidationError,
+            "quote expired before broker placement",
+        ):
+            self.gateway.submit_opening(command)
+        self.assertEqual(self.harness.count("/orders/place"), 0)
+        self.assertEqual(
+            self.ledger.active_reserved_margin(ACCOUNT_ID, "sandbox"),
             Decimal("0"),
         )
 
@@ -3435,6 +3388,31 @@ class EtradeOrderGatewayTests(unittest.TestCase):
             "gateway-run-b",
         )
 
+    def test_execution_readiness_includes_amendment_leases(self):
+        submitted = self.submit_success()
+        self.assertTrue(self.gateway.execution_ready)
+        amendment = self.ledger.acquire_amendment_lease(
+            submitted.intent_id,
+            "nudger",
+            lease_seconds=30,
+            idempotency_key="readiness-amend",
+            amendment_payload=vertical_payload(1.50),
+        )
+
+        self.assertTrue(
+            self.ledger.has_execution_blockers(
+                ACCOUNT_ID, "sandbox"
+            )
+        )
+        self.assertFalse(self.gateway.execution_ready)
+
+        self.ledger.release_amendment_lease(
+            submitted.intent_id,
+            "nudger",
+            amendment.fencing_token,
+        )
+        self.assertTrue(self.gateway.execution_ready)
+
     def test_not_found_known_order_keeps_gateway_read_only(self):
         self.submit_success()
         restarted, _, reader = self.restart()
@@ -3446,10 +3424,38 @@ class EtradeOrderGatewayTests(unittest.TestCase):
 
     def test_incomplete_capacity_blocks_before_any_preview(self):
         self.reader.capacity_complete = False
+        command = self.command()
 
         with self.assertRaises(GatewayValidationError):
-            self.gateway.submit_opening(self.command())
+            self.gateway.submit_opening(command)
 
+        self.assertEqual(self.harness.calls, [])
+        envelope = OrderIntent.build(
+            account_id=ACCOUNT_ID,
+            environment="sandbox",
+            strategy_id=command.strategy_id,
+            decision_id=command.decision_id,
+            idempotency_scope=command.idempotency_scope,
+            idempotency_key=command.idempotency_key,
+            intent_kind="OPENING",
+            order_payload=json.loads(command.payload_bytes),
+        )
+        record = self.ledger.find_intent(envelope)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state, "FAILED")
+        self.assertIsNone(
+            self.ledger.get_margin_reservation(record.intent_id)
+        )
+        self.assertEqual(
+            self.ledger.reconciliation_blockers(
+                ACCOUNT_ID, "sandbox"
+            ),
+            (),
+        )
+        self.assertEqual(
+            self.gateway.submit_opening(command).state,
+            "FAILED",
+        )
         self.assertEqual(self.harness.calls, [])
 
     def test_gateway_owned_risk_ceiling_cannot_be_raised_by_a_command(self):

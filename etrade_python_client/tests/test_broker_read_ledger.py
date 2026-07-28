@@ -541,7 +541,7 @@ class BrokerReadLedgerTests(unittest.TestCase):
         *,
         buying_power: str = "1000",
         positions: list[dict[str, Any]] | None = None,
-        schema: str = "etrade-capacity.v1",
+        schema: str = "etrade-capacity.v3",
     ) -> tuple[BrokerReadEvidenceRef, str, tuple[str, ...]]:
         if schema not in {
             "etrade-capacity.v1",
@@ -1451,15 +1451,15 @@ class BrokerReadLedgerTests(unittest.TestCase):
         # after the selected terminal order observation. This fixture models a
         # bounded 30-second read window.
         self.clock.now += timedelta(seconds=31)
-        legacy_capacity, _, _ = self._capacity_manifest()
-        legacy_post = self.ledger.set_reservation_cap_from_read(
-            legacy_capacity, risk_budget=Decimal("750")
+        legacy_capacity, _, _ = self._capacity_manifest(
+            schema="etrade-capacity.v1"
         )
-        with self.assertRaises(OrderIntentReconciliationRequired):
-            self.ledger.absorb_terminal_reservation(
-                record.intent_id,
-                fresh_terminal,
-                post_capacity_decision=legacy_post,
+        with self.assertRaisesRegex(
+            OrderIntentIntegrityError,
+            "schema-v3 contract evidence",
+        ):
+            self.ledger.set_reservation_cap_from_read(
+                legacy_capacity, risk_budget=Decimal("750")
             )
 
         conflicting_positions = _filled_vertical_positions(
@@ -1583,9 +1583,10 @@ class BrokerReadLedgerTests(unittest.TestCase):
         second = self.ledger.create_intent(
             _opening_intent(key="absorbed-cap-not-recycled")
         ).intent
+        self.assertEqual(post.policy_outcome, "DENY")
         with self.assertRaisesRegex(
             OrderIntentReservationError,
-            "exceeds account/environment cap",
+            "allowed current capacity policy",
         ):
             self.ledger.reserve_margin(
                 second.intent_id,

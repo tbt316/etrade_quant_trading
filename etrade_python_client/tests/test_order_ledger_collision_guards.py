@@ -219,7 +219,9 @@ def test_exact_collision_inventory_and_mutable_projection_boundary(
         "ledger_metadata",
     ):
         assert not any(
-            table == projection and "before insert" in sql
+            table == projection
+            and "before insert" in sql
+            and "when exists" in sql
             for table, sql in triggers.values()
         )
 

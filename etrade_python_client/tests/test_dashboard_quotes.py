@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from types import SimpleNamespace
 
 from accounts.accounts_bo import (
@@ -27,6 +28,7 @@ class _Session:
         self.payload = payload
         self.responses = list(responses or [])
         self.calls = []
+        self.auth = None
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
@@ -369,6 +371,68 @@ class DashboardQuoteTests(unittest.TestCase):
         self.assertEqual(
             positions[0].option_deliverables,
             "100 shares",
+        )
+
+    def test_manual_spread_selection_requests_standard_unadjusted_contracts_and_retains_osi(self):
+        def put(strike, bid, ask, delta):
+            return {
+                "osiKey": f"SPY---260821P{strike * 1000:08d}",
+                "strikePrice": strike,
+                "bid": bid,
+                "ask": ask,
+                "volume": 10,
+                "openInterest": 100,
+                "OptionGreeks": {
+                    "delta": delta,
+                    "gamma": 0.01,
+                    "iv": 0.20,
+                },
+            }
+
+        session = _Session({
+            "OptionChainResponse": {
+                "OptionPair": [
+                    {"Put": put(495, 2.00, 2.20, -0.15)},
+                    {"Put": put(490, 1.00, 1.20, -0.10)},
+                    {"Put": put(485, 0.50, 0.70, -0.05)},
+                ],
+            },
+        })
+        accounts = Accounts(
+            session,
+            "https://api.etrade.test",
+            consumer_key="",
+        )
+        accounts.get_stock_price = lambda _ticker: 500
+
+        spread = accounts.get_option_spread_by_price(
+            "SPY",
+            "Put",
+            days_to_expire=25,
+            target_premium=0,
+            hedge_ratio=1,
+            hedge_spread=10,
+            qty=1,
+            target_delta=0.15,
+            target_expiration=date(2026, 8, 21),
+        )
+
+        self.assertIsNotNone(spread)
+        self.assertEqual(
+            session.calls[0][1]["params"]["skipAdjusted"],
+            True,
+        )
+        self.assertEqual(
+            session.calls[0][1]["params"]["optionCategory"],
+            "STANDARD",
+        )
+        self.assertEqual(
+            spread["sell_option"].osi_key,
+            "SPY---260821P00495000",
+        )
+        self.assertEqual(
+            spread["buy_option"].osi_key,
+            "SPY---260821P00485000",
         )
 
     def test_required_portfolio_rejects_duplicate_position_across_pages(self):

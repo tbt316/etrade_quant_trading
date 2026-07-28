@@ -81,6 +81,7 @@ class SubmitOpeningCommand:
     max_loss_amount: Decimal
     collateral_amount: Decimal
     quote_observed_at: datetime
+    quote_valid_until: datetime
     quote_digest: str
     owner: str
     lease_seconds: int = 30
@@ -175,6 +176,7 @@ class EtradeOrderGateway:
         "_transport",
         "_reader",
         "_opening_risk_budget",
+        "_daily_opening_risk_budget",
         "_clock",
         "_started",
         "_account",
@@ -188,6 +190,7 @@ class EtradeOrderGateway:
         transport: ETradeBrokerTransport,
         reader: ETradeBrokerReader,
         opening_risk_budget: Decimal,
+        daily_opening_risk_budget: Decimal | None = None,
         clock=None,
     ) -> None:
         if type(runtime_safety) is not RuntimeSafetyBoundary:
@@ -222,11 +225,19 @@ class EtradeOrderGateway:
             "opening_risk_budget",
             allow_zero=True,
         )
+        if daily_opening_risk_budget is None:
+            daily_opening_risk_budget = opening_risk_budget
+        _exact_decimal(
+            daily_opening_risk_budget,
+            "daily_opening_risk_budget",
+            allow_zero=True,
+        )
         self._runtime_safety = runtime_safety
         self._ledger = ledger
         self._transport = transport
         self._reader = reader
         self._opening_risk_budget = opening_risk_budget
+        self._daily_opening_risk_budget = daily_opening_risk_budget
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started = False
         self._account: SelectedBrokerAccount | None = None
@@ -253,6 +264,40 @@ class EtradeOrderGateway:
     @property
     def reader(self) -> ETradeBrokerReader:
         return self._reader
+
+    @property
+    def execution_ready(self) -> bool:
+        """Return whether mutation is currently safe without changing state."""
+
+        if not self._started:
+            return False
+        try:
+            account = self._checked_account()
+            if self._account is None or account != self._account:
+                return False
+            return not self.ledger.has_execution_blockers(
+                account.account_id,
+                self.runtime_safety.environment,
+            )
+        except Exception:
+            return False
+
+    def recent_opening_intents(
+        self,
+        *,
+        idempotency_scope: str,
+        limit: int,
+    ) -> tuple[IntentRecord, ...]:
+        """Read exact durable opening history without broker I/O or a live arm."""
+
+        account = self._history_account()
+        return self.ledger.recent_intents(
+            account_id=account.account_id,
+            environment=self.runtime_safety.environment,
+            intent_kind="OPENING",
+            idempotency_scope=idempotency_scope,
+            limit=limit,
+        )
 
     def start(self) -> None:
         """Reconcile every resolvable prior order before enabling mutation."""
@@ -371,6 +416,10 @@ class EtradeOrderGateway:
 
         self._require_started()
         command = _validate_submit_command(command)
+        if self._now() >= command.quote_valid_until:
+            raise GatewayValidationError(
+                "opening quote expired before durable submission began"
+            )
         account = self._checked_account()
         self._require_no_blockers(account)
         envelope = OrderIntent.build(
@@ -391,27 +440,42 @@ class EtradeOrderGateway:
         if existing is not None:
             return existing
         if self.ledger.get_margin_reservation(record.intent_id) is None:
-            capacity = self._read_capacity(account)
-            self.ledger.reserve_margin(
-                record.intent_id,
-                RiskEvidence(
-                    decision_id=command.decision_id,
-                    max_loss_amount=command.max_loss_amount,
-                    collateral_amount=command.collateral_amount,
-                    quote_observed_at=command.quote_observed_at,
-                    quote_digest=command.quote_digest,
-                    portfolio_observed_at=capacity.observed_at,
-                    portfolio_snapshot_digest=(
-                        capacity.portfolio_snapshot_digest
+            try:
+                capacity = self._read_capacity(account)
+                self.ledger.reserve_margin(
+                    record.intent_id,
+                    RiskEvidence(
+                        decision_id=command.decision_id,
+                        max_loss_amount=command.max_loss_amount,
+                        collateral_amount=command.collateral_amount,
+                        quote_observed_at=command.quote_observed_at,
+                        quote_digest=command.quote_digest,
+                        portfolio_observed_at=capacity.observed_at,
+                        portfolio_snapshot_digest=(
+                            capacity.portfolio_snapshot_digest
+                        ),
+                        capacity_decision_sha256=(
+                            capacity.decision_sha256
+                        ),
                     ),
-                    capacity_decision_sha256=capacity.decision_sha256,
-                ),
-            )
+                )
+            except Exception:
+                try:
+                    self.ledger.abandon_trace_free_opening_intent(
+                        record.intent_id
+                    )
+                except Exception:
+                    # The original capacity/reservation failure is the caller's
+                    # actionable error.  A refusal here means durable evidence
+                    # exists, so the intent correctly remains a blocker.
+                    pass
+                raise
         return self._submit_intent(
             record,
             created=created.created,
             owner=command.owner,
             lease_seconds=command.lease_seconds,
+            quote_valid_until=command.quote_valid_until,
         )
 
     def submit_closing(
@@ -496,6 +560,7 @@ class EtradeOrderGateway:
         created: bool,
         owner: str,
         lease_seconds: int,
+        quote_valid_until: datetime | None = None,
     ) -> GatewayMutationResult:
         """Run the one reviewed preview/place path for an already-reserved intent."""
 
@@ -504,6 +569,16 @@ class EtradeOrderGateway:
             owner,
             lease_seconds=lease_seconds,
         )
+        if (
+            quote_valid_until is not None
+            and self._now() >= quote_valid_until
+        ):
+            self._fail_unplaced_submission(
+                record.intent_id, owner, lease.fencing_token
+            )
+            raise GatewayValidationError(
+                "opening quote expired before broker preview"
+            )
         try:
             authorization = self.ledger.prepare_submission_payload(
                 record.intent_id, owner, lease.fencing_token
@@ -514,7 +589,10 @@ class EtradeOrderGateway:
             )
             raise
         try:
-            preview = self._transport.preview(authorization)
+            preview = self._transport.preview(
+                authorization,
+                not_after=quote_valid_until,
+            )
         except Exception:
             self._fail_unplaced_submission(
                 record.intent_id, owner, lease.fencing_token
@@ -541,8 +619,22 @@ class EtradeOrderGateway:
                 record.intent_id, owner, lease.fencing_token
             )
             raise
+        if (
+            quote_valid_until is not None
+            and self._now() >= quote_valid_until
+        ):
+            self._fail_unplaced_submission(
+                record.intent_id, owner, lease.fencing_token
+            )
+            raise GatewayValidationError(
+                "opening quote expired before broker placement"
+            )
         try:
-            placed = self._transport.place(authorization, preview)
+            placed = self._transport.place(
+                authorization,
+                preview,
+                not_after=quote_valid_until,
+            )
         except ETradeBrokerTransportError:
             current = self._require_intent(record.intent_id)
             if current.state == "SUBMISSION_UNKNOWN":
@@ -907,6 +999,38 @@ class EtradeOrderGateway:
             _require_same_account(self._account, transport_account)
         return transport_account
 
+    def _history_account(self) -> SelectedBrokerAccount:
+        """Verify immutable adapter/runtime identity without arm freshness."""
+
+        if (
+            type(self._runtime_safety) is not RuntimeSafetyBoundary
+            or type(self._ledger) is not OrderIntentLedger
+            or type(self._transport) is not ETradeBrokerTransport
+            or type(self._reader) is not ETradeBrokerReader
+        ):
+            raise GatewayValidationError(
+                "gateway history dependency identity changed"
+            )
+        transport_account = self._transport.selected_account()
+        reader_account = self._reader.selected_account()
+        _validate_account(transport_account)
+        _validate_account(reader_account)
+        _require_same_account(transport_account, reader_account)
+        if (
+            transport_account.account_id
+            != self.runtime_safety.expected_account_id
+            or transport_account.account_id_key
+            != self.runtime_safety.expected_account_id_key
+            or transport_account.institution_type
+            != self.runtime_safety.expected_institution_type
+        ):
+            raise GatewayValidationError(
+                "gateway history account does not match runtime binding"
+            )
+        if self._account is not None:
+            _require_same_account(self._account, transport_account)
+        return transport_account
+
     def _query_known_order(
         self,
         account: SelectedBrokerAccount,
@@ -1053,6 +1177,7 @@ class EtradeOrderGateway:
             decision = self.ledger.set_reservation_cap_from_read(
                 evidence,
                 risk_budget=self._opening_risk_budget,
+                daily_risk_budget=self._daily_opening_risk_budget,
             )
         except OrderIntentLedgerError as exc:
             raise GatewayValidationError(
@@ -1708,6 +1833,11 @@ def _validate_submit_command(
     _exact_decimal(command.max_loss_amount, "max_loss_amount")
     _exact_decimal(command.collateral_amount, "collateral_amount")
     _exact_utc_time(command.quote_observed_at, "quote_observed_at")
+    _exact_utc_time(command.quote_valid_until, "quote_valid_until")
+    if command.quote_valid_until <= command.quote_observed_at:
+        raise GatewayValidationError(
+            "quote_valid_until must be after quote_observed_at"
+        )
     _exact_sha256(command.quote_digest, "quote_digest")
     _lease_seconds(command.lease_seconds)
     return command

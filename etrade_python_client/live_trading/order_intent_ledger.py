@@ -23,6 +23,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from live_trading.etrade_order_protocol import (
     cancel_order_route as _cancel_order_route,
@@ -60,9 +61,9 @@ from live_trading.opening_risk_lineage import (
 )
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 _MIGRATABLE_SCHEMA_VERSIONS = frozenset(
-    {8, 9, 10, 11, 12, 13, 14, 15, 16}
+    {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
 )
 _BUSY_TIMEOUT_MS = 5_000
 _EVIDENCE_MAX_AGE_SECONDS = 300
@@ -105,7 +106,40 @@ _READ_REQUEST_HASH_DOMAIN = b"etrade-read-request.v1\0"
 _READ_PARSED_HASH_DOMAIN = b"etrade-read-parsed.v1\0"
 _READ_RECEIPT_HASH_DOMAIN = b"etrade-read-receipt.v1\0"
 _READ_MANIFEST_HASH_DOMAIN = b"etrade-read-manifest.v1\0"
-_CAPACITY_DECISION_HASH_DOMAIN = b"etrade-capacity-decision.v1\0"
+_LEGACY_CAPACITY_DECISION_HASH_DOMAIN = (
+    b"etrade-capacity-decision.v1\0"
+)
+_CAPACITY_DECISION_HASH_DOMAIN = b"etrade-capacity-decision.v2\0"
+_CAPACITY_POLICY_V1_HASH_DOMAIN = b"etrade-capacity-policy.v1\0"
+_CAPACITY_POLICY_HASH_DOMAIN = b"etrade-capacity-policy.v2\0"
+_CAPACITY_POLICY_INPUTS_V1_HASH_DOMAIN = (
+    b"etrade-capacity-policy-inputs.v1\0"
+)
+_CAPACITY_POLICY_INPUTS_HASH_DOMAIN = (
+    b"etrade-capacity-policy-inputs.v2\0"
+)
+_CAPACITY_POLICY_V1_VERSION = "OPENING_MAX_LOSS_V1"
+_CAPACITY_POLICY_VERSION = "OPENING_MAX_LOSS_V2"
+_LEGACY_CAPACITY_POLICY_VERSION = "LEGACY_CAPACITY_V1"
+_CAPACITY_POLICY_OUTCOMES = frozenset({"ALLOW", "DENY"})
+_CAPACITY_POLICY_REASON_CODES = frozenset(
+    {
+        "SUPPORTED_RISK_DEFINED_ACCOUNT",
+        "UNSUPPORTED_OPTION_POSITION",
+        "UNSUPPORTED_ACTIVE_ORDER",
+        "UNSUPPORTED_MANAGED_RISK_STATE",
+    }
+)
+_LEGACY_POLICY_DIGEST = "0" * 64
+_NEW_YORK = ZoneInfo("America/New_York")
+_SCHEMA_18_LEGACY_RELEASE_REASON = (
+    "SCHEMA_18_UNCLAIMED_LEGACY_RESERVATION_RELEASED"
+)
+_SCHEMA_18_MIGRATION_ACTOR = "schema-18-migration"
+_SCHEMA_19_POLICY_V1_RELEASE_REASON = (
+    "SCHEMA_19_UNCLAIMED_POLICY_V1_RESERVATION_RELEASED"
+)
+_SCHEMA_19_MIGRATION_ACTOR = "schema-19-migration"
 _RESERVATION_ABSORPTION_HASH_DOMAIN = (
     b"etrade-reservation-absorption.v1\0"
 )
@@ -982,6 +1016,74 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
             SELECT RAISE(ABORT, 'capacity decisions are append-only');
         END
     """,
+    "validate_capacity_decision_policy_insert": """
+        CREATE TRIGGER validate_capacity_decision_policy_insert
+        BEFORE INSERT ON capacity_decisions
+        WHEN CAST(NEW.broker_buying_power AS REAL) < 0
+          OR CAST(NEW.risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_authorized_risk AS REAL) < 0
+          OR CAST(NEW.external_position_risk AS REAL) < 0
+          OR CAST(NEW.external_order_risk AS REAL) < 0
+          OR CAST(NEW.represented_managed_risk AS REAL) < 0
+          OR CAST(NEW.cap_amount AS REAL) < 0
+          OR NEW.daily_window_end <= NEW.daily_window_start
+          OR length(NEW.risk_policy_sha256) != 64
+          OR length(NEW.policy_inputs_sha256) != 64
+          OR NEW.policy_outcome NOT IN ('ALLOW', 'DENY')
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'capacity decision policy fields are invalid'
+            );
+        END
+    """,
+    "validate_reservation_cap_policy_insert": """
+        CREATE TRIGGER validate_reservation_cap_policy_insert
+        BEFORE INSERT ON reservation_caps
+        WHEN CAST(NEW.cap_amount AS REAL) < 0
+          OR CAST(NEW.broker_buying_power AS REAL) < 0
+          OR CAST(NEW.risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_authorized_risk AS REAL) < 0
+          OR CAST(NEW.external_position_risk AS REAL) < 0
+          OR CAST(NEW.external_order_risk AS REAL) < 0
+          OR CAST(NEW.represented_managed_risk AS REAL) < 0
+          OR NEW.daily_window_end <= NEW.daily_window_start
+          OR length(NEW.portfolio_snapshot_digest) != 64
+          OR length(NEW.risk_policy_sha256) != 64
+          OR length(NEW.policy_inputs_sha256) != 64
+          OR NEW.policy_outcome NOT IN ('ALLOW', 'DENY')
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'reservation cap policy fields are invalid'
+            );
+        END
+    """,
+    "validate_reservation_cap_policy_update": """
+        CREATE TRIGGER validate_reservation_cap_policy_update
+        BEFORE UPDATE ON reservation_caps
+        WHEN CAST(NEW.cap_amount AS REAL) < 0
+          OR CAST(NEW.broker_buying_power AS REAL) < 0
+          OR CAST(NEW.risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_risk_budget AS REAL) < 0
+          OR CAST(NEW.daily_authorized_risk AS REAL) < 0
+          OR CAST(NEW.external_position_risk AS REAL) < 0
+          OR CAST(NEW.external_order_risk AS REAL) < 0
+          OR CAST(NEW.represented_managed_risk AS REAL) < 0
+          OR NEW.daily_window_end <= NEW.daily_window_start
+          OR length(NEW.portfolio_snapshot_digest) != 64
+          OR length(NEW.risk_policy_sha256) != 64
+          OR length(NEW.policy_inputs_sha256) != 64
+          OR NEW.policy_outcome NOT IN ('ALLOW', 'DENY')
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'reservation cap policy fields are invalid'
+            );
+        END
+    """,
     "prevent_opening_risk_prerequisite_update": """
         CREATE TRIGGER prevent_opening_risk_prerequisite_update
         BEFORE UPDATE ON opening_risk_prerequisites
@@ -1256,11 +1358,42 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
                   AND cap.broker_buying_power =
                         decision.broker_buying_power
                   AND cap.risk_budget = decision.risk_budget
+                  AND cap.daily_risk_budget =
+                        decision.daily_risk_budget
+                  AND cap.daily_authorized_risk =
+                        decision.daily_authorized_risk
+                  AND cap.external_position_risk =
+                        decision.external_position_risk
+                  AND cap.external_order_risk =
+                        decision.external_order_risk
+                  AND cap.represented_managed_risk =
+                        decision.represented_managed_risk
+                  AND cap.daily_window_start =
+                        decision.daily_window_start
+                  AND cap.daily_window_end =
+                        decision.daily_window_end
+                  AND cap.risk_policy_version =
+                        decision.risk_policy_version
+                  AND cap.risk_policy_sha256 =
+                        decision.risk_policy_sha256
+                  AND cap.policy_inputs_json =
+                        decision.policy_inputs_json
+                  AND cap.policy_inputs_sha256 =
+                        decision.policy_inputs_sha256
+                  AND cap.policy_outcome = decision.policy_outcome
+                  AND cap.policy_reason_code =
+                        decision.policy_reason_code
                   AND cap.observed_at = decision.observed_at
                   AND cap.portfolio_snapshot_digest =
                         decision.capacity_snapshot_sha256
+                  AND decision.risk_policy_version =
+                        'OPENING_MAX_LOSS_V2'
+                  AND decision.policy_outcome = 'ALLOW'
                   AND decision.account_id = NEW.account_id
                   AND decision.environment = NEW.environment
+                  AND NEW.created_at >= decision.daily_window_start
+                  AND NEW.created_at < decision.daily_window_end
+                  AND NEW.amount = NEW.max_loss_amount
                   AND NEW.portfolio_observed_at =
                         decision.observed_at
                   AND NEW.portfolio_snapshot_digest =
@@ -1415,48 +1548,145 @@ _REQUIRED_TRIGGER_DEFINITIONS = {
         BEFORE UPDATE ON margin_reservations
         WHEN OLD.state = 'ACTIVE'
          AND NEW.state = 'RELEASED'
-         AND NOT EXISTS (
-            SELECT 1
-            FROM order_intents AS intent
-            WHERE intent.intent_id = OLD.intent_id
-              AND intent.intent_kind = 'OPENING'
-              AND intent.state = 'FAILED'
-              AND intent.broker_order_id IS NULL
-              AND intent.updated_at = NEW.released_at
-              AND NEW.released_reason_code =
-                    'PRE_POST_ABORTED'
-              AND EXISTS (
-                    SELECT 1
-                    FROM order_events AS claim
-                    WHERE claim.intent_id = intent.intent_id
-                      AND claim.event_type =
-                            'SUBMISSION_CLAIMED'
-                      AND claim.from_state = 'INTENT'
-                      AND claim.to_state = 'CLAIMED'
-                      AND claim.reason_code =
-                            'SUBMISSION_CLAIMED'
-                      AND claim.created_at <= NEW.released_at
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM order_events AS post
-                    WHERE post.intent_id = intent.intent_id
-                      AND post.event_type = 'POST_STARTED'
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM transport_send_attempts AS attempt
-                    WHERE attempt.intent_id = intent.intent_id
-                      AND attempt.transport_operation =
-                            'SUBMIT_PLACE'
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM transport_response_receipts AS response
-                    WHERE response.intent_id = intent.intent_id
-                      AND response.transport_operation =
-                            'SUBMIT_PLACE'
-              )
+         AND NOT (
+            EXISTS (
+                SELECT 1
+                FROM order_intents AS intent
+                WHERE intent.intent_id = OLD.intent_id
+                  AND intent.intent_kind = 'OPENING'
+                  AND intent.state = 'FAILED'
+                  AND intent.broker_order_id IS NULL
+                  AND intent.updated_at = NEW.released_at
+                  AND NEW.released_reason_code =
+                        'PRE_POST_ABORTED'
+                  AND EXISTS (
+                        SELECT 1
+                        FROM order_events AS claim
+                        WHERE claim.intent_id = intent.intent_id
+                          AND claim.event_type =
+                                'SUBMISSION_CLAIMED'
+                          AND claim.from_state = 'INTENT'
+                          AND claim.to_state = 'CLAIMED'
+                          AND claim.reason_code =
+                                'SUBMISSION_CLAIMED'
+                          AND claim.created_at <= NEW.released_at
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM order_events AS post
+                        WHERE post.intent_id = intent.intent_id
+                          AND post.event_type = 'POST_STARTED'
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM transport_send_attempts AS attempt
+                        WHERE attempt.intent_id = intent.intent_id
+                          AND attempt.transport_operation =
+                                'SUBMIT_PLACE'
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM transport_response_receipts AS response
+                        WHERE response.intent_id = intent.intent_id
+                          AND response.transport_operation =
+                                'SUBMIT_PLACE'
+                  )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM order_intents AS intent
+                JOIN ledger_metadata AS metadata
+                  ON metadata.singleton = 1
+                WHERE metadata.schema_version = 17
+                  AND intent.intent_id = OLD.intent_id
+                  AND intent.intent_kind = 'OPENING'
+                  AND intent.state = 'FAILED'
+                  AND intent.broker_order_id IS NULL
+                  AND intent.submission_fence = 0
+                  AND intent.submission_lease_owner IS NULL
+                  AND intent.submission_lease_expires_at IS NULL
+                  AND intent.pending_operation IS NULL
+                  AND intent.pending_owner IS NULL
+                  AND intent.pending_fence IS NULL
+                  AND intent.updated_at = NEW.released_at
+                  AND NEW.released_reason_code =
+                        'SCHEMA_18_UNCLAIMED_LEGACY_RESERVATION_RELEASED'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM order_events AS claim
+                        WHERE claim.intent_id = intent.intent_id
+                          AND claim.event_type = 'SUBMISSION_CLAIMED'
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM outbound_authorizations AS authorization
+                        WHERE authorization.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM transport_send_attempts AS attempt
+                        WHERE attempt.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM broker_preview_receipts AS preview
+                        WHERE preview.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM transport_response_receipts AS response
+                        WHERE response.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM broker_order_history AS history
+                        WHERE history.intent_id = intent.intent_id
+                  )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM order_intents AS intent
+                JOIN ledger_metadata AS metadata
+                  ON metadata.singleton = 1
+                JOIN capacity_decisions AS decision
+                  ON decision.capacity_decision_sha256 =
+                        OLD.capacity_decision_sha256
+                WHERE metadata.schema_version = 18
+                  AND intent.intent_id = OLD.intent_id
+                  AND intent.intent_kind = 'OPENING'
+                  AND intent.state = 'FAILED'
+                  AND intent.broker_order_id IS NULL
+                  AND intent.submission_fence = 0
+                  AND intent.submission_lease_owner IS NULL
+                  AND intent.submission_lease_expires_at IS NULL
+                  AND intent.pending_operation IS NULL
+                  AND intent.pending_owner IS NULL
+                  AND intent.pending_fence IS NULL
+                  AND intent.updated_at = NEW.released_at
+                  AND decision.risk_policy_version =
+                        'OPENING_MAX_LOSS_V1'
+                  AND NEW.released_reason_code =
+                        'SCHEMA_19_UNCLAIMED_POLICY_V1_RESERVATION_RELEASED'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM order_events AS claim
+                        WHERE claim.intent_id = intent.intent_id
+                          AND claim.event_type = 'SUBMISSION_CLAIMED'
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM outbound_authorizations AS authorization
+                        WHERE authorization.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM transport_send_attempts AS attempt
+                        WHERE attempt.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM broker_preview_receipts AS preview
+                        WHERE preview.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM transport_response_receipts AS response
+                        WHERE response.intent_id = intent.intent_id
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1 FROM broker_order_history AS history
+                        WHERE history.intent_id = intent.intent_id
+                  )
+            )
          )
         BEGIN
             SELECT RAISE(ABORT, 'active reservation release lacks pre-post failure proof');
@@ -1592,6 +1822,16 @@ class OrderIntentBrokerTermsMismatch(
 
 class OrderIntentReservationError(OrderIntentLedgerError):
     """An opening intent lacks a valid margin reservation or capacity."""
+
+
+class _UnsupportedOpeningCapacity(Exception):
+    """A complete snapshot contains option risk the closed policy cannot prove."""
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in _CAPACITY_POLICY_REASON_CODES:
+            raise ValueError("unsupported capacity reason code")
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 @dataclass(frozen=True)
@@ -2000,8 +2240,31 @@ class CapacityDecisionReceipt:
     cap_amount: Decimal
     broker_buying_power: Decimal
     risk_budget: Decimal
+    daily_risk_budget: Decimal
+    daily_authorized_risk: Decimal
+    external_position_risk: Decimal
+    external_order_risk: Decimal
+    represented_managed_risk: Decimal
+    daily_window_start: datetime
+    daily_window_end: datetime
+    risk_policy_version: str
+    risk_policy_sha256: str
+    policy_inputs_sha256: str
+    policy_outcome: Literal["ALLOW", "DENY"]
+    policy_reason_code: str
     observed_at: datetime
     portfolio_snapshot_digest: str
+
+
+@dataclass(frozen=True)
+class _CapacityPolicyEvaluation:
+    cap_amount: Decimal
+    daily_authorized_risk: Decimal
+    external_position_risk: Decimal
+    external_order_risk: Decimal
+    represented_managed_risk: Decimal
+    policy_outcome: Literal["ALLOW", "DENY"]
+    policy_reason_code: str
 
 
 @dataclass(frozen=True)
@@ -2509,6 +2772,115 @@ class OrderIntentLedger:
             )
             return CreateIntentResult(self._intent_from_row(self._require_intent(conn, requested_id)), True)
 
+    def abandon_trace_free_opening_intent(
+        self, intent_id: str
+    ) -> IntentRecord:
+        """Fail only a never-reserved opening intent with no submission trace."""
+
+        _validate_identity("intent_id", intent_id)
+        now = self._now_us()
+        with self._transaction() as conn:
+            intent = self._require_intent(conn, intent_id)
+            existing = conn.execute(
+                """
+                SELECT * FROM order_events
+                WHERE intent_id = ? AND event_type = 'INTENT_ABANDONED'
+                """,
+                (intent_id,),
+            ).fetchall()
+            if intent["state"] == "FAILED" and len(existing) == 1:
+                event = existing[0]
+                if (
+                    event["from_state"] == "INTENT"
+                    and event["to_state"] == "FAILED"
+                    and event["actor"] == "system"
+                    and event["reason_code"] == "PRE_POST_ABORTED"
+                ):
+                    return self._intent_from_row(intent)
+            if (
+                intent["intent_kind"] != "OPENING"
+                or intent["state"] != "INTENT"
+                or intent["broker_order_id"] is not None
+                or int(intent["submission_fence"]) != 0
+                or intent["submission_lease_owner"] is not None
+                or intent["submission_lease_expires_at"] is not None
+                or intent["pending_operation"] is not None
+                or intent["pending_owner"] is not None
+                or intent["pending_fence"] is not None
+            ):
+                raise OrderIntentTransitionError(
+                    "only a trace-free opening INTENT can be abandoned"
+                )
+            events = conn.execute(
+                """
+                SELECT * FROM order_events
+                WHERE intent_id = ? ORDER BY sequence
+                """,
+                (intent_id,),
+            ).fetchall()
+            if (
+                len(events) != 1
+                or events[0]["event_type"] != "INTENT_CREATED"
+                or events[0]["from_state"] is not None
+                or events[0]["to_state"] != "INTENT"
+                or events[0]["actor"] != "system"
+                or events[0]["reason_code"] != "INTENT_CREATED"
+            ):
+                raise OrderIntentTransitionError(
+                    "opening intent has durable lifecycle evidence"
+                )
+            trace = conn.execute(
+                """
+                SELECT 1 FROM margin_reservations WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM opening_risk_prerequisites WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM outbound_authorizations WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_send_attempts WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_preview_receipts WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_response_receipts WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_order_history WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM amendment_leases WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM amendment_history WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM order_cancellations WHERE intent_id = ?
+                LIMIT 1
+                """,
+                (intent_id,) * 10,
+            ).fetchone()
+            if trace is not None:
+                raise OrderIntentTransitionError(
+                    "opening intent has reservation or broker-operation trace"
+                )
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'FAILED', last_reconciled_run = ?,
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (self.run_id, now, intent_id),
+            )
+            self._append_event(
+                conn,
+                intent_id,
+                "INTENT_ABANDONED",
+                "INTENT",
+                "FAILED",
+                "system",
+                "PRE_POST_ABORTED",
+                now,
+            )
+            return self._intent_from_row(
+                self._require_intent(conn, intent_id)
+            )
+
     def create_opening_risk_prerequisite(
         self,
         envelope: OrderIntent,
@@ -2738,7 +3110,7 @@ class OrderIntentLedger:
             with localcontext() as decimal_context:
                 decimal_context.prec = _DECIMAL_PRECISION
                 exceeds_cap = (
-                    active + collateral_amount
+                    active + max_loss_amount
                     > Decimal(cap["cap_amount"])
                 )
             if exceeds_cap:
@@ -3651,6 +4023,94 @@ class OrderIntentLedger:
             row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
         return self._intent_from_row(row) if row else None
 
+    def recent_intents(
+        self,
+        *,
+        account_id: str,
+        environment: str,
+        intent_kind: Literal["OPENING", "CLOSING"],
+        idempotency_scope: str,
+        limit: int,
+    ) -> tuple[IntentRecord, ...]:
+        """Return a bounded, exact-scope projection of verified durable intents."""
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        if type(intent_kind) is not str or intent_kind not in _INTENT_KINDS:
+            raise OrderIntentValidationError(
+                "intent_kind must be OPENING or CLOSING"
+            )
+        _validate_identity("idempotency_scope", idempotency_scope)
+        if type(limit) is not int or not 1 <= limit <= 25:
+            raise OrderIntentValidationError(
+                "recent intent limit must be between 1 and 25"
+            )
+        with self._connection() as conn:
+            self._verify_durable_risk_state(
+                conn,
+                account_id=account_id,
+                environment=environment,
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE account_id = ? AND environment = ?
+                  AND intent_kind = ? AND idempotency_scope = ?
+                ORDER BY created_at DESC, intent_id DESC
+                LIMIT ?
+                """,
+                (
+                    account_id,
+                    environment,
+                    intent_kind,
+                    idempotency_scope,
+                    limit,
+                ),
+            ).fetchall()
+            return tuple(self._intent_from_row(row) for row in rows)
+
+    def find_intent_by_idempotency(
+        self,
+        *,
+        account_id: str,
+        environment: str,
+        intent_kind: Literal["OPENING", "CLOSING"],
+        idempotency_scope: str,
+        idempotency_key: str,
+    ) -> IntentRecord | None:
+        """Read one exact durable idempotency identity without broker access."""
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        if type(intent_kind) is not str or intent_kind not in _INTENT_KINDS:
+            raise OrderIntentValidationError(
+                "intent_kind must be OPENING or CLOSING"
+            )
+        _validate_identity("idempotency_scope", idempotency_scope)
+        _validate_identity("idempotency_key", idempotency_key)
+        with self._connection() as conn:
+            self._verify_durable_risk_state(
+                conn,
+                account_id=account_id,
+                environment=environment,
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE account_id = ? AND environment = ?
+                  AND intent_kind = ? AND idempotency_scope = ?
+                  AND idempotency_key = ?
+                """,
+                (
+                    account_id,
+                    environment,
+                    intent_kind,
+                    idempotency_scope,
+                    idempotency_key,
+                ),
+            ).fetchone()
+            return self._intent_from_row(row) if row is not None else None
+
     def find_intent(
         self, envelope: OrderIntent
     ) -> IntentRecord | None:
@@ -4144,8 +4604,9 @@ class OrderIntentLedger:
         evidence: BrokerReadEvidenceRef,
         *,
         risk_budget: Decimal,
+        daily_risk_budget: Decimal | None = None,
     ) -> CapacityDecisionReceipt:
-        """Derive and persist a cap only from a complete durable capacity read."""
+        """Derive one account cap and daily budget from capacity-v3 evidence."""
 
         if (
             type(evidence) is not BrokerReadEvidenceRef
@@ -4163,6 +4624,16 @@ class OrderIntentLedger:
             raise OrderIntentValidationError(
                 "risk_budget must be a non-negative finite Decimal"
             )
+        if daily_risk_budget is None:
+            daily_risk_budget = risk_budget
+        if (
+            type(daily_risk_budget) is not Decimal
+            or not daily_risk_budget.is_finite()
+            or daily_risk_budget < 0
+        ):
+            raise OrderIntentValidationError(
+                "daily_risk_budget must be a non-negative finite Decimal"
+            )
         now = self._now_us()
         with self._transaction() as conn:
             manifest, result = self._verified_broker_read_manifest(
@@ -4177,6 +4648,10 @@ class OrderIntentLedger:
                     "capacity evidence is not a complete capacity manifest"
                 )
             _validate_capacity_manifest_result(result)
+            if result["schema"] != "etrade-capacity.v3":
+                raise OrderIntentIntegrityError(
+                    "opening capacity requires exact schema-v3 contract evidence"
+                )
             observed_at = int(manifest["observed_at"])
             if (
                 observed_at > now + 5_000_000
@@ -4186,13 +4661,40 @@ class OrderIntentLedger:
                 raise OrderIntentValidationError(
                     "capacity evidence is stale or from the future"
                 )
+            self._verify_durable_risk_state(
+                conn,
+                account_id=manifest["account_id"],
+                environment=manifest["environment"],
+            )
             broker_buying_power = Decimal(
                 result["broker_buying_power"]
             )
             canonical_risk_budget = _canonical_amount(risk_budget)
-            cap_amount = _canonical_amount(
-                min(broker_buying_power, risk_budget)
+            canonical_daily_risk_budget = _canonical_amount(
+                daily_risk_budget
             )
+            daily_window_start, daily_window_end = _new_york_day_window(
+                observed_at
+            )
+            policy_inputs = self._capacity_policy_inputs(
+                conn,
+                account_id=manifest["account_id"],
+                environment=manifest["environment"],
+                daily_window_start=daily_window_start,
+                daily_window_end=daily_window_end,
+            )
+            policy_inputs_json = _canonical_read_json(policy_inputs)
+            policy_inputs_sha256 = _domain_json_hash(
+                _CAPACITY_POLICY_INPUTS_HASH_DOMAIN, policy_inputs
+            )
+            risk_policy_sha256 = _capacity_policy_sha256()
+            evaluation = _evaluate_opening_capacity_policy(
+                result,
+                policy_inputs,
+                broker_buying_power=broker_buying_power,
+                account_risk_budget=risk_budget,
+            )
+            cap_amount = _canonical_amount(evaluation.cap_amount)
             snapshot_digest = result["state_sha256"]
             decided_at = observed_at
             decision_material = {
@@ -4203,6 +4705,27 @@ class OrderIntentLedger:
                     broker_buying_power
                 ),
                 "risk_budget": canonical_risk_budget,
+                "daily_risk_budget": canonical_daily_risk_budget,
+                "daily_authorized_risk": _canonical_amount(
+                    evaluation.daily_authorized_risk
+                ),
+                "external_position_risk": _canonical_amount(
+                    evaluation.external_position_risk
+                ),
+                "external_order_risk": _canonical_amount(
+                    evaluation.external_order_risk
+                ),
+                "represented_managed_risk": _canonical_amount(
+                    evaluation.represented_managed_risk
+                ),
+                "daily_window_start": daily_window_start,
+                "daily_window_end": daily_window_end,
+                "risk_policy_version": _CAPACITY_POLICY_VERSION,
+                "risk_policy_sha256": risk_policy_sha256,
+                "policy_inputs_json": policy_inputs_json,
+                "policy_inputs_sha256": policy_inputs_sha256,
+                "policy_outcome": evaluation.policy_outcome,
+                "policy_reason_code": evaluation.policy_reason_code,
                 "cap_amount": cap_amount,
                 "observed_at": observed_at,
                 "capacity_snapshot_sha256": snapshot_digest,
@@ -4218,6 +4741,19 @@ class OrderIntentLedger:
                 manifest["environment"],
                 _canonical_amount(broker_buying_power),
                 canonical_risk_budget,
+                canonical_daily_risk_budget,
+                _canonical_amount(evaluation.daily_authorized_risk),
+                _canonical_amount(evaluation.external_position_risk),
+                _canonical_amount(evaluation.external_order_risk),
+                _canonical_amount(evaluation.represented_managed_risk),
+                daily_window_start,
+                daily_window_end,
+                _CAPACITY_POLICY_VERSION,
+                risk_policy_sha256,
+                policy_inputs_json,
+                policy_inputs_sha256,
+                evaluation.policy_outcome,
+                evaluation.policy_reason_code,
                 cap_amount,
                 observed_at,
                 snapshot_digest,
@@ -4236,9 +4772,19 @@ class OrderIntentLedger:
                     INSERT INTO capacity_decisions (
                         capacity_decision_sha256, evidence_sha256,
                         account_id, environment, broker_buying_power,
-                        risk_budget, cap_amount, observed_at,
+                        risk_budget, daily_risk_budget,
+                        daily_authorized_risk, external_position_risk,
+                        external_order_risk, represented_managed_risk,
+                        daily_window_start, daily_window_end,
+                        risk_policy_version, risk_policy_sha256,
+                        policy_inputs_json, policy_inputs_sha256,
+                        policy_outcome, policy_reason_code,
+                        cap_amount, observed_at,
                         capacity_snapshot_sha256, decided_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     decision_values,
                 )
@@ -4250,6 +4796,19 @@ class OrderIntentLedger:
                     "environment",
                     "broker_buying_power",
                     "risk_budget",
+                    "daily_risk_budget",
+                    "daily_authorized_risk",
+                    "external_position_risk",
+                    "external_order_risk",
+                    "represented_managed_risk",
+                    "daily_window_start",
+                    "daily_window_end",
+                    "risk_policy_version",
+                    "risk_policy_sha256",
+                    "policy_inputs_json",
+                    "policy_inputs_sha256",
+                    "policy_outcome",
+                    "policy_reason_code",
                     "cap_amount",
                     "observed_at",
                     "capacity_snapshot_sha256",
@@ -4290,12 +4849,39 @@ class OrderIntentLedger:
                     account_id, environment, cap_amount,
                     broker_buying_power, risk_budget, observed_at,
                     portfolio_snapshot_digest, updated_at,
-                    capacity_decision_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    capacity_decision_sha256, daily_risk_budget,
+                    daily_authorized_risk, external_position_risk,
+                    external_order_risk, represented_managed_risk,
+                    daily_window_start, daily_window_end,
+                    risk_policy_version, risk_policy_sha256,
+                    policy_inputs_json, policy_inputs_sha256,
+                    policy_outcome, policy_reason_code
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
                 ON CONFLICT(account_id, environment) DO UPDATE SET
                     cap_amount = excluded.cap_amount,
                     broker_buying_power = excluded.broker_buying_power,
                     risk_budget = excluded.risk_budget,
+                    daily_risk_budget = excluded.daily_risk_budget,
+                    daily_authorized_risk =
+                        excluded.daily_authorized_risk,
+                    external_position_risk =
+                        excluded.external_position_risk,
+                    external_order_risk =
+                        excluded.external_order_risk,
+                    represented_managed_risk =
+                        excluded.represented_managed_risk,
+                    daily_window_start = excluded.daily_window_start,
+                    daily_window_end = excluded.daily_window_end,
+                    risk_policy_version = excluded.risk_policy_version,
+                    risk_policy_sha256 = excluded.risk_policy_sha256,
+                    policy_inputs_json = excluded.policy_inputs_json,
+                    policy_inputs_sha256 =
+                        excluded.policy_inputs_sha256,
+                    policy_outcome = excluded.policy_outcome,
+                    policy_reason_code = excluded.policy_reason_code,
                     observed_at = excluded.observed_at,
                     portfolio_snapshot_digest =
                         excluded.portfolio_snapshot_digest,
@@ -4313,6 +4899,19 @@ class OrderIntentLedger:
                     snapshot_digest,
                     now,
                     decision_sha256,
+                    canonical_daily_risk_budget,
+                    _canonical_amount(evaluation.daily_authorized_risk),
+                    _canonical_amount(evaluation.external_position_risk),
+                    _canonical_amount(evaluation.external_order_risk),
+                    _canonical_amount(evaluation.represented_managed_risk),
+                    daily_window_start,
+                    daily_window_end,
+                    _CAPACITY_POLICY_VERSION,
+                    risk_policy_sha256,
+                    policy_inputs_json,
+                    policy_inputs_sha256,
+                    evaluation.policy_outcome,
+                    evaluation.policy_reason_code,
                 ),
             )
         return CapacityDecisionReceipt(
@@ -4321,9 +4920,165 @@ class OrderIntentLedger:
             cap_amount=Decimal(cap_amount),
             broker_buying_power=broker_buying_power,
             risk_budget=Decimal(canonical_risk_budget),
+            daily_risk_budget=Decimal(canonical_daily_risk_budget),
+            daily_authorized_risk=evaluation.daily_authorized_risk,
+            external_position_risk=evaluation.external_position_risk,
+            external_order_risk=evaluation.external_order_risk,
+            represented_managed_risk=evaluation.represented_managed_risk,
+            daily_window_start=_from_us(daily_window_start),
+            daily_window_end=_from_us(daily_window_end),
+            risk_policy_version=_CAPACITY_POLICY_VERSION,
+            risk_policy_sha256=risk_policy_sha256,
+            policy_inputs_sha256=policy_inputs_sha256,
+            policy_outcome=evaluation.policy_outcome,
+            policy_reason_code=evaluation.policy_reason_code,
             observed_at=_from_us(observed_at),
             portfolio_snapshot_digest=snapshot_digest,
         )
+
+    def _capacity_policy_inputs(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_id: str,
+        environment: str,
+        daily_window_start: int,
+        daily_window_end: int,
+    ) -> dict[str, Any]:
+        """Snapshot every mutable ledger input used by capacity policy."""
+
+        daily_rows = conn.execute(
+            """
+            SELECT reservation.intent_id, reservation.max_loss_amount,
+                   reservation.created_at
+            FROM margin_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND intent.account_id = ?
+              AND intent.environment = ?
+              AND reservation.created_at >= ?
+              AND reservation.created_at < ?
+            ORDER BY reservation.created_at, reservation.intent_id
+            """,
+            (
+                account_id,
+                environment,
+                account_id,
+                environment,
+                daily_window_start,
+                daily_window_end,
+            ),
+        ).fetchall()
+        daily_authorizations = []
+        for row in daily_rows:
+            max_loss = _canonical_signed_decimal_text(
+                row["max_loss_amount"],
+                "daily authorization max loss",
+            )
+            if max_loss <= 0:
+                raise OrderIntentIntegrityError(
+                    "daily authorization contains invalid max loss"
+                )
+            daily_authorizations.append(
+                {
+                    "intent_id": row["intent_id"],
+                    "max_loss_amount": _canonical_amount(max_loss),
+                    "created_at": int(row["created_at"]),
+                }
+            )
+
+        managed_rows = conn.execute(
+            """
+            SELECT intent.*,
+                   intent.state AS intent_state,
+                   reservation.amount, reservation.state AS reservation_state,
+                   reservation.released_reason_code
+            FROM margin_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND intent.account_id = ?
+              AND intent.environment = ?
+              AND intent.intent_kind = 'OPENING'
+              AND intent.broker_order_id IS NOT NULL
+              AND (
+                    reservation.state IN (
+                        'ACTIVE', 'FILLED_PENDING_ABSORPTION'
+                    )
+                    OR (
+                        reservation.state = 'RELEASED'
+                        AND reservation.released_reason_code =
+                            'FULL_FILL_POSITION_ABSORBED'
+                    )
+                  )
+            ORDER BY intent.broker_order_id, intent.intent_id
+            """,
+            (account_id, environment, account_id, environment),
+        ).fetchall()
+        managed_reservations = []
+        seen_broker_order_ids: set[str] = set()
+        for row in managed_rows:
+            broker_order_id = row["broker_order_id"]
+            if broker_order_id in seen_broker_order_ids:
+                raise OrderIntentIntegrityError(
+                    "managed risk reuses one broker order identity"
+                )
+            seen_broker_order_ids.add(broker_order_id)
+            if (
+                row["intent_state"] == "SUBMITTED"
+                and row["reservation_state"] == "ACTIVE"
+                and row["released_reason_code"] is None
+            ):
+                role = "OPEN_ORDER"
+            elif (
+                row["intent_state"] == "FILLED"
+                and row["reservation_state"] == "RELEASED"
+                and row["released_reason_code"]
+                == "FULL_FILL_POSITION_ABSORBED"
+            ):
+                role = "POSITION"
+            else:
+                role = "UNSUPPORTED"
+            amount = _canonical_signed_decimal_text(
+                row["amount"], "managed reservation amount"
+            )
+            if amount <= 0:
+                raise OrderIntentIntegrityError(
+                    "managed reservation amount is invalid"
+                )
+            try:
+                payload = json.loads(row["wire_payload"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise OrderIntentIntegrityError(
+                    "managed opening payload is not valid JSON"
+                ) from exc
+            if type(payload) is not dict:
+                raise OrderIntentIntegrityError(
+                    "managed opening payload must be a JSON object"
+                )
+            managed_reservations.append(
+                {
+                    "intent_id": row["intent_id"],
+                    "broker_order_id": broker_order_id,
+                    "role": role,
+                    "reservation_amount": _canonical_amount(amount),
+                    "expected_payload_hash":
+                        self._expected_order_payload_hash_conn(conn, row),
+                    "expected_legs": _managed_opening_legs(payload),
+                }
+            )
+
+        return {
+            "schema": "etrade-opening-capacity-policy-inputs.v2",
+            "policy": _capacity_policy_material(),
+            "daily_window": {
+                "start": daily_window_start,
+                "end": daily_window_end,
+            },
+            "daily_authorizations": daily_authorizations,
+            "managed_reservations": managed_reservations,
+        }
 
     def broker_evidence_from_read(
         self,
@@ -5178,7 +5933,7 @@ class OrderIntentLedger:
         if type(evidence) is not RiskEvidence:
             raise OrderIntentValidationError("reserve_margin requires typed RiskEvidence")
         RiskEvidence.validate(evidence, _from_us(now))
-        value = _canonical_amount(evidence.collateral_amount)
+        value = _canonical_amount(evidence.max_loss_amount)
         with self._transaction() as conn:
             intent = self._require_intent(conn, intent_id)
             if intent["intent_kind"] != "OPENING" or intent["state"] != "INTENT":
@@ -5229,7 +5984,15 @@ class OrderIntentLedger:
                 raise OrderIntentIntegrityError(
                     "reservation must name the exact durable capacity decision"
                 )
-            self._verified_reservation_cap_row(conn, cap)
+            decision = self._verified_reservation_cap_row(conn, cap)
+            if (
+                decision["risk_policy_version"]
+                != _CAPACITY_POLICY_VERSION
+                or decision["policy_outcome"] != "ALLOW"
+            ):
+                raise OrderIntentReservationError(
+                    "opening reservations require an allowed current capacity policy"
+                )
             if (
                 int(cap["observed_at"]) != _to_us(evidence.portfolio_observed_at)
                 or cap["portfolio_snapshot_digest"] != evidence.portfolio_snapshot_digest
@@ -5252,6 +6015,31 @@ class OrderIntentLedger:
                 ):
                     return reservation
                 raise OrderIntentTransitionError("reservation already exists and is immutable")
+            if not (
+                int(cap["daily_window_start"])
+                <= now
+                < int(cap["daily_window_end"])
+            ):
+                raise OrderIntentReservationError(
+                    "opening reservation daily budget window is not current"
+                )
+            daily_authorized = self._daily_authorized_risk_total(
+                conn,
+                intent["account_id"],
+                intent["environment"],
+                start=int(cap["daily_window_start"]),
+                end=int(cap["daily_window_end"]),
+            )
+            with localcontext() as decimal_context:
+                decimal_context.prec = _DECIMAL_PRECISION
+                exceeds_daily_budget = (
+                    daily_authorized + evidence.max_loss_amount
+                    > Decimal(cap["daily_risk_budget"])
+                )
+            if exceeds_daily_budget:
+                raise OrderIntentReservationError(
+                    "opening max-loss authorization exceeds the daily budget"
+                )
             active = self._active_reservation_total(conn, intent["account_id"], intent["environment"])
             with localcontext() as decimal_context:
                 decimal_context.prec = _DECIMAL_PRECISION
@@ -5380,6 +6168,53 @@ class OrderIntentLedger:
                         "pending terminal reservation has inconsistent durable state"
                     )
             return tuple(self._intent_from_row(row) for row in rows)
+
+    def has_execution_blockers(
+        self, account_id: str, environment: str
+    ) -> bool:
+        """Read whether durable work currently blocks broker mutation.
+
+        This is deliberately read-only so UI readiness checks cannot expire
+        leases or advance ledger state.
+        """
+
+        _validate_identity("account_id", account_id)
+        _validate_environment(environment)
+        with self._connection() as conn:
+            self._verify_durable_risk_state(
+                conn,
+                account_id=account_id,
+                environment=environment,
+            )
+            cancellation_rows = self._cancellation_blocker_rows(
+                conn, account_id, environment
+            )
+            for row in cancellation_rows:
+                self._verify_cancellation_row(conn, row)
+            pending_absorption = conn.execute(
+                """
+                SELECT 1
+                FROM margin_reservations
+                WHERE account_id = ? AND environment = ?
+                  AND state = 'FILLED_PENDING_ABSORPTION'
+                LIMIT 1
+                """,
+                (account_id, environment),
+            ).fetchone()
+            return bool(
+                self._blocker_rows(conn, account_id, environment)
+                or self._amendment_blocker_rows(
+                    conn, account_id, environment
+                )
+                or cancellation_rows
+                or self._closing_uncertainty_blocker_rows(
+                    conn, account_id, environment
+                )
+                or self._terminal_closing_blocker_rows(
+                    conn, account_id, environment
+                )
+                or pending_absorption is not None
+            )
 
     def claim_submission(self, intent_id: str, owner: str, *, lease_seconds: float) -> SubmissionLease:
         _validate_identity("intent_id", intent_id)
@@ -7150,13 +7985,41 @@ class OrderIntentLedger:
                     cap_amount TEXT NOT NULL,
                     broker_buying_power TEXT NOT NULL,
                     risk_budget TEXT NOT NULL,
+                    daily_risk_budget TEXT NOT NULL,
+                    daily_authorized_risk TEXT NOT NULL,
+                    external_position_risk TEXT NOT NULL,
+                    external_order_risk TEXT NOT NULL,
+                    represented_managed_risk TEXT NOT NULL,
+                    daily_window_start INTEGER NOT NULL,
+                    daily_window_end INTEGER NOT NULL,
+                    risk_policy_version TEXT NOT NULL,
+                    risk_policy_sha256 TEXT NOT NULL,
+                    policy_inputs_json TEXT NOT NULL,
+                    policy_inputs_sha256 TEXT NOT NULL,
+                    policy_outcome TEXT NOT NULL
+                        CHECK (policy_outcome IN ('ALLOW', 'DENY')),
+                    policy_reason_code TEXT NOT NULL,
                     observed_at INTEGER NOT NULL,
                     portfolio_snapshot_digest TEXT NOT NULL,
                     updated_at INTEGER NOT NULL,
                     capacity_decision_sha256 TEXT REFERENCES capacity_decisions(capacity_decision_sha256),
                     PRIMARY KEY (account_id, environment),
-                    CHECK (CAST(cap_amount AS REAL) >= 0 AND CAST(broker_buying_power AS REAL) >= 0 AND CAST(risk_budget AS REAL) >= 0),
-                    CHECK (length(portfolio_snapshot_digest) = 64)
+                    CHECK (
+                        CAST(cap_amount AS REAL) >= 0
+                        AND CAST(broker_buying_power AS REAL) >= 0
+                        AND CAST(risk_budget AS REAL) >= 0
+                        AND CAST(daily_risk_budget AS REAL) >= 0
+                        AND CAST(daily_authorized_risk AS REAL) >= 0
+                        AND CAST(external_position_risk AS REAL) >= 0
+                        AND CAST(external_order_risk AS REAL) >= 0
+                        AND CAST(represented_managed_risk AS REAL) >= 0
+                    ),
+                    CHECK (daily_window_end > daily_window_start),
+                    CHECK (
+                        length(portfolio_snapshot_digest) = 64
+                        AND length(risk_policy_sha256) = 64
+                        AND length(policy_inputs_sha256) = 64
+                    )
                 );
                 CREATE TABLE IF NOT EXISTS margin_reservations (
                     intent_id TEXT PRIMARY KEY REFERENCES order_intents(intent_id),
@@ -7774,6 +8637,15 @@ class OrderIntentLedger:
                 conn.execute(
                     "DROP TRIGGER IF EXISTS prevent_intent_identity_mutation"
                 )
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS validate_margin_reservation_insert"
+                )
+                conn.execute(
+                    """
+                    DROP TRIGGER IF EXISTS
+                        validate_margin_reservation_pre_post_release
+                    """
+                )
             if created_schema or current_schema_version != SCHEMA_VERSION:
                 for definition in _REQUIRED_TRIGGER_DEFINITIONS.values():
                     conn.execute(
@@ -7784,6 +8656,12 @@ class OrderIntentLedger:
                         )
                     )
             self._migrate_legacy_opening_reservations(
+                conn, current_schema_version
+            )
+            self._migrate_schema_17_capacity_policy(
+                conn, current_schema_version
+            )
+            self._migrate_schema_18_capacity_policy_v2(
                 conn, current_schema_version
             )
             if current_schema_version != SCHEMA_VERSION:
@@ -7877,6 +8755,269 @@ class OrderIntentLedger:
                 "schema-migration",
                 "RESERVATION_CREATED",
                 observed_at,
+            )
+
+    def _migrate_schema_17_capacity_policy(
+        self,
+        conn: sqlite3.Connection,
+        source_schema_version: int,
+    ) -> None:
+        """Release never-claimed v17 openings and fence all ambiguous work."""
+
+        if source_schema_version != 17:
+            return
+        now = self._now_us()
+        rows = conn.execute(
+            """
+            SELECT intent.*
+            FROM order_intents AS intent
+            JOIN margin_reservations AS reservation USING (intent_id)
+            WHERE intent.intent_kind = 'OPENING'
+              AND intent.state = 'INTENT'
+              AND reservation.state = 'ACTIVE'
+            ORDER BY intent.created_at, intent.intent_id
+            """
+        ).fetchall()
+        for intent in rows:
+            durable_submission_trace = conn.execute(
+                """
+                SELECT 1 FROM order_events
+                WHERE intent_id = ?
+                  AND event_type IN (
+                        'SUBMISSION_CLAIMED','POST_STARTED'
+                  )
+                UNION ALL
+                SELECT 1 FROM outbound_authorizations
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_send_attempts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_preview_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_response_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_order_history
+                WHERE intent_id = ?
+                LIMIT 1
+                """,
+                (intent["intent_id"],) * 6,
+            ).fetchone()
+            crossed_submission_boundary = (
+                int(intent["submission_fence"]) != 0
+                or intent["broker_order_id"] is not None
+                or intent["submission_lease_owner"] is not None
+                or intent["submission_lease_expires_at"] is not None
+                or intent["pending_operation"] is not None
+                or intent["pending_owner"] is not None
+                or intent["pending_fence"] is not None
+                or durable_submission_trace is not None
+            )
+            if crossed_submission_boundary:
+                conn.execute(
+                    """
+                    UPDATE order_intents
+                    SET state = 'SUBMISSION_UNKNOWN',
+                        submission_lease_owner = NULL,
+                        submission_lease_expires_at = NULL,
+                        last_reconciled_run = NULL,
+                        updated_at = ?
+                    WHERE intent_id = ? AND state = 'INTENT'
+                    """,
+                    (now, intent["intent_id"]),
+                )
+                self._append_event(
+                    conn,
+                    intent["intent_id"],
+                    "LEASE_EXPIRED_IN_DOUBT",
+                    "INTENT",
+                    "SUBMISSION_UNKNOWN",
+                    _SCHEMA_18_MIGRATION_ACTOR,
+                    "LEASE_EXPIRED_IN_DOUBT",
+                    now,
+                )
+                continue
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'FAILED', last_reconciled_run = ?,
+                    updated_at = ?
+                WHERE intent_id = ? AND state = 'INTENT'
+                """,
+                (
+                    _SCHEMA_18_MIGRATION_ACTOR,
+                    now,
+                    intent["intent_id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE margin_reservations
+                SET state = 'RELEASED', released_reason_code = ?,
+                    released_at = ?
+                WHERE intent_id = ? AND state = 'ACTIVE'
+                """,
+                (
+                    _SCHEMA_18_LEGACY_RELEASE_REASON,
+                    now,
+                    intent["intent_id"],
+                ),
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "RESERVATION_RELEASED",
+                "FAILED",
+                "FAILED",
+                _SCHEMA_18_MIGRATION_ACTOR,
+                "RESERVATION_RELEASED",
+                now,
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "PRE_POST_FAILED",
+                "INTENT",
+                "FAILED",
+                _SCHEMA_18_MIGRATION_ACTOR,
+                "PRE_POST_ABORTED",
+                now,
+            )
+
+    def _migrate_schema_18_capacity_policy_v2(
+        self,
+        conn: sqlite3.Connection,
+        source_schema_version: int,
+    ) -> None:
+        """Release only pristine V1 reserves; fence every traced intent."""
+
+        if source_schema_version != 18:
+            return
+        now = self._now_us()
+        rows = conn.execute(
+            """
+            SELECT intent.*
+            FROM order_intents AS intent
+            JOIN margin_reservations AS reservation USING (intent_id)
+            JOIN capacity_decisions AS decision
+              ON decision.capacity_decision_sha256 =
+                    reservation.capacity_decision_sha256
+            WHERE intent.intent_kind = 'OPENING'
+              AND intent.state = 'INTENT'
+              AND reservation.state = 'ACTIVE'
+              AND decision.risk_policy_version =
+                    'OPENING_MAX_LOSS_V1'
+            ORDER BY intent.created_at, intent.intent_id
+            """
+        ).fetchall()
+        for intent in rows:
+            durable_submission_trace = conn.execute(
+                """
+                SELECT 1 FROM order_events
+                WHERE intent_id = ?
+                  AND event_type IN (
+                        'SUBMISSION_CLAIMED','POST_STARTED'
+                  )
+                UNION ALL
+                SELECT 1 FROM outbound_authorizations
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_send_attempts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_preview_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_response_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_order_history
+                WHERE intent_id = ?
+                LIMIT 1
+                """,
+                (intent["intent_id"],) * 6,
+            ).fetchone()
+            crossed_submission_boundary = (
+                int(intent["submission_fence"]) != 0
+                or intent["broker_order_id"] is not None
+                or intent["submission_lease_owner"] is not None
+                or intent["submission_lease_expires_at"] is not None
+                or intent["pending_operation"] is not None
+                or intent["pending_owner"] is not None
+                or intent["pending_fence"] is not None
+                or durable_submission_trace is not None
+            )
+            if crossed_submission_boundary:
+                conn.execute(
+                    """
+                    UPDATE order_intents
+                    SET state = 'SUBMISSION_UNKNOWN',
+                        submission_lease_owner = NULL,
+                        submission_lease_expires_at = NULL,
+                        last_reconciled_run = NULL,
+                        updated_at = ?
+                    WHERE intent_id = ? AND state = 'INTENT'
+                    """,
+                    (now, intent["intent_id"]),
+                )
+                self._append_event(
+                    conn,
+                    intent["intent_id"],
+                    "LEASE_EXPIRED_IN_DOUBT",
+                    "INTENT",
+                    "SUBMISSION_UNKNOWN",
+                    _SCHEMA_19_MIGRATION_ACTOR,
+                    "LEASE_EXPIRED_IN_DOUBT",
+                    now,
+                )
+                continue
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'FAILED', last_reconciled_run = ?,
+                    updated_at = ?
+                WHERE intent_id = ? AND state = 'INTENT'
+                """,
+                (
+                    _SCHEMA_19_MIGRATION_ACTOR,
+                    now,
+                    intent["intent_id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE margin_reservations
+                SET state = 'RELEASED', released_reason_code = ?,
+                    released_at = ?
+                WHERE intent_id = ? AND state = 'ACTIVE'
+                """,
+                (
+                    _SCHEMA_19_POLICY_V1_RELEASE_REASON,
+                    now,
+                    intent["intent_id"],
+                ),
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "RESERVATION_RELEASED",
+                "FAILED",
+                "FAILED",
+                _SCHEMA_19_MIGRATION_ACTOR,
+                "RESERVATION_RELEASED",
+                now,
+            )
+            self._append_event(
+                conn,
+                intent["intent_id"],
+                "PRE_POST_FAILED",
+                "INTENT",
+                "FAILED",
+                _SCHEMA_19_MIGRATION_ACTOR,
+                "PRE_POST_ABORTED",
+                now,
             )
 
     @staticmethod
@@ -8003,6 +9144,22 @@ class OrderIntentLedger:
                     CHECK (environment IN ('sandbox', 'production')),
                 broker_buying_power TEXT NOT NULL,
                 risk_budget TEXT NOT NULL,
+                daily_risk_budget TEXT NOT NULL,
+                daily_authorized_risk TEXT NOT NULL,
+                external_position_risk TEXT NOT NULL,
+                external_order_risk TEXT NOT NULL,
+                represented_managed_risk TEXT NOT NULL,
+                daily_window_start INTEGER NOT NULL,
+                daily_window_end INTEGER NOT NULL,
+                risk_policy_version TEXT NOT NULL,
+                risk_policy_sha256 TEXT NOT NULL
+                    CHECK (length(risk_policy_sha256) = 64),
+                policy_inputs_json TEXT NOT NULL,
+                policy_inputs_sha256 TEXT NOT NULL
+                    CHECK (length(policy_inputs_sha256) = 64),
+                policy_outcome TEXT NOT NULL
+                    CHECK (policy_outcome IN ('ALLOW', 'DENY')),
+                policy_reason_code TEXT NOT NULL,
                 cap_amount TEXT NOT NULL,
                 observed_at INTEGER NOT NULL,
                 capacity_snapshot_sha256 TEXT NOT NULL
@@ -8011,8 +9168,14 @@ class OrderIntentLedger:
                 CHECK (
                     CAST(broker_buying_power AS REAL) >= 0
                     AND CAST(risk_budget AS REAL) >= 0
+                    AND CAST(daily_risk_budget AS REAL) >= 0
+                    AND CAST(daily_authorized_risk AS REAL) >= 0
+                    AND CAST(external_position_risk AS REAL) >= 0
+                    AND CAST(external_order_risk AS REAL) >= 0
+                    AND CAST(represented_managed_risk AS REAL) >= 0
                     AND CAST(cap_amount AS REAL) >= 0
-                )
+                ),
+                CHECK (daily_window_end > daily_window_start)
             )
             """,
             """
@@ -8039,6 +9202,136 @@ class OrderIntentLedger:
         for statement in statements:
             conn.execute(statement)
         column_upgrades = (
+            (
+                "capacity_decisions",
+                "daily_risk_budget",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "capacity_decisions",
+                "daily_authorized_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "capacity_decisions",
+                "external_position_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "capacity_decisions",
+                "external_order_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "capacity_decisions",
+                "represented_managed_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "capacity_decisions",
+                "daily_window_start",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "capacity_decisions",
+                "daily_window_end",
+                "INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "capacity_decisions",
+                "risk_policy_version",
+                "TEXT NOT NULL DEFAULT 'LEGACY_CAPACITY_V1'",
+            ),
+            (
+                "capacity_decisions",
+                "risk_policy_sha256",
+                "TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            (
+                "capacity_decisions",
+                "policy_inputs_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "capacity_decisions",
+                "policy_inputs_sha256",
+                "TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            (
+                "capacity_decisions",
+                "policy_outcome",
+                "TEXT NOT NULL DEFAULT 'DENY'",
+            ),
+            (
+                "capacity_decisions",
+                "policy_reason_code",
+                "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED'",
+            ),
+            (
+                "reservation_caps",
+                "daily_risk_budget",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "reservation_caps",
+                "daily_authorized_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "reservation_caps",
+                "external_position_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "reservation_caps",
+                "external_order_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "reservation_caps",
+                "represented_managed_risk",
+                "TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "reservation_caps",
+                "daily_window_start",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "reservation_caps",
+                "daily_window_end",
+                "INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "reservation_caps",
+                "risk_policy_version",
+                "TEXT NOT NULL DEFAULT 'LEGACY_CAPACITY_V1'",
+            ),
+            (
+                "reservation_caps",
+                "risk_policy_sha256",
+                "TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            (
+                "reservation_caps",
+                "policy_inputs_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "reservation_caps",
+                "policy_inputs_sha256",
+                "TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            ),
+            (
+                "reservation_caps",
+                "policy_outcome",
+                "TEXT NOT NULL DEFAULT 'DENY'",
+            ),
+            (
+                "reservation_caps",
+                "policy_reason_code",
+                "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED'",
+            ),
             (
                 "order_intents",
                 "opening_risk_prerequisite_sha256",
@@ -8151,12 +9444,40 @@ class OrderIntentLedger:
                 "environment",
                 "broker_buying_power",
                 "risk_budget",
+                "daily_risk_budget",
+                "daily_authorized_risk",
+                "external_position_risk",
+                "external_order_risk",
+                "represented_managed_risk",
+                "daily_window_start",
+                "daily_window_end",
+                "risk_policy_version",
+                "risk_policy_sha256",
+                "policy_inputs_json",
+                "policy_inputs_sha256",
+                "policy_outcome",
+                "policy_reason_code",
                 "cap_amount",
                 "observed_at",
                 "capacity_snapshot_sha256",
                 "decided_at",
             },
-            "reservation_caps": {"capacity_decision_sha256"},
+            "reservation_caps": {
+                "capacity_decision_sha256",
+                "daily_risk_budget",
+                "daily_authorized_risk",
+                "external_position_risk",
+                "external_order_risk",
+                "represented_managed_risk",
+                "daily_window_start",
+                "daily_window_end",
+                "risk_policy_version",
+                "risk_policy_sha256",
+                "policy_inputs_json",
+                "policy_inputs_sha256",
+                "policy_outcome",
+                "policy_reason_code",
+            },
             "margin_reservations": {"capacity_decision_sha256"},
             "opening_risk_prerequisites": {
                 "binding_sha256",
@@ -8895,7 +10216,9 @@ class OrderIntentLedger:
         cap = conn.execute(
             """
             SELECT cap_amount, observed_at, portfolio_snapshot_digest,
-                   capacity_decision_sha256
+                   capacity_decision_sha256, daily_window_start,
+                   daily_window_end, risk_policy_version,
+                   policy_outcome
             FROM reservation_caps
             WHERE account_id = ? AND environment = ?
             """,
@@ -8909,8 +10232,18 @@ class OrderIntentLedger:
             or cap["capacity_decision_sha256"] is None
             or reservation["capacity_decision_sha256"]
             != cap["capacity_decision_sha256"]
+            or cap["risk_policy_version"] != _CAPACITY_POLICY_VERSION
+            or cap["policy_outcome"] != "ALLOW"
         ):
             raise OrderIntentReservationError("opening submission requires an active capped margin reservation")
+        if not (
+            int(cap["daily_window_start"])
+            <= now
+            < int(cap["daily_window_end"])
+        ):
+            raise OrderIntentReservationError(
+                "opening submission daily authorization has expired"
+            )
         if now - int(reservation["quote_observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000 or now - int(reservation["portfolio_observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000 or now - int(cap["observed_at"]) > _EVIDENCE_MAX_AGE_SECONDS * 1_000_000:
             raise OrderIntentReservationError("opening submission requires fresh quote, portfolio, and capacity evidence")
         if int(cap["observed_at"]) < int(reservation["portfolio_observed_at"]):
@@ -9880,6 +11213,51 @@ class OrderIntentLedger:
                 (Decimal(row["amount"]) for row in rows), Decimal("0")
             )
 
+    @staticmethod
+    def _daily_authorized_risk_total(
+        conn: sqlite3.Connection,
+        account_id: str,
+        environment: str,
+        *,
+        start: int,
+        end: int,
+    ) -> Decimal:
+        rows = conn.execute(
+            """
+            SELECT reservation.max_loss_amount
+            FROM margin_reservations AS reservation
+            JOIN order_intents AS intent USING (intent_id)
+            WHERE reservation.account_id = ?
+              AND reservation.environment = ?
+              AND intent.account_id = ?
+              AND intent.environment = ?
+              AND reservation.created_at >= ?
+              AND reservation.created_at < ?
+            """,
+            (
+                account_id,
+                environment,
+                account_id,
+                environment,
+                start,
+                end,
+            ),
+        ).fetchall()
+        with localcontext() as decimal_context:
+            decimal_context.prec = _DECIMAL_PRECISION
+            total = Decimal("0")
+            for row in rows:
+                amount = _canonical_signed_decimal_text(
+                    row["max_loss_amount"],
+                    "daily authorized max loss",
+                )
+                if amount <= 0:
+                    raise OrderIntentIntegrityError(
+                        "daily authorized max loss is invalid"
+                    )
+                total += amount
+            return total
+
     def _verify_reservation_creation_provenance(
         self,
         conn: sqlite3.Connection,
@@ -10053,6 +11431,160 @@ class OrderIntentLedger:
         conn: sqlite3.Connection,
         reservation: sqlite3.Row,
     ) -> None:
+        migration_actor = {
+            _SCHEMA_18_LEGACY_RELEASE_REASON:
+                _SCHEMA_18_MIGRATION_ACTOR,
+            _SCHEMA_19_POLICY_V1_RELEASE_REASON:
+                _SCHEMA_19_MIGRATION_ACTOR,
+        }.get(reservation["released_reason_code"])
+        if migration_actor is not None:
+            if (
+                reservation["released_reason_code"]
+                == _SCHEMA_19_POLICY_V1_RELEASE_REASON
+            ):
+                decision = conn.execute(
+                    """
+                    SELECT risk_policy_version
+                    FROM capacity_decisions
+                    WHERE capacity_decision_sha256 = ?
+                    """,
+                    (reservation["capacity_decision_sha256"],),
+                ).fetchone()
+                if (
+                    decision is None
+                    or decision["risk_policy_version"]
+                    != _CAPACITY_POLICY_V1_VERSION
+                ):
+                    raise OrderIntentIntegrityError(
+                        "schema-19 release did not retire a V1 reservation"
+                    )
+            intent = conn.execute(
+                """
+                SELECT * FROM order_intents
+                WHERE intent_id = ?
+                """,
+                (reservation["intent_id"],),
+            ).fetchone()
+            if (
+                intent is None
+                or intent["intent_kind"] != "OPENING"
+                or intent["state"] != "FAILED"
+                or intent["broker_order_id"] is not None
+                or int(intent["submission_fence"]) != 0
+                or intent["submission_lease_owner"] is not None
+                or intent["submission_lease_expires_at"] is not None
+                or intent["pending_operation"] is not None
+                or intent["pending_owner"] is not None
+                or intent["pending_fence"] is not None
+                or intent["last_reconciled_run"]
+                != migration_actor
+                or reservation["released_at"] is None
+                or int(reservation["released_at"])
+                != int(intent["updated_at"])
+            ):
+                raise OrderIntentIntegrityError(
+                    "schema reservation release lacks migration provenance"
+                )
+            submission_trace = conn.execute(
+                """
+                SELECT 1 FROM order_events
+                WHERE intent_id = ?
+                  AND event_type IN (
+                        'SUBMISSION_CLAIMED','POST_STARTED'
+                  )
+                UNION ALL
+                SELECT 1 FROM outbound_authorizations
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_send_attempts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_preview_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM transport_response_receipts
+                WHERE intent_id = ?
+                UNION ALL
+                SELECT 1 FROM broker_order_history
+                WHERE intent_id = ?
+                LIMIT 1
+                """,
+                (reservation["intent_id"],) * 6,
+            ).fetchone()
+            if submission_trace is not None:
+                raise OrderIntentIntegrityError(
+                    "schema reservation release crossed submission boundary"
+                )
+            events = conn.execute(
+                """
+                SELECT * FROM order_events
+                WHERE intent_id = ?
+                  AND event_type IN (
+                        'RESERVATION_RELEASED','PRE_POST_FAILED'
+                  )
+                ORDER BY sequence
+                """,
+                (reservation["intent_id"],),
+            ).fetchall()
+            if (
+                len(events) != 2
+                or events[0]["event_type"] != "RESERVATION_RELEASED"
+                or events[1]["event_type"] != "PRE_POST_FAILED"
+            ):
+                raise OrderIntentIntegrityError(
+                    "schema reservation release event chain is incomplete"
+                )
+            release, failure = events
+            released_at = int(reservation["released_at"])
+            identity = (
+                reservation["account_id"],
+                reservation["environment"],
+                reservation["intent_client_order_id"],
+            )
+            empty_evidence_fields = (
+                "broker_status",
+                "broker_order_id",
+                "observed_at",
+                "evidence_operation",
+                "http_status",
+                "raw_response_digest",
+                "broker_read_evidence_sha256",
+            )
+            if (
+                (
+                    release["account_id"],
+                    release["environment"],
+                    release["client_order_id"],
+                )
+                != identity
+                or release["from_state"] != "FAILED"
+                or release["to_state"] != "FAILED"
+                or release["actor"] != migration_actor
+                or release["reason_code"] != "RESERVATION_RELEASED"
+                or int(release["created_at"]) != released_at
+                or (
+                    failure["account_id"],
+                    failure["environment"],
+                    failure["client_order_id"],
+                )
+                != identity
+                or failure["from_state"] != "INTENT"
+                or failure["to_state"] != "FAILED"
+                or failure["actor"] != migration_actor
+                or failure["reason_code"] != "PRE_POST_ABORTED"
+                or int(failure["created_at"]) != released_at
+                or int(release["sequence"]) + 1
+                != int(failure["sequence"])
+                or any(
+                    event[field] is not None
+                    for event in events
+                    for field in empty_evidence_fields
+                )
+            ):
+                raise OrderIntentIntegrityError(
+                    "schema reservation release event semantics changed"
+                )
+            return
         if (
             reservation["intent_kind"] != "OPENING"
             or reservation["intent_state"] != "FAILED"
@@ -10556,6 +12088,31 @@ class OrderIntentLedger:
             or cap["broker_buying_power"]
             != decision["broker_buying_power"]
             or cap["risk_budget"] != decision["risk_budget"]
+            or cap["daily_risk_budget"]
+            != decision["daily_risk_budget"]
+            or cap["daily_authorized_risk"]
+            != decision["daily_authorized_risk"]
+            or cap["external_position_risk"]
+            != decision["external_position_risk"]
+            or cap["external_order_risk"]
+            != decision["external_order_risk"]
+            or cap["represented_managed_risk"]
+            != decision["represented_managed_risk"]
+            or int(cap["daily_window_start"])
+            != int(decision["daily_window_start"])
+            or int(cap["daily_window_end"])
+            != int(decision["daily_window_end"])
+            or cap["risk_policy_version"]
+            != decision["risk_policy_version"]
+            or cap["risk_policy_sha256"]
+            != decision["risk_policy_sha256"]
+            or cap["policy_inputs_json"]
+            != decision["policy_inputs_json"]
+            or cap["policy_inputs_sha256"]
+            != decision["policy_inputs_sha256"]
+            or cap["policy_outcome"] != decision["policy_outcome"]
+            or cap["policy_reason_code"]
+            != decision["policy_reason_code"]
             or int(cap["observed_at"]) != int(decision["observed_at"])
             or cap["portfolio_snapshot_digest"]
             != decision["capacity_snapshot_sha256"]
@@ -11461,21 +13018,61 @@ class OrderIntentLedger:
             raise OrderIntentIntegrityError(
                 "capacity decision is not durable"
             )
-        decision_material = {
-            "evidence_sha256": row["evidence_sha256"],
-            "account_id": row["account_id"],
-            "environment": row["environment"],
-            "broker_buying_power": row["broker_buying_power"],
-            "risk_budget": row["risk_budget"],
-            "cap_amount": row["cap_amount"],
-            "observed_at": int(row["observed_at"]),
-            "capacity_snapshot_sha256":
-                row["capacity_snapshot_sha256"],
-            "decided_at": int(row["decided_at"]),
-        }
-        expected_decision_sha256 = _domain_json_hash(
-            _CAPACITY_DECISION_HASH_DOMAIN, decision_material
+        legacy = (
+            row["risk_policy_version"]
+            == _LEGACY_CAPACITY_POLICY_VERSION
         )
+        if legacy:
+            decision_material = {
+                "evidence_sha256": row["evidence_sha256"],
+                "account_id": row["account_id"],
+                "environment": row["environment"],
+                "broker_buying_power": row["broker_buying_power"],
+                "risk_budget": row["risk_budget"],
+                "cap_amount": row["cap_amount"],
+                "observed_at": int(row["observed_at"]),
+                "capacity_snapshot_sha256":
+                    row["capacity_snapshot_sha256"],
+                "decided_at": int(row["decided_at"]),
+            }
+            expected_decision_sha256 = _domain_json_hash(
+                _LEGACY_CAPACITY_DECISION_HASH_DOMAIN,
+                decision_material,
+            )
+        else:
+            decision_material = {
+                "evidence_sha256": row["evidence_sha256"],
+                "account_id": row["account_id"],
+                "environment": row["environment"],
+                "broker_buying_power": row["broker_buying_power"],
+                "risk_budget": row["risk_budget"],
+                "daily_risk_budget": row["daily_risk_budget"],
+                "daily_authorized_risk":
+                    row["daily_authorized_risk"],
+                "external_position_risk":
+                    row["external_position_risk"],
+                "external_order_risk": row["external_order_risk"],
+                "represented_managed_risk":
+                    row["represented_managed_risk"],
+                "daily_window_start": int(
+                    row["daily_window_start"]
+                ),
+                "daily_window_end": int(row["daily_window_end"]),
+                "risk_policy_version": row["risk_policy_version"],
+                "risk_policy_sha256": row["risk_policy_sha256"],
+                "policy_inputs_json": row["policy_inputs_json"],
+                "policy_inputs_sha256": row["policy_inputs_sha256"],
+                "policy_outcome": row["policy_outcome"],
+                "policy_reason_code": row["policy_reason_code"],
+                "cap_amount": row["cap_amount"],
+                "observed_at": int(row["observed_at"]),
+                "capacity_snapshot_sha256":
+                    row["capacity_snapshot_sha256"],
+                "decided_at": int(row["decided_at"]),
+            }
+            expected_decision_sha256 = _domain_json_hash(
+                _CAPACITY_DECISION_HASH_DOMAIN, decision_material
+            )
         if not hmac.compare_digest(
             expected_decision_sha256, decision_sha256
         ):
@@ -11498,7 +13095,6 @@ class OrderIntentLedger:
         if (
             buying_power < 0
             or risk_budget < 0
-            or cap_amount != min(buying_power, risk_budget)
             or manifest["evidence_kind"] != "CAPACITY"
             or manifest["completeness"] != "COMPLETE"
             or manifest["target_broker_order_id"] is not None
@@ -11513,6 +13109,130 @@ class OrderIntentLedger:
         ):
             raise OrderIntentIntegrityError(
                 "capacity decision is disconnected from its durable manifest"
+            )
+        if legacy:
+            if (
+                cap_amount != min(buying_power, risk_budget)
+                or row["daily_risk_budget"] != "0"
+                or row["daily_authorized_risk"] != "0"
+                or row["external_position_risk"] != "0"
+                or row["external_order_risk"] != "0"
+                or row["represented_managed_risk"] != "0"
+                or int(row["daily_window_start"]) != 0
+                or int(row["daily_window_end"]) != 1
+                or row["risk_policy_sha256"]
+                != _LEGACY_POLICY_DIGEST
+                or row["policy_inputs_json"] != "{}"
+                or row["policy_inputs_sha256"]
+                != _LEGACY_POLICY_DIGEST
+                or row["policy_outcome"] != "DENY"
+                or row["policy_reason_code"]
+                != "LEGACY_UNVERIFIED"
+            ):
+                raise OrderIntentIntegrityError(
+                    "legacy capacity decision policy migration changed"
+                )
+            return row, manifest, result
+
+        policy_version = row["risk_policy_version"]
+        if (
+            policy_version not in {
+                _CAPACITY_POLICY_V1_VERSION,
+                _CAPACITY_POLICY_VERSION,
+            }
+            or row["risk_policy_sha256"]
+            != _capacity_policy_sha256(policy_version)
+            or result["schema"] != "etrade-capacity.v3"
+            or row["policy_outcome"] not in _CAPACITY_POLICY_OUTCOMES
+            or row["policy_reason_code"]
+            not in _CAPACITY_POLICY_REASON_CODES
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision policy identity is invalid"
+            )
+        daily_risk_budget = _canonical_signed_decimal_text(
+            row["daily_risk_budget"],
+            "capacity decision daily risk budget",
+        )
+        daily_authorized_risk = _canonical_signed_decimal_text(
+            row["daily_authorized_risk"],
+            "capacity decision daily authorized risk",
+        )
+        external_position_risk = _canonical_signed_decimal_text(
+            row["external_position_risk"],
+            "capacity decision external position risk",
+        )
+        external_order_risk = _canonical_signed_decimal_text(
+            row["external_order_risk"],
+            "capacity decision external order risk",
+        )
+        represented_managed_risk = _canonical_signed_decimal_text(
+            row["represented_managed_risk"],
+            "capacity decision represented managed risk",
+        )
+        if any(
+            amount < 0
+            for amount in (
+                daily_risk_budget,
+                daily_authorized_risk,
+                external_position_risk,
+                external_order_risk,
+                represented_managed_risk,
+                cap_amount,
+            )
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision policy amounts are invalid"
+            )
+        policy_inputs = _load_canonical_json_object(
+            row["policy_inputs_json"], "capacity policy inputs"
+        )
+        expected_inputs_sha256 = _domain_json_hash(
+            _capacity_policy_inputs_hash_domain(policy_version),
+            policy_inputs,
+        )
+        if not hmac.compare_digest(
+            expected_inputs_sha256, row["policy_inputs_sha256"]
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity policy inputs digest does not verify"
+            )
+        expected_window = _new_york_day_window(int(row["observed_at"]))
+        if (
+            (
+                int(row["daily_window_start"]),
+                int(row["daily_window_end"]),
+            )
+            != expected_window
+            or policy_inputs.get("daily_window")
+            != {"start": expected_window[0], "end": expected_window[1]}
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision daily window is invalid"
+            )
+        evaluation = _evaluate_opening_capacity_policy_version(
+            result,
+            policy_inputs,
+            broker_buying_power=buying_power,
+            account_risk_budget=risk_budget,
+            policy_version=policy_version,
+        )
+        if (
+            cap_amount != evaluation.cap_amount
+            or daily_authorized_risk
+            != evaluation.daily_authorized_risk
+            or external_position_risk
+            != evaluation.external_position_risk
+            or external_order_risk
+            != evaluation.external_order_risk
+            or represented_managed_risk
+            != evaluation.represented_managed_risk
+            or row["policy_outcome"] != evaluation.policy_outcome
+            or row["policy_reason_code"]
+            != evaluation.policy_reason_code
+        ):
+            raise OrderIntentIntegrityError(
+                "capacity decision no longer replays from policy inputs"
             )
         return row, manifest, result
 
@@ -11534,9 +13254,21 @@ class OrderIntentLedger:
             receipt.portfolio_snapshot_digest,
         )
         for name in (
+            "risk_policy_sha256",
+            "policy_inputs_sha256",
+        ):
+            _validate_sha256(name, getattr(receipt, name))
+        for name in ("daily_window_start", "daily_window_end"):
+            _validate_timestamp(getattr(receipt, name))
+        for name in (
             "cap_amount",
             "broker_buying_power",
             "risk_budget",
+            "daily_risk_budget",
+            "daily_authorized_risk",
+            "external_position_risk",
+            "external_order_risk",
+            "represented_managed_risk",
         ):
             value = getattr(receipt, name)
             if type(value) is not Decimal or not value.is_finite() or value < 0:
@@ -11550,6 +13282,18 @@ class OrderIntentLedger:
             receipt.evidence_sha256,
             _canonical_amount(receipt.broker_buying_power),
             _canonical_amount(receipt.risk_budget),
+            _canonical_amount(receipt.daily_risk_budget),
+            _canonical_amount(receipt.daily_authorized_risk),
+            _canonical_amount(receipt.external_position_risk),
+            _canonical_amount(receipt.external_order_risk),
+            _canonical_amount(receipt.represented_managed_risk),
+            _to_us(receipt.daily_window_start),
+            _to_us(receipt.daily_window_end),
+            receipt.risk_policy_version,
+            receipt.risk_policy_sha256,
+            receipt.policy_inputs_sha256,
+            receipt.policy_outcome,
+            receipt.policy_reason_code,
             _canonical_amount(receipt.cap_amount),
             _to_us(receipt.observed_at),
             receipt.portfolio_snapshot_digest,
@@ -11558,6 +13302,18 @@ class OrderIntentLedger:
             row["evidence_sha256"],
             row["broker_buying_power"],
             row["risk_budget"],
+            row["daily_risk_budget"],
+            row["daily_authorized_risk"],
+            row["external_position_risk"],
+            row["external_order_risk"],
+            row["represented_managed_risk"],
+            int(row["daily_window_start"]),
+            int(row["daily_window_end"]),
+            row["risk_policy_version"],
+            row["risk_policy_sha256"],
+            row["policy_inputs_sha256"],
+            row["policy_outcome"],
+            row["policy_reason_code"],
             row["cap_amount"],
             int(row["observed_at"]),
             row["capacity_snapshot_sha256"],
@@ -16375,6 +18131,910 @@ def _absorption_products_match(
         position_id is None
         or fill_id is None
         or position_id == fill_id
+    )
+
+
+def _capacity_policy_v1_material() -> dict[str, Any]:
+    return {
+        "schema": "etrade-opening-capacity-policy.v1",
+        "capacity_schema": "etrade-capacity.v3",
+        "reservation_measure": "MAX_LOSS",
+        "daily_budget_clock": "America/New_York",
+        "position_contract_policy":
+            "STANDARD_UNADJUSTED_100X_ORDER_BOUND_VERTICAL_WITH_APPROVED_DELIVERABLES",
+        "managed_order_policy":
+            "DENY_CONTRACT_IDENTITY_UNAVAILABLE",
+        "unmanaged_active_order_policy":
+            "DENY_CONTRACT_IDENTITY_UNAVAILABLE",
+        "unsupported_structure_policy": "DENY_ZERO_CAP",
+    }
+
+
+def _capacity_policy_material() -> dict[str, Any]:
+    return {
+        **_capacity_policy_v1_material(),
+        "schema": "etrade-opening-capacity-policy.v2",
+        "account_capacity_formula":
+            "MIN_RAW_BROKER_BP_AND_BUDGET_NET_ALL_DURABLE_RISK",
+        "represented_managed_risk_policy":
+            "SUBTRACT_FROM_ACCOUNT_BUDGET_NEVER_ADD_TO_BROKER_BP",
+    }
+
+
+def _capacity_policy_sha256(
+    policy_version: str = _CAPACITY_POLICY_VERSION,
+) -> str:
+    if policy_version == _CAPACITY_POLICY_VERSION:
+        domain = _CAPACITY_POLICY_HASH_DOMAIN
+        material = _capacity_policy_material()
+    elif policy_version == _CAPACITY_POLICY_V1_VERSION:
+        domain = _CAPACITY_POLICY_V1_HASH_DOMAIN
+        material = _capacity_policy_v1_material()
+    else:
+        raise OrderIntentIntegrityError(
+            "capacity policy version is unsupported"
+        )
+    return _domain_json_hash(
+        domain, material
+    )
+
+
+def _capacity_policy_inputs_hash_domain(
+    policy_version: str,
+) -> bytes:
+    if policy_version == _CAPACITY_POLICY_VERSION:
+        return _CAPACITY_POLICY_INPUTS_HASH_DOMAIN
+    if policy_version == _CAPACITY_POLICY_V1_VERSION:
+        return _CAPACITY_POLICY_INPUTS_V1_HASH_DOMAIN
+    raise OrderIntentIntegrityError(
+        "capacity policy input version is unsupported"
+    )
+
+
+def _new_york_day_window(observed_at_us: int) -> tuple[int, int]:
+    observed = _from_us(observed_at_us)
+    local_day = observed.astimezone(_NEW_YORK).date()
+    start = datetime.combine(
+        local_day, datetime.min.time(), tzinfo=_NEW_YORK
+    ).astimezone(timezone.utc)
+    end = datetime.combine(
+        local_day + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=_NEW_YORK,
+    ).astimezone(timezone.utc)
+    return _to_us(start), _to_us(end)
+
+
+def _managed_opening_legs(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    _opening_exposure_floor(payload)
+    legs = payload.get("legs")
+    if type(legs) is not list or len(legs) != 2:
+        raise OrderIntentIntegrityError(
+            "managed opening payload is not an exact vertical"
+        )
+    documents = []
+    for leg in legs:
+        if type(leg) is not dict:
+            raise OrderIntentIntegrityError(
+                "managed opening leg is invalid"
+            )
+        action = leg.get("orderAction")
+        if action not in {"BUY_OPEN", "SELL_OPEN"}:
+            raise OrderIntentIntegrityError(
+                "managed opening leg has unsupported exposure"
+            )
+        symbol = leg.get("symbol")
+        call_put = leg.get("callPut")
+        if (
+            type(symbol) is not str
+            or not symbol
+            or call_put not in {"CALL", "PUT"}
+        ):
+            raise OrderIntentIntegrityError(
+                "managed opening leg identity is invalid"
+            )
+        try:
+            expiry = date(
+                int(leg["expiryYear"]),
+                int(leg["expiryMonth"]),
+                int(leg["expiryDay"]),
+            )
+            strike = Decimal(str(leg["strikePrice"]))
+            quantity = Decimal(str(leg["quantity"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+            raise OrderIntentIntegrityError(
+                "managed opening leg economics are invalid"
+            ) from exc
+        if (
+            not strike.is_finite()
+            or strike <= 0
+            or not quantity.is_finite()
+            or quantity <= 0
+            or quantity != quantity.to_integral_value()
+        ):
+            raise OrderIntentIntegrityError(
+                "managed opening leg economics are invalid"
+            )
+        signed_quantity = (
+            quantity if action == "BUY_OPEN" else -quantity
+        )
+        documents.append(
+            {
+                "symbol": symbol,
+                "call_put": call_put,
+                "expiry": expiry.isoformat(),
+                "strike": _canonical_amount(strike),
+                "signed_quantity": (
+                    f"-{_canonical_amount(-signed_quantity)}"
+                    if signed_quantity < 0
+                    else _canonical_amount(signed_quantity)
+                ),
+            }
+        )
+    documents.sort(key=_canonical_read_json)
+    return documents
+
+
+def _validate_capacity_policy_inputs(
+    inputs: dict[str, Any],
+    *,
+    policy_version: str = _CAPACITY_POLICY_VERSION,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    Decimal,
+]:
+    if policy_version == _CAPACITY_POLICY_VERSION:
+        expected_schema = "etrade-opening-capacity-policy-inputs.v2"
+        expected_policy = _capacity_policy_material()
+    elif policy_version == _CAPACITY_POLICY_V1_VERSION:
+        expected_schema = "etrade-opening-capacity-policy-inputs.v1"
+        expected_policy = _capacity_policy_v1_material()
+    else:
+        raise OrderIntentIntegrityError(
+            "capacity policy input version is unsupported"
+        )
+    if (
+        set(inputs)
+        != {
+            "schema",
+            "policy",
+            "daily_window",
+            "daily_authorizations",
+            "managed_reservations",
+        }
+        or inputs["schema"]
+        != expected_schema
+        or inputs["policy"] != expected_policy
+        or type(inputs["daily_window"]) is not dict
+        or set(inputs["daily_window"]) != {"start", "end"}
+        or type(inputs["daily_window"]["start"]) is not int
+        or type(inputs["daily_window"]["end"]) is not int
+        or inputs["daily_window"]["end"]
+        <= inputs["daily_window"]["start"]
+        or type(inputs["daily_authorizations"]) is not list
+        or type(inputs["managed_reservations"]) is not list
+    ):
+        raise OrderIntentIntegrityError(
+            "capacity policy inputs have an invalid shape"
+        )
+    start = inputs["daily_window"]["start"]
+    end = inputs["daily_window"]["end"]
+    daily_total = Decimal("0")
+    seen_intents: set[str] = set()
+    previous_daily_key: tuple[int, str] | None = None
+    for item in inputs["daily_authorizations"]:
+        if (
+            type(item) is not dict
+            or set(item)
+            != {"intent_id", "max_loss_amount", "created_at"}
+        ):
+            raise OrderIntentIntegrityError(
+                "daily capacity authorization is invalid"
+            )
+        _validate_identity("daily intent id", item["intent_id"])
+        created_at = item["created_at"]
+        if (
+            type(created_at) is not int
+            or not start <= created_at < end
+            or item["intent_id"] in seen_intents
+        ):
+            raise OrderIntentIntegrityError(
+                "daily capacity authorization identity is invalid"
+            )
+        key = (created_at, item["intent_id"])
+        if previous_daily_key is not None and key <= previous_daily_key:
+            raise OrderIntentIntegrityError(
+                "daily capacity authorizations are not canonical"
+            )
+        previous_daily_key = key
+        seen_intents.add(item["intent_id"])
+        amount = _canonical_signed_decimal_text(
+            item["max_loss_amount"],
+            "daily authorization max loss",
+        )
+        if amount <= 0:
+            raise OrderIntentIntegrityError(
+                "daily capacity authorization amount is invalid"
+            )
+        daily_total += amount
+
+    managed: dict[str, dict[str, Any]] = {}
+    previous_managed_key: tuple[str, str] | None = None
+    for item in inputs["managed_reservations"]:
+        if (
+            type(item) is not dict
+            or set(item)
+            != {
+                "intent_id",
+                "broker_order_id",
+                "role",
+                "reservation_amount",
+                "expected_payload_hash",
+                "expected_legs",
+            }
+        ):
+            raise OrderIntentIntegrityError(
+                "managed capacity input is invalid"
+            )
+        _validate_identity("managed intent id", item["intent_id"])
+        _validate_identity(
+            "managed broker order id", item["broker_order_id"]
+        )
+        _validate_sha256(
+            "managed expected payload hash",
+            item["expected_payload_hash"],
+        )
+        if item["role"] not in {
+            "OPEN_ORDER",
+            "POSITION",
+            "UNSUPPORTED",
+        }:
+            raise OrderIntentIntegrityError(
+                "managed capacity role is invalid"
+            )
+        amount = _canonical_signed_decimal_text(
+            item["reservation_amount"],
+            "managed reservation amount",
+        )
+        if amount <= 0:
+            raise OrderIntentIntegrityError(
+                "managed reservation amount is invalid"
+            )
+        legs = item["expected_legs"]
+        if (
+            type(legs) is not list
+            or len(legs) != 2
+            or legs != sorted(legs, key=_canonical_read_json)
+        ):
+            raise OrderIntentIntegrityError(
+                "managed expected legs are invalid"
+            )
+        for leg in legs:
+            if (
+                type(leg) is not dict
+                or set(leg)
+                != {
+                    "symbol",
+                    "call_put",
+                    "expiry",
+                    "strike",
+                    "signed_quantity",
+                }
+                or type(leg["symbol"]) is not str
+                or not leg["symbol"]
+                or leg["call_put"] not in {"CALL", "PUT"}
+            ):
+                raise OrderIntentIntegrityError(
+                    "managed expected leg identity is invalid"
+                )
+            try:
+                date.fromisoformat(leg["expiry"])
+            except (TypeError, ValueError) as exc:
+                raise OrderIntentIntegrityError(
+                    "managed expected leg expiry is invalid"
+                ) from exc
+            strike = _canonical_signed_decimal_text(
+                leg["strike"], "managed expected leg strike"
+            )
+            quantity = _canonical_signed_decimal_text(
+                leg["signed_quantity"],
+                "managed expected leg quantity",
+            )
+            if (
+                strike <= 0
+                or quantity == 0
+                or quantity != quantity.to_integral_value()
+            ):
+                raise OrderIntentIntegrityError(
+                    "managed expected leg economics are invalid"
+                )
+        broker_order_id = item["broker_order_id"]
+        key = (broker_order_id, item["intent_id"])
+        if previous_managed_key is not None and key <= previous_managed_key:
+            raise OrderIntentIntegrityError(
+                "managed capacity inputs are not canonical"
+            )
+        previous_managed_key = key
+        if broker_order_id in managed:
+            raise OrderIntentIntegrityError(
+                "managed capacity broker identity is duplicated"
+            )
+        managed[broker_order_id] = item
+    return managed, daily_total
+
+
+def _capacity_option_contract(
+    position: dict[str, Any],
+) -> dict[str, Any]:
+    product = position["product"]
+    if (
+        product["security_type"] != "OPTN"
+        or product["call_put"] not in {"CALL", "PUT"}
+        or any(
+            product[name] is None
+            for name in (
+                "expiry_year",
+                "expiry_month",
+                "expiry_day",
+                "strike_price",
+            )
+        )
+        or position["options_adjusted_flag"] is not False
+        or _canonical_signed_decimal_text(
+            position["option_multiplier"],
+            "capacity option multiplier",
+        )
+        != Decimal("100")
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    symbol = product["symbol"]
+    if (
+        type(symbol) is not str
+        or not 1 <= len(symbol) <= 6
+        or not symbol.isascii()
+        or symbol != symbol.upper()
+        or not symbol.replace(".", "").isalnum()
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    if position["deliverables"] not in {
+        None,
+        "100 shares",
+        f"100 shares of {symbol}",
+    }:
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    try:
+        expiry = date(
+            int(product["expiry_year"]),
+            int(product["expiry_month"]),
+            int(product["expiry_day"]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        ) from exc
+    strike = _canonical_signed_decimal_text(
+        product["strike_price"], "capacity option strike"
+    )
+    osi_key = position["osi_key"]
+    if (
+        strike <= 0
+        or type(osi_key) is not str
+        or len(osi_key) != 21
+        or not osi_key.isascii()
+        or osi_key[:6]
+        not in {symbol.ljust(6, "-"), symbol.ljust(6, " ")}
+        or osi_key[6:12] != expiry.strftime("%y%m%d")
+        or osi_key[12]
+        != ("C" if product["call_put"] == "CALL" else "P")
+        or not osi_key[13:].isdigit()
+        or Decimal(osi_key[13:]) / Decimal("1000") != strike
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    return {
+        "symbol": symbol,
+        "call_put": product["call_put"],
+        "expiry": expiry.isoformat(),
+        "strike": _canonical_amount(strike),
+        "osi_key": osi_key,
+    }
+
+
+def _position_group_risk(
+    quantities: dict[str, tuple[dict[str, Any], Decimal]],
+) -> Decimal:
+    if len(quantities) != 2:
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    values = list(quantities.values())
+    first_contract, first_quantity = values[0]
+    second_contract, second_quantity = values[1]
+    if (
+        any(
+            first_contract[name] != second_contract[name]
+            for name in ("symbol", "call_put", "expiry")
+        )
+        or first_contract["strike"] == second_contract["strike"]
+        or first_quantity == 0
+        or second_quantity == 0
+        or first_quantity != -second_quantity
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_OPTION_POSITION"
+        )
+    width = abs(
+        Decimal(first_contract["strike"])
+        - Decimal(second_contract["strike"])
+    )
+    return width * Decimal("100") * abs(first_quantity)
+
+
+def _managed_position_matches(
+    quantities: dict[str, tuple[dict[str, Any], Decimal]],
+    managed: dict[str, Any],
+) -> bool:
+    if len(quantities) != 2:
+        return False
+    actual: dict[tuple[str, str, str, str], Decimal] = {}
+    for contract, quantity in quantities.values():
+        key = (
+            contract["symbol"],
+            contract["call_put"],
+            contract["expiry"],
+            contract["strike"],
+        )
+        if key in actual:
+            return False
+        actual[key] = quantity
+    expected = {
+        (
+            leg["symbol"],
+            leg["call_put"],
+            leg["expiry"],
+            leg["strike"],
+        ): Decimal(leg["signed_quantity"])
+        for leg in managed["expected_legs"]
+    }
+    if set(actual) != set(expected):
+        return False
+    for key, quantity in actual.items():
+        expected_quantity = expected[key]
+        if (
+            quantity == 0
+            or (quantity > 0) != (expected_quantity > 0)
+            or abs(quantity) > abs(expected_quantity)
+        ):
+            return False
+    try:
+        _position_group_risk(quantities)
+    except _UnsupportedOpeningCapacity:
+        return False
+    return True
+
+
+def _capacity_position_risk(
+    positions: list[Any],
+    managed: dict[str, dict[str, Any]],
+) -> tuple[Decimal, set[str]]:
+    groups: dict[
+        str, dict[str, tuple[dict[str, Any], Decimal]]
+    ] = {}
+    group_signs: dict[tuple[str, str], int] = {}
+    for position in positions:
+        if position["product"]["security_type"] != "OPTN":
+            continue
+        contract = _capacity_option_contract(position)
+        position_quantity = _canonical_signed_decimal_text(
+            position["quantity"], "capacity option position quantity"
+        )
+        if (
+            position_quantity == 0
+            or position_quantity != position_quantity.to_integral_value()
+            or (
+                position_quantity > 0
+                and position["position_type"] != "LONG"
+            )
+            or (
+                position_quantity < 0
+                and position["position_type"] != "SHORT"
+            )
+            or not position["lots"]
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_OPTION_POSITION"
+            )
+        parent_total = Decimal("0")
+        for lot in position["lots"]:
+            order_no = lot["order_no"]
+            original = _canonical_signed_decimal_text(
+                lot["original_quantity"],
+                "capacity option lot original quantity",
+            )
+            remaining = _canonical_signed_decimal_text(
+                lot["remaining_quantity"],
+                "capacity option lot remaining quantity",
+            )
+            available = _canonical_signed_decimal_text(
+                lot["available_quantity"],
+                "capacity option lot available quantity",
+            )
+            if (
+                order_no is None
+                or remaining == 0
+                or any(
+                    value != value.to_integral_value()
+                    for value in (original, remaining, available)
+                )
+                or (remaining > 0) != (position_quantity > 0)
+                or (original > 0) != (position_quantity > 0)
+                or available != remaining
+                or abs(remaining) > abs(original)
+            ):
+                raise _UnsupportedOpeningCapacity(
+                    "UNSUPPORTED_OPTION_POSITION"
+                )
+            parent_total += remaining
+            contract_key = _canonical_read_json(contract)
+            sign_key = (order_no, contract_key)
+            sign = 1 if remaining > 0 else -1
+            if sign_key in group_signs and group_signs[sign_key] != sign:
+                raise _UnsupportedOpeningCapacity(
+                    "UNSUPPORTED_OPTION_POSITION"
+                )
+            group_signs[sign_key] = sign
+            group = groups.setdefault(order_no, {})
+            if contract_key in group:
+                stored_contract, stored_quantity = group[contract_key]
+                group[contract_key] = (
+                    stored_contract,
+                    stored_quantity + remaining,
+                )
+            else:
+                group[contract_key] = (contract, remaining)
+        if parent_total != position_quantity:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_OPTION_POSITION"
+            )
+
+    external_risk = Decimal("0")
+    represented: set[str] = set()
+    for broker_order_id in sorted(groups):
+        quantities = groups[broker_order_id]
+        if any(quantity == 0 for _contract, quantity in quantities.values()):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_OPTION_POSITION"
+            )
+        managed_item = managed.get(broker_order_id)
+        if managed_item is None:
+            external_risk += _position_group_risk(quantities)
+            continue
+        if (
+            managed_item["role"] != "POSITION"
+            or not _managed_position_matches(quantities, managed_item)
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_MANAGED_RISK_STATE"
+            )
+        represented.add(broker_order_id)
+    return external_risk, represented
+
+
+def _capacity_opening_order_payload(
+    order: Any,
+) -> dict[str, Any]:
+    if (
+        type(order) is not dict
+        or set(order)
+        != {
+            "order_id",
+            "order_type",
+            "replaces_order_id",
+            "replaced_by_order_id",
+            "details",
+        }
+        or order["order_type"] != "SPREADS"
+        or order["replaces_order_id"] is not None
+        or order["replaced_by_order_id"] is not None
+        or type(order["details"]) is not list
+        or len(order["details"]) != 1
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_ACTIVE_ORDER"
+        )
+    detail = order["details"][0]
+    if (
+        type(detail) is not dict
+        or set(detail)
+        != {
+            "account_id",
+            "status",
+            "price_type",
+            "limit_price",
+            "order_term",
+            "market_session",
+            "all_or_none",
+            "replaces_order_id",
+            "replaced_by_order_id",
+            "instruments",
+        }
+        or detail["status"] != "OPEN"
+        or detail["price_type"] not in {"NET_CREDIT", "NET_DEBIT"}
+        or detail["limit_price"] is None
+        or detail["order_term"] != "GOOD_FOR_DAY"
+        or detail["market_session"] != "REGULAR"
+        or detail["all_or_none"] is not False
+        or detail["replaces_order_id"] is not None
+        or detail["replaced_by_order_id"] is not None
+        or type(detail["instruments"]) is not list
+        or len(detail["instruments"]) != 2
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_ACTIVE_ORDER"
+        )
+    legs = []
+    reference: tuple[str, str, str, str, str] | None = None
+    quantities: set[int] = set()
+    actions: set[str] = set()
+    for instrument in detail["instruments"]:
+        if (
+            type(instrument) is not dict
+            or set(instrument)
+            != {
+                "product",
+                "order_action",
+                "quantity_type",
+                "ordered_quantity",
+                "filled_quantity",
+                "cancel_quantity",
+            }
+            or instrument["order_action"]
+            not in {"BUY_OPEN", "SELL_OPEN"}
+            or instrument["quantity_type"] != "QUANTITY"
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            )
+        product = instrument["product"]
+        if (
+            type(product) is not dict
+            or product.get("security_type") != "OPTN"
+            or product.get("call_put") not in {"CALL", "PUT"}
+            or any(
+                product.get(name) is None
+                for name in (
+                    "expiry_year",
+                    "expiry_month",
+                    "expiry_day",
+                    "strike_price",
+                )
+            )
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            )
+        ordered = _canonical_signed_decimal_text(
+            instrument["ordered_quantity"],
+            "active opening ordered quantity",
+        )
+        filled = _canonical_signed_decimal_text(
+            instrument["filled_quantity"],
+            "active opening filled quantity",
+        )
+        cancelled = _canonical_signed_decimal_text(
+            instrument["cancel_quantity"],
+            "active opening cancel quantity",
+        )
+        if (
+            ordered <= 0
+            or ordered != ordered.to_integral_value()
+            or filled != 0
+            or cancelled != 0
+            or ordered > Decimal("2147483647")
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            )
+        try:
+            expiry = date(
+                int(product["expiry_year"]),
+                int(product["expiry_month"]),
+                int(product["expiry_day"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            ) from exc
+        strike = _canonical_signed_decimal_text(
+            product["strike_price"],
+            "active opening strike",
+        )
+        if strike <= 0:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            )
+        candidate_reference = (
+            product["symbol"],
+            product["call_put"],
+            str(expiry.year),
+            str(expiry.month),
+            str(expiry.day),
+        )
+        if reference is None:
+            reference = candidate_reference
+        elif candidate_reference != reference:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_ACTIVE_ORDER"
+            )
+        quantity = int(ordered)
+        quantities.add(quantity)
+        actions.add(instrument["order_action"])
+        legs.append(
+            {
+                "symbol": product["symbol"],
+                "callPut": product["call_put"],
+                "expiryYear": expiry.year,
+                "expiryMonth": expiry.month,
+                "expiryDay": expiry.day,
+                "strikePrice": strike,
+                "orderAction": instrument["order_action"],
+                "quantity": quantity,
+            }
+        )
+    if (
+        len(quantities) != 1
+        or actions != {"BUY_OPEN", "SELL_OPEN"}
+        or len({leg["strikePrice"] for leg in legs}) != 2
+    ):
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_ACTIVE_ORDER"
+        )
+    payload = {
+        "securityType": "OPTN",
+        "orderAction": "SPREAD",
+        "priceType": detail["price_type"],
+        "limitPrice": Decimal(detail["limit_price"]),
+        "orderTerm": "GOOD_FOR_DAY",
+        "spreadType": "VERTICAL",
+        "legs": legs,
+    }
+    try:
+        _opening_exposure_floor(payload)
+    except OrderIntentLedgerError as exc:
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_ACTIVE_ORDER"
+        ) from exc
+    return payload
+
+
+def _capacity_order_risk(
+    orders: list[Any],
+    managed: dict[str, dict[str, Any]],
+) -> tuple[Decimal, set[str]]:
+    del managed
+    if orders:
+        # Capacity-v3 omits OSI, multiplier, adjustment, and deliverables
+        # identity for active orders. A durable payload hash proves only what
+        # we submitted, not what contract identity the broker now reports.
+        raise _UnsupportedOpeningCapacity(
+            "UNSUPPORTED_ACTIVE_ORDER"
+        )
+    return Decimal("0"), set()
+
+
+def _evaluate_opening_capacity_policy(
+    result: dict[str, Any],
+    policy_inputs: dict[str, Any],
+    *,
+    broker_buying_power: Decimal,
+    account_risk_budget: Decimal,
+) -> _CapacityPolicyEvaluation:
+    return _evaluate_opening_capacity_policy_version(
+        result,
+        policy_inputs,
+        broker_buying_power=broker_buying_power,
+        account_risk_budget=account_risk_budget,
+        policy_version=_CAPACITY_POLICY_VERSION,
+    )
+
+
+def _evaluate_opening_capacity_policy_version(
+    result: dict[str, Any],
+    policy_inputs: dict[str, Any],
+    *,
+    broker_buying_power: Decimal,
+    account_risk_budget: Decimal,
+    policy_version: str,
+) -> _CapacityPolicyEvaluation:
+    managed, daily_authorized = _validate_capacity_policy_inputs(
+        policy_inputs,
+        policy_version=policy_version,
+    )
+    try:
+        if any(
+            item["role"] == "UNSUPPORTED"
+            for item in managed.values()
+        ):
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_MANAGED_RISK_STATE"
+            )
+        external_position_risk, represented_positions = (
+            _capacity_position_risk(result["positions"], managed)
+        )
+        external_order_risk, represented_orders = _capacity_order_risk(
+            result["open_orders"], managed
+        )
+        if represented_positions & represented_orders:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_MANAGED_RISK_STATE"
+            )
+        represented_ids = represented_positions | represented_orders
+        if set(managed) != represented_ids:
+            raise _UnsupportedOpeningCapacity(
+                "UNSUPPORTED_MANAGED_RISK_STATE"
+            )
+        represented_managed_risk = sum(
+            (
+                Decimal(managed[broker_order_id]["reservation_amount"])
+                for broker_order_id in represented_ids
+            ),
+            Decimal("0"),
+        )
+    except _UnsupportedOpeningCapacity as exc:
+        return _CapacityPolicyEvaluation(
+            cap_amount=Decimal("0"),
+            daily_authorized_risk=daily_authorized,
+            external_position_risk=Decimal("0"),
+            external_order_risk=Decimal("0"),
+            represented_managed_risk=Decimal("0"),
+            policy_outcome="DENY",
+            policy_reason_code=exc.reason_code,
+        )
+    with localcontext() as decimal_context:
+        decimal_context.prec = _DECIMAL_PRECISION
+        external_total = (
+            external_position_risk + external_order_risk
+        )
+        if policy_version == _CAPACITY_POLICY_V1_VERSION:
+            # Exact replay of the superseded policy. V1 is accepted only for
+            # historical reconciliation and cannot authorize a new reserve or
+            # claim.
+            account_capacity = max(
+                Decimal("0"), account_risk_budget - external_total
+            )
+            broker_capacity = (
+                broker_buying_power + represented_managed_risk
+            )
+        elif policy_version == _CAPACITY_POLICY_VERSION:
+            account_capacity = max(
+                Decimal("0"),
+                account_risk_budget
+                - external_total
+                - represented_managed_risk,
+            )
+            broker_capacity = broker_buying_power
+        else:
+            raise OrderIntentIntegrityError(
+                "capacity policy version is unsupported"
+            )
+        cap_amount = min(account_capacity, broker_capacity)
+    return _CapacityPolicyEvaluation(
+        cap_amount=cap_amount,
+        daily_authorized_risk=daily_authorized,
+        external_position_risk=external_position_risk,
+        external_order_risk=external_order_risk,
+        represented_managed_risk=represented_managed_risk,
+        policy_outcome="ALLOW",
+        policy_reason_code="SUPPORTED_RISK_DEFINED_ACCOUNT",
     )
 
 

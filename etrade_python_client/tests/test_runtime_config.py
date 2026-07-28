@@ -114,6 +114,41 @@ def _enabled_document(*, runtime_root: str = "runtime") -> dict[str, object]:
     return document
 
 
+def _manual_open_document(
+    *,
+    mode: str = "sandbox",
+    runtime_root: str = "runtime",
+    symbols: list[str] | None = None,
+    model_required: bool = False,
+) -> dict[str, object]:
+    document = _document(mode=mode, runtime_root=runtime_root)
+    document["schema_version"] = 2
+    document["strategy"] = {
+        "enabled": True,
+        "strategy_id": "manual-credit-spread.v1",
+        "symbols": ["SPY", "SPX"] if symbols is None else symbols,
+    }
+    document["model"] = {
+        "enabled": model_required,
+        "required_for_entry": model_required,
+        "max_signal_age_seconds": 86_400,
+    }
+    execution = document["execution"]
+    assert isinstance(execution, dict)
+    execution["account_allowlist"] = [
+        _account(account_id="12345678")
+    ]
+    execution["broker_mutations_enabled"] = True
+    document["risk"] = {
+        "max_order_contracts": 5,
+        "max_order_loss_cents": 250_000,
+        "max_account_open_risk_cents": 500_000,
+        "max_daily_loss_cents": 250_000,
+        "max_quote_age_seconds": 30,
+    }
+    return document
+
+
 def _write_payload(
     directory: Path,
     payload: bytes,
@@ -300,7 +335,7 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             section_value["unexpected"] = "value"
             invalid_documents.append((f"{section} unknown field", unknown))
 
-        for schema_version in (0, 2, True, "1"):
+        for schema_version in (0, 3, True, "1"):
             document = _document()
             document["schema_version"] = schema_version
             invalid_documents.append(
@@ -331,6 +366,94 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeConfigError, "object"):
                 load_runtime_config(primitive)
+
+    def test_schema_v2_accepts_only_supervised_manual_open_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            for mode in ("sandbox", "live"):
+                for symbols in (["SPY"], ["SPX"], ["SPY", "SPX"]):
+                    with self.subTest(mode=mode, symbols=symbols):
+                        config = load_runtime_config(
+                            _write_config(
+                                base,
+                                _manual_open_document(
+                                    mode=mode,
+                                    runtime_root=(
+                                        f"runtime-{mode}-{'-'.join(symbols)}"
+                                    ),
+                                    symbols=symbols,
+                                ),
+                                name=f"{mode}-{'-'.join(symbols)}.json",
+                            )
+                        )
+                        self.assertEqual(config.schema_version, 2)
+                        self.assertEqual(config.mode, mode)
+                        self.assertTrue(
+                            config.execution.broker_mutations_enabled
+                        )
+                        self.assertEqual(config.strategy.symbols, tuple(symbols))
+                        self.assertFalse(config.model.required_for_entry)
+                        self.assertFalse(config.broker_mutations_authorized)
+                        self.assertFalse(config.starts_armed)
+
+    def test_schema_v2_manual_open_rejects_modes_symbols_and_model_dependency(
+        self,
+    ):
+        invalid_documents = []
+        for mode in ("paper", "shadow"):
+            invalid_documents.append(
+                (
+                    f"mode-{mode}",
+                    _manual_open_document(
+                        mode=mode,
+                        runtime_root=f"runtime-{mode}",
+                    ),
+                )
+            )
+        for index, symbols in enumerate(
+            (["QQQ"], ["SPY", "QQQ"], ["SPXW"])
+        ):
+            invalid_documents.append(
+                (
+                    f"symbols-{index}",
+                    _manual_open_document(
+                        runtime_root=f"runtime-symbols-{index}",
+                        symbols=symbols,
+                    ),
+                )
+            )
+        invalid_documents.append(
+            (
+                "required-model",
+                _manual_open_document(
+                    runtime_root="runtime-model",
+                    model_required=True,
+                ),
+            )
+        )
+        nonnumeric_account = _manual_open_document(
+            runtime_root="runtime-account-id"
+        )
+        nonnumeric_execution = nonnumeric_account["execution"]
+        assert isinstance(nonnumeric_execution, dict)
+        nonnumeric_execution["account_allowlist"] = [
+            _account(account_id="display-id")
+        ]
+        invalid_documents.append(
+            ("nonnumeric-account-id", nonnumeric_account)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            for index, (label, document) in enumerate(invalid_documents):
+                with self.subTest(case=label):
+                    path = _write_config(
+                        base,
+                        document,
+                        name=f"invalid-manual-open-{index}.json",
+                    )
+                    with self.assertRaises(RuntimeConfigError):
+                        load_runtime_config(path)
 
     def test_broker_accounts_are_exact_unique_and_fail_closed(self):
         invalid_documents: list[tuple[str, dict[str, object]]] = []

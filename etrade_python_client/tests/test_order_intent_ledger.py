@@ -43,7 +43,12 @@ from live_trading.order_intent_ledger import (
     OrderIntentTransitionError,
     OrderIntentValidationError,
     RiskEvidence,
+    _capacity_policy_material,
+    _capacity_policy_v1_material,
+    _evaluate_opening_capacity_policy,
+    _evaluate_opening_capacity_policy_version,
     canonical_order_payload,
+    canonical_order_payload_hash,
     normalize_order_payload,
     stable_client_order_id,
     wire_order_payload,
@@ -441,6 +446,10 @@ class OrderIntentLedgerTests(unittest.TestCase):
                         "position_type": "LONG",
                         "position_indicator": None,
                         "osi_key": None,
+                        "option_multiplier": None,
+                        "options_adjusted_flag": None,
+                        "deliverables": None,
+                        "lots": [],
                     }
                 ]
             sources = [
@@ -476,7 +485,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                             f"/v1/accounts/{quote(account_key, safe='')}/portfolio.json",
                             (
                                 ("count", "50"),
-                                ("lotsRequired", "false"),
+                                ("lotsRequired", "true"),
                                 ("marketSession", "REGULAR"),
                                 ("pageNumber", "1"),
                                 ("sortBy", "SYMBOL"),
@@ -600,7 +609,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                     )
                 )
             economic_state = {
-                "schema": "etrade-capacity.v1",
+                "schema": "etrade-capacity.v3",
                 "account_status": "ACTIVE",
                 "account_mode": "MARGIN",
                 "account_type": "INDIVIDUAL",
@@ -611,7 +620,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
             result = dict(economic_state)
             result["broker_buying_power_as_of"] = balance_as_of
             result["state_sha256"] = domain_json_hash(
-                b"etrade-capacity-state.v1\0", economic_state
+                b"etrade-capacity-state.v3\0", economic_state
             )
             reference = ledger.record_broker_read_manifest(
                 BrokerReadManifestEvidence(
@@ -632,7 +641,9 @@ class OrderIntentLedgerTests(unittest.TestCase):
         else:
             reference = cached
         decision = ledger.set_reservation_cap_from_read(
-            reference, risk_budget=Decimal(str(risk_budget))
+            reference,
+            risk_budget=Decimal(str(risk_budget)),
+            daily_risk_budget=Decimal(str(risk_budget)),
         )
         self.latest_capacity_decisions[
             (str(ledger.path), account, environment)
@@ -714,6 +725,357 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 """,
                 (decision.decision_sha256,),
             ).fetchone()[0]
+
+    def downgrade_to_schema_17(self):
+        """Rebuild the two policy tables to their actual schema-17 shape."""
+
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            decision = conn.execute(
+                """
+                SELECT * FROM capacity_decisions
+                ORDER BY decided_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(decision)
+            legacy_material = {
+                "evidence_sha256": decision["evidence_sha256"],
+                "account_id": decision["account_id"],
+                "environment": decision["environment"],
+                "broker_buying_power":
+                    decision["broker_buying_power"],
+                "risk_budget": decision["risk_budget"],
+                "cap_amount": decision["cap_amount"],
+                "observed_at": int(decision["observed_at"]),
+                "capacity_snapshot_sha256":
+                    decision["capacity_snapshot_sha256"],
+                "decided_at": int(decision["decided_at"]),
+            }
+            legacy_sha256 = domain_json_hash(
+                b"etrade-capacity-decision.v1\0", legacy_material
+            )
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("BEGIN")
+            trigger_names = [
+                row["name"]
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND (
+                            sql LIKE '%capacity_decisions%'
+                            OR sql LIKE '%reservation_caps%'
+                            OR name =
+                                'prevent_margin_reservation_identity_update'
+                          )
+                    """
+                )
+            ]
+            for trigger_name in trigger_names:
+                conn.execute(
+                    f'DROP TRIGGER "{trigger_name}"'
+                )
+            conn.execute(
+                """
+                UPDATE margin_reservations
+                SET capacity_decision_sha256 = ?
+                WHERE capacity_decision_sha256 = ?
+                """,
+                (
+                    legacy_sha256,
+                    decision["capacity_decision_sha256"],
+                ),
+            )
+            conn.execute(
+                """
+                CREATE TABLE reservation_caps_v17 (
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    cap_amount TEXT NOT NULL,
+                    broker_buying_power TEXT NOT NULL,
+                    risk_budget TEXT NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    portfolio_snapshot_digest TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    capacity_decision_sha256 TEXT
+                        REFERENCES capacity_decisions(
+                            capacity_decision_sha256
+                        ),
+                    PRIMARY KEY (account_id, environment),
+                    CHECK (
+                        CAST(cap_amount AS REAL) >= 0
+                        AND CAST(broker_buying_power AS REAL) >= 0
+                        AND CAST(risk_budget AS REAL) >= 0
+                    ),
+                    CHECK (length(portfolio_snapshot_digest) = 64)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO reservation_caps_v17 (
+                    account_id, environment, cap_amount,
+                    broker_buying_power, risk_budget, observed_at,
+                    portfolio_snapshot_digest, updated_at,
+                    capacity_decision_sha256
+                )
+                SELECT account_id, environment, cap_amount,
+                       broker_buying_power, risk_budget, observed_at,
+                       portfolio_snapshot_digest, updated_at, ?
+                FROM reservation_caps
+                """,
+                (legacy_sha256,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE capacity_decisions_v17 (
+                    capacity_decision_sha256 TEXT NOT NULL PRIMARY KEY
+                        CHECK (length(capacity_decision_sha256) = 64),
+                    evidence_sha256 TEXT NOT NULL
+                        REFERENCES broker_read_manifests(evidence_sha256),
+                    account_id TEXT NOT NULL,
+                    environment TEXT NOT NULL
+                        CHECK (
+                            environment IN ('sandbox', 'production')
+                        ),
+                    broker_buying_power TEXT NOT NULL,
+                    risk_budget TEXT NOT NULL,
+                    cap_amount TEXT NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    capacity_snapshot_sha256 TEXT NOT NULL
+                        CHECK (
+                            length(capacity_snapshot_sha256) = 64
+                        ),
+                    decided_at INTEGER NOT NULL,
+                    CHECK (
+                        CAST(broker_buying_power AS REAL) >= 0
+                        AND CAST(risk_budget AS REAL) >= 0
+                        AND CAST(cap_amount AS REAL) >= 0
+                    )
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO capacity_decisions_v17 (
+                    capacity_decision_sha256, evidence_sha256,
+                    account_id, environment, broker_buying_power,
+                    risk_budget, cap_amount, observed_at,
+                    capacity_snapshot_sha256, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (legacy_sha256, *legacy_material.values()),
+            )
+            conn.execute("DROP TABLE reservation_caps")
+            conn.execute("DROP TABLE capacity_decisions")
+            conn.execute(
+                """
+                ALTER TABLE capacity_decisions_v17
+                RENAME TO capacity_decisions
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE reservation_caps_v17
+                RENAME TO reservation_caps
+                """
+            )
+            conn.execute(
+                """
+                DROP TRIGGER IF EXISTS
+                    validate_margin_reservation_pre_post_release
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER
+                    validate_margin_reservation_pre_post_release
+                BEFORE UPDATE ON margin_reservations
+                WHEN OLD.state = 'ACTIVE'
+                 AND NEW.state = 'RELEASED'
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'schema-17 pre-post release guard'
+                    );
+                END
+                """
+            )
+            conn.execute(
+                """
+                UPDATE ledger_metadata
+                SET schema_version = 17
+                WHERE singleton = 1
+                """
+            )
+            conn.commit()
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        return legacy_sha256
+
+    def downgrade_to_schema_18_policy_v1(self):
+        """Rewrite the active cap as an exact pre-fix schema-18 V1 record."""
+
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            current = conn.execute(
+                """
+                SELECT * FROM capacity_decisions
+                ORDER BY decided_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(current)
+            self.assertEqual(
+                current["risk_policy_version"],
+                "OPENING_MAX_LOSS_V2",
+            )
+            self.assertEqual(current["external_position_risk"], "0")
+            self.assertEqual(current["external_order_risk"], "0")
+            self.assertEqual(current["represented_managed_risk"], "0")
+            policy_inputs = json.loads(current["policy_inputs_json"])
+            policy_inputs["schema"] = (
+                "etrade-opening-capacity-policy-inputs.v1"
+            )
+            policy_inputs["policy"] = _capacity_policy_v1_material()
+            policy_inputs_json = canonical_json(policy_inputs)
+            policy_inputs_sha256 = domain_json_hash(
+                b"etrade-capacity-policy-inputs.v1\0",
+                policy_inputs,
+            )
+            risk_policy_sha256 = domain_json_hash(
+                b"etrade-capacity-policy.v1\0",
+                _capacity_policy_v1_material(),
+            )
+            decision_material = {
+                "evidence_sha256": current["evidence_sha256"],
+                "account_id": current["account_id"],
+                "environment": current["environment"],
+                "broker_buying_power":
+                    current["broker_buying_power"],
+                "risk_budget": current["risk_budget"],
+                "daily_risk_budget": current["daily_risk_budget"],
+                "daily_authorized_risk":
+                    current["daily_authorized_risk"],
+                "external_position_risk":
+                    current["external_position_risk"],
+                "external_order_risk":
+                    current["external_order_risk"],
+                "represented_managed_risk":
+                    current["represented_managed_risk"],
+                "daily_window_start":
+                    int(current["daily_window_start"]),
+                "daily_window_end":
+                    int(current["daily_window_end"]),
+                "risk_policy_version": "OPENING_MAX_LOSS_V1",
+                "risk_policy_sha256": risk_policy_sha256,
+                "policy_inputs_json": policy_inputs_json,
+                "policy_inputs_sha256": policy_inputs_sha256,
+                "policy_outcome": current["policy_outcome"],
+                "policy_reason_code":
+                    current["policy_reason_code"],
+                "cap_amount": current["cap_amount"],
+                "observed_at": int(current["observed_at"]),
+                "capacity_snapshot_sha256":
+                    current["capacity_snapshot_sha256"],
+                "decided_at": int(current["decided_at"]),
+            }
+            decision_sha256 = domain_json_hash(
+                b"etrade-capacity-decision.v2\0",
+                decision_material,
+            )
+            conn.execute(
+                """
+                INSERT INTO capacity_decisions (
+                    capacity_decision_sha256, evidence_sha256,
+                    account_id, environment, broker_buying_power,
+                    risk_budget, daily_risk_budget,
+                    daily_authorized_risk, external_position_risk,
+                    external_order_risk, represented_managed_risk,
+                    daily_window_start, daily_window_end,
+                    risk_policy_version, risk_policy_sha256,
+                    policy_inputs_json, policy_inputs_sha256,
+                    policy_outcome, policy_reason_code, cap_amount,
+                    observed_at, capacity_snapshot_sha256, decided_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (decision_sha256, *decision_material.values()),
+            )
+            conn.execute(
+                """
+                UPDATE reservation_caps
+                SET cap_amount = ?, broker_buying_power = ?,
+                    risk_budget = ?, daily_risk_budget = ?,
+                    daily_authorized_risk = ?,
+                    external_position_risk = ?,
+                    external_order_risk = ?,
+                    represented_managed_risk = ?,
+                    daily_window_start = ?, daily_window_end = ?,
+                    risk_policy_version = ?, risk_policy_sha256 = ?,
+                    policy_inputs_json = ?, policy_inputs_sha256 = ?,
+                    policy_outcome = ?, policy_reason_code = ?,
+                    observed_at = ?,
+                    portfolio_snapshot_digest = ?,
+                    capacity_decision_sha256 = ?
+                WHERE account_id = ? AND environment = ?
+                """,
+                (
+                    decision_material["cap_amount"],
+                    decision_material["broker_buying_power"],
+                    decision_material["risk_budget"],
+                    decision_material["daily_risk_budget"],
+                    decision_material["daily_authorized_risk"],
+                    decision_material["external_position_risk"],
+                    decision_material["external_order_risk"],
+                    decision_material["represented_managed_risk"],
+                    decision_material["daily_window_start"],
+                    decision_material["daily_window_end"],
+                    decision_material["risk_policy_version"],
+                    decision_material["risk_policy_sha256"],
+                    decision_material["policy_inputs_json"],
+                    decision_material["policy_inputs_sha256"],
+                    decision_material["policy_outcome"],
+                    decision_material["policy_reason_code"],
+                    decision_material["observed_at"],
+                    decision_material["capacity_snapshot_sha256"],
+                    decision_sha256,
+                    decision_material["account_id"],
+                    decision_material["environment"],
+                ),
+            )
+            conn.execute(
+                """
+                DROP TRIGGER prevent_margin_reservation_identity_update
+                """
+            )
+            conn.execute(
+                """
+                UPDATE margin_reservations
+                SET capacity_decision_sha256 = ?
+                WHERE capacity_decision_sha256 = ?
+                """,
+                (
+                    decision_sha256,
+                    current["capacity_decision_sha256"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE ledger_metadata
+                SET schema_version = 18
+                WHERE singleton = 1
+                """
+            )
+            conn.commit()
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        return decision_sha256
 
     def query_evidence(
         self,
@@ -1051,6 +1413,70 @@ class OrderIntentLedgerTests(unittest.TestCase):
         with self.assertRaises(OrderIntentIntegrityError):
             self.ledger.create_intent(make_intent(strike=615))
 
+    def test_trace_free_opening_intent_can_be_safely_abandoned(self):
+        record = self.ledger.create_intent(
+            make_intent(key="trace-free", decision="trace-free")
+        ).intent
+
+        failed = self.ledger.abandon_trace_free_opening_intent(
+            record.intent_id
+        )
+        replay = self.ledger.abandon_trace_free_opening_intent(
+            record.intent_id
+        )
+
+        self.assertEqual(failed.state, "FAILED")
+        self.assertEqual(replay, failed)
+        self.assertIsNone(
+            self.ledger.get_margin_reservation(record.intent_id)
+        )
+        self.assertEqual(
+            [
+                (
+                    event.event_type,
+                    event.from_state,
+                    event.to_state,
+                    event.reason_code,
+                )
+                for event in self.ledger.events(record.intent_id)
+            ],
+            [
+                ("INTENT_CREATED", None, "INTENT", "INTENT_CREATED"),
+                (
+                    "INTENT_ABANDONED",
+                    "INTENT",
+                    "FAILED",
+                    "PRE_POST_ABORTED",
+                ),
+            ],
+        )
+        restarted = OrderIntentLedger(
+            self.path, clock=self.clock, run_id="trace-free-restart"
+        )
+        self.assertEqual(
+            restarted.get_intent(record.intent_id).state,
+            "FAILED",
+        )
+
+    def test_opening_intent_with_reservation_cannot_be_abandoned(self):
+        record = self.opening(
+            key="reserved-opening",
+        )
+
+        with self.assertRaises(OrderIntentTransitionError):
+            self.ledger.abandon_trace_free_opening_intent(
+                record.intent_id
+            )
+
+        self.assertEqual(
+            self.ledger.get_intent(record.intent_id).state,
+            "INTENT",
+        )
+        self.assertEqual(
+            self.ledger.get_margin_reservation(record.intent_id).state,
+            "ACTIVE",
+        )
+
     def test_environment_exposure_and_broker_schema_are_strictly_derived(self):
         with self.assertRaises(OrderIntentValidationError):
             OrderIntent.build(account_id="acct", environment="live", strategy_id="s", decision_id="d", idempotency_scope="scope", idempotency_key="key", intent_kind="OPENING", order_payload=raw_payload())
@@ -1268,7 +1694,12 @@ class OrderIntentLedgerTests(unittest.TestCase):
         def reserve(record):
             barrier.wait()
             try:
-                self.ledger.reserve_margin(record.intent_id, self.risk(record, collateral="600", max_loss="400"))
+                self.ledger.reserve_margin(
+                    record.intent_id,
+                    self.risk(
+                        record, collateral="600", max_loss="600"
+                    ),
+                )
                 return True
             except OrderIntentReservationError:
                 return False
@@ -1316,6 +1747,386 @@ class OrderIntentLedgerTests(unittest.TestCase):
         )
         with self.assertRaises(OrderIntentIntegrityError):
             self.set_capacity(state_marker="different")
+
+    def test_capacity_denies_managed_open_order_missing_from_snapshot(self):
+        record = self.opening()
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+            evidence(
+                record,
+                self.clock,
+                operation="SUBMIT_ACK",
+                broker_order_id="2000000101",
+            ),
+        )
+
+        self.clock.advance(1)
+        decision = self.set_capacity()
+
+        self.assertEqual(decision.cap_amount, Decimal("0"))
+        self.assertEqual(decision.policy_outcome, "DENY")
+        self.assertEqual(
+            decision.policy_reason_code,
+            "UNSUPPORTED_MANAGED_RISK_STATE",
+        )
+        self.assertEqual(
+            decision.represented_managed_risk, Decimal("0")
+        )
+
+    def test_capacity_denies_unsupported_managed_reservation_state(self):
+        record = self.opening()
+        lease = self.ledger.claim_submission(
+            record.intent_id, "worker", lease_seconds=30
+        )
+        self.begin_submission(record, "worker", lease)
+        self.ledger.record_post_acknowledgement(
+            record.intent_id,
+            "worker",
+            lease.fencing_token,
+            evidence(
+                record,
+                self.clock,
+                operation="SUBMIT_ACK",
+                broker_order_id="2000000102",
+            ),
+        )
+        terminal = self.query_evidence(
+            record,
+            outcome="FILLED",
+            broker_order_id="2000000102",
+        )
+        self.ledger.reconcile_terminal(
+            record.intent_id, "FILLED", terminal
+        )
+
+        self.clock.advance(1)
+        decision = self.set_capacity()
+
+        self.assertEqual(decision.cap_amount, Decimal("0"))
+        self.assertEqual(decision.policy_outcome, "DENY")
+        self.assertEqual(
+            decision.policy_reason_code,
+            "UNSUPPORTED_MANAGED_RISK_STATE",
+        )
+
+    @staticmethod
+    def capacity_policy_inputs(*, managed=()):
+        return {
+            "schema": "etrade-opening-capacity-policy-inputs.v2",
+            "policy": _capacity_policy_material(),
+            "daily_window": {"start": 1, "end": 2},
+            "daily_authorizations": [],
+            "managed_reservations": list(managed),
+        }
+
+    def test_capacity_denies_even_matching_managed_active_order(self):
+        expected_legs = [
+            {
+                "symbol": "SPY",
+                "call_put": "PUT",
+                "expiry": "2026-08-21",
+                "strike": "620",
+                "signed_quantity": "-1",
+            },
+            {
+                "symbol": "SPY",
+                "call_put": "PUT",
+                "expiry": "2026-08-21",
+                "strike": "615",
+                "signed_quantity": "1",
+            },
+        ]
+        expected_legs.sort(key=canonical_json)
+        managed = {
+            "intent_id": "managed-intent",
+            "broker_order_id": "2000000103",
+            "role": "OPEN_ORDER",
+            "reservation_amount": "400",
+            "expected_payload_hash": canonical_order_payload_hash(
+                raw_payload()
+            ),
+            "expected_legs": expected_legs,
+        }
+        matching_order = {
+            "order_id": "2000000103",
+            "order_type": "SPREADS",
+            "replaces_order_id": None,
+            "replaced_by_order_id": None,
+            "details": [
+                {
+                    "account_id": "1000000001",
+                    "status": "OPEN",
+                    "price_type": "NET_CREDIT",
+                    "limit_price": "1.25",
+                    "order_term": "GOOD_FOR_DAY",
+                    "market_session": "REGULAR",
+                    "all_or_none": False,
+                    "replaces_order_id": None,
+                    "replaced_by_order_id": None,
+                    "instruments": [
+                        {
+                            "product": {
+                                "symbol": "SPY",
+                                "security_type": "OPTN",
+                                "call_put": "PUT",
+                                "expiry_year": "2026",
+                                "expiry_month": "8",
+                                "expiry_day": "21",
+                                "strike_price": "620",
+                                "product_id": None,
+                            },
+                            "order_action": "SELL_OPEN",
+                            "quantity_type": "QUANTITY",
+                            "ordered_quantity": "1",
+                            "filled_quantity": "0",
+                            "cancel_quantity": "0",
+                        },
+                        {
+                            "product": {
+                                "symbol": "SPY",
+                                "security_type": "OPTN",
+                                "call_put": "PUT",
+                                "expiry_year": "2026",
+                                "expiry_month": "8",
+                                "expiry_day": "21",
+                                "strike_price": "615",
+                                "product_id": None,
+                            },
+                            "order_action": "BUY_OPEN",
+                            "quantity_type": "QUANTITY",
+                            "ordered_quantity": "1",
+                            "filled_quantity": "0",
+                            "cancel_quantity": "0",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        decision = _evaluate_opening_capacity_policy(
+            {"positions": [], "open_orders": [matching_order]},
+            self.capacity_policy_inputs(managed=(managed,)),
+            broker_buying_power=Decimal("1000"),
+            account_risk_budget=Decimal("1000"),
+        )
+
+        self.assertEqual(decision.cap_amount, Decimal("0"))
+        self.assertEqual(decision.policy_outcome, "DENY")
+        self.assertEqual(
+            decision.policy_reason_code, "UNSUPPORTED_ACTIVE_ORDER"
+        )
+
+    def test_capacity_v2_does_not_add_managed_filled_risk_to_broker_power(
+        self,
+    ):
+        broker_order_id = "2000000105"
+        acquired = str(int(self.clock.now.timestamp() * 1_000) - 1)
+        positions = []
+        expected_legs = []
+        for index, (strike, quantity, position_type) in enumerate(
+            (("620", "-1", "SHORT"), ("615", "1", "LONG")),
+            start=1,
+        ):
+            position_id = str(200 + index)
+            positions.append(
+                {
+                    "position_id": position_id,
+                    "account_id": "1000000001",
+                    "product": {
+                        "symbol": "SPY",
+                        "security_type": "OPTN",
+                        "call_put": "PUT",
+                        "expiry_year": "2026",
+                        "expiry_month": "8",
+                        "expiry_day": "21",
+                        "strike_price": strike,
+                        "product_id": None,
+                    },
+                    "quantity": quantity,
+                    "position_type": position_type,
+                    "position_indicator": "TYPE1",
+                    "osi_key": (
+                        "SPY---260821P00620000"
+                        if strike == "620"
+                        else "SPY---260821P00615000"
+                    ),
+                    "option_multiplier": "100",
+                    "options_adjusted_flag": False,
+                    "deliverables": "100 shares of SPY",
+                    "lots": [
+                        {
+                            "position_id": position_id,
+                            "position_lot_id": str(2000 + index),
+                            "order_no": broker_order_id,
+                            "leg_no": str(index),
+                            "original_quantity": quantity,
+                            "remaining_quantity": quantity,
+                            "available_quantity": quantity,
+                            "acquired_date_epoch_ms": acquired,
+                        }
+                    ],
+                }
+            )
+            expected_legs.append(
+                {
+                    "symbol": "SPY",
+                    "call_put": "PUT",
+                    "expiry": "2026-08-21",
+                    "strike": strike,
+                    "signed_quantity": quantity,
+                }
+            )
+        expected_legs.sort(key=canonical_json)
+        managed = {
+            "intent_id": "managed-filled-intent",
+            "broker_order_id": broker_order_id,
+            "role": "POSITION",
+            "reservation_amount": "375",
+            "expected_payload_hash": canonical_order_payload_hash(
+                raw_payload()
+            ),
+            "expected_legs": expected_legs,
+        }
+
+        decision = _evaluate_opening_capacity_policy(
+            {"positions": positions, "open_orders": []},
+            self.capacity_policy_inputs(managed=(managed,)),
+            broker_buying_power=Decimal("625"),
+            account_risk_budget=Decimal("1000"),
+        )
+
+        self.assertEqual(decision.policy_outcome, "ALLOW")
+        self.assertEqual(decision.external_position_risk, Decimal("0"))
+        self.assertEqual(decision.external_order_risk, Decimal("0"))
+        self.assertEqual(
+            decision.represented_managed_risk, Decimal("375")
+        )
+        self.assertEqual(decision.cap_amount, Decimal("625"))
+        v1_inputs = self.capacity_policy_inputs(managed=(managed,))
+        v1_inputs["schema"] = (
+            "etrade-opening-capacity-policy-inputs.v1"
+        )
+        v1_inputs["policy"] = _capacity_policy_v1_material()
+        replay_only_v1 = _evaluate_opening_capacity_policy_version(
+            {"positions": positions, "open_orders": []},
+            v1_inputs,
+            broker_buying_power=Decimal("625"),
+            account_risk_budget=Decimal("1000"),
+            policy_version="OPENING_MAX_LOSS_V1",
+        )
+        self.assertEqual(replay_only_v1.cap_amount, Decimal("1000"))
+
+    def test_fresh_capacity_decisions_use_policy_v2(self):
+        decision = self.set_capacity(
+            buying_power="625", risk_budget="1000"
+        )
+
+        self.assertEqual(
+            decision.risk_policy_version, "OPENING_MAX_LOSS_V2"
+        )
+        self.assertEqual(decision.cap_amount, Decimal("625"))
+
+    def test_capacity_requires_exact_standard_option_deliverables(self):
+        def positions(deliverables):
+            acquired = str(
+                int(self.clock.now.timestamp() * 1_000) - 1
+            )
+            documents = []
+            for index, (strike, quantity, position_type) in enumerate(
+                (("620", "-1", "SHORT"), ("615", "1", "LONG")),
+                start=1,
+            ):
+                position_id = str(100 + index)
+                documents.append(
+                    {
+                        "position_id": position_id,
+                        "account_id": "1000000001",
+                        "product": {
+                            "symbol": "SPY",
+                            "security_type": "OPTN",
+                            "call_put": "PUT",
+                            "expiry_year": "2026",
+                            "expiry_month": "8",
+                            "expiry_day": "21",
+                            "strike_price": strike,
+                            "product_id": None,
+                        },
+                        "quantity": quantity,
+                        "position_type": position_type,
+                        "position_indicator": "TYPE1",
+                        "osi_key": (
+                            "SPY---260821P00620000"
+                            if strike == "620"
+                            else "SPY---260821P00615000"
+                        ),
+                        "option_multiplier": "100",
+                        "options_adjusted_flag": False,
+                        "deliverables": deliverables,
+                        "lots": [
+                            {
+                                "position_id": position_id,
+                                "position_lot_id": str(1000 + index),
+                                "order_no": "2000000104",
+                                "leg_no": str(index),
+                                "original_quantity": quantity,
+                                "remaining_quantity": quantity,
+                                "available_quantity": quantity,
+                                "acquired_date_epoch_ms": acquired,
+                            }
+                        ],
+                    }
+                )
+            return documents
+
+        for deliverables in (
+            None,
+            "100 shares",
+            "100 shares of SPY",
+        ):
+            with self.subTest(allowed=deliverables):
+                decision = _evaluate_opening_capacity_policy(
+                    {
+                        "positions": positions(deliverables),
+                        "open_orders": [],
+                    },
+                    self.capacity_policy_inputs(),
+                    broker_buying_power=Decimal("1000"),
+                    account_risk_budget=Decimal("1000"),
+                )
+                self.assertEqual(decision.policy_outcome, "ALLOW")
+                self.assertEqual(
+                    decision.external_position_risk, Decimal("500")
+                )
+                self.assertEqual(decision.cap_amount, Decimal("500"))
+
+        for deliverables in (
+            "100 shares of QQQ",
+            "50 shares of SPY",
+            "100 Shares of SPY",
+            "100 shares of SPY ",
+        ):
+            with self.subTest(denied=deliverables):
+                decision = _evaluate_opening_capacity_policy(
+                    {
+                        "positions": positions(deliverables),
+                        "open_orders": [],
+                    },
+                    self.capacity_policy_inputs(),
+                    broker_buying_power=Decimal("1000"),
+                    account_risk_budget=Decimal("1000"),
+                )
+                self.assertEqual(decision.cap_amount, Decimal("0"))
+                self.assertEqual(decision.policy_outcome, "DENY")
+                self.assertEqual(
+                    decision.policy_reason_code,
+                    "UNSUPPORTED_OPTION_POSITION",
+                )
 
     def test_reservation_requires_the_capacity_snapshot_used_for_its_portfolio_risk(self):
         record = self.ledger.create_intent(make_intent()).intent
@@ -1466,7 +2277,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 record.envelope.account_id,
                 record.envelope.environment,
             ),
-            Decimal("500"),
+            Decimal("400"),
         )
 
         with sqlite3.connect(self.path) as connection:
@@ -2540,7 +3351,7 @@ class OrderIntentLedgerTests(unittest.TestCase):
                 record.envelope.account_id,
                 record.envelope.environment,
             ),
-            Decimal("500"),
+            Decimal("400"),
         )
 
     def test_concurrent_amendment_race_has_one_winner(self):
@@ -2583,6 +3394,344 @@ class OrderIntentLedgerTests(unittest.TestCase):
                     "SELECT schema_version FROM ledger_metadata"
                 ).fetchone()[0],
                 SCHEMA_VERSION,
+            )
+
+    def test_schema_17_releases_only_never_claimed_opening_capacity(self):
+        record = self.opening(key="schema-17-pristine")
+        self.assertEqual(
+            self.ledger.active_reserved_margin(
+                "1000000001", "production"
+            ),
+            Decimal("400"),
+        )
+        self.downgrade_to_schema_17()
+
+        migrated = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-18-upgrade",
+        )
+
+        self.assertEqual(
+            migrated.get_intent(record.intent_id).state, "FAILED"
+        )
+        reservation = migrated.get_margin_reservation(
+            record.intent_id
+        )
+        self.assertEqual(reservation.state, "RELEASED")
+        self.assertEqual(
+            reservation.released_reason_code,
+            "SCHEMA_18_UNCLAIMED_LEGACY_RESERVATION_RELEASED",
+        )
+        self.assertEqual(
+            migrated.active_reserved_margin(
+                "1000000001", "production"
+            ),
+            Decimal("0"),
+        )
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            self.assertEqual(
+                conn.execute(
+                    """
+                    SELECT schema_version FROM ledger_metadata
+                    WHERE singleton = 1
+                    """
+                ).fetchone()["schema_version"],
+                SCHEMA_VERSION,
+            )
+            events = conn.execute(
+                """
+                SELECT event_type, from_state, to_state, actor,
+                       reason_code
+                FROM order_events
+                WHERE intent_id = ?
+                  AND event_type IN (
+                        'RESERVATION_RELEASED','PRE_POST_FAILED'
+                  )
+                ORDER BY sequence
+                """,
+                (record.intent_id,),
+            ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    event["event_type"],
+                    event["from_state"],
+                    event["to_state"],
+                    event["actor"],
+                    event["reason_code"],
+                )
+                for event in events
+            ],
+            [
+                (
+                    "RESERVATION_RELEASED",
+                    "FAILED",
+                    "FAILED",
+                    "schema-18-migration",
+                    "RESERVATION_RELEASED",
+                ),
+                (
+                    "PRE_POST_FAILED",
+                    "INTENT",
+                    "FAILED",
+                    "schema-18-migration",
+                    "PRE_POST_ABORTED",
+                ),
+            ],
+        )
+        reopened = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-18-reopen",
+        )
+        self.assertEqual(
+            reopened.active_reserved_margin(
+                "1000000001", "production"
+            ),
+            Decimal("0"),
+        )
+
+    def test_schema_17_submission_trace_is_fenced_and_never_reclaimable(
+        self,
+    ):
+        record = self.opening(key="schema-17-prior-claim")
+        self.ledger.claim_submission(
+            record.intent_id, "legacy-worker", lease_seconds=5
+        )
+        self.clock.advance(6)
+        self.assertEqual(
+            self.ledger.reconciliation_blockers(
+                "1000000001", "production"
+            ),
+            (),
+        )
+        self.assertEqual(
+            self.ledger.get_intent(record.intent_id).state, "INTENT"
+        )
+        self.downgrade_to_schema_17()
+
+        migrated = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-18-trace-upgrade",
+        )
+
+        self.assertEqual(
+            migrated.get_intent(record.intent_id).state,
+            "SUBMISSION_UNKNOWN",
+        )
+        self.assertEqual(
+            migrated.get_margin_reservation(record.intent_id).state,
+            "ACTIVE",
+        )
+        self.assertTrue(
+            migrated.has_execution_blockers(
+                "1000000001", "production"
+            )
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            migrated.claim_submission(
+                record.intent_id,
+                "new-worker",
+                lease_seconds=30,
+            )
+
+    def test_schema_17_policy_constraint_upgrade_matches_fresh_behavior(
+        self,
+    ):
+        self.opening(key="schema-17-policy-constraints")
+        self.downgrade_to_schema_17()
+        OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-18-policy-upgrade",
+        )
+        fresh_parent = Path(self.tmp.name) / "fresh-schema-18"
+        fresh_parent.mkdir(mode=0o700)
+        fresh_path = fresh_parent / "orders.sqlite3"
+        fresh = OrderIntentLedger(
+            fresh_path,
+            clock=self.clock,
+            run_id="fresh-schema-18",
+        )
+        self.set_capacity(ledger=fresh)
+
+        trigger_names = (
+            "validate_capacity_decision_policy_insert",
+            "validate_reservation_cap_policy_insert",
+            "validate_reservation_cap_policy_update",
+        )
+
+        def trigger_sql(path):
+            with sqlite3.connect(path) as conn:
+                return {
+                    name: " ".join(
+                        conn.execute(
+                            """
+                            SELECT sql FROM sqlite_master
+                            WHERE type = 'trigger' AND name = ?
+                            """,
+                            (name,),
+                        ).fetchone()[0].split()
+                    )
+                    for name in trigger_names
+                }
+
+        self.assertEqual(
+            trigger_sql(self.path), trigger_sql(fresh_path)
+        )
+
+        invalid_statements = (
+            """
+            UPDATE reservation_caps
+            SET daily_risk_budget = '-1'
+            """,
+            """
+            UPDATE reservation_caps
+            SET risk_policy_sha256 = 'short'
+            """,
+            """
+            UPDATE reservation_caps
+            SET policy_outcome = 'MAYBE'
+            """,
+            """
+            UPDATE reservation_caps
+            SET daily_window_end = daily_window_start
+            """,
+            """
+            INSERT INTO capacity_decisions (
+                capacity_decision_sha256, evidence_sha256,
+                account_id, environment, broker_buying_power,
+                risk_budget, daily_risk_budget,
+                daily_authorized_risk, external_position_risk,
+                external_order_risk, represented_managed_risk,
+                daily_window_start, daily_window_end,
+                risk_policy_version, risk_policy_sha256,
+                policy_inputs_json, policy_inputs_sha256,
+                policy_outcome, policy_reason_code, cap_amount,
+                observed_at, capacity_snapshot_sha256, decided_at
+            )
+            SELECT ?, evidence_sha256, account_id, environment,
+                   broker_buying_power, risk_budget, '-1',
+                   daily_authorized_risk, external_position_risk,
+                   external_order_risk, represented_managed_risk,
+                   daily_window_start, daily_window_end,
+                   risk_policy_version, risk_policy_sha256,
+                   policy_inputs_json, policy_inputs_sha256,
+                   policy_outcome, policy_reason_code, cap_amount,
+                   observed_at, capacity_snapshot_sha256, decided_at
+            FROM capacity_decisions
+            ORDER BY decided_at DESC
+            LIMIT 1
+            """,
+        )
+        for path in (self.path, fresh_path):
+            for index, statement in enumerate(invalid_statements):
+                with self.subTest(path=path.name, statement=index):
+                    with sqlite3.connect(path) as conn:
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        parameters = (
+                            ("f" * 64,)
+                            if "INSERT INTO capacity_decisions"
+                            in statement
+                            else ()
+                        )
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            conn.execute(statement, parameters)
+
+    def test_schema_18_v1_pristine_reservation_is_released_safely(
+        self,
+    ):
+        record = self.opening(key="schema-18-policy-v1-pristine")
+        policy_v1_sha256 = self.downgrade_to_schema_18_policy_v1()
+
+        migrated = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-19-policy-v2-upgrade",
+        )
+
+        self.assertEqual(
+            migrated.get_intent(record.intent_id).state, "FAILED"
+        )
+        reservation = migrated.get_margin_reservation(record.intent_id)
+        self.assertEqual(reservation.state, "RELEASED")
+        self.assertEqual(
+            reservation.released_reason_code,
+            "SCHEMA_19_UNCLAIMED_POLICY_V1_RESERVATION_RELEASED",
+        )
+        self.assertEqual(
+            migrated.active_reserved_margin(
+                "1000000001", "production"
+            ),
+            Decimal("0"),
+        )
+        with migrated._connection() as conn:
+            replayed, _manifest, _result = (
+                migrated._verified_capacity_decision_row(
+                    conn, policy_v1_sha256
+                )
+            )
+        self.assertEqual(
+            replayed["risk_policy_version"],
+            "OPENING_MAX_LOSS_V1",
+        )
+
+    def test_schema_18_v1_submission_trace_is_fenced_and_cannot_authorize(
+        self,
+    ):
+        record = self.opening(key="schema-18-policy-v1-traced")
+        current_decision = self.capacity_decision_for(record)
+        self.ledger.claim_submission(
+            record.intent_id, "policy-v1-worker", lease_seconds=5
+        )
+        self.clock.advance(6)
+        self.assertEqual(
+            self.ledger.reconciliation_blockers(
+                "1000000001", "production"
+            ),
+            (),
+        )
+        policy_v1_sha256 = self.downgrade_to_schema_18_policy_v1()
+
+        migrated = OrderIntentLedger(
+            self.path,
+            clock=self.clock,
+            run_id="schema-19-policy-v1-trace-upgrade",
+        )
+
+        self.assertEqual(
+            migrated.get_intent(record.intent_id).state,
+            "SUBMISSION_UNKNOWN",
+        )
+        self.assertEqual(
+            migrated.get_margin_reservation(record.intent_id).state,
+            "ACTIVE",
+        )
+        with self.assertRaises(OrderIntentReconciliationRequired):
+            migrated.claim_submission(
+                record.intent_id,
+                "new-worker",
+                lease_seconds=30,
+            )
+
+        fresh = migrated.create_intent(
+            make_intent(
+                key="schema-18-policy-v1-new-reserve",
+                decision="schema-18-policy-v1-new-reserve",
+            )
+        ).intent
+        with self.assertRaises(OrderIntentReservationError):
+            migrated.reserve_margin(
+                fresh.intent_id,
+                self.risk(
+                    fresh,
+                    ledger=migrated,
+                    decision=current_decision,
+                    capacity_decision_sha256=policy_v1_sha256,
+                ),
             )
 
     def test_schema_8_migrates_without_losing_the_ledger(self):

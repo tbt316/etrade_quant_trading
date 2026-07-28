@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -469,15 +470,24 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(agent.order.consumer_key, "sandbox-env-key")
 
     def test_dashboard_credentials_reject_defaults_and_accept_strong_values(self):
+        strong_secret = hashlib.sha256(
+            b"runtime-safety-dashboard-secret"
+        ).hexdigest()
         with self.assertRaisesRegex(RuntimeSafetyError, "weak"):
             validate_dashboard_credentials(
-                {"dashboard_user": "operator", "dashboard_pass": "short", "pin": "1234"}
+                {
+                    "dashboard_user": "operator",
+                    "dashboard_pass": "short",
+                    "pin": "1234",
+                    "dashboard_auth_secret": strong_secret,
+                }
             )
         validate_dashboard_credentials(
             {
                 "dashboard_user": "operator",
                 "dashboard_pass": "long-random-dashboard-password",
-                "pin": "84927163",
+                "pin": "A9~strong",
+                "dashboard_auth_secret": strong_secret,
             }
         )
         with self.assertRaisesRegex(RuntimeSafetyError, "weak"):
@@ -485,9 +495,40 @@ class RuntimeSafetyTests(unittest.TestCase):
                 {
                     "dashboard_user": "operator",
                     "dashboard_pass": "long-random-dashboard-password",
-                    "pin": "9" * 65,
+                    "pin": "password",
+                    "dashboard_auth_secret": strong_secret,
                 }
             )
+        with self.assertRaisesRegex(RuntimeSafetyError, "weak"):
+            validate_dashboard_credentials(
+                {
+                    "dashboard_user": "operator",
+                    "dashboard_pass": "long-random-dashboard-password",
+                    "pin": "9" * 65,
+                    "dashboard_auth_secret": strong_secret,
+                }
+            )
+        for invalid_secret in (
+            None,
+            "",
+            "short",
+            "A" * 64,
+            "a" * 64,
+            "0123456789abcdef" * 4,
+        ):
+            with self.subTest(invalid_secret=invalid_secret):
+                with self.assertRaisesRegex(
+                    RuntimeSafetyError, "generated 256-bit"
+                ):
+                    validate_dashboard_credentials(
+                        {
+                            "dashboard_user": "operator",
+                            "dashboard_pass":
+                                "long-random-dashboard-password",
+                            "pin": "A9~strong",
+                            "dashboard_auth_secret": invalid_secret,
+                        }
+                    )
 
     def test_dashboard_settings_and_logs_do_not_leave_plaintext_credentials(self):
         from live_trading import etrade_cover_call_new as dashboard
@@ -499,7 +540,9 @@ class RuntimeSafetyTests(unittest.TestCase):
                 "dashboard_user": "operator",
                 "dashboard_pass": "long-random-dashboard-password",
                 "pin": "84927163",
-                "dashboard_auth_secret": "session-secret-value",
+                "dashboard_auth_secret": hashlib.sha256(
+                    b"settings-redaction-dashboard-secret"
+                ).hexdigest(),
             }
             with mock.patch.object(dashboard, "LIVE_SETTINGS_FILE", str(settings_path)), mock.patch.object(
                 dashboard, "DASHBOARD_LOG_FILE", str(log_path)

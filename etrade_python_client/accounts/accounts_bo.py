@@ -6477,8 +6477,8 @@ class Accounts:
             "expiryMonth": target_expiration.month,
             "expiryDay": target_expiration.day,
             "includeWeekly": True,
-            "skipAdjusted": False,
-            "optionCategory": "ALL",
+            "skipAdjusted": True,
+            "optionCategory": "STANDARD",
             "chainType": call_put,
             "noOfStrikes": 400
         }
@@ -6575,6 +6575,7 @@ class Accounts:
                         min_price_diff = price_diff
                         candidate = {
                             "symbol": contract_symbol,
+                            "osiKey": osi_key,
                             "strikePrice": strike,
                             "optionPrice": option_price,
                             "volume": volume,
@@ -6589,6 +6590,7 @@ class Accounts:
                     if previous_strike and ( ( call_put == 'Put' and previous_strike >= strike_overwrite >= strike ) or ( call_put == 'Call' and previous_strike <= strike_overwrite <= strike ) ):
                         candidate = {
                             "symbol": contract_symbol,
+                            "osiKey": osi_key,
                             "strikePrice": strike,
                             "optionPrice": option_price,
                             "volume": volume,
@@ -6677,7 +6679,8 @@ class Accounts:
         sell_position = StockPosition(
             symbol=sell_option.get("symbol", ticker),
             quantity=qty,
-            last_price=sell_option['optionPrice']
+            last_price=sell_option['optionPrice'],
+            osi_key=sell_option["osiKey"],
         )
         sell_position.strike_price = sell_option["strikePrice"]
         sell_position.expiration_date = sell_option['expiryDate']
@@ -6751,7 +6754,8 @@ class Accounts:
             buy_position = StockPosition(
                 symbol=buy_option.get("symbol", ticker),
                 quantity=qty,
-                last_price=buy_option['optionPrice']
+                last_price=buy_option['optionPrice'],
+                osi_key=buy_option["osiKey"],
             )
             buy_position.strike_price = buy_option["strikePrice"] 
             buy_position.expiration_date = buy_option['expiryDate']

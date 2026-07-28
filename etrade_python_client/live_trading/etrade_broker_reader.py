@@ -26,6 +26,13 @@ from live_trading.etrade_broker_transport import (
     _ExchangeResult,
     _isolated_get_exchange,
 )
+from live_trading.opening_risk_lineage import (
+    OpeningQuoteReceiptRef,
+    OpeningQuoteResponseEvidence,
+    expected_quote_route,
+    parse_opening_quote_response,
+)
+from live_trading.order_domain import OptionContractId
 from live_trading.order_intent_ledger import (
     BrokerReadEvidenceRef,
     BrokerReadManifestEvidence,
@@ -35,6 +42,7 @@ from live_trading.order_intent_ledger import (
     OrderIntentLedger,
     canonical_order_payload_hash,
 )
+from live_trading.pretrade_risk import QuoteSnapshotEvidence
 from live_trading.runtime_safety import (
     RuntimeSafetyBoundary,
     RuntimeSafetyError,
@@ -121,6 +129,25 @@ class _CapacityScan:
     state_sha256: str
     members: tuple[BrokerReadManifestMember, ...]
     completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningQuoteRead:
+    """Durable exact two-leg quote receipt plus its replayed snapshot."""
+
+    receipt: OpeningQuoteReceiptRef
+    snapshot: QuoteSnapshotEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.receipt) is not OpeningQuoteReceiptRef
+            or type(self.snapshot) is not QuoteSnapshotEvidence
+            or self.snapshot.complete is not True
+            or len(self.snapshot.quotes) != 2
+        ):
+            raise ETradeBrokerReaderIntegrityError(
+                "opening quote read is incomplete"
+            )
 
 
 class ETradeBrokerReader:
@@ -276,6 +303,125 @@ class ETradeBrokerReader:
             )
             self._assert_runtime()
             return evidence
+
+    def read_opening_quotes(
+        self,
+        account: SelectedBrokerAccount,
+        contracts: tuple[OptionContractId, OptionContractId],
+    ) -> OpeningQuoteRead:
+        """Return one retained, origin-pinned REALTIME quote for both legs."""
+
+        self._require_account(account)
+        if (
+            type(contracts) is not tuple
+            or len(contracts) != 2
+            or any(type(contract) is not OptionContractId for contract in contracts)
+            or contracts[0] == contracts[1]
+        ):
+            raise ETradeBrokerReaderIntegrityError(
+                "opening quote read requires two distinct exact contracts"
+            )
+        with self._read_lock:
+            self._assert_runtime()
+            route = expected_quote_route(contracts)
+            query = tuple(
+                sorted(
+                    (
+                        ("detailFlag", "ALL"),
+                        ("overrideSymbolCount", "false"),
+                        ("skipMiniOptionsCheck", "true"),
+                    )
+                )
+            )
+            prepared, expected_url = _prepare_oauth_get(
+                self._oauth,
+                self._origin,
+                route,
+                query,
+            )
+            _validate_prepared_get(
+                prepared,
+                expected_url,
+                self._origin,
+                route,
+                query,
+            )
+            authorization = prepared.headers["Authorization"]
+            if (
+                type(authorization) is not str
+                or not authorization.isascii()
+            ):
+                raise ETradeBrokerReaderIntegrityError(
+                    "prepared quote authorization is not bounded ASCII"
+                )
+            started_at = self._now()
+            self._assert_runtime()
+            try:
+                exchange = _isolated_get_exchange(
+                    prepared,
+                    timeout_seconds=_TOTAL_EXCHANGE_TIMEOUT_SECONDS,
+                    max_response_bytes=_MAX_RAW_RESPONSE_BYTES,
+                )
+            except Exception as exc:
+                raise ETradeBrokerReaderUnavailable(
+                    "isolated opening quote GET failed"
+                ) from exc
+            completed_at = self._now()
+            self._assert_runtime()
+            if (
+                type(exchange) is not _ExchangeResult
+                or exchange.kind != "RESPONSE"
+                or exchange.http_status != 200
+                or type(exchange.raw_response) is not bytes
+                or not exchange.raw_response
+                or len(exchange.raw_response) > _MAX_RAW_RESPONSE_BYTES
+            ):
+                raise ETradeBrokerReaderUnavailable(
+                    "opening quote GET did not return a complete HTTP 200 response"
+                )
+            evidence = OpeningQuoteResponseEvidence(
+                account_id=self._account_id,
+                account_id_key=self._account_id_key,
+                institution_type=self._institution_type,
+                environment=self._environment,
+                origin=self._origin,
+                route=route,
+                query_json=_canonical_json(
+                    [list(pair) for pair in query]
+                ),
+                authorization_sha256=hashlib.sha256(
+                    authorization.encode("ascii")
+                ).hexdigest(),
+                request_started_at=started_at,
+                response_completed_at=completed_at,
+                http_status=exchange.http_status,
+                raw_response_bytes=exchange.raw_response,
+            )
+            try:
+                snapshot, _canonical = parse_opening_quote_response(
+                    evidence
+                )
+                if (
+                    set(snapshot.quotes)
+                    and {
+                        quote.contract for quote in snapshot.quotes
+                    }
+                    != set(contracts)
+                ):
+                    raise ETradeBrokerReaderIntegrityError(
+                        "opening quote response changed exact contract identity"
+                    )
+                receipt = self._ledger.record_opening_quote_response(
+                    evidence
+                )
+            except ETradeBrokerReaderError:
+                raise
+            except Exception as exc:
+                raise ETradeBrokerReaderIntegrityError(
+                    "opening quote response could not be replayed durably"
+                ) from exc
+            self._assert_runtime()
+            return OpeningQuoteRead(receipt=receipt, snapshot=snapshot)
 
     def query_order(
         self,
@@ -1753,7 +1899,10 @@ def _prepare_oauth_get(
         or oauth.cert is not None
         or origin not in _ETRADE_ORIGINS.values()
         or type(route) is not str
-        or not route.startswith("/v1/accounts/")
+        or not (
+            route.startswith("/v1/accounts/")
+            or route.startswith("/v1/market/quote/")
+        )
         or "?" in route
         or "#" in route
     ):
