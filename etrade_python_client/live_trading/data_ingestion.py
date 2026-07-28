@@ -15,8 +15,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 
+from live_trading.market_sessions import (
+    MarketSessionUnavailable,
+    filter_to_nyse_sessions,
+)
 
-CAUSAL_FEATURE_SCHEMA_VERSION = 1
+CAUSAL_FEATURE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -39,7 +43,10 @@ class CausalFeatureManifest:
     scaler_window: int
     scaler_min_periods: int
     availability: str
+    source_training_data_sha256: str
     training_data_sha256: str
+    modeling_calendar: str
+    modeling_session_data_sha256: str
     feature_hash: str
     schema_version: int = CAUSAL_FEATURE_SCHEMA_VERSION
 
@@ -853,9 +860,20 @@ class DataIngestor:
             raise ValueError("Feature input requires a DatetimeIndex")
         if df.index.has_duplicates or not df.index.is_monotonic_increasing:
             raise ValueError("Feature input index must be sorted and unique")
-        fit_ts = pd.Timestamp(fit_end).tz_localize(None).normalize()
+        try:
+            fit_ts = pd.Timestamp(fit_end)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("INVALID_FEATURE_FIT_END") from exc
+        if (
+            pd.isna(fit_ts)
+            or fit_ts.tzinfo is not None
+            or fit_ts != fit_ts.normalize()
+        ):
+            raise ValueError("INVALID_FEATURE_FIT_END")
         if fit_ts < df.index.min() or fit_ts > df.index.max():
             raise ValueError("FEATURE_FIT_END_OUTSIDE_INPUT_RANGE")
+        if fit_ts not in df.index:
+            raise ValueError("FEATURE_FIT_END_MUST_BE_NYSE_SESSION")
         return fit_ts
 
     def _select_stationarity_decision(self, series, column, alpha=0.05):
@@ -921,9 +939,16 @@ class DataIngestor:
             or len(df.columns) != len(set(df.columns))
         ):
             raise ValueError("Feature columns must be unique non-empty strings")
-        fit_ts = self._normalized_fit_end(df, fit_end)
-        numeric = df.apply(pd.to_numeric, errors="coerce").copy()
-        numeric = numeric.replace([np.inf, -np.inf], np.nan)
+        source_numeric = df.apply(pd.to_numeric, errors="coerce").copy()
+        source_numeric = source_numeric.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        try:
+            numeric = filter_to_nyse_sessions(source_numeric)
+        except MarketSessionUnavailable as exc:
+            raise ValueError(exc.code) from exc
+        fit_ts = self._normalized_fit_end(numeric, fit_end)
         training = numeric.loc[:fit_ts]
         if len(training) < max(20, scaler_min_periods):
             raise ValueError("INSUFFICIENT_FEATURE_FIT_PREFIX")
@@ -959,6 +984,10 @@ class DataIngestor:
         # Forward fill is causal. Backward fill is prohibited because it would
         # manufacture early values from later observations.
         selected_df = numeric.loc[:, selected].ffill()
+        source_selected_df = source_numeric.loc[:, selected].ffill()
+        source_training_data_sha256 = _causal_frame_sha256(
+            source_selected_df.loc[:fit_ts]
+        )
         training_data_sha256 = _causal_frame_sha256(
             selected_df.loc[:fit_ts]
         )
@@ -1008,6 +1037,8 @@ class DataIngestor:
             "scaler_window": int(scaler_window),
             "scaler_min_periods": int(scaler_min_periods),
             "availability": "close_T_for_next_session",
+            "modeling_calendar": "NYSE",
+            "modeling_session_data_sha256": training_data_sha256,
             "training_data_sha256": training_data_sha256,
         }
         feature_hash = hashlib.sha256(
@@ -1025,7 +1056,12 @@ class DataIngestor:
             scaler_window=int(scaler_window),
             scaler_min_periods=int(scaler_min_periods),
             availability="close_T_for_next_session",
+            source_training_data_sha256=(
+                source_training_data_sha256
+            ),
             training_data_sha256=training_data_sha256,
+            modeling_calendar="NYSE",
+            modeling_session_data_sha256=training_data_sha256,
             feature_hash=feature_hash,
         )
         return CausalFeatureResult(
@@ -1138,6 +1174,10 @@ class DataIngestor:
             combined = yf_df
         else:
             combined = pd.concat([yf_df, fred_df], axis=1).ffill()
+        try:
+            combined = filter_to_nyse_sessions(combined)
+        except MarketSessionUnavailable as exc:
+            raise ValueError(exc.code) from exc
         
         # Drop columns that completely failed to download (e.g. due to yfinance rate limits)
         # before we run dropna(), otherwise an all-NaN column wipes out all rows!

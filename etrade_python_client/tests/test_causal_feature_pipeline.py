@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from pandas_market_calendars import get_calendar
 
 import live_trading.ev_engine as engine_module
 from live_trading.data_ingestion import (
@@ -15,9 +16,19 @@ from live_trading.data_ingestion import (
 from live_trading.ev_engine import _select_pca_dimension, train_regime_hmm
 
 
+def _nyse_index(start, rows):
+    schedule = get_calendar("NYSE").schedule(
+        start_date=start,
+        end_date=(
+            pd.Timestamp(start) + pd.Timedelta(days=rows * 2)
+        ).date(),
+    )
+    return pd.DatetimeIndex(schedule.index[:rows]).tz_localize(None)
+
+
 def _feature_frame(rows=180):
     rng = np.random.default_rng(20260727)
-    index = pd.date_range("2025-01-02", periods=rows, freq="B")
+    index = _nyse_index("2025-01-02", rows)
     innovations = rng.normal(0.0004, 0.01, rows)
     price = 100.0 * np.exp(np.cumsum(innovations))
     stationary = np.empty(rows)
@@ -115,9 +126,52 @@ class CausalFeaturePipelineTests(unittest.TestCase):
             changed.manifest.feature_hash,
         )
 
+    def test_weekend_and_holiday_rows_do_not_change_modeling_prefix(self):
+        frame = _feature_frame(90)
+        fit_end = frame.index[69]
+        extra = pd.DataFrame(
+            {
+                "SPY_Close": [9999.0, 8888.0],
+                "Stationary_Signal": [99.0, -99.0],
+                "Future_Only": [np.nan, np.nan],
+            },
+            index=pd.to_datetime(["2025-01-18", "2025-01-20"]),
+        )
+        contaminated = pd.concat([frame, extra]).sort_index()
+
+        clean = _pure_ingestor().prepare_causal_features(
+            frame,
+            fit_end=fit_end,
+            scaler_window=60,
+        )
+        filtered = _pure_ingestor().prepare_causal_features(
+            contaminated,
+            fit_end=fit_end,
+            scaler_window=60,
+        )
+
+        pd.testing.assert_frame_equal(
+            clean.stationary,
+            filtered.stationary,
+        )
+        pd.testing.assert_frame_equal(clean.scaled, filtered.scaled)
+        self.assertEqual(
+            clean.manifest.modeling_session_data_sha256,
+            filtered.manifest.modeling_session_data_sha256,
+        )
+        self.assertEqual(
+            clean.manifest.feature_hash,
+            filtered.manifest.feature_hash,
+        )
+        self.assertNotEqual(
+            clean.manifest.source_training_data_sha256,
+            filtered.manifest.source_training_data_sha256,
+        )
+        self.assertEqual(clean.manifest.modeling_calendar, "NYSE")
+
     def test_pca_dimension_selection_uses_only_fit_prefix(self):
         rng = np.random.default_rng(11)
-        index = pd.date_range("2025-01-02", periods=160, freq="B")
+        index = _nyse_index("2025-01-02", 160)
         prefix_values = rng.normal(size=(100, 4))
         future_values = rng.normal(scale=(1.0, 20.0, 40.0, 80.0), size=(60, 4))
         full = pd.DataFrame(
@@ -170,7 +224,7 @@ class CausalFeaturePipelineTests(unittest.TestCase):
 
     def test_fixed_oos_states_and_model_inputs_are_prefix_invariant(self):
         rng = np.random.default_rng(91)
-        index = pd.date_range("2024-01-02", periods=150, freq="B")
+        index = _nyse_index("2024-01-02", 150)
         state = np.repeat([0.0, 3.0], 75)
         stationary = pd.DataFrame(
             {
@@ -191,7 +245,10 @@ class CausalFeaturePipelineTests(unittest.TestCase):
             scaler_window=1260,
             scaler_min_periods=20,
             availability="close_T_for_next_session",
+            source_training_data_sha256="a" * 64,
             training_data_sha256="a" * 64,
+            modeling_calendar="NYSE",
+            modeling_session_data_sha256="a" * 64,
             feature_hash="b" * 64,
         )
 
@@ -237,10 +294,25 @@ class CausalFeaturePipelineTests(unittest.TestCase):
                 fit_end=fit_end,
             )
 
-        compare_columns = ["PC1", "PC2", "HMM_State", "prob_state_0", "prob_state_1"]
+        compare_columns = [
+            "PC1",
+            "PC2",
+            "HMM_State",
+            "Raw_HMM_Taxonomy_ID",
+            "prob_state_0",
+            "prob_state_1",
+        ]
         pd.testing.assert_frame_equal(
             prefix_trace[compare_columns],
             full_trace.loc[prefix_trace.index, compare_columns],
+        )
+        self.assertEqual(
+            prefix_trace.attrs["raw_hmm_taxonomy_scope"],
+            "fixed_model",
+        )
+        self.assertEqual(
+            prefix_trace["Raw_HMM_Taxonomy_ID"].nunique(),
+            1,
         )
 
         class _ReplayIngestor(_OfflineIngestor):
@@ -285,6 +357,15 @@ class CausalFeaturePipelineTests(unittest.TestCase):
         pd.testing.assert_frame_equal(
             walk_prefix[compare_columns],
             walk_full.loc[walk_prefix.index, compare_columns],
+        )
+        self.assertEqual(
+            walk_prefix.attrs["raw_hmm_taxonomy_scope"],
+            "per_row_refit",
+        )
+        self.assertTrue(
+            walk_prefix["Raw_HMM_Taxonomy_ID"].str.fullmatch(
+                r"[0-9a-f]{64}"
+            ).all()
         )
 
 

@@ -15,6 +15,7 @@ from live_trading.ev_engine import (
     train_regime_hmm,
     calendar_days_to_trading_days,
 )
+from live_trading.market_sessions import latest_available_session_before
 
 
 def build_smoke_test_frame(
@@ -39,11 +40,16 @@ def build_smoke_test_frame(
 
     df["Log_Return"] = np.log(df["SPY_Close"] / df["SPY_Close"].shift(1))
     df["future_return"] = df["SPY_Close"].shift(-trading_horizon) / df["SPY_Close"] - 1
+    fit_end = latest_available_session_before(
+        df.index,
+        audit_start,
+    )
 
     best_hmm, best_k, feature_df = train_regime_hmm(
         df,
         n_components=n_components,
         expanding_window=False,
+        fit_end=fit_end,
     )
     if best_hmm is None or feature_df.empty:
         raise RuntimeError("HMM training did not produce a usable feature frame.")
@@ -103,6 +109,7 @@ def build_smoke_test_frame(
                 "terminal_spot": terminal_spot,
                 "effective_trading_horizon": trading_horizon,
                 "best_k": best_k,
+                "model_calibration_end": fit_end,
             }
         )
 
@@ -163,6 +170,10 @@ async def main():
     print("REGIME PROBABILITY SMOKE TEST")
     print("=" * 72)
     print("Window: 2022-01-01 -> 2024-08-31")
+    print(
+        "Calibration end: "
+        f"{audit_df['model_calibration_end'].iloc[0]}"
+    )
     print("Audit:  2024-05-01 -> 2024-06-28")
     print("Horizon: 14 calendar days")
     print(f"Trading horizon used: {int(audit_df['effective_trading_horizon'].iloc[0])} rows")

@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import functools
 import hashlib
 import re
 from copy import deepcopy
@@ -14,13 +13,28 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from sklearn.mixture import GaussianMixture
 from hmmlearn import hmm
-from live_trading.data_ingestion import DataIngestor, RollingRobustScaler
+from live_trading.data_ingestion import (
+    CAUSAL_FEATURE_SCHEMA_VERSION,
+    DataIngestor,
+    RollingRobustScaler,
+)
 from live_trading.pca_fusion import PCAFusion
 from datetime import datetime, timedelta
 import asyncio
 from sklearn.preprocessing import RobustScaler
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
+from live_trading.regime_taxonomy import (
+    RawHMMStateRef,
+    RegimeReturnBuckets,
+    RegimeTaxonomyError,
+    build_raw_hmm_taxonomy_id,
+)
+from live_trading.market_sessions import (
+    MarketSessionUnavailable,
+    filter_to_nyse_sessions,
+    require_nyse_session_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +88,9 @@ class ProbabilityEngineResult:
     input_feature_hash: str = ""
     model_as_of_date: str = ""
     inference_mode: str = ""
+    raw_hmm_taxonomy_id: str = ""
+    return_bucket_as_of: str = ""
+    return_outcomes_resolved_through: str = ""
     validity_status: str = "UNVERIFIED"
     execution_eligible: bool = False
     schema_version: int = PROBABILITY_ENGINE_SCHEMA_VERSION
@@ -108,6 +125,28 @@ class ProbabilityEngineResult:
             "fixed_snapshot_prefix_filter",
         }:
             raise ProbabilityEngineUnavailable("INVALID_INFERENCE_MODE")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.raw_hmm_taxonomy_id):
+            raise ProbabilityEngineUnavailable("INVALID_REGIME_TAXONOMY")
+        try:
+            bucket_as_of = pd.Timestamp(self.return_bucket_as_of)
+            resolved_through = pd.Timestamp(
+                self.return_outcomes_resolved_through
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProbabilityEngineUnavailable(
+                "INVALID_RETURN_RESOLUTION_DATE"
+            ) from exc
+        if (
+            bucket_as_of.tzinfo is not None
+            or bucket_as_of != bucket_as_of.normalize()
+            or bucket_as_of != parsed_as_of
+            or resolved_through.tzinfo is not None
+            or resolved_through != resolved_through.normalize()
+            or resolved_through >= bucket_as_of
+        ):
+            raise ProbabilityEngineUnavailable(
+                "INVALID_RETURN_RESOLUTION_DATE"
+            )
         if type(self.models) is not tuple or not self.models:
             raise ProbabilityEngineUnavailable("INVALID_REGIME_MODELS")
         for name, probabilities in (
@@ -642,7 +681,10 @@ COST_PER_SPREAD = 1.0
 YF_QUOTE_CACHE_PATH = os.path.join(PROJECT_ROOT, "s_and_p_data", "yf_quote_cache.json")
 REGIME_CACHE_FILE = os.path.join(PROJECT_ROOT, "market_regime_results.pkl")
 REGIME_SNAPSHOT_CACHE_DIR = os.path.join(PROJECT_ROOT, "backtest_cache", "regime_snapshots")
-REGIME_SNAPSHOT_PIPELINE_VERSION = 2
+REGIME_SNAPSHOT_PIPELINE_VERSION = 4
+RAW_HMM_TAXONOMY_PIPELINE_VERSION = (
+    "causal-hmm-return-buckets-nyse-sessions.v2"
+)
 REGIME_HMM_REFIT_INTERVAL_DAYS = 20
 GMM_MIN_OBS_PER_COMPONENT = 15
 GMM_MAX_COMPONENTS = 5
@@ -788,14 +830,31 @@ def train_regime_hmm(
     """
     Upgraded HMM training using PCA-fused features and BIC optimization.
     """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("INVALID_HMM_MARKET_FRAME")
+    try:
+        df = filter_to_nyse_sessions(df)
+    except MarketSessionUnavailable as exc:
+        raise ValueError(exc.code) from exc
     if expanding_window and fit_end is None:
         raise ValueError("EXPLICIT_FEATURE_FIT_END_REQUIRED")
-    if (
-        expanding_window
-        and pd.Timestamp(fit_end).normalize()
-        >= pd.Timestamp(df.index.max()).normalize()
-    ):
-        raise ValueError("WALK_FORWARD_REQUIRES_OUT_OF_SAMPLE_ROWS")
+    if fit_end is not None:
+        try:
+            requested_fit_end = pd.Timestamp(fit_end)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("INVALID_FEATURE_FIT_END") from exc
+        if (
+            pd.isna(requested_fit_end)
+            or requested_fit_end.tzinfo is not None
+            or requested_fit_end != requested_fit_end.normalize()
+            or requested_fit_end not in df.index
+        ):
+            raise ValueError("FEATURE_FIT_END_MUST_BE_NYSE_SESSION")
+        if (
+            expanding_window
+            and requested_fit_end >= df.index.max()
+        ):
+            raise ValueError("WALK_FORWARD_REQUIRES_OUT_OF_SAMPLE_ROWS")
 
     # 1. High-Dimensional Data Ingestion
     ingestor = DataIngestor()
@@ -833,6 +892,10 @@ def train_regime_hmm(
     feature_manifest = stationary_df.attrs.get("causal_feature_manifest")
     if feature_manifest is None:
         raise ValueError("CAUSAL_FEATURE_MANIFEST_MISSING")
+    try:
+        require_nyse_session_index(stationary_df.index)
+    except MarketSessionUnavailable as exc:
+        raise ValueError(exc.code) from exc
     
     # ENSURE WE ONLY USE DATA UP TO THE PROVIDED DF'S END DATE (Double check)
     stationary_df = stationary_df[stationary_df.index <= df.index.max()]
@@ -983,6 +1046,7 @@ def train_regime_hmm(
         causal_state_means = []
         causal_state_variances = []
         causal_semantic_drift = []
+        causal_taxonomy_ids = []
         current_hmm = None
         current_k = n_components
         current_fusion = None
@@ -1061,6 +1125,10 @@ def train_regime_hmm(
                     current_hmm.feature_manifest_ = feature_manifest
                     current_hmm.feature_fit_end_ = feature_manifest.fit_end
                     current_hmm.model_preparation_manifest_ = model_preparation_manifest
+                    current_hmm.model_training_end_ = pd.Timestamp(
+                        current_window_scaled.index[-1]
+                    ).strftime("%Y-%m-%d")
+                    _bind_raw_hmm_taxonomy(current_hmm)
                     current_fusion = stable_fusion
                     prev_refit_loadings = stable_fusion.sparse_pca.components_.copy()
                     next_refit_i = i + refit_interval
@@ -1112,6 +1180,9 @@ def train_regime_hmm(
             causal_state_means.append(json.dumps(current_refit_metadata.get("state_means")))
             causal_state_variances.append(json.dumps(current_refit_metadata.get("state_variances")))
             causal_semantic_drift.append(bool(current_refit_metadata.get("semantic_drift_flag", False)))
+            causal_taxonomy_ids.append(
+                current_hmm.raw_hmm_taxonomy_id_
+            )
 
         print(f"  [Step 3/4] Walk-Forward done in {time.time()-_t0_wf:.1f}s ({_refit_count} refits).", flush=True)
 
@@ -1137,14 +1208,17 @@ def train_regime_hmm(
         pc_df['HMM_State_Means'] = causal_state_means
         pc_df['HMM_State_Variances'] = causal_state_variances
         pc_df['HMM_Semantic_Drift_Flag'] = causal_semantic_drift
+        pc_df['Raw_HMM_Taxonomy_ID'] = causal_taxonomy_ids
         pc_df['Regime_Signal_Timestamp'] = 'close_T_for_next_session'
         pc_df.attrs['regime_signal_timestamp'] = 'close_T_for_next_session'
         pc_df.attrs['regime_inference_mode'] = 'walk_forward_refit'
+        pc_df.attrs['raw_hmm_taxonomy_scope'] = 'per_row_refit'
         for k in range(current_k):
             pc_df[f'prob_state_{k}'] = causal_probs_arr[:, k]
         current_hmm.causal_tail_probability_ = causal_probs_arr[-1].copy()
         current_hmm.causal_tail_as_of_ = pd.Timestamp(pc_df.index[-1]).strftime("%Y-%m-%d")
         current_hmm.causal_inference_mode_ = "walk_forward_refit"
+        _verify_raw_hmm_taxonomy(current_hmm)
         pc_df = _apply_causal_stress_overlay(pc_df, df, current_k)
         return current_hmm, current_k, pc_df
 
@@ -1181,6 +1255,16 @@ def train_regime_hmm(
     best_hmm.feature_manifest_ = feature_manifest
     best_hmm.feature_fit_end_ = feature_manifest.fit_end
     best_hmm.model_preparation_manifest_ = model_preparation_manifest
+    training_index = (
+        pc_df.loc[:feature_fit_end].index
+        if fixed_oos
+        else pc_df.index
+    )
+    if len(training_index) == 0:
+        raise ValueError("HMM_TRAINING_CUTOFF_UNAVAILABLE")
+    best_hmm.model_training_end_ = pd.Timestamp(
+        training_index[-1]
+    ).strftime("%Y-%m-%d")
 
     # Mandate 10.2: Causal Viterbi Decoding
     # During live trading or backtesting, if the agent runs .predict(), 
@@ -1248,6 +1332,10 @@ def train_regime_hmm(
         pc_df["Regime_Signal_Timestamp"] = "close_T_for_next_session"
         pc_df.attrs["regime_signal_timestamp"] = "close_T_for_next_session"
         pc_df.attrs["regime_inference_mode"] = "fixed_out_of_sample"
+
+    taxonomy_id = _bind_raw_hmm_taxonomy(best_hmm)
+    pc_df["Raw_HMM_Taxonomy_ID"] = taxonomy_id
+    pc_df.attrs["raw_hmm_taxonomy_scope"] = "fixed_model"
     
     # Return the LAST model from the expanding window as the "live" model
     if expanding_window and n_samples > warmup:
@@ -1353,9 +1441,267 @@ def get_regime_labels(hmm_model, pc_df=None):
             
     return labels
 
+
+def _raw_hmm_taxonomy_material(hmm_model):
+    """Return the exact identity material for one fitted, ordered HMM."""
+
+    if (
+        hmm_model is None
+        or type(getattr(hmm_model, "n_components", None)) is not int
+        or hmm_model.n_components < 2
+    ):
+        raise RegimeTaxonomyError(
+            "a fitted multi-state HMM is required for taxonomy binding"
+        )
+    feature_manifest = getattr(hmm_model, "feature_manifest_", None)
+    feature_hash = getattr(feature_manifest, "feature_hash", None)
+    modeling_digest = getattr(
+        feature_manifest,
+        "modeling_session_data_sha256",
+        None,
+    )
+    training_end = getattr(hmm_model, "model_training_end_", None)
+    if (
+        type(feature_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", feature_hash) is None
+        or getattr(feature_manifest, "schema_version", None)
+        != CAUSAL_FEATURE_SCHEMA_VERSION
+        or getattr(feature_manifest, "modeling_calendar", None)
+        != "NYSE"
+        or type(modeling_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", modeling_digest) is None
+        or modeling_digest
+        != getattr(feature_manifest, "training_data_sha256", None)
+    ):
+        raise RegimeTaxonomyError(
+            "the HMM is missing its exact causal feature manifest"
+        )
+    if type(training_end) is not str:
+        raise RegimeTaxonomyError(
+            "the HMM is missing its exact training cutoff"
+        )
+
+    labels = get_regime_labels(hmm_model)
+    ordered_labels = tuple(
+        labels.get(state, f"Regime {state}")
+        for state in range(hmm_model.n_components)
+    )
+    model_class = (
+        f"{type(hmm_model).__module__}.{type(hmm_model).__qualname__}"
+    )
+    covariance_type = str(
+        getattr(hmm_model, "covariance_type", "unknown")
+    )
+    mixture_count = int(getattr(hmm_model, "n_mix", 1))
+    model_variant_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "model_class": model_class,
+                "covariance_type": covariance_type,
+                "mixture_count": mixture_count,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    pipeline_version = (
+        f"{RAW_HMM_TAXONOMY_PIPELINE_VERSION}:"
+        f"snapshot-v{REGIME_SNAPSHOT_PIPELINE_VERSION}:"
+        f"model-{model_variant_sha256}"
+    )
+    taxonomy_id = build_raw_hmm_taxonomy_id(
+        n_components=hmm_model.n_components,
+        feature_manifest_sha256=feature_hash,
+        training_end=training_end,
+        pipeline_version=pipeline_version,
+        state_labels=ordered_labels,
+        means=hmm_model.means_,
+        covariances=hmm_model.covars_,
+        transition_matrix=hmm_model.transmat_,
+        start_probabilities=hmm_model.startprob_,
+        mixture_weights=getattr(hmm_model, "weights_", None),
+    )
+    return taxonomy_id, ordered_labels, training_end, pipeline_version
+
+
+def _bind_raw_hmm_taxonomy(hmm_model):
+    """Attach an immutable-by-verification taxonomy identity to a fresh HMM."""
+
+    (
+        taxonomy_id,
+        ordered_labels,
+        training_end,
+        pipeline_version,
+    ) = _raw_hmm_taxonomy_material(hmm_model)
+    existing = getattr(hmm_model, "raw_hmm_taxonomy_id_", None)
+    if existing is not None and existing != taxonomy_id:
+        raise RegimeTaxonomyError(
+            "the fitted HMM taxonomy changed after it was bound"
+        )
+    hmm_model.raw_hmm_taxonomy_id_ = taxonomy_id
+    hmm_model.raw_hmm_taxonomy_state_labels_ = ordered_labels
+    hmm_model.raw_hmm_taxonomy_training_end_ = training_end
+    hmm_model.raw_hmm_taxonomy_pipeline_version_ = pipeline_version
+    return taxonomy_id
+
+
+def _verify_raw_hmm_taxonomy(hmm_model):
+    """Recompute and verify a previously bound taxonomy without upgrading it."""
+
+    bound_id = getattr(hmm_model, "raw_hmm_taxonomy_id_", None)
+    bound_labels = getattr(
+        hmm_model,
+        "raw_hmm_taxonomy_state_labels_",
+        None,
+    )
+    bound_training_end = getattr(
+        hmm_model,
+        "raw_hmm_taxonomy_training_end_",
+        None,
+    )
+    bound_pipeline = getattr(
+        hmm_model,
+        "raw_hmm_taxonomy_pipeline_version_",
+        None,
+    )
+    if (
+        type(bound_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", bound_id) is None
+        or type(bound_labels) is not tuple
+        or type(bound_training_end) is not str
+        or type(bound_pipeline) is not str
+    ):
+        raise RegimeTaxonomyError(
+            "legacy or unbound HMM taxonomy is not accepted"
+        )
+    (
+        expected_id,
+        expected_labels,
+        expected_training_end,
+        expected_pipeline,
+    ) = _raw_hmm_taxonomy_material(hmm_model)
+    if (
+        bound_id != expected_id
+        or bound_labels != expected_labels
+        or bound_training_end != expected_training_end
+        or bound_pipeline != expected_pipeline
+    ):
+        raise RegimeTaxonomyError(
+            "bound HMM taxonomy does not match its fitted parameters"
+        )
+    return bound_id
+
+
+def _validate_regime_cache_payload(data, expected_metadata=None):
+    """Reject legacy, stale, or cross-taxonomy return-bucket cache content."""
+
+    if type(data) is not dict:
+        return None
+    buckets = data.get("regime_dict")
+    hmm_model = data.get("hmm_model")
+    daily_models = data.get("daily_models")
+    metadata = data.get("metadata")
+    if (
+        type(buckets) is not RegimeReturnBuckets
+        or hmm_model is None
+        or type(daily_models) is not list
+        or type(metadata) is not dict
+    ):
+        return None
+    try:
+        taxonomy_id = _verify_raw_hmm_taxonomy(hmm_model)
+    except (AttributeError, RegimeTaxonomyError, TypeError, ValueError):
+        return None
+    if (
+        not _regime_bucket_binding_is_exact(
+            buckets,
+            hmm_model,
+            daily_models,
+            taxonomy_id,
+        )
+        or metadata.get("raw_hmm_taxonomy_id") != taxonomy_id
+        or metadata.get("return_buckets_manifest") != buckets.manifest()
+    ):
+        return None
+    for key, expected_value in (expected_metadata or {}).items():
+        if expected_value is not None and metadata.get(key) != expected_value:
+            return None
+    return data
+
+
+def _regime_bucket_binding_is_exact(
+    buckets,
+    hmm_model,
+    daily_models,
+    taxonomy_id,
+):
+    """Require one model, raw taxonomy, as-of date, and bucket set."""
+
+    tail_as_of = getattr(hmm_model, "causal_tail_as_of_", None)
+    return (
+        type(buckets) is RegimeReturnBuckets
+        and type(taxonomy_id) is str
+        and buckets.taxonomy_id == taxonomy_id
+        and buckets.model_training_end
+        == getattr(hmm_model, "model_training_end_", None)
+        and buckets.state_count
+        == getattr(hmm_model, "n_components", None)
+        and type(daily_models) is list
+        and len(daily_models) == buckets.state_count
+        and type(tail_as_of) is str
+        and bool(tail_as_of)
+        and buckets.inference_as_of == tail_as_of
+    )
+
+
 def _feature_hash(feature_names):
     payload = json.dumps(list(feature_names or []), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _market_data_prefix_sha256(frame):
+    """Hash the exact ordered numeric market-data prefix used by a snapshot."""
+
+    if (
+        not isinstance(frame, pd.DataFrame)
+        or frame.empty
+        or not frame.index.is_monotonic_increasing
+        or not frame.index.is_unique
+    ):
+        raise ValueError("INVALID_MARKET_DATA_PREFIX")
+    try:
+        numeric = frame.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("NON_NUMERIC_MARKET_DATA_PREFIX") from exc
+    rows = []
+    for index_value, values in zip(
+        numeric.index,
+        numeric.to_numpy(dtype=float),
+    ):
+        rows.append(
+            [
+                pd.Timestamp(index_value).isoformat(),
+                [
+                    None
+                    if not np.isfinite(value)
+                    else float(value).hex()
+                    for value in values
+                ],
+            ]
+        )
+    payload = {
+        "domain": "regime_market_data_prefix.v1",
+        "columns": [str(column) for column in numeric.columns],
+        "rows": rows,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _safe_cache_token(value):
@@ -1408,10 +1754,26 @@ def save_regime_snapshot(regime_dict, hmm_model, daily_models, metadata=None):
     import pickle
 
     try:
+        if type(regime_dict) is not RegimeReturnBuckets:
+            raise RegimeTaxonomyError(
+                "legacy return-bucket dictionaries cannot be cached"
+            )
+        taxonomy_id = _verify_raw_hmm_taxonomy(hmm_model)
+        if not _regime_bucket_binding_is_exact(
+            regime_dict,
+            hmm_model,
+            daily_models,
+            taxonomy_id,
+        ):
+            raise RegimeTaxonomyError(
+                "return buckets do not match the fitted HMM taxonomy"
+            )
         metadata = metadata or {}
         metadata = dict(metadata)
         metadata.setdefault("snapshot_pipeline_version", REGIME_SNAPSHOT_PIPELINE_VERSION)
         metadata.setdefault("training_data_end", metadata.get("as_of_date"))
+        metadata["raw_hmm_taxonomy_id"] = taxonomy_id
+        metadata["return_buckets_manifest"] = regime_dict.manifest()
         if hmm_model is not None:
             metadata.setdefault("fitted_n_components", getattr(hmm_model, "n_components", None))
             metadata.setdefault("feature_hash", _feature_hash(getattr(hmm_model, "feature_names_", [])))
@@ -1429,6 +1791,26 @@ def save_regime_snapshot(regime_dict, hmm_model, daily_models, metadata=None):
             metadata.setdefault(
                 "feature_training_data_sha256",
                 getattr(feature_manifest, "training_data_sha256", None),
+            )
+            metadata.setdefault(
+                "feature_source_training_data_sha256",
+                getattr(
+                    feature_manifest,
+                    "source_training_data_sha256",
+                    None,
+                ),
+            )
+            metadata.setdefault(
+                "feature_modeling_calendar",
+                getattr(feature_manifest, "modeling_calendar", None),
+            )
+            metadata.setdefault(
+                "feature_modeling_session_data_sha256",
+                getattr(
+                    feature_manifest,
+                    "modeling_session_data_sha256",
+                    None,
+                ),
             )
             metadata.setdefault(
                 "pca_components",
@@ -1477,7 +1859,10 @@ def load_regime_snapshot(expected_metadata=None):
                 continue
             if actual_metadata.get(key) != expected_value:
                 return None
-        return data
+        return _validate_regime_cache_payload(
+            data,
+            expected_metadata=expected_metadata,
+        )
     except Exception as e:
         print(f"❌ Failed to load regime snapshot {path}: {e}")
         return None
@@ -1486,10 +1871,26 @@ def save_regime_cache(regime_dict, hmm_model, daily_models, metadata=None):
     """Saves the regime detection results to a pickle file."""
     import pickle
     try:
+        if type(regime_dict) is not RegimeReturnBuckets:
+            raise RegimeTaxonomyError(
+                "legacy return-bucket dictionaries cannot be cached"
+            )
+        taxonomy_id = _verify_raw_hmm_taxonomy(hmm_model)
+        if not _regime_bucket_binding_is_exact(
+            regime_dict,
+            hmm_model,
+            daily_models,
+            taxonomy_id,
+        ):
+            raise RegimeTaxonomyError(
+                "return buckets do not match the fitted HMM taxonomy"
+            )
         metadata = metadata or {}
         metadata = dict(metadata)
         metadata.setdefault("snapshot_pipeline_version", REGIME_SNAPSHOT_PIPELINE_VERSION)
         metadata.setdefault("training_data_end", metadata.get("as_of_date"))
+        metadata["raw_hmm_taxonomy_id"] = taxonomy_id
+        metadata["return_buckets_manifest"] = regime_dict.manifest()
         if hmm_model is not None:
             metadata.setdefault("fitted_n_components", getattr(hmm_model, "n_components", None))
             metadata.setdefault("feature_hash", _feature_hash(getattr(hmm_model, "feature_names_", [])))
@@ -1507,6 +1908,26 @@ def save_regime_cache(regime_dict, hmm_model, daily_models, metadata=None):
             metadata.setdefault(
                 "feature_training_data_sha256",
                 getattr(feature_manifest, "training_data_sha256", None),
+            )
+            metadata.setdefault(
+                "feature_source_training_data_sha256",
+                getattr(
+                    feature_manifest,
+                    "source_training_data_sha256",
+                    None,
+                ),
+            )
+            metadata.setdefault(
+                "feature_modeling_calendar",
+                getattr(feature_manifest, "modeling_calendar", None),
+            )
+            metadata.setdefault(
+                "feature_modeling_session_data_sha256",
+                getattr(
+                    feature_manifest,
+                    "modeling_session_data_sha256",
+                    None,
+                ),
             )
             metadata.setdefault(
                 "pca_components",
@@ -1563,7 +1984,10 @@ def load_regime_cache(expected_metadata=None):
                 )
                 return None
         
-        return data
+        return _validate_regime_cache_payload(
+            data,
+            expected_metadata=expected_metadata,
+        )
     except Exception as e:
         print(f"❌ Failed to load regime cache: {e}")
         return None
@@ -1590,6 +2014,11 @@ def _hmm_refit_anchor_date(trading_index, as_of_date, refit_interval=REGIME_HMM_
 
 def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_date=None, exclude_features=None):
     """Score a causal dataframe with a cached HMM snapshot."""
+    try:
+        causal_df = filter_to_nyse_sessions(causal_df)
+        require_nyse_session_index(causal_df.index)
+    except MarketSessionUnavailable as exc:
+        raise ValueError(exc.code) from exc
     if hmm_model is None or not hasattr(hmm_model, "fusion_"):
         raise ValueError("Cached HMM snapshot is missing the fitted fusion pipeline.")
     feature_manifest = getattr(hmm_model, "feature_manifest_", None)
@@ -1631,6 +2060,10 @@ def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_dat
         )
     )
     rebuilt_manifest = stationary_df.attrs.get("causal_feature_manifest")
+    try:
+        require_nyse_session_index(stationary_df.index)
+    except MarketSessionUnavailable as exc:
+        raise ValueError(exc.code) from exc
     if (
         rebuilt_manifest is None
         or rebuilt_manifest.feature_hash != feature_manifest.feature_hash
@@ -1746,29 +2179,91 @@ def _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts, refit_dat
     hmm_model.causal_tail_probability_ = causal_probs[-1].copy()
     hmm_model.causal_tail_as_of_ = pd.Timestamp(pc_df.index[-1]).strftime("%Y-%m-%d")
     hmm_model.causal_inference_mode_ = "fixed_snapshot_prefix_filter"
+    taxonomy_id = _verify_raw_hmm_taxonomy(hmm_model)
+    pc_df["Raw_HMM_Taxonomy_ID"] = taxonomy_id
+    pc_df.attrs["raw_hmm_taxonomy_scope"] = "fixed_model"
     pc_df = _apply_causal_stress_overlay(pc_df, stationary_df, hmm_model.n_components)
     return pc_df
 
 
 
-@functools.lru_cache(maxsize=10)
 def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=3, force_refit=False, as_of_date=None):
+    """Build strictly resolved returns for one exact fitted raw-HMM taxonomy."""
+
+    if as_of_date is None:
+        raise ProbabilityEngineUnavailable(
+            "EXPLICIT_BUCKET_AS_OF_DATE_REQUIRED"
+        )
+    if type(horizon) is not int or type(horizon) is bool or horizon < 1:
+        raise ProbabilityEngineUnavailable("INVALID_HORIZON")
+    if (
+        n_components is not None
+        and (
+            type(n_components) is not int
+            or type(n_components) is bool
+            or n_components < 2
+        )
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_HMM_COMPONENT_COUNT")
+    if type(force_refit) is not bool:
+        raise ProbabilityEngineUnavailable("INVALID_FORCE_REFIT_FLAG")
     trading_horizon = calendar_days_to_trading_days(horizon)
-    as_of_ts = pd.Timestamp(as_of_date).normalize() if as_of_date is not None else pd.Timestamp(datetime.now()).normalize()
+    try:
+        as_of_ts = pd.Timestamp(as_of_date)
+    except (TypeError, ValueError) as exc:
+        raise ProbabilityEngineUnavailable(
+            "INVALID_BUCKET_AS_OF_DATE"
+        ) from exc
+    if (
+        pd.isna(as_of_ts)
+        or as_of_ts.tzinfo is not None
+        or as_of_ts != as_of_ts.normalize()
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_BUCKET_AS_OF_DATE")
+    inference_as_of = as_of_ts.strftime("%Y-%m-%d")
     df = fetch_historical_data()
     if df.empty:
-        return {}, None, []
+        raise ProbabilityEngineUnavailable("HISTORICAL_DATA_UNAVAILABLE")
 
     total_rows = len(df)
-    causal_df = df.loc[df.index <= as_of_ts].copy()
-    if causal_df.empty:
-        return {}, None, []
+    source_causal_df = df.loc[df.index <= as_of_ts].copy()
+    if source_causal_df.empty:
+        raise ProbabilityEngineUnavailable("HISTORICAL_PREFIX_UNAVAILABLE")
+    try:
+        source_market_data_prefix_sha256 = _market_data_prefix_sha256(
+            source_causal_df
+        )
+        causal_df = filter_to_nyse_sessions(source_causal_df)
+        require_nyse_session_index(causal_df.index)
+        modeling_market_data_prefix_sha256 = (
+            _market_data_prefix_sha256(causal_df)
+        )
+    except (MarketSessionUnavailable, ValueError) as exc:
+        raise ProbabilityEngineUnavailable(
+            "INVALID_HISTORICAL_DATA_PREFIX"
+        ) from exc
+    if as_of_ts not in causal_df.index:
+        raise ProbabilityEngineUnavailable(
+            "BUCKET_AS_OF_MUST_BE_NYSE_SESSION"
+        )
 
     hmm_anchor_date = _hmm_refit_anchor_date(causal_df.index, as_of_ts, REGIME_HMM_REFIT_INTERVAL_DAYS)
     requested_metadata = {
-        "as_of_date": hmm_anchor_date.strftime("%Y-%m-%d"),
+        "as_of_date": inference_as_of,
+        "inference_as_of": inference_as_of,
         "training_data_end": hmm_anchor_date.strftime("%Y-%m-%d"),
         "snapshot_pipeline_version": REGIME_SNAPSHOT_PIPELINE_VERSION,
+        "taxonomy_pipeline_version": RAW_HMM_TAXONOMY_PIPELINE_VERSION,
+        "market_data_prefix_sha256": modeling_market_data_prefix_sha256,
+        "source_market_data_prefix_sha256": (
+            source_market_data_prefix_sha256
+        ),
+        "modeling_market_data_prefix_sha256": (
+            modeling_market_data_prefix_sha256
+        ),
+        "modeling_calendar": "NYSE",
+        "source_row_count": int(len(source_causal_df)),
+        "modeling_session_row_count": int(len(causal_df)),
         "horizon_calendar_days": int(horizon),
         "trading_horizon": int(trading_horizon),
         "requested_n_components": n_components if n_components is not None else "auto",
@@ -1783,7 +2278,10 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=3, forc
         f"hmm_refit_anchor={hmm_anchor_date.date()}, interval={REGIME_HMM_REFIT_INTERVAL_DAYS}d",
         flush=True,
     )
-    print(f"  Loaded {total_rows} days of historical data; {len(causal_df)} rows eligible as of {as_of_ts.date()}.")
+    print(
+        f"  Loaded {total_rows} source rows; {len(causal_df)} exact "
+        f"NYSE sessions eligible as of {as_of_ts.date()}."
+    )
     _t0_total = time.time()
 
     cached_data = None
@@ -1792,96 +2290,240 @@ def build_regime_return_arrays(cache_key_dummy, horizon=45, n_components=3, forc
         if cached_data is None:
             cached_data = load_regime_cache(requested_metadata)
 
-    if cached_data and cached_data.get("hmm_model") is not None:
-        best_hmm = cached_data["hmm_model"]
-        print(f"📈 Using cached HMM snapshot (from {cached_data['timestamp']})")
-    else:
-        hmm_train_df = df.loc[df.index <= hmm_anchor_date].copy()
-        if hmm_train_df.empty:
-            return {}, None, []
-        print("🧠 Starting heavy HMM market regime training (this may take several minutes)...")
+    if cached_data is not None:
         print(
-            f"  Config: horizon={horizon}cal/{trading_horizon}trd days, "
-            f"K={n_components or 'auto(3-5)'}, anchor={hmm_anchor_date.date()}",
-            flush=True,
+            f"📈 Using taxonomy-bound HMM snapshot "
+            f"(from {cached_data['timestamp']})"
         )
-        try:
-            # For historical analysis, we MUST use expanding_window=True to eliminate parameter look-ahead bias
-            best_hmm, best_k, _ = train_regime_hmm(
-                hmm_train_df,
-                n_components=n_components,
-                expanding_window=False,
-                fit_end=hmm_anchor_date,
-            )
-        except Exception as e:
-            from live_trading.data_ingestion import red_alert
-            red_alert(f"Failed to train HMM: {e}")
-            return {}, None, []
-        print(f"  [Step 4/4] Building return buckets & GMM fitting...", flush=True)
+        return (
+            cached_data["regime_dict"],
+            cached_data["hmm_model"],
+            cached_data["daily_models"],
+        )
+
+    hmm_train_df = causal_df.loc[
+        causal_df.index <= hmm_anchor_date
+    ].copy()
+    if hmm_train_df.empty:
+        raise ProbabilityEngineUnavailable("HMM_TRAINING_PREFIX_UNAVAILABLE")
+    print("🧠 Starting heavy HMM market regime training (this may take several minutes)...")
+    print(
+        f"  Config: horizon={horizon}cal/{trading_horizon}trd days, "
+        f"K={n_components or 'auto(3-5)'}, anchor={hmm_anchor_date.date()}",
+        flush=True,
+    )
+    try:
+        best_hmm, best_k, _ = train_regime_hmm(
+            hmm_train_df,
+            n_components=n_components,
+            expanding_window=False,
+            fit_end=hmm_anchor_date,
+        )
+    except Exception as exc:
+        from live_trading.data_ingestion import red_alert
+        red_alert(f"Failed to train HMM: {exc}")
+        raise ProbabilityEngineUnavailable("HMM_TRAINING_FAILED") from exc
+    if best_hmm is None or best_k < 2:
+        raise ProbabilityEngineUnavailable("INVALID_HMM_COMPONENT_COUNT")
+    try:
+        taxonomy_id = _verify_raw_hmm_taxonomy(best_hmm)
+    except RegimeTaxonomyError as exc:
+        raise ProbabilityEngineUnavailable(
+            "MODEL_TAXONOMY_UNAVAILABLE"
+        ) from exc
+    print(f"  [Step 4/4] Building return buckets & GMM fitting...", flush=True)
 
     try:
-        feature_df = _build_causal_regime_feature_frame(causal_df, best_hmm, as_of_ts, refit_date=hmm_anchor_date)
-    except Exception as e:
+        feature_df = _build_causal_regime_feature_frame(
+            causal_df,
+            best_hmm,
+            as_of_ts,
+            refit_date=hmm_anchor_date,
+        )
+    except Exception as exc:
         from live_trading.data_ingestion import red_alert
-        red_alert(f"Failed to score HMM snapshot: {e}")
-        return {}, None, []
+        red_alert(f"Failed to score HMM snapshot: {exc}")
+        raise ProbabilityEngineUnavailable("HMM_CAUSAL_SCORING_FAILED") from exc
 
     if feature_df.empty:
-        return {}, None, []
+        raise ProbabilityEngineUnavailable("HMM_CAUSAL_TRACE_UNAVAILABLE")
 
-    best_k = getattr(best_hmm, "n_components", None) or len([c for c in feature_df.columns if c.startswith("prob_state_")])
-    
-    # Align and add necessary physical columns for return calculation
+    best_k = getattr(best_hmm, "n_components", None)
+    if type(best_k) is not int or best_k < 2:
+        raise ProbabilityEngineUnavailable("INVALID_HMM_COMPONENT_COUNT")
+
     common_idx = feature_df.index.intersection(causal_df.index)
     feature_df = feature_df.loc[common_idx].copy()
-    feature_df['SPY_Close'] = causal_df.loc[common_idx, 'SPY_Close']
-    
-    # Ensure Log_Return exists for daily models
-    if 'Log_Return' not in feature_df.columns:
-        if 'Log_Return' in causal_df.columns:
-            feature_df['Log_Return'] = causal_df.loc[common_idx, 'Log_Return']
+    feature_df["SPY_Close"] = causal_df.loc[common_idx, "SPY_Close"]
+    if "Log_Return" not in feature_df.columns:
+        if "Log_Return" in causal_df.columns:
+            feature_df["Log_Return"] = causal_df.loc[
+                common_idx,
+                "Log_Return",
+            ]
         else:
-            feature_df['Log_Return'] = np.log(feature_df['SPY_Close'] / feature_df['SPY_Close'].shift(1))
-    
-    # Mandate 11.1: Calendar vs. Trading Day Alignment
-    feature_df['future_terminal_return'] = feature_df['SPY_Close'].shift(-trading_horizon) / feature_df['SPY_Close'] - 1
-    feature_df = feature_df.dropna(subset=['future_terminal_return'])
-    if not feature_df.empty:
-        as_of_pos = feature_df.index.searchsorted(as_of_ts, side="right") - 1
-        eligible_positions = np.arange(len(feature_df)) + trading_horizon <= as_of_pos
-        feature_df = feature_df.iloc[eligible_positions].copy()
-    
-    regime_dict = {}
+            feature_df["Log_Return"] = np.log(
+                feature_df["SPY_Close"]
+                / feature_df["SPY_Close"].shift(1)
+            )
+
+    price_series = causal_df["SPY_Close"].dropna().astype(float).copy()
+    price_series.index = pd.DatetimeIndex(price_series.index).normalize()
+    if (
+        price_series.empty
+        or not price_series.index.is_monotonic_increasing
+        or not price_series.index.is_unique
+        or not np.isfinite(price_series.to_numpy(dtype=float)).all()
+        or np.any(price_series.to_numpy(dtype=float) <= 0.0)
+    ):
+        raise ProbabilityEngineUnavailable("INVALID_HISTORICAL_PRICE_INDEX")
+
+    resolution_values = np.full(
+        len(price_series),
+        np.datetime64("NaT"),
+        dtype="datetime64[ns]",
+    )
+    if len(price_series) > trading_horizon:
+        resolution_values[:-trading_horizon] = (
+            price_series.index[trading_horizon:].to_numpy(
+                dtype="datetime64[ns]"
+            )
+        )
+    outcome_frame = pd.DataFrame(
+        {
+            "future_terminal_return": (
+                price_series.shift(-trading_horizon) / price_series - 1.0
+            ),
+            "outcome_resolution_session": pd.to_datetime(
+                resolution_values
+            ),
+        },
+        index=price_series.index,
+    )
+    bucket_frame = feature_df.join(outcome_frame, how="left")
+    eligible = (
+        bucket_frame["future_terminal_return"].notna()
+        & bucket_frame["outcome_resolution_session"].notna()
+        & (bucket_frame["outcome_resolution_session"] < as_of_ts)
+    )
+    bucket_frame = bucket_frame.loc[eligible].copy()
+    if bucket_frame.empty:
+        raise ProbabilityEngineUnavailable(
+            "STRICTLY_RESOLVED_RETURN_OUTCOMES_UNAVAILABLE"
+        )
+    if not (
+        bucket_frame["outcome_resolution_session"] < as_of_ts
+    ).all():
+        raise ProbabilityEngineUnavailable(
+            "UNRESOLVED_RETURN_OUTCOME_PRESENT"
+        )
+    try:
+        state_values = bucket_frame["HMM_State"].to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ProbabilityEngineUnavailable(
+            "INVALID_RAW_HMM_STATE_TRACE"
+        ) from exc
+    if (
+        not np.isfinite(state_values).all()
+        or not np.equal(state_values, np.floor(state_values)).all()
+        or np.any(state_values < 0)
+        or np.any(state_values >= best_k)
+    ):
+        raise ProbabilityEngineUnavailable(
+            "INVALID_RAW_HMM_STATE_TRACE"
+        )
+    resolved_through = pd.Timestamp(
+        bucket_frame["outcome_resolution_session"].max()
+    ).strftime("%Y-%m-%d")
+
+    ordered_buckets = []
     daily_models = []
     for state in range(best_k):
-        state_returns = feature_df[feature_df['HMM_State'] == state]['future_terminal_return'].values
-        regime_dict[f'State_{state}'] = state_returns
-        
-        # Build daily models for path simulation
-        state_subset = feature_df[feature_df['HMM_State'] == state]
-        state_log_returns = state_subset['Log_Return'].dropna().values
+        state_subset = bucket_frame[
+            bucket_frame["HMM_State"] == state
+        ]
+        state_returns = tuple(
+            float(value)
+            for value in state_subset[
+                "future_terminal_return"
+            ].to_numpy(dtype=float)
+        )
+        ordered_buckets.append(state_returns)
+
+        state_log_returns = state_subset["Log_Return"].dropna().to_numpy(
+            dtype=float
+        )
         if len(state_log_returns) > 0:
             daily_frac_returns = np.exp(state_log_returns) - 1
-            daily_models.append(fit_gmm(daily_frac_returns, regime_label=f'Daily_State_{state}'))
+            daily_models.append(
+                fit_gmm(
+                    daily_frac_returns,
+                    regime_label=f"Daily_State_{state}",
+                )
+            )
         else:
-            daily_models.append({"type": "gaussian_fallback", "loc": 0.0, "scale": 0.01})
-        
-    # Summary
-    labels = get_regime_labels(best_hmm)
+            daily_models.append(
+                {
+                    "type": "gaussian_fallback",
+                    "loc": 0.0,
+                    "scale": 0.01,
+                }
+            )
+
+    try:
+        regime_buckets = RegimeReturnBuckets(
+            taxonomy_id=taxonomy_id,
+            model_training_end=best_hmm.model_training_end_,
+            inference_as_of=inference_as_of,
+            resolved_outcomes_through=resolved_through,
+            horizon_calendar_days=int(horizon),
+            horizon_trading_days=int(trading_horizon),
+            buckets=tuple(ordered_buckets),
+        )
+    except RegimeTaxonomyError as exc:
+        raise ProbabilityEngineUnavailable(
+            "INCOMPLETE_REGIME_RETURN_BUCKETS"
+        ) from exc
+
+    labels = tuple(best_hmm.raw_hmm_taxonomy_state_labels_)
     for state in range(best_k):
-        n_obs = len(regime_dict.get(f'State_{state}', []))
-        label = labels.get(state, f'State {state}')
-        print(f"    State {state} ({label}): {n_obs} return observations", flush=True)
+        n_obs = len(
+            regime_buckets.bucket_for(
+                RawHMMStateRef(taxonomy_id, state)
+            )
+        )
+        print(
+            f"    State {state} ({labels[state]}): "
+            f"{n_obs} return observations",
+            flush=True,
+        )
     total_elapsed = time.time() - _t0_total
-    print(f"  ✅ Regime training complete in {total_elapsed:.1f}s (K={best_k})", flush=True)
+    print(
+        f"  ✅ Regime training complete in {total_elapsed:.1f}s "
+        f"(K={best_k}, outcomes through {resolved_through})",
+        flush=True,
+    )
 
     cache_metadata = dict(requested_metadata)
     cache_metadata["fitted_n_components"] = best_k
-    cache_metadata["feature_hash"] = _feature_hash(getattr(best_hmm, "feature_names_", []))
-    cache_metadata["feature_names"] = getattr(best_hmm, "feature_names_", [])
-    if cached_data is None or cached_data.get("hmm_model") is None:
-        save_regime_cache(regime_dict, best_hmm, daily_models, metadata=cache_metadata)
-    return regime_dict, best_hmm, daily_models
+    cache_metadata["feature_hash"] = _feature_hash(
+        getattr(best_hmm, "feature_names_", [])
+    )
+    cache_metadata["feature_names"] = getattr(
+        best_hmm,
+        "feature_names_",
+        [],
+    )
+    cache_metadata["model_training_end"] = best_hmm.model_training_end_
+    cache_metadata["resolved_outcomes_through"] = resolved_through
+    cache_metadata["raw_hmm_taxonomy_id"] = taxonomy_id
+    save_regime_cache(
+        regime_buckets,
+        best_hmm,
+        daily_models,
+        metadata=cache_metadata,
+    )
+    return regime_buckets, best_hmm, daily_models
 
 
 def select_gmm_by_bic(log_returns, max_components=GMM_MAX_COMPONENTS, min_obs_per_component=GMM_MIN_OBS_PER_COMPONENT):
@@ -1956,7 +2598,7 @@ def _build_single_regime_prob_func(spot_price, bucket, regime_label=""):
 def get_probability_engine(
     spot_price,
     current_vix,
-    regime_dict,
+    regime_buckets,
     horizon=45,
     hmm_model=None,
 ) -> ProbabilityEngineResult:
@@ -1981,8 +2623,10 @@ def get_probability_engine(
         raise ProbabilityEngineUnavailable("INVALID_VIX_VALUE")
     if type(horizon) is not int or type(horizon) is bool or horizon < 1:
         raise ProbabilityEngineUnavailable("INVALID_HORIZON")
-    if not isinstance(regime_dict, dict) or not regime_dict:
-        raise ProbabilityEngineUnavailable("REGIME_BUCKETS_UNAVAILABLE")
+    if type(regime_buckets) is not RegimeReturnBuckets:
+        raise ProbabilityEngineUnavailable(
+            "TYPED_REGIME_BUCKETS_REQUIRED"
+        )
     if hmm_model is None:
         raise ProbabilityEngineUnavailable("HMM_MODEL_UNAVAILABLE")
     if (
@@ -1992,16 +2636,46 @@ def get_probability_engine(
         raise ProbabilityEngineUnavailable("INVALID_HMM_COMPONENT_COUNT")
 
     state_count = hmm_model.n_components
+    try:
+        model_taxonomy_id = _verify_raw_hmm_taxonomy(hmm_model)
+    except (AttributeError, RegimeTaxonomyError, TypeError, ValueError) as exc:
+        raise ProbabilityEngineUnavailable(
+            "MODEL_TAXONOMY_UNAVAILABLE"
+        ) from exc
+    if regime_buckets.taxonomy_id != model_taxonomy_id:
+        raise ProbabilityEngineUnavailable("REGIME_TAXONOMY_MISMATCH")
+    if (
+        regime_buckets.model_training_end
+        != getattr(hmm_model, "model_training_end_", None)
+        or regime_buckets.state_count != state_count
+    ):
+        raise ProbabilityEngineUnavailable(
+            "REGIME_BUCKET_MODEL_BINDING_MISMATCH"
+        )
+    trading_horizon = calendar_days_to_trading_days(horizon)
+    if (
+        regime_buckets.horizon_calendar_days != horizon
+        or regime_buckets.horizon_trading_days != trading_horizon
+    ):
+        raise ProbabilityEngineUnavailable("REGIME_BUCKET_HORIZON_MISMATCH")
+    if (
+        regime_buckets.validity_status != "UNVERIFIED"
+        or regime_buckets.execution_eligible
+    ):
+        raise ProbabilityEngineUnavailable(
+            "UNCERTIFIED_BUCKET_CONTRACT_INVALID"
+        )
+
     normalized_buckets: list[np.ndarray] = []
     for state in range(state_count):
-        key = f"State_{state}"
-        if key not in regime_dict:
-            raise ProbabilityEngineUnavailable(
-                f"MISSING_REGIME_BUCKET_STATE_{state}"
-            )
         try:
-            bucket = np.asarray(regime_dict[key], dtype=float).reshape(-1)
-        except (TypeError, ValueError) as exc:
+            bucket = np.asarray(
+                regime_buckets.bucket_for(
+                    RawHMMStateRef(model_taxonomy_id, state)
+                ),
+                dtype=float,
+            ).reshape(-1)
+        except (RegimeTaxonomyError, TypeError, ValueError) as exc:
             raise ProbabilityEngineUnavailable(
                 f"INVALID_REGIME_BUCKET_STATE_{state}"
             ) from exc
@@ -2024,6 +2698,13 @@ def get_probability_engine(
     feature_hash = getattr(feature_manifest, "feature_hash", "")
     tail_as_of = getattr(hmm_model, "causal_tail_as_of_", "")
     inference_mode = getattr(hmm_model, "causal_inference_mode_", "")
+    if (
+        tail_as_of
+        and str(tail_as_of) != regime_buckets.inference_as_of
+    ):
+        raise ProbabilityEngineUnavailable(
+            "REGIME_BUCKET_INFERENCE_AS_OF_MISMATCH"
+        )
     try:
         current_probs = np.asarray(
             getattr(hmm_model, "causal_tail_probability_"),
@@ -2093,7 +2774,6 @@ def get_probability_engine(
         raise ProbabilityEngineUnavailable("HMM_QUALITY_REJECTED")
 
     try:
-        trading_horizon = calendar_days_to_trading_days(horizon)
         if USE_MARKOV_TRANSITIONS:
             transition_matrix = np.asarray(
                 hmm_model.transmat_,
@@ -2156,6 +2836,11 @@ def get_probability_engine(
         input_feature_hash=str(feature_hash),
         model_as_of_date=str(tail_as_of),
         inference_mode=str(inference_mode),
+        raw_hmm_taxonomy_id=model_taxonomy_id,
+        return_bucket_as_of=regime_buckets.inference_as_of,
+        return_outcomes_resolved_through=(
+            regime_buckets.resolved_outcomes_through
+        ),
     )
 
 def calculate_probability_of_touch(current_state_probs, trans_matrix, gmm_models, dte, strike_pct_drop, num_paths=1000, option_type="put"):

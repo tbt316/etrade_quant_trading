@@ -34,6 +34,10 @@ from live_trading.ev_engine import (
     fetch_cached_yf_close, fetch_historical_data, _build_causal_regime_feature_frame,
     ProbabilityEngineUnavailable,
 )
+from live_trading.market_sessions import (
+    MarketSessionUnavailable,
+    latest_completed_nyse_session as _latest_completed_nyse_session,
+)
 import yfinance as yf
 from backtesting import backtest_bo
 import matplotlib.pyplot as plt
@@ -1924,7 +1928,8 @@ def calculate_spy_regime_status(hmm_model):
         if historical_df.empty:
             raise ValueError("historical data is empty")
 
-        as_of_ts = pd.Timestamp(datetime.now()).normalize()
+        completed_session = latest_completed_nyse_session()
+        as_of_ts = pd.Timestamp(completed_session)
         causal_df = historical_df.loc[historical_df.index <= as_of_ts].copy()
         if causal_df.empty:
             raise ValueError(f"no historical rows available as of {as_of_ts.date()}")
@@ -1932,6 +1937,10 @@ def calculate_spy_regime_status(hmm_model):
         feature_df = _build_causal_regime_feature_frame(causal_df, hmm_model, as_of_ts)
         if feature_df.empty:
             raise ValueError("HMM scoring returned no rows")
+        if pd.Timestamp(feature_df.index[-1]).normalize() != as_of_ts:
+            raise ValueError(
+                "HMM scoring did not end on the latest completed NYSE session"
+            )
 
         last_date = feature_df.index[-1]
         row = feature_df.iloc[-1].copy()
@@ -3021,6 +3030,36 @@ def is_market_open(check_datetime=None):
         else:
             return True, "OPEN", market_open_fallback, market_close_fallback
 
+
+def latest_completed_nyse_session(check_datetime=None):
+    """Return the latest NYSE session whose regular close is in the past."""
+
+    try:
+        return _latest_completed_nyse_session(
+            check_datetime,
+        )
+    except MarketSessionUnavailable as exc:
+        raise ProbabilityEngineUnavailable(exc.code) from exc
+
+
+def _build_live_regime_return_arrays(
+    *,
+    horizon,
+    n_components=3,
+    check_datetime=None,
+):
+    """Build live inputs only through a fully completed NYSE session."""
+
+    as_of_date = latest_completed_nyse_session(check_datetime)
+    cache_key = date.fromisoformat(as_of_date).toordinal()
+    return build_regime_return_arrays(
+        cache_key,
+        horizon=horizon,
+        n_components=n_components,
+        as_of_date=as_of_date,
+    )
+
+
 def _market_close_refresh_due(check_datetime=None, market_status=None, market_close_time=None):
     """
     Return True once per trading day shortly after the regular NYSE close.
@@ -4087,7 +4126,7 @@ if __name__ == "__main__":
 
     # Load EV/Probability engine data lazily after the market-status gate.
     # Pre-market refreshes do not need a yfinance-backed regime sync.
-    regime_dict, best_hmm, daily_models = {}, None, []
+    regime_buckets, best_hmm, daily_models = None, None, []
     regime_load_deferred_logged = False
     if no_regime:
         print("⏭️  Skipping market regime detection (--no-regime).")
@@ -4195,7 +4234,13 @@ if __name__ == "__main__":
                 if market_status == "OPEN":
                     print("📈 Loading regime-based return data for EV engine...")
                     # build_regime_return_arrays performs yfinance sync; avoid it before regular hours.
-                    regime_dict, best_hmm, daily_models = build_regime_return_arrays(int(t.time()/86400), horizon=7)
+                    (
+                        regime_buckets,
+                        best_hmm,
+                        daily_models,
+                    ) = _build_live_regime_return_arrays(
+                        horizon=7,
+                    )
                 elif market_status == "PRE_MARKET" and not regime_load_deferred_logged:
                     print("⏭️  Deferring yfinance-backed regime refresh until market is OPEN (currently PRE_MARKET).")
                     regime_load_deferred_logged = True
@@ -4867,7 +4912,7 @@ if __name__ == "__main__":
                         probability_engine = get_probability_engine(
                             spot_price,
                             vix_value,
-                            regime_dict,
+                            regime_buckets,
                             horizon=7,
                             hmm_model=best_hmm,
                         )

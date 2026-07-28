@@ -3,9 +3,8 @@ Market Regime Comparison Script (2019-2025)
 -------------------------------------------
 Full model (incl BTC + WTI Oil) vs. Partial model (ex BTC + WTI Oil).
 
-Uses expanding_window=False for each model run to make it tractable;
-the HMM is still fitted causally on 2005-2025 data, and a final
-filtered probability pass (forward-algorithm only) is applied.
+Uses one fixed HMM snapshot calibrated strictly before 2019, then applies
+prefix-only filtering across the 2019-2025 out-of-sample review period.
 Run time: ~2-5 min per model.
 """
 
@@ -27,6 +26,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from live_trading.ev_engine import train_regime_hmm, fetch_historical_data, get_regime_labels
+from live_trading.market_sessions import latest_available_session_before
 
 # ── Key events for annotation ──────────────────────────────────────────────
 KEY_EVENTS = [
@@ -58,9 +58,9 @@ def plot_comparison(df, result_full, result_part, out_dir="research_reports"):
 def _save_single_plot(df, best_hmm, best_k, feature_df, labels, tag, out_dir):
     title_map = {
         "full":    f"Market Regime Analysis 2019-2025 — Full Model (incl BTC & Crude)\n"
-                   f"GMMHMM K={best_k} | Walk-Forward Causal Filtering",
+                   f"GMMHMM K={best_k} | Fixed-Snapshot OOS Filtering",
         "partial": f"Market Regime Analysis 2019-2025 — Equity-Only Model (ex BTC & Crude)\n"
-                   f"GMMHMM K={best_k} | Walk-Forward Causal Filtering",
+                   f"GMMHMM K={best_k} | Fixed-Snapshot OOS Filtering",
     }
 
     # join SPY/VIX for plotting
@@ -162,7 +162,7 @@ def _save_single_plot(df, best_hmm, best_k, feature_df, labels, tag, out_dir):
     print(f"  ✅  Saved → {out_path}")
 
 
-def run_model(df, label, exclude=None):
+def run_model(df, label, fit_end, exclude=None):
     t0 = time.time()
     print(f"\n{'='*60}")
     print(f"  Running {label} ...")
@@ -173,6 +173,7 @@ def run_model(df, label, exclude=None):
         df,
         expanding_window=False,
         exclude_features=exclude,
+        fit_end=fit_end,
     )
     labels = get_regime_labels(best_hmm, feature_df)
     elapsed = time.time() - t0
@@ -190,14 +191,32 @@ def main():
     print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Fetching historical data...")
     df = fetch_historical_data()
     df = df[df.index <= '2025-12-31']
+    fit_end = latest_available_session_before(
+        df.index,
+        "2019-01-01",
+    )
     print(f"  Data range: {df.index.min().date()} → {df.index.max().date()}  ({len(df)} rows)")
+    print(
+        f"  Calibration ends {fit_end}; "
+        "fixed-snapshot OOS review starts 2019-01-01."
+    )
 
     # ── Full model ──────────────────────────────────────────────────────────
-    result_full = run_model(df, "FULL MODEL (incl BTC + Crude)", exclude=None)
+    result_full = run_model(
+        df,
+        "FULL MODEL (incl BTC + Crude)",
+        fit_end,
+        exclude=None,
+    )
 
     # ── Equity-only model ───────────────────────────────────────────────────
     BTC_CRUDE_COLS = ['BTC_Close', 'BTC_Log_Return', 'WTI_Oil']
-    result_part = run_model(df, "EQUITY-ONLY MODEL (ex BTC + Crude)", exclude=BTC_CRUDE_COLS)
+    result_part = run_model(
+        df,
+        "EQUITY-ONLY MODEL (ex BTC + Crude)",
+        fit_end,
+        exclude=BTC_CRUDE_COLS,
+    )
 
     # ── Generate comparison plots ───────────────────────────────────────────
     print("\nGenerating plots...")

@@ -1,45 +1,123 @@
+"""Generate a causal, explicitly out-of-sample regime review dataset."""
+
+import argparse
+import json
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
+
 from live_trading.data_ingestion import DataIngestor
-from live_trading.ev_engine import train_regime_hmm, fetch_historical_data
-import asyncio
-import os
+from live_trading.ev_engine import fetch_historical_data, train_regime_hmm
+from live_trading.market_sessions import (
+    latest_available_session_before,
+    latest_completed_nyse_session,
+)
 
-print("Fetching historical data...")
-df = fetch_historical_data()
 
-ingestor = DataIngestor()
-start_date = df.index.min().strftime("%Y-%m-%d")
-end_date = df.index.max().strftime("%Y-%m-%d")
+DEFAULT_TEST_START = "2020-01-02"
+DEFAULT_OUTPUT = Path("quant-review-0430/quant_review_data.csv")
 
-print("Building raw and scaled datasets...")
-# Get raw combined data
-fred_df = ingestor.fetch_fred_data(start_date, end_date)
-yf_df = ingestor.fetch_yf_data(start_date, end_date)
-raw_combined = pd.concat([yf_df, fred_df], axis=1).ffill().dropna()
 
-# Train HMM which handles the async call internally
-print("Training HMM...")
-best_hmm, best_k, feature_df = train_regime_hmm(df, n_components=3, expanding_window=True)
+def generate_quant_data(
+    *,
+    test_start=DEFAULT_TEST_START,
+    test_end=None,
+    output_path=DEFAULT_OUTPUT,
+):
+    """Write only causal OOS rows and an adjacent audit manifest."""
 
-# Causal Probabilities (Forward Filtering)
-pc_cols = [c for c in feature_df.columns if c.startswith('PC')]
-features_scaled = feature_df[pc_cols].values
-n_samples = len(features_scaled)
-all_probs = np.zeros((n_samples, best_k))
+    end = test_end or latest_completed_nyse_session()
+    test_start_ts = pd.Timestamp(test_start)
+    test_end_ts = pd.Timestamp(end)
+    if (
+        test_start_ts.tzinfo is not None
+        or test_end_ts.tzinfo is not None
+        or test_start_ts != test_start_ts.normalize()
+        or test_end_ts != test_end_ts.normalize()
+        or test_end_ts < test_start_ts
+    ):
+        raise ValueError("INVALID_QUANT_REVIEW_TEST_WINDOW")
 
-print(f"Calculating causal probabilities for {n_samples} samples...")
-for t in range(n_samples):
-    # predict_proba on an expanding window returns the filtered probability at the last step
-    all_probs[t] = best_hmm.predict_proba(features_scaled[:t+1])[-1]
+    print("Fetching historical data...")
+    history = fetch_historical_data()
+    history = history.loc[history.index <= test_end_ts].copy()
+    if history.empty:
+        raise RuntimeError("HISTORICAL_REGIME_DATA_UNAVAILABLE")
+    fit_end = latest_available_session_before(
+        history.index,
+        test_start_ts,
+    )
+    calibration_start = pd.Timestamp(history.index.min()).strftime(
+        "%Y-%m-%d"
+    )
 
-for i in range(best_k):
-    feature_df[f'Prob_State_{i}'] = all_probs[:, i]
+    print(
+        f"Training causal HMM: calibration {calibration_start} to "
+        f"{fit_end}; OOS {test_start_ts.date()} to {test_end_ts.date()}."
+    )
+    best_hmm, best_k, feature_df = train_regime_hmm(
+        history,
+        n_components=3,
+        expanding_window=True,
+        fit_end=fit_end,
+    )
+    if best_hmm is None or feature_df.empty:
+        raise RuntimeError("CAUSAL_REGIME_TRACE_UNAVAILABLE")
+    feature_df = feature_df.loc[test_start_ts:test_end_ts].copy()
+    if feature_df.empty:
+        raise RuntimeError("OUT_OF_SAMPLE_REGIME_TRACE_UNAVAILABLE")
 
-# Merge
-print("Merging dataframes...")
-final_df = raw_combined.join(feature_df, how='inner')
+    ingestor = DataIngestor()
+    raw_levels = pd.concat(
+        [
+            ingestor.fetch_yf_data(calibration_start, end),
+            ingestor.fetch_fred_data(calibration_start, end),
+        ],
+        axis=1,
+    ).ffill()
+    final_df = raw_levels.join(feature_df, how="inner")
+    if final_df.empty:
+        raise RuntimeError("QUANT_REVIEW_JOIN_UNAVAILABLE")
 
-out_path = '/Users/btian/EtradePythonClient/etrade_python_client/quant-review-0430/quant_review_data.csv'
-final_df.to_csv(out_path)
-print(f"Data saved to {out_path}")
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    final_df.to_csv(output)
+    manifest = {
+        "schema": "causal-quant-review.v1",
+        "calibration_start": calibration_start,
+        "calibration_end": fit_end,
+        "test_start": test_start_ts.strftime("%Y-%m-%d"),
+        "test_end": test_end_ts.strftime("%Y-%m-%d"),
+        "inference_method": "walk_forward_refit",
+        "regime_signal_timestamp": "close_T_for_next_session",
+        "raw_hmm_taxonomy_scope": "per_row_refit",
+        "fitted_state_count": int(best_k),
+        "validity_status": "UNVERIFIED",
+        "execution_eligible": False,
+    }
+    manifest_path = output.with_suffix(".manifest.json")
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        manifest_file.write("\n")
+    print(f"Data saved to {output}")
+    print(f"Audit manifest saved to {manifest_path}")
+    return output, manifest_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate a causal out-of-sample regime dataset."
+    )
+    parser.add_argument("--test-start", default=DEFAULT_TEST_START)
+    parser.add_argument("--test-end", default=None)
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    args = parser.parse_args()
+    generate_quant_data(
+        test_start=args.test_start,
+        test_end=args.test_end,
+        output_path=args.output,
+    )
+
+
+if __name__ == "__main__":
+    main()

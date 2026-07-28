@@ -17,8 +17,15 @@ import matplotlib.dates as mdates
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from accounts.accounts_bo import Accounts
+from backtesting.regime_bridge import (
+    BacktestRegimeProtocol,
+    build_lagged_final_risk_map,
+)
 from core_api.stock_trade_class import LoginFailureException
-from live_trading.etrade_cover_call_new import oauth, send_login_failure_notification
+from live_trading.etrade_cover_call_new import (
+    oauth,
+    send_login_failure_notification,
+)
 from live_trading.ev_engine import (
     PROBABILITY_MODEL, USE_MARKOV_TRANSITIONS, COST_PER_SPREAD, YF_QUOTE_CACHE_PATH,
     fetch_cached_yf_close, fetch_historical_data, build_regime_return_arrays,
@@ -28,6 +35,14 @@ from live_trading.ev_engine import (
     get_regime_labels, select_gmm_by_bic
 )
 from live_trading.data_ingestion import DataIngestor
+from live_trading.market_sessions import (
+    MarketSessionUnavailable,
+    latest_available_session_before,
+    latest_completed_nyse_session,
+)
+from live_trading.regime_taxonomy import (
+    RawHMMStateRef,
+)
 import asyncio
 
 TARGET_MARGIN_DOLLARS = 10000.0
@@ -36,14 +51,80 @@ COST_PER_SPREAD = 1.0
 # Logic moved to ev_engine.py float(prob)
 
 
-def _dominant_label(frame, state):
-    rows = frame[frame['HMM_State'] == state]
-    if 'Regime_Label' in rows.columns and not rows.empty and rows['Regime_Label'].notna().any():
-        labels = rows['Regime_Label'].dropna()
+def _dominant_label(
+    frame,
+    state,
+    *,
+    state_column="HMM_State",
+    label_column="Regime_Label",
+):
+    rows = frame[frame[state_column] == state]
+    if (
+        label_column in rows.columns
+        and not rows.empty
+        and rows[label_column].notna().any()
+    ):
+        labels = rows[label_column].dropna()
         mode = labels.value_counts()
         if not mode.empty:
             return mode.index[0]
     return f"State {state}"
+
+
+def _calibration_fit_end(frame, first_evaluation_date, *, context):
+    """Return the last available session strictly before an OOS period."""
+
+    if frame.empty:
+        raise ValueError(f"{context}: calibration data is unavailable")
+    try:
+        return latest_available_session_before(
+            frame.index,
+            first_evaluation_date,
+        )
+    except MarketSessionUnavailable as exc:
+        raise ValueError(
+            f"{context}: no NYSE calibration session exists strictly before "
+            f"the evaluation period ({exc.code})"
+        ) from exc
+
+
+def _prepare_regime_plot_frame(frame):
+    """Keep raw HMM columns intact and expose the overlay separately."""
+
+    prepared = frame.copy()
+    detected_columns = {
+        "Detected_Regime_State",
+        "Detected_Regime_Label",
+    }
+    present = detected_columns.intersection(prepared.columns)
+    if present and present != detected_columns:
+        raise ValueError("INCOMPLETE_STRESS_OVERLAY_COLUMNS")
+    if detected_columns.issubset(prepared.columns):
+        prepared["Overlay_Regime_State"] = prepared[
+            "Detected_Regime_State"
+        ]
+        prepared["Overlay_Regime_Label"] = prepared[
+            "Detected_Regime_Label"
+        ]
+    return prepared
+
+
+def _return_bucket_values(regime_buckets, state):
+    state_ref = RawHMMStateRef(regime_buckets.taxonomy_id, int(state))
+    return np.asarray(
+        regime_buckets.bucket_for(state_ref),
+        dtype=float,
+    )
+
+
+def _build_backtest_final_overlay_inputs(feature_df, trading_dates):
+    """Return the typed exact T-1 final-overlay boundary."""
+
+    return build_lagged_final_risk_map(
+        feature_df,
+        trading_dates,
+    )
+
 
 def plot_regime_timeline(n_components=None):
     """
@@ -57,23 +138,40 @@ def plot_regime_timeline(n_components=None):
         print("ERROR: No historical data available.")
         return
 
-    # Train HMM with expanding_window=True to eliminate look-ahead bias
-    best_hmm, best_k, feature_df = train_regime_hmm(df, n_components=n_components, expanding_window=True)
+    display_start = "2015-01-01"
+    fit_end = _calibration_fit_end(
+        df,
+        display_start,
+        context="regime timeline",
+    )
+    best_hmm, best_k, feature_df = train_regime_hmm(
+        df,
+        n_components=n_components,
+        expanding_window=True,
+        fit_end=fit_end,
+    )
     # Mandate 10.6: Probabilities are now causally generated and stored in feature_df by the engine.
     # Bring in SPY and VIX from the original df for plotting
     feature_df = feature_df.join(df[['SPY_Close', 'VIX_Close']], how='inner')
 
     # Filter for 2015 onwards
-    timeline_df = feature_df[feature_df.index >= '2015-01-01'].copy()
-    if {'Detected_Regime_State', 'Detected_Regime_Label'}.issubset(timeline_df.columns):
-        timeline_df['Raw_HMM_State'] = timeline_df['HMM_State']
-        timeline_df['Raw_Regime_Label'] = timeline_df['Regime_Label']
-        timeline_df['HMM_State'] = timeline_df['Detected_Regime_State']
-        timeline_df['Regime_Label'] = timeline_df['Detected_Regime_Label']
-        best_k = 3
+    timeline_df = _prepare_regime_plot_frame(
+        feature_df[feature_df.index >= display_start]
+    )
     if timeline_df.empty:
         print("ERROR: No data available for 2015 onwards.")
         return
+    has_overlay = {
+        "Overlay_Regime_State",
+        "Overlay_Regime_Label",
+    }.issubset(timeline_df.columns)
+    display_state_column = (
+        "Overlay_Regime_State" if has_overlay else "HMM_State"
+    )
+    display_label_column = (
+        "Overlay_Regime_Label" if has_overlay else "Regime_Label"
+    )
+    display_state_count = 3 if has_overlay else best_k
 
     # Create 2 subplots
     fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(24, 16), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
@@ -83,13 +181,23 @@ def plot_regime_timeline(n_components=None):
 
     # --- Plot 1: Price and Regimes ---
     colors_list = plt.cm.Set3.colors
-    stable_labels = {i: _dominant_label(timeline_df, i) for i in range(best_k)}
-    state_changes = timeline_df['HMM_State'].ne(timeline_df['HMM_State'].shift()).cumsum()
+    stable_labels = {
+        i: _dominant_label(
+            timeline_df,
+            i,
+            state_column=display_state_column,
+            label_column=display_label_column,
+        )
+        for i in range(display_state_count)
+    }
+    state_changes = timeline_df[display_state_column].ne(
+        timeline_df[display_state_column].shift()
+    ).cumsum()
     groups = timeline_df.groupby(state_changes)
     
     added_to_legend = set()
     for _, group in groups:
-        state = group['HMM_State'].iloc[0]
+        state = group[display_state_column].iloc[0]
         state_val = int(state) if not pd.isna(state) else 0
         color = colors_list[state_val % len(colors_list)]
         start_date = group.index[0]
@@ -114,18 +222,21 @@ def plot_regime_timeline(n_components=None):
     ax2.tick_params(axis='y', labelcolor=color_vix, labelsize=12)
 
     # --- Plot 2: Probability Stacked Area ---
-    detected_prob_cols = [f'detected_prob_state_{i}' for i in range(3)]
-    if all(c in timeline_df.columns for c in detected_prob_cols):
-        prob_data = [timeline_df[c].values for c in detected_prob_cols]
-        state_labels = ['Expansion (0)', 'Cautious Decline (1)', 'Panic / Crisis (2)']
-    else:
-        prob_data = [timeline_df[f'prob_state_{i}'].values for i in range(best_k)]
-        state_labels = []
-        for i in range(best_k):
-            state_labels.append(stable_labels.get(i, f'State {i}'))
+    raw_labels = {
+        i: _dominant_label(timeline_df, i)
+        for i in range(best_k)
+    }
+    prob_data = [
+        timeline_df[f"prob_state_{i}"].values
+        for i in range(best_k)
+    ]
+    state_labels = [
+        raw_labels.get(i, f"State {i}")
+        for i in range(best_k)
+    ]
     ax3.stackplot(dates, prob_data, labels=state_labels, 
                   colors=colors_list[:best_k], alpha=0.8)
-    ax3.set_ylabel('Regime Probability', fontsize=14, fontweight='bold')
+    ax3.set_ylabel('Raw HMM Probability', fontsize=14, fontweight='bold')
     ax3.set_ylim(0, 1)
     ax3.set_xlabel('Date', fontsize=14, fontweight='bold')
     ax3.legend(loc='lower left', frameon=True, fontsize=10, ncol=best_k)
@@ -136,7 +247,12 @@ def plot_regime_timeline(n_components=None):
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
     plt.setp(ax3.get_xticklabels(), rotation=30, ha='right', fontsize=11)
 
-    plt.suptitle(f"Detailed Market Regime Analysis (2015 - Present)\nMarkov-Switching HMM States (K={best_k}) with Posterior Probabilities", 
+    overlay_note = (
+        "stress-overlay shading + raw HMM posteriors"
+        if has_overlay
+        else "raw HMM states and posteriors"
+    )
+    plt.suptitle(f"Detailed Market Regime Analysis (2015 - Present)\nMarkov-Switching HMM States (K={best_k}); {overlay_note}",
                  fontsize=20, fontweight='bold', y=0.95)
     
     h1, l1 = ax1.get_legend_handles_labels()
@@ -168,7 +284,12 @@ def plot_regime_distributions(horizon=45, n_components=None):
         print("ERROR: No historical data available.")
         return
 
-    regime_dict, hmm_model, _ = build_regime_return_arrays(int(time.time()/86400), horizon=horizon, n_components=n_components)
+    regime_buckets, hmm_model, _ = build_regime_return_arrays(
+        int(time.time() / 86400),
+        horizon=horizon,
+        n_components=n_components,
+        as_of_date=latest_completed_nyse_session(),
+    )
     K = hmm_model.n_components
 
     cols = 2
@@ -188,10 +309,9 @@ def plot_regime_distributions(horizon=45, n_components=None):
              ax.set_visible(False)
              continue
              
-        key = f'State_{idx}'
         label = f'HMM State {idx}'
         color = colors_list[idx % len(colors_list)]
-        returns = regime_dict.get(key, np.array([]))
+        returns = _return_bucket_values(regime_buckets, idx)
         n = len(returns)
 
         if n < 10:
@@ -279,10 +399,16 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
         print("ERROR: No historical data available.")
         return
 
+    fit_end = _calibration_fit_end(
+        hist_df,
+        start_date,
+        context="regime log-return diagnostic",
+    )
     best_hmm, best_k, feature_df = train_regime_hmm(
         hist_df,
         n_components=n_components,
         expanding_window=True,
+        fit_end=fit_end,
     )
     if best_hmm is None or feature_df.empty:
         print("ERROR: HMM training did not produce a usable feature frame.")
@@ -293,16 +419,22 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     diag_df['SPY_Close'] = hist_df.loc[common_idx, 'SPY_Close']
     diag_df['VIX_Close'] = hist_df.loc[common_idx, 'VIX_Close']
     diag_df['SPY_Log_Return'] = np.log(diag_df['SPY_Close'] / diag_df['SPY_Close'].shift(1))
-    if {'Detected_Regime_State', 'Detected_Regime_Label'}.issubset(diag_df.columns):
-        diag_df['Raw_HMM_State'] = diag_df['HMM_State']
-        diag_df['Raw_Regime_Label'] = diag_df['Regime_Label']
-        diag_df['HMM_State'] = diag_df['Detected_Regime_State']
-        diag_df['Regime_Label'] = diag_df['Detected_Regime_Label']
+    diag_df = _prepare_regime_plot_frame(diag_df)
     diag_df = diag_df.loc[pd.Timestamp(start_date):].dropna(subset=['SPY_Log_Return', 'HMM_State'])
     if diag_df.empty:
         print(f"ERROR: No diagnostic rows available from {start_date}.")
         return
-    best_k = 3
+    has_overlay = {
+        "Overlay_Regime_State",
+        "Overlay_Regime_Label",
+    }.issubset(diag_df.columns)
+    display_state_column = (
+        "Overlay_Regime_State" if has_overlay else "HMM_State"
+    )
+    display_label_column = (
+        "Overlay_Regime_Label" if has_overlay else "Regime_Label"
+    )
+    display_state_count = 3 if has_overlay else best_k
 
     os.makedirs(output_dir, exist_ok=True)
     colors_list = plt.cm.Set3.colors
@@ -310,12 +442,26 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     fig, (ax_price, ax_prob) = plt.subplots(
         2, 1, figsize=(24, 14), gridspec_kw={'height_ratios': [3, 1]}, sharex=True
     )
-    stable_labels = {i: _dominant_label(diag_df, i) for i in range(best_k)}
-    state_changes = diag_df['HMM_State'].ne(diag_df['HMM_State'].shift()).cumsum()
+    display_labels = {
+        i: _dominant_label(
+            diag_df,
+            i,
+            state_column=display_state_column,
+            label_column=display_label_column,
+        )
+        for i in range(display_state_count)
+    }
+    raw_labels = {
+        i: _dominant_label(diag_df, i)
+        for i in range(best_k)
+    }
+    state_changes = diag_df[display_state_column].ne(
+        diag_df[display_state_column].shift()
+    ).cumsum()
     added = set()
     for _, group in diag_df.groupby(state_changes):
-        state = int(group['HMM_State'].iloc[0])
-        label = stable_labels.get(state, f"State {state}")
+        state = int(group[display_state_column].iloc[0])
+        label = display_labels.get(state, f"State {state}")
         color = colors_list[state % len(colors_list)]
         if label not in added:
             ax_price.axvspan(group.index[0], group.index[-1], color=color, alpha=0.35, label=label)
@@ -330,15 +476,15 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     ax_vix.set_ylabel('VIX')
     ax_price.grid(True, alpha=0.25, linestyle='--')
 
-    detected_prob_cols = [f'detected_prob_state_{i}' for i in range(3)]
-    if all(c in diag_df.columns for c in detected_prob_cols):
-        prob_cols = detected_prob_cols
-        prob_labels = ['Expansion (0)', 'Cautious Decline (1)', 'Panic / Crisis (2)']
-    else:
-        prob_cols = [f'prob_state_{i}' for i in range(best_k) if f'prob_state_{i}' in diag_df.columns]
-        prob_labels = []
-        for i in range(best_k):
-            prob_labels.append(stable_labels.get(i, f'State {i}'))
+    prob_cols = [
+        f"prob_state_{i}"
+        for i in range(best_k)
+        if f"prob_state_{i}" in diag_df.columns
+    ]
+    prob_labels = [
+        raw_labels.get(i, f"State {i}")
+        for i in range(len(prob_cols))
+    ]
     ax_prob.stackplot(
         diag_df.index,
         [diag_df[c].values for c in prob_cols],
@@ -347,7 +493,7 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
         alpha=0.85,
     )
     ax_prob.set_ylim(0, 1)
-    ax_prob.set_ylabel('Regime Probability')
+    ax_prob.set_ylabel('Raw HMM Probability')
     ax_prob.set_xlabel('Date')
     ax_prob.legend(loc='lower left', fontsize=9, ncol=max(1, min(best_k, 5)))
     ax_prob.grid(True, alpha=0.25)
@@ -357,7 +503,9 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
     ax_price.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=9, ncol=3)
     fig.suptitle(
         f"Causal Market Regime Timeline ({start_date} - present)\n"
-        f"Gaussian HMM K=3 + stress overlay | Signal timestamp: {diag_df.attrs.get('regime_signal_timestamp', 'close_T_for_next_session')}",
+        f"Gaussian HMM K={best_k}"
+        f"{' + separate stress-overlay shading' if has_overlay else ''} "
+        f"| Signal timestamp: {diag_df.attrs.get('regime_signal_timestamp', 'close_T_for_next_session')}",
         fontsize=16,
         fontweight='bold',
     )
@@ -383,7 +531,7 @@ def plot_regime_log_return_gmm(n_components=None, start_date='2015-01-01', outpu
         ax = axes[state]
         state_df = diag_df[diag_df['HMM_State'] == state]
         returns = state_df['SPY_Log_Return'].dropna().values.reshape(-1, 1)
-        label = stable_labels.get(state, f"State {state}")
+        label = raw_labels.get(state, f"State {state}")
         n = len(returns)
         color = colors_list[state % len(colors_list)]
 
@@ -457,6 +605,11 @@ def plot_gmm_clusters(horizon=45):
     Visualization: scatter plots of returns for each regime,
     colored by the GMM component (0 vs 1) to show sub-regime discovery.
     """
+    raise RuntimeError(
+        "UNSAFE_REGIME_GMM_CLUSTER_DIAGNOSTIC_DISABLED: migrate this "
+        "forward-outcome diagnostic to exact-as-of typed return buckets"
+    )
+
     hist_df = fetch_historical_data()
     if hist_df.empty: return
 
@@ -538,7 +691,11 @@ def plot_gmm_distributions(horizon=45):
     if hist_df.empty: return
 
     # Use cache key that rotates daily
-    regime_dict, hmm_model, _ = build_regime_return_arrays(int(time.time()/86400), horizon=horizon)
+    regime_buckets, hmm_model, _ = build_regime_return_arrays(
+        int(time.time() / 86400),
+        horizon=horizon,
+        as_of_date=latest_completed_nyse_session(),
+    )
     K = hmm_model.n_components
 
     cols = 2
@@ -554,11 +711,10 @@ def plot_gmm_distributions(horizon=45):
             ax.set_visible(False)
             continue
             
-        key = f'State_{idx}'
         label = f'HMM State {idx}'
         color = colors_list[idx % len(colors_list)]
         
-        returns = regime_dict.get(key, np.array([]))
+        returns = _return_bucket_values(regime_buckets, idx)
         n = len(returns)
         if n < 10:
             ax.set_title(f"{label} (Insufficient Data)")
@@ -837,8 +993,11 @@ def main(args):
         print("Warning: VIX price lookup failed. Attempting local yfinance fallback...")
         vix_price = fetch_cached_yf_close("^VIX", cache_minutes=15)
         if vix_price is None:
-            print("Local VIX fallback failed.")
-            vix_price = 20.0  # Default to 20 if everything fails
+            print(
+                "CRITICAL: VIX is unavailable from both configured sources. "
+                "No strategy selection or trade construction is allowed."
+            )
+            return
             
     if spy_price is None or spx_price is None:
         print(f"SPY: {spy_price}, SPX: {spx_price}")
@@ -876,52 +1035,57 @@ def main(args):
     days_to_exp = max(1, (exp_date_obj - datetime.now()).days)
 
     print(f"[Engine] Building {days_to_exp}d rolling-horizon return buckets...", flush=True)
-    regime_dict, hmm_model, daily_models = build_regime_return_arrays(int(time.time()/86400), horizon=days_to_exp, n_components=args.force_k)
+    regime_buckets, hmm_model, daily_models = build_regime_return_arrays(
+        int(time.time() / 86400),
+        horizon=days_to_exp,
+        n_components=args.force_k,
+        as_of_date=latest_completed_nyse_session(),
+    )
 
     print(f"Current VIX: {vix_price:.2f}")
     spy_probability_engine = get_probability_engine(
-        spy_price, vix_price, regime_dict, horizon=days_to_exp, hmm_model=hmm_model
+        spy_price,
+        vix_price,
+        regime_buckets,
+        horizon=days_to_exp,
+        hmm_model=hmm_model,
     )
     spx_probability_engine = get_probability_engine(
-        spx_price, vix_price, regime_dict, horizon=days_to_exp, hmm_model=hmm_model
+        spx_price,
+        vix_price,
+        regime_buckets,
+        horizon=days_to_exp,
+        hmm_model=hmm_model,
     )
     regime_name = spy_probability_engine.regime_name
     projected_weights = spy_probability_engine.projected_probabilities
     current_probs = spy_probability_engine.current_probabilities
     
     dominant_regime_label = get_regime_labels(hmm_model, pc_df=None).get(np.argmax(current_probs), "Unknown")
-    print(f"\n[Regime Detection] Detected: {dominant_regime_label}")
+    print(
+        "\n[Raw HMM Diagnostic] "
+        f"Dominant model-specific state: {dominant_regime_label}"
+    )
     print(f"  Net GEX: {net_gex:.2f}B | Zero Gamma: {zero_gamma:.2f} | VXV/VIX: {vxv_vix_ratio:.2f}")
 
-    # HARD GATING LOGIC
-    is_turmoil = "Market Turmoil" in dominant_regime_label
+    # Raw HMM archetype labels are model-specific diagnostics. They cannot
+    # authorize, veto, or resize a live order. Only independently typed final
+    # risk evidence may do that; this legacy CLI does not yet carry it.
     is_neg_gex = net_gex < 0
     is_backwardation = vxv_vix_ratio < 1.0
     
-    if is_turmoil or is_neg_gex or is_backwardation:
+    if is_neg_gex or is_backwardation:
         print("\n🛑 CRITICAL GATING ACTIVATED:")
-        if is_turmoil: print("  - Archetype 'Market Turmoil' detected.")
         if is_neg_gex: print(f"  - Negative GEX ({net_gex:.2f}B) indicates unstable architecture.")
         if is_backwardation: print(f"  - Volatility Curve Backwardation (VXV/VIX={vxv_vix_ratio:.2f}).")
         print("  Recommendation: SKIP PUT SELLING. Risk of tail expansion is high.")
-        if not args.override_risk_gates:
-            print("  Hard gate enforced. Re-run with --override-risk-gates to continue intentionally.")
-            return
-        print("  OVERRIDE ENABLED: continuing despite hard gate.")
-    
-    # Dynamic Parameter Mapping
-    STRATEGY_MAP = {
-        "Robust Expansion": {"short_delta": -0.20},
-        "Emerging Expansion": {"short_delta": -0.15},
-        "High Vol Chop": {"short_delta": -0.10},
-        "Market Turmoil": {"short_delta": -0.05}
-    }
-    
-    for archetype, params in STRATEGY_MAP.items():
-        if archetype in dominant_regime_label:
-            print(f"  [Strategy Map] Adjusting target short delta to {params['short_delta']} for {archetype}")
-            args.short_delta = params["short_delta"]
-            break
+        if args.override_risk_gates:
+            print(
+                "  --override-risk-gates is disabled until a durable, "
+                "time-scoped operator-override ledger is implemented."
+            )
+        print("  Hard gate enforced.")
+        return
 
     print("Current regime weights (Snapshot):", flush=True)
     if current_probs is not None:
@@ -1261,6 +1425,11 @@ def run_calibration_backtest(horizon=45, val_start_year=2020, refit_interval=21,
     """
     Walk-forward probability calibration backtest using the Continuous HMM logic.
     """
+    raise RuntimeError(
+        "UNSAFE_REGIME_CALIBRATION_BACKTEST_DISABLED: migrate this path to "
+        "BacktestRegimeProtocol and strictly resolved typed return buckets"
+    )
+
     t_start = time.time()
     print("=" * 70)
     print("  PROBABILITY CALIBRATION BACKTEST (HMM OOS)")
@@ -1462,6 +1631,11 @@ def sample_prediction_outcomes(horizon=45, force_k=None):
     Spot-checks the model on specific historical dates to demonstrate 
     prediction vs outcome without look-forward bias.
     """
+    raise RuntimeError(
+        "UNSAFE_REGIME_SAMPLE_OUTCOMES_DISABLED: migrate this path to exact "
+        "NYSE as-of snapshots and strictly resolved typed return buckets"
+    )
+
     df = fetch_historical_data()
     if df.empty: return
     trading_horizon = calendar_days_to_trading_days(horizon)
@@ -1560,13 +1734,13 @@ if __name__ == "__main__":
     parser.add_argument('--no-headless', help='disable headless mode for login', action='store_true')
     parser.add_argument('--distributions', help='plot VIX-regime return distributions and exit (no login needed)',
                         action='store_true')
-    parser.add_argument('--gmm-plots', help='plot GMM internal clustering and exit (no login needed)',
+    parser.add_argument('--gmm-plots', help='disabled unsafe legacy GMM clustering path',
                         action='store_true')
     parser.add_argument('--gmm-dist', help='plot GMM distribution fit and exit (no login needed)',
                         action='store_true')
-    parser.add_argument('--calibrate', help='run probability calibration backtest and exit (no login needed)',
+    parser.add_argument('--calibrate', help='disabled unsafe legacy calibration path',
                         action='store_true')
-    parser.add_argument('--samples', help='run sample prediction spot-checks and exit (no login needed)',
+    parser.add_argument('--samples', help='disabled unsafe legacy sample-outcome path',
                         action='store_true')
     parser.add_argument('--timeline', help='plot regime timeline from 2024 and exit (no login needed)',
                         action='store_true')
@@ -1600,7 +1774,14 @@ if __name__ == "__main__":
     parser.add_argument('--panic-width-mult', help='Spread width multiplier in panic regime', type=float, default=2.0)
     parser.add_argument('--no-panic-swap', help='Disable closing all positions when entering panic regime', action='store_true')
     parser.add_argument('--strategy-id', help='Load configuration from backtesting/strategies YAML by ID', type=str)
-    parser.add_argument('--override-risk-gates', help='Allow live trade construction even when hard regime/GEX/vol gates fire', action='store_true')
+    parser.add_argument(
+        '--override-risk-gates',
+        help=(
+            'deprecated compatibility flag; hard risk gates remain enforced '
+            'until a durable operator-override ledger exists'
+        ),
+        action='store_true',
+    )
     args = parser.parse_args()
 
     if args.distributions:
@@ -1619,7 +1800,10 @@ if __name__ == "__main__":
         plot_regime_log_return_gmm(n_components=args.force_k, start_date=args.diagnostic_start)
     elif args.backtest:
         import asyncio
-        from backtesting.backtest_runner import run_put_credit_spread_backtest, get_trading_dates, lag_daily_regime_map
+        from backtesting.backtest_runner import (
+            get_trading_dates,
+            run_put_credit_spread_backtest,
+        )
         from backtesting.strategy_loader import load_strategy
         from live_trading.ev_engine import fetch_historical_data, train_regime_hmm
         
@@ -1686,19 +1870,41 @@ if __name__ == "__main__":
             (df_hist.index <= pd.to_datetime(args.backtest_end))
         ].copy()
         print(f"  [Walk-Forward] Training causal trace from {cal_start_date.strftime('%Y-%m-%d')} to {args.backtest_end}")
-        best_hmm, k, feature_df = train_regime_hmm(df_cal, n_components=args.force_k, expanding_window=True)
+        fit_end = _calibration_fit_end(
+            df_cal,
+            args.backtest_start,
+            context="regime-aware backtest",
+        )
+        best_hmm, k, feature_df = train_regime_hmm(
+            df_cal,
+            n_components=args.force_k,
+            expanding_window=True,
+            fit_end=fit_end,
+        )
         if best_hmm is None or feature_df.empty:
             print("  ERROR: Could not build causal regime trace.")
             import sys
             sys.exit(1)
-        regime_labels = get_regime_labels(best_hmm, feature_df)
-        close_regimes = {
-            d.strftime('%Y-%m-%d'): int(s)
-            for d, s in feature_df['HMM_State'].dropna().to_dict().items()
-        }
         trading_dates = get_trading_dates(args.backtest_start, args.backtest_end)
-        regimes_dict = lag_daily_regime_map(close_regimes, trading_dates)
-        print("  [Regime Timing] Using one-trading-day-lagged close_T regimes for trade entry.")
+        lagged_final_regimes = _build_backtest_final_overlay_inputs(
+            feature_df,
+            trading_dates,
+        )
+        if not trading_dates:
+            raise ValueError("BACKTEST_NYSE_SESSION_RANGE_UNAVAILABLE")
+        regime_protocol = BacktestRegimeProtocol(
+            calibration_end=fit_end,
+            test_start=trading_dates[0],
+            test_end=trading_dates[-1],
+            inference_method="external_exact_lagged_overlay",
+            raw_hmm_components=k,
+        )
+        strategy_config = dict(strategy_config)
+        strategy_config["regime_aware"] = True
+        print(
+            "  [Regime Timing] Using exact prior-NYSE-session final "
+            "stress overlays for trade entry; missing rows remain unavailable."
+        )
 
         # Extract SPY and VIX prices
         spy_close = df_hist['SPY_Close'].copy()
@@ -1706,9 +1912,15 @@ if __name__ == "__main__":
         vix_close = df_hist['VIX_Close'].copy()
         vix_close.index = vix_close.index.strftime("%Y-%m-%d")
         
-        mask = (spy_close.index >= args.backtest_start) & (spy_close.index <= args.backtest_end)
-        spy_prices = spy_close[mask]
-        vix_prices = vix_close[mask]
+        price_frame = pd.concat(
+            [
+                spy_close.rename("SPY_Close"),
+                vix_close.rename("VIX_Close"),
+            ],
+            axis=1,
+        ).reindex(trading_dates).dropna()
+        spy_prices = price_frame["SPY_Close"]
+        vix_prices = price_frame["VIX_Close"]
         
         print(f"  Debug: spy_prices index sample: {spy_prices.index[:5].tolist()} ... {spy_prices.index[-5:].tolist()}")
         print(f"  Debug: spy_prices count: {len(spy_prices)}")
@@ -1725,16 +1937,17 @@ if __name__ == "__main__":
             initial_capital=args.initial_capital,
             margin_limit_pct=args.margin_limit,
             backtest_qty=args.qty,
-            regimes=regimes_dict,
             underlying_prices=spy_prices,
             vix_prices=vix_prices,
             enable_logging=args.log_backtest,
             hold_itm_to_expiration=args.hold_itm_exp,
-            regime_labels=regime_labels,
+            regime_protocol=regime_protocol,
+            lagged_final_regimes=lagged_final_regimes,
             panic_delta_multiplier=args.panic_delta_mult,
             panic_dte_target=args.panic_dte_target,
             panic_width_multiplier=args.panic_width_mult,
-            panic_swap_enabled=not args.no_panic_swap
+            panic_swap_enabled=not args.no_panic_swap,
+            strategy_config=strategy_config,
         ))
     else:
         if not args.username or not args.password:

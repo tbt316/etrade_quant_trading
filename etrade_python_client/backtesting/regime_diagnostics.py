@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from live_trading.data_ingestion import DataIngestor
 from live_trading.ev_engine import train_regime_hmm, select_gmm_by_bic
+from live_trading.market_sessions import latest_available_session_before
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn.decomposition._pca")
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.validation")
@@ -138,8 +139,15 @@ def _build_timeline_figure(trace, best_k):
             col=1,
             secondary_y=False,
         )
-    for _, group in trace.groupby(trace["HMM_State"].ne(trace["HMM_State"].shift()).cumsum()):
-        state = int(group["HMM_State"].iloc[0])
+    display_state = (
+        "Overlay_Regime_State"
+        if "Overlay_Regime_State" in trace.columns
+        else "HMM_State"
+    )
+    for _, group in trace.groupby(
+        trace[display_state].ne(trace[display_state].shift()).cumsum()
+    ):
+        state = int(group[display_state].iloc[0])
         fig.add_vrect(
             x0=group.index[0],
             x1=group.index[-1],
@@ -243,10 +251,16 @@ def build_regime_diagnostics(
 
     df_raw = _fetch_history(fetch_start, end)
     df_raw = df_raw.loc[:end].copy()
+    fit_end = latest_available_session_before(
+        df_raw.index,
+        analysis_start,
+    )
+    print(f"Calibration end: {fit_end} (strictly pre-analysis)")
     hmm_model, best_k, feature_df = train_regime_hmm(
         df_raw,
         n_components=n_components,
         expanding_window=True,
+        fit_end=fit_end,
     )
     if hmm_model is None or feature_df.empty:
         raise RuntimeError("Regime model did not produce a usable causal trace.")
@@ -261,10 +275,8 @@ def build_regime_diagnostics(
         pd.Series("close_T_for_next_session", index=trace.index),
     )
     if {"Detected_Regime_State", "Detected_Regime_Label"}.issubset(trace.columns):
-        trace["Raw_HMM_State"] = trace["HMM_State"]
-        trace["Raw_Regime_Label"] = trace["Regime_Label"]
-        trace["HMM_State"] = trace["Detected_Regime_State"]
-        trace["Regime_Label"] = trace["Detected_Regime_Label"]
+        trace["Overlay_Regime_State"] = trace["Detected_Regime_State"]
+        trace["Overlay_Regime_Label"] = trace["Detected_Regime_Label"]
     trace = trace.loc[pd.Timestamp(analysis_start):pd.Timestamp(end)].copy()
     trace = trace.dropna(subset=["SPY_Log_Return", "HMM_State"])
     if trace.empty:
@@ -280,7 +292,7 @@ def build_regime_diagnostics(
     summary_path = os.path.join(output_dir, "spy_log_return_gmm_summary.csv")
 
     _plot_timeline(trace, effective_k, timeline_path)
-    summary = _plot_gmm_fits(trace, effective_k, gmm_path)
+    summary = _plot_gmm_fits(trace, best_k, gmm_path)
 
     trace.to_csv(trace_path)
     summary_df = pd.DataFrame(summary)
@@ -295,6 +307,7 @@ def build_regime_diagnostics(
         fetch_start=fetch_start,
         analysis_start=analysis_start,
         analysis_end=end,
+        calibration_end=fit_end,
         requested_k=n_components or 3,
         raw_k=best_k,
         pca_feature_names=getattr(hmm_model, "feature_names_", []),
@@ -321,6 +334,9 @@ def build_regime_diagnostics(
         "rows": len(trace),
         "best_k": best_k,
         "effective_k": effective_k,
+        "calibration_end": fit_end,
+        "analysis_start": analysis_start,
+        "analysis_end": end,
     }
 
 
@@ -339,11 +355,23 @@ def _plot_timeline(trace, best_k, output_path):
         1: "Cautious Decline (1)",
         2: "Panic / Crisis (2)",
     }
-    change_groups = trace["HMM_State"].ne(trace["HMM_State"].shift()).cumsum()
+    display_state = (
+        "Overlay_Regime_State"
+        if "Overlay_Regime_State" in trace.columns
+        else "HMM_State"
+    )
+    display_label = (
+        "Overlay_Regime_Label"
+        if "Overlay_Regime_Label" in trace.columns
+        else "Regime_Label"
+    )
+    change_groups = trace[display_state].ne(
+        trace[display_state].shift()
+    ).cumsum()
     added = set()
     for _, group in trace.groupby(change_groups):
-        state = int(group["HMM_State"].iloc[0])
-        label = state_labels.get(state, f"State {state}")
+        state = int(group[display_state].iloc[0])
+        label = group[display_label].iloc[0]
         color = colors[state % len(colors)]
         if label not in added:
             ax_price.axvspan(group.index[0], group.index[-1], color=color, alpha=0.35, label=label)
@@ -503,6 +531,7 @@ def _write_html_report(
     fetch_start,
     analysis_start,
     analysis_end,
+    calibration_end,
     requested_k,
     raw_k,
     pca_feature_names=None,
@@ -511,25 +540,28 @@ def _write_html_report(
     pca_feature_influence_df=None,
     pca_dominant_df=None,
 ):
+    display_label_column = (
+        "Overlay_Regime_Label"
+        if "Overlay_Regime_Label" in trace.columns
+        else "Regime_Label"
+    )
     label_counts = (
-        trace["Regime_Label"]
+        trace[display_label_column]
         .value_counts()
         .rename_axis("regime")
         .reset_index(name="rows")
     )
-    raw_counts = pd.DataFrame()
-    if "Raw_Regime_Label" in trace.columns:
-        raw_counts = (
-            trace["Raw_Regime_Label"]
-            .value_counts()
-            .rename_axis("raw_hmm_label")
-            .reset_index(name="rows")
-        )
+    raw_counts = (
+        trace["Regime_Label"]
+        .value_counts()
+        .rename_axis("raw_hmm_label")
+        .reset_index(name="rows")
+    )
 
     stress_cols = [
         "date",
+        "Overlay_Regime_Label",
         "Regime_Label",
-        "Raw_Regime_Label",
         "Stress_Overlay",
         "Stress_21d_Drawdown",
         "Stress_5d_Log_Return",
@@ -874,6 +906,7 @@ document.querySelectorAll('.flow-node').forEach((node) => {
 
   <section class="panel grid">
     <div class="metric">Fetch window<b>{html.escape(fetch_start)} to {html.escape(analysis_end)}</b></div>
+    <div class="metric">Calibration end<b>{html.escape(calibration_end)} (strictly pre-test)</b></div>
     <div class="metric">Analysis window<b>{html.escape(analysis_start)} to {html.escape(analysis_end)}</b></div>
     <div class="metric">HMM states<b>K = {int(requested_k)} raw, 3 displayed</b></div>
   </section>

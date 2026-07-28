@@ -1,22 +1,174 @@
-import os
-import sys
 import argparse
 import asyncio
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-# Add quant-review-0430 to sys.path to access the remediated modules
-QUANT_REVIEW_DIR = os.path.join(os.getcwd(), "quant-review-0430")
-if QUANT_REVIEW_DIR not in sys.path:
-    sys.path.insert(0, QUANT_REVIEW_DIR)
-
-# Now import from the quant-review-0430 directory
 from live_trading.data_ingestion import DataIngestor
-from live_trading.ev_engine import train_regime_hmm, get_regime_labels, build_regime_return_arrays, save_regime_cache
-from live_trading.pca_fusion import PCAFusion
+from live_trading.ev_engine import (
+    build_regime_return_arrays,
+    save_regime_cache,
+    train_regime_hmm,
+)
+from live_trading.market_sessions import (
+    latest_completed_nyse_session,
+    latest_nyse_session_before,
+)
+
+DEFAULT_CALIBRATION_YEARS = 8
+REGIME_REVIEW_SCHEMA = "causal-regime-review.v1"
+
+
+@dataclass(frozen=True)
+class RegimeReviewWindow:
+    """Explicit calibration and out-of-sample boundaries for one review."""
+
+    calibration_start: str
+    calibration_end: str
+    test_start: str
+    test_end: str
+
+    def __post_init__(self):
+        calibration_start = _canonical_date(
+            self.calibration_start,
+            "calibration_start",
+        )
+        calibration_end = _canonical_date(
+            self.calibration_end,
+            "calibration_end",
+        )
+        test_start = _canonical_date(self.test_start, "test_start")
+        test_end = _canonical_date(self.test_end, "test_end")
+        if calibration_start > calibration_end:
+            raise ValueError(
+                "calibration_start must not follow calibration_end"
+            )
+        if calibration_end >= test_start:
+            raise ValueError(
+                "calibration_end must be strictly before test_start"
+            )
+        if test_end < test_start:
+            raise ValueError("test_end must not precede test_start")
+
+    def manifest(self):
+        return {
+            "schema": REGIME_REVIEW_SCHEMA,
+            "calibration_start": self.calibration_start,
+            "calibration_end": self.calibration_end,
+            "test_start": self.test_start,
+            "test_end": self.test_end,
+            "inference_method": "walk_forward_refit",
+            "regime_signal_timestamp": "close_T_for_next_session",
+            "validity_status": "UNVERIFIED",
+            "execution_eligible": False,
+        }
+
+
+def _canonical_date(value, field_name):
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a canonical ISO date")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be a canonical ISO date"
+        ) from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field_name} must be a canonical ISO date")
+    return pd.Timestamp(parsed)
+
+
+def _resolve_review_window(
+    start_date,
+    end_date,
+    *,
+    calibration_start=None,
+    calibration_end=None,
+):
+    """Resolve a causal calibration prefix strictly before the test range."""
+
+    test_start = _canonical_date(start_date, "start_date")
+    test_end = _canonical_date(end_date, "end_date")
+    if test_end < test_start:
+        raise ValueError("test_end must not precede test_start")
+
+    if calibration_end is None:
+        resolved_calibration_end = latest_nyse_session_before(test_start)
+    else:
+        requested_calibration_end = _canonical_date(
+            calibration_end,
+            "calibration_end",
+        )
+        if requested_calibration_end >= test_start:
+            raise ValueError(
+                "calibration_end must be strictly before test_start"
+            )
+        resolved_calibration_end = latest_nyse_session_before(
+            requested_calibration_end + pd.Timedelta(days=1)
+        )
+    calibration_end_ts = pd.Timestamp(resolved_calibration_end)
+    if calibration_end_ts >= test_start:
+        raise ValueError(
+            "calibration_end must be strictly before test_start"
+        )
+
+    if calibration_start is None:
+        calibration_start_ts = test_start - pd.DateOffset(
+            years=DEFAULT_CALIBRATION_YEARS
+        )
+    else:
+        calibration_start_ts = _canonical_date(
+            calibration_start,
+            "calibration_start",
+        )
+    if calibration_start_ts > calibration_end_ts:
+        raise ValueError(
+            "calibration_start must not follow calibration_end"
+        )
+
+    return RegimeReviewWindow(
+        calibration_start=calibration_start_ts.strftime("%Y-%m-%d"),
+        calibration_end=calibration_end_ts.strftime("%Y-%m-%d"),
+        test_start=test_start.strftime("%Y-%m-%d"),
+        test_end=test_end.strftime("%Y-%m-%d"),
+    )
+
+
+def _train_causal_review_trace(frame, window, *, n_components=None):
+    """Train on the declared prefix and return only requested OOS rows."""
+
+    if not isinstance(window, RegimeReviewWindow):
+        raise TypeError("window must be RegimeReviewWindow")
+    if (
+        not isinstance(frame, pd.DataFrame)
+        or frame.empty
+        or not frame.index.is_monotonic_increasing
+        or not frame.index.is_unique
+    ):
+        raise ValueError("review frame must be ordered and non-empty")
+    frame_index = pd.DatetimeIndex(frame.index).tz_localize(None).normalize()
+    calibration_end = pd.Timestamp(window.calibration_end)
+    if calibration_end not in frame_index:
+        raise ValueError("CALIBRATION_END_DATA_UNAVAILABLE")
+
+    best_hmm, best_k, causal_trace = train_regime_hmm(
+        frame,
+        n_components=n_components,
+        expanding_window=True,
+        fit_end=window.calibration_end,
+    )
+    if best_hmm is None or causal_trace.empty:
+        raise ValueError("CAUSAL_REGIME_TRACE_UNAVAILABLE")
+    test_trace = causal_trace.loc[
+        pd.Timestamp(window.test_start):pd.Timestamp(window.test_end)
+    ].copy()
+    if test_trace.empty:
+        raise ValueError("OUT_OF_SAMPLE_REGIME_TRACE_UNAVAILABLE")
+    test_trace.attrs["regime_review_manifest"] = window.manifest()
+    return best_hmm, best_k, test_trace
+
 
 def setup_plot_style():
     """Sets a premium, dark-themed plotting style."""
@@ -46,87 +198,118 @@ def run_sync(coro):
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    
+
     if loop.is_running():
         # This shouldn't happen in this script's structure
         return asyncio.run_coroutine_threadsafe(coro, loop).result()
     return loop.run_until_complete(coro)
 
-def run_regime_detection(start_date, end_date, n_components=None, save_results=False):
 
-    print(f"\n🚀 [Regime Detector] Starting analysis for period: {start_date} to {end_date}")
+def _build_completed_session_return_arrays(*, horizon, force_refit=False):
+    """Build review buckets only through a fully closed NYSE session."""
+
+    as_of_date = latest_completed_nyse_session()
+    cache_key = datetime.fromisoformat(as_of_date).date().toordinal()
+    return build_regime_return_arrays(
+        cache_key,
+        horizon=horizon,
+        force_refit=force_refit,
+        as_of_date=as_of_date,
+    )
+
+
+def run_regime_detection(
+    start_date,
+    end_date,
+    n_components=None,
+    save_results=False,
+    *,
+    calibration_start=None,
+    calibration_end=None,
+):
+    window = _resolve_review_window(
+        start_date,
+        end_date,
+        calibration_start=calibration_start,
+        calibration_end=calibration_end,
+    )
+    print(
+        "\n🚀 [Regime Detector] Starting causal analysis "
+        f"for test period: {window.test_start} to {window.test_end}"
+    )
+    print(
+        "  Calibration prefix: "
+        f"{window.calibration_start} to {window.calibration_end}"
+    )
     
     ingestor = DataIngestor()
     
     # 1. High-Dimensional Data Ingestion
     print("📡 Fetching feature set (Macro + Price + Vol)...")
-    # build_fused_dataset is async, run it sync
-    stationary_df = run_sync(ingestor.build_fused_dataset(start_date, end_date, scale=False))
+    stationary_df = run_sync(
+        ingestor.build_fused_dataset(
+            window.calibration_start,
+            window.test_end,
+            scale=False,
+            fit_end=window.calibration_end,
+        )
+    )
     
     if stationary_df.empty:
         print("❌ Error: Failed to fetch data.")
         return
-    
+
     # 2. Raw data for plotting (SPY and VIX)
     print("📊 Fetching raw price data for visualization...")
-    raw_df = ingestor.fetch_yf_data(start_date, end_date)
-    
-    # 3. Training HMM with expanding window to eliminate look-ahead bias
-    print(f"🧠 Training Gaussian HMM (Causal Walk-Forward)...")
-    best_hmm, best_k, feature_df = train_regime_hmm(stationary_df, n_components=n_components, expanding_window=True)
-    
-    if best_hmm is None:
-        print("❌ Error: HMM training failed.")
-        return
+    raw_df = ingestor.fetch_yf_data(
+        window.calibration_start,
+        window.test_end,
+    )
+    if (
+        raw_df.empty
+        or not {"SPY_Close", "VIX_Close"}.issubset(raw_df.columns)
+    ):
+        raise ValueError("REGIME_REVIEW_MARKET_DATA_UNAVAILABLE")
 
-    # 4. Calculate posterior probabilities (predict_proba)
-    pc_cols = [c for c in feature_df.columns if c.startswith('PC')]
-    features_pc = feature_df[pc_cols].values
-    
-    n_samples = len(features_pc)
-    all_probs = np.zeros((n_samples, best_k))
-    print(f"🔮 Calculating causal probabilities for {n_samples} samples...")
-    for t in range(n_samples):
-        all_probs[t] = best_hmm.predict_proba(features_pc[:t+1])[-1]
-    
-    for i in range(best_k):
-        feature_df[f'prob_state_{i}'] = all_probs[:, i]
-    
-    feature_df['Dominant_State'] = np.argmax(all_probs, axis=1)
-    
-    # 5. Empirical Labeling (Safer than mathematical inversion)
+    # 3. The engine owns causal posterior extraction. This caller supplies a
+    # strictly pre-test fit boundary and consumes only the returned OOS trace.
+    print("🧠 Training Gaussian HMM (Causal Walk-Forward)...")
+    best_hmm, best_k, feature_df = _train_causal_review_trace(
+        stationary_df,
+        window,
+        n_components=n_components,
+    )
+    probability_columns = [
+        f"prob_state_{state}"
+        for state in range(best_k)
+    ]
+    if (
+        "HMM_State" not in feature_df.columns
+        or "Regime_Label" not in feature_df.columns
+        or any(
+            column not in feature_df.columns
+            for column in probability_columns
+        )
+    ):
+        raise ValueError("CAUSAL_REGIME_PROVENANCE_INCOMPLETE")
+    feature_df["Dominant_State"] = feature_df["HMM_State"].astype(int)
+
+    # 4. Preserve the snapshot-time label carried by each causal row.
     plot_df = feature_df.join(raw_df[['SPY_Close', 'VIX_Close']], how='inner')
-    plot_df['SPY_Log_Return'] = np.log(plot_df['SPY_Close'] / plot_df['SPY_Close'].shift(1))
+    if plot_df.empty:
+        raise ValueError("REGIME_REVIEW_PLOT_DATA_UNAVAILABLE")
     
     regime_labels = {}
-    print("🏷️  Calculating empirical regime labels...")
+    print("🏷️  Reading snapshot-time regime labels...")
     for i in range(best_k):
-        state_mask = plot_df['Dominant_State'] == i
-        if not state_mask.any():
+        state_labels = plot_df.loc[
+            plot_df["Dominant_State"] == i,
+            "Regime_Label",
+        ].dropna()
+        if state_labels.empty:
             continue
-            
-        median_vix = plot_df.loc[state_mask, 'VIX_Close'].median()
-        # Annualized mean return, handle potential NaNs
-        rets = plot_df.loc[state_mask, 'SPY_Log_Return'].dropna()
-        mean_return = rets.mean() * 252 if not rets.empty else 0
-        
-        # REFINED THRESHOLDS: More aggressive Turmoil and realistic Expansion boundaries
-        if median_vix > 25:
-            name = "Market Turmoil"
-        elif median_vix > 18:
-            if mean_return < -0.05:
-                name = "Cautious Decline"
-            else:
-                name = "High Vol Chop"
-        elif mean_return > 0.05 and median_vix < 15:
-            name = "Robust Expansion"
-        elif mean_return > 0 and median_vix < 20:
-            name = "Emerging Expansion"
-        else:
-            name = f"Regime {i}"
-            
-        regime_labels[i] = f"{name} ({i})"
-        print(f"  • State {i}: VIX={median_vix:.1f}, Return={mean_return*100:.1f}% -> {name}")
+        regime_labels[i] = state_labels.iloc[-1]
+        print(f"  • State {i}: latest causal label={regime_labels[i]}")
     
     # 5. Plotting
     print("🎨 Generating Regime Analysis Dashboard...")
@@ -147,14 +330,21 @@ def run_regime_detection(start_date, end_date, n_components=None, save_results=F
     colors = [cmap(i) for i in np.linspace(0, 1, best_k)]
     
     # Draw Regime Backgrounds
-    state_changes = plot_df['Dominant_State'].ne(plot_df['Dominant_State'].shift()).cumsum()
+    state_changes = (
+        plot_df["Dominant_State"].ne(
+            plot_df["Dominant_State"].shift()
+        )
+        | plot_df["Regime_Label"].ne(
+            plot_df["Regime_Label"].shift()
+        )
+    ).cumsum()
     groups = plot_df.groupby(state_changes)
     
     added_to_legend = set()
     for _, group in groups:
         state = group['Dominant_State'].iloc[0]
         color = colors[state]
-        label = regime_labels.get(state, f"Regime {state}")
+        label = group["Regime_Label"].iloc[0]
         
         start_idx = group['index_int'].iloc[0]
         end_idx = group['index_int'].iloc[-1]
@@ -175,7 +365,13 @@ def run_regime_detection(start_date, end_date, n_components=None, save_results=F
     ax_vix.tick_params(axis='y', labelcolor='#ff5252')
     ax_vix.grid(False)
     
-    ax_price.set_title(f'Market Regime Timeline Analysis (K={best_k})', fontsize=16, pad=20, fontweight='bold')
+    ax_price.set_title(
+        f"Causal OOS Market Regime Timeline "
+        f"({window.test_start} to {window.test_end}, K={best_k})",
+        fontsize=16,
+        pad=20,
+        fontweight='bold',
+    )
     ax_price.legend(loc='upper left', framealpha=0.8)
     
     # Format X-axis with Date Labels
@@ -186,7 +382,7 @@ def run_regime_detection(start_date, end_date, n_components=None, save_results=F
     ax_prob.set_xticklabels(tick_labels, rotation=45, ha='right')
     
     prob_data = [plot_df[f'prob_state_{i}'].values for i in range(best_k)]
-    labels = [regime_labels.get(i, f'State {i}') for i in range(best_k)]
+    labels = [f"Raw HMM State {i}" for i in range(best_k)]
     
     ax_prob.stackplot(x_coords, prob_data, labels=labels, colors=colors, alpha=0.7)
     ax_prob.set_ylabel('Probability', fontsize=12, fontweight='bold')
@@ -205,16 +401,29 @@ def run_regime_detection(start_date, end_date, n_components=None, save_results=F
         print("💾 Saving regime data to cache for live trading engine...")
         # build_regime_return_arrays does the return grouping and GMM fitting
         # and it will now use the current date to key the results
-        regime_dict, model, daily_models = build_regime_return_arrays(int(datetime.now().timestamp()/86400), horizon=7, force_refit=True)
+        regime_buckets, model, daily_models = (
+            _build_completed_session_return_arrays(
+                horizon=7,
+                force_refit=True,
+            )
+        )
         if model:
-            save_regime_cache(regime_dict, model, daily_models)
+            save_regime_cache(regime_buckets, model, daily_models)
         else:
             print("❌ Failed to generate regime return arrays for saving.")
 
     print("\n" + "="*50)
     print("🔍 REGIME ENGINE VALIDITY CHECK")
     print("="*50)
-    print(f"  • Date Range: {start_date} to {end_date}")
+    print(
+        "  • Calibration Range: "
+        f"{window.calibration_start} to {window.calibration_end}"
+    )
+    print(
+        f"  • OOS Test Range: {window.test_start} to {window.test_end}"
+    )
+    print("  • Inference Method: walk_forward_refit")
+    print("  • Signal Timestamp: close_T_for_next_session")
     print(f"  • Optimal K (BIC): {best_k}")
     print(f"  • Feature Set: {len(stationary_df.columns)} indicators")
     
@@ -229,6 +438,10 @@ def run_regime_detection(start_date, end_date, n_components=None, save_results=F
     print("PRO TIP: Review the stacked probability chart to verify state stability.")
     print("Frequent 'flickering' between states suggests overfitting or noisy features.")
     print("="*50 + "\n")
+    return {
+        "artifact": output_fn,
+        "regime_review_manifest": window.manifest(),
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Market Regime Detection Review Script")
@@ -240,8 +453,32 @@ if __name__ == "__main__":
                         help="Force number of HMM states (optional)")
     parser.add_argument("--save", action="store_true",
                         help="Save results to cache for live trading agent")
+    parser.add_argument(
+        "--calibration-start",
+        type=str,
+        default=None,
+        help=(
+            "Calibration fetch start (YYYY-MM-DD). Defaults to eight years "
+            "before --start."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-end",
+        type=str,
+        default=None,
+        help=(
+            "Latest allowed calibration date (YYYY-MM-DD). It is resolved "
+            "to an NYSE session strictly before --start."
+        ),
+    )
     
     args = parser.parse_args()
     
-    run_regime_detection(args.start, args.end, n_components=args.k, save_results=args.save)
-
+    run_regime_detection(
+        args.start,
+        args.end,
+        n_components=args.k,
+        save_results=args.save,
+        calibration_start=args.calibration_start,
+        calibration_end=args.calibration_end,
+    )

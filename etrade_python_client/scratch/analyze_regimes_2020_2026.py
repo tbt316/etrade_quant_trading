@@ -2,8 +2,9 @@ import asyncio
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from live_trading.ev_engine import train_regime_hmm, fetch_historical_data, get_regime_labels
+from live_trading.ev_engine import train_regime_hmm
 from live_trading.data_ingestion import DataIngestor
+from live_trading.market_sessions import latest_available_session_before
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -15,6 +16,7 @@ async def run_analysis():
     # Start date for data fetching: 2015-01-01
     # Analysis start date: 2020-01-01
     start_fetch = "2015-01-01"
+    analysis_start = "2020-01-02"
     end_fetch = "2026-05-03" # Current date
     
     ingestor = DataIngestor()
@@ -33,23 +35,37 @@ async def run_analysis():
     print("🧠 Training HMM in walk-forward mode (2020-2026)...")
     # We pass the full DF but the engine handles the warmup and causal logic.
     # train_regime_hmm is SYNC but uses run_async internally.
-    hmm_model, k, results_df = train_regime_hmm(df_raw, expanding_window=True)
+    fit_end = latest_available_session_before(
+        df_raw.index,
+        analysis_start,
+    )
+    print(
+        f"  Calibration {start_fetch} to {fit_end}; "
+        f"OOS {analysis_start} to {end_fetch}"
+    )
+    hmm_model, k, results_df = train_regime_hmm(
+        df_raw,
+        expanding_window=True,
+        fit_end=fit_end,
+    )
     
     if hmm_model is None:
         print("❌ HMM Training failed.")
         return
 
     # Filter results to the 2020-2026 window
-    analysis_df = results_df[results_df.index >= "2020-01-01"].copy()
+    analysis_df = results_df.loc[
+        pd.Timestamp(analysis_start):pd.Timestamp(end_fetch)
+    ].copy()
     
     print(f"✅ Analysis complete. Processed {len(analysis_df)} days.")
     
     # 1. State Characteristics
-    labels = get_regime_labels(hmm_model, analysis_df)
     print("\n--- Regime Characteristics ---")
-    for state_id, label in labels.items():
+    for state_id in sorted(analysis_df["HMM_State"].unique()):
         state_data = analysis_df[analysis_df['HMM_State'] == state_id]
         if not state_data.empty:
+            label = state_data["Regime_Label"].dropna().iloc[-1]
             # We need to map back to raw data for physical metrics
             raw_subset = df_raw.loc[df_raw.index.intersection(state_data.index)]
             avg_vix = raw_subset['VIX_Close'].mean()

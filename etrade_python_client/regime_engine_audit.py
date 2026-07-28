@@ -1,19 +1,17 @@
 import os
-import sys
+import argparse
 import asyncio
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
-
-# Add quant-review-0430 to sys.path
-QUANT_REVIEW_DIR = os.path.join(os.getcwd(), "quant-review-0430")
-if QUANT_REVIEW_DIR not in sys.path:
-    sys.path.insert(0, QUANT_REVIEW_DIR)
+from pathlib import Path
 
 from live_trading.data_ingestion import DataIngestor
-from live_trading.ev_engine import train_regime_hmm, get_regime_labels
+from live_trading.ev_engine import train_regime_hmm
+from live_trading.market_sessions import latest_available_session_before
 from live_trading.pca_fusion import PCAFusion
 
 def setup_plot_style():
@@ -35,14 +33,14 @@ def run_sync(coro):
         asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
 
-def generate_audit_report(start_date, end_date):
+def generate_audit_report(calibration_start, test_start, test_end):
     setup_plot_style()
     os.makedirs("audit_plots", exist_ok=True)
     ingestor = DataIngestor()
     
     print("Step 1: Fetching Raw Data...")
-    fred_raw = ingestor.fetch_fred_data(start_date, end_date)
-    yf_raw = ingestor.fetch_yf_data(start_date, end_date)
+    fred_raw = ingestor.fetch_fred_data(calibration_start, test_end)
+    yf_raw = ingestor.fetch_yf_data(calibration_start, test_end)
     
     print(f"  YFinance Data: {yf_raw.shape}")
     print(f"  FRED Data: {fred_raw.shape}")
@@ -54,13 +52,6 @@ def generate_audit_report(start_date, end_date):
     # Combine data
     combined = pd.concat([yf_raw, fred_raw], axis=1).ffill()
     
-    # Clean up empty columns (if any)
-    missing_ratios = combined.isna().mean()
-    bad_cols = missing_ratios[missing_ratios > 0.8].index
-    if not bad_cols.empty:
-        print(f"  Dropping sparse features (>80% NaN): {list(bad_cols)}")
-        combined = combined.drop(columns=bad_cols)
-    
     # Drop rows only where core features (SPY/VIX) are missing
     core_cols = ['SPY_Close', 'VIX_Close']
     existing_core = [c for c in core_cols if c in combined.columns]
@@ -71,6 +62,22 @@ def generate_audit_report(start_date, end_date):
     if raw_df.empty:
         print("❌ Error: Merged dataset is empty after cleaning.")
         return
+    fit_end = latest_available_session_before(
+        raw_df.index,
+        test_start,
+    )
+    missing_ratios = raw_df.loc[:fit_end].isna().mean()
+    bad_cols = missing_ratios[missing_ratios > 0.8].index
+    if not bad_cols.empty:
+        print(
+            "  Dropping prefix-sparse features (>80% NaN): "
+            f"{list(bad_cols)}"
+        )
+        raw_df = raw_df.drop(columns=bad_cols)
+    print(
+        f"  Calibration: {calibration_start} to {fit_end}; "
+        f"OOS test: {test_start} to {test_end}"
+    )
     
     # Plot 1: Raw Data
     fig, axes = plt.subplots(4, 1, figsize=(16, 20), sharex=True)
@@ -126,13 +133,16 @@ def generate_audit_report(start_date, end_date):
     plt.close(fig)
     
     print("Step 2: Processing Stationarity...")
-    stationary_df = ingestor.ensure_stationarity(raw_df)
+    prepared = ingestor.prepare_causal_features(
+        raw_df,
+        fit_end=fit_end,
+    )
+    stationary_df = prepared.stationary
     
     # Plot 2: Stationary Data (Z-Scores for comparison)
     # Use expanding window scaling to avoid global leakage in visualization
     print("  Applying Causal Scaling for Heatmap...")
-    scaled_stationary = ingestor.scale_features(stationary_df, expanding=True, warmup=min(252, len(stationary_df)-1))
-    scaled_stationary = scaled_stationary.dropna()
+    scaled_stationary = prepared.scaled.dropna()
     
     fig, ax = plt.subplots(figsize=(15, 8))
     sns.heatmap(scaled_stationary.T, cmap='RdYlGn', ax=ax, cbar_kws={'label': 'Robust Scaled Value'})
@@ -141,7 +151,8 @@ def generate_audit_report(start_date, end_date):
     
     print("Step 3: PCA Fusion...")
     fusion = PCAFusion()
-    pc_df = fusion.fit_transform(scaled_stationary)
+    fusion.fit(scaled_stationary.loc[:fit_end])
+    pc_df = fusion.transform(scaled_stationary)
     loadings = fusion.get_loadings_table()
     
     # Plot 3: PCA Loadings
@@ -160,7 +171,18 @@ def generate_audit_report(start_date, end_date):
     
     print("Step 4: HMM Training & State Centroids...")
     # Train HMM with expanding_window=True to eliminate look-ahead bias
-    best_hmm, best_k, final_df = train_regime_hmm(stationary_df, expanding_window=True)
+    best_hmm, best_k, final_df = train_regime_hmm(
+        raw_df,
+        expanding_window=True,
+        fit_end=fit_end,
+    )
+    if best_hmm is None or final_df.empty:
+        raise RuntimeError("CAUSAL_REGIME_TRACE_UNAVAILABLE")
+    final_df = final_df.loc[
+        pd.Timestamp(test_start):pd.Timestamp(test_end)
+    ].copy()
+    if final_df.empty:
+        raise RuntimeError("OUT_OF_SAMPLE_REGIME_TRACE_UNAVAILABLE")
     # Labels are now in final_df['Regime_Label'] point-in-time
     
     # Plot 4: HMM State Clusters in PCA Space
@@ -170,7 +192,14 @@ def generate_audit_report(start_date, end_date):
     # Plot Centroids
     for i in range(best_k):
         # Calculate centroid based on FINAL model for cluster visualization
-        centroid = np.sum(best_hmm.weights_[i][:, np.newaxis] * best_hmm.means_[i], axis=0)
+        if hasattr(best_hmm, "weights_"):
+            centroid = np.sum(
+                best_hmm.weights_[i][:, np.newaxis]
+                * best_hmm.means_[i],
+                axis=0,
+            )
+        else:
+            centroid = np.asarray(best_hmm.means_[i], dtype=float)
         ax.scatter(centroid[0], centroid[1], marker='X', s=200, color='red', edgecolor='white')
         
         # Get label from the last known state archetype
@@ -181,7 +210,7 @@ def generate_audit_report(start_date, end_date):
     ax.set_title('HMM State Clusters in Latent Factor Space (PC1 vs PC2)')
     plt.savefig("audit_plots/04_hmm_clusters.png")
     
-    print("Step 5: Final Regime Timeline...")
+    print("Step 5: Raw HMM State Timeline...")
     fig, ax = plt.subplots(figsize=(15, 6))
     ax.plot(final_df.index, final_df['PC1'], color='white', alpha=0.3, label='PC1 (Market Trend)')
     
@@ -193,13 +222,32 @@ def generate_audit_report(start_date, end_date):
         state = int(group['HMM_State'].iloc[0])
         ax.axvspan(group.index[0], group.index[-1], color=colors[state], alpha=0.4)
         
-    ax.set_title('Final Causal Regime Classification over PC1 Factor')
-    plt.savefig("audit_plots/05_final_timeline.png")
+    ax.set_title('Causal Raw HMM State Classification over PC1 Factor')
+    plt.savefig("audit_plots/05_raw_hmm_timeline.png")
     
     # Export Data for Review Package
-    export_path = "quant-review-0430/data/regime_audit_2015_2020.csv"
+    export_dir = Path("quant-review-0430/data")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    export_path = export_dir / "regime_audit_oos.csv"
     final_df.to_csv(export_path)
     print(f"✅ Audit data exported to: {export_path}")
+    manifest = {
+        "schema": "causal-regime-engine-audit.v1",
+        "calibration_start": calibration_start,
+        "calibration_end": fit_end,
+        "test_start": test_start,
+        "test_end": test_end,
+        "inference_method": "walk_forward_refit",
+        "regime_signal_timestamp": "close_T_for_next_session",
+        "raw_hmm_taxonomy_scope": "per_row_refit",
+        "feature_hash": prepared.manifest.feature_hash,
+        "validity_status": "UNVERIFIED",
+        "execution_eligible": False,
+    }
+    manifest_path = export_path.with_suffix(".manifest.json")
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        manifest_file.write("\n")
     
     print("\n✅ Audit complete. Plots saved to audit_plots/")
     print(f"  • Final K: {best_k}")
@@ -209,6 +257,15 @@ def generate_audit_report(start_date, end_date):
         print(f"  • Top PC2 Features: {loadings['PC2'].abs().sort_values(ascending=False).head(3).index.tolist()}")
 
 if __name__ == "__main__":
-    start = "2015-01-01"
-    end = "2020-01-01"
-    generate_audit_report(start, end)
+    parser = argparse.ArgumentParser(
+        description="Generate a causal out-of-sample regime-engine audit."
+    )
+    parser.add_argument("--calibration-start", default="2015-01-01")
+    parser.add_argument("--test-start", default="2019-01-02")
+    parser.add_argument("--test-end", default="2020-01-01")
+    args = parser.parse_args()
+    generate_audit_report(
+        args.calibration_start,
+        args.test_start,
+        args.test_end,
+    )

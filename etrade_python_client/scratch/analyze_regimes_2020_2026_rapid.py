@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime
 from live_trading.ev_engine import train_regime_hmm, get_regime_labels
 from live_trading.data_ingestion import DataIngestor
+from live_trading.market_sessions import latest_available_session_before
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -13,6 +14,7 @@ async def run_analysis():
     
     # We use a shorter window for the global fit
     start_fetch = "2019-01-01"
+    analysis_start = "2020-01-02"
     end_fetch = "2026-05-03" 
     
     ingestor = DataIngestor()
@@ -24,22 +26,35 @@ async def run_analysis():
         print("❌ Failed to fetch data.")
         return
 
-    # Use a GLOBAL fit (expanding_window=False) for rapid archetyping
-    print("🧠 Performing global HMM fit for rapid walkthrough...")
-    hmm_model, k, results_df = train_regime_hmm(df_raw, expanding_window=False)
+    fit_end = latest_available_session_before(
+        df_raw.index,
+        analysis_start,
+    )
+    print(
+        "🧠 Performing fixed-snapshot OOS HMM filtering: "
+        f"calibration {start_fetch} to {fit_end}; "
+        f"test {analysis_start} to {end_fetch}."
+    )
+    hmm_model, k, results_df = train_regime_hmm(
+        df_raw,
+        expanding_window=False,
+        fit_end=fit_end,
+    )
     
     if hmm_model is None:
         print("❌ HMM Training failed.")
         return
 
     # Filter results to the 2020-2026 window
-    analysis_df = results_df[results_df.index >= "2020-01-01"].copy()
+    analysis_df = results_df.loc[
+        pd.Timestamp(analysis_start):pd.Timestamp(end_fetch)
+    ].copy()
     
     print(f"✅ Analysis complete. Processed {len(analysis_df)} days.")
     
     # 1. State Characteristics
     labels = get_regime_labels(hmm_model, analysis_df)
-    print("\n--- GLOBAL Regime Characteristics (2020-2026) ---")
+    print("\n--- FIXED-SNAPSHOT OOS Regime Characteristics (2020-2026) ---")
     for state_id, label in labels.items():
         state_data = analysis_df[analysis_df['HMM_State'] == state_id]
         if not state_data.empty:

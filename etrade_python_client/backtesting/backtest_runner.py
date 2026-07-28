@@ -47,6 +47,24 @@ from backtesting.contract_universe import (
     build_contract_universe_snapshot,
     filter_chain_for_snapshot,
 )
+from backtesting.regime_bridge import (
+    BacktestRegimeProtocol,
+    ExactAssignmentTargetCache,
+    ExactRegimeRunCache,
+    LaggedFinalRiskMap,
+    RegimeBridgeUnavailable,
+    RegimeDecisionEvidence,
+    build_lagged_final_risk_map,
+    make_regime_decision_evidence,
+)
+from live_trading.market_sessions import (
+    latest_nyse_session_before,
+    prior_nyse_session_map,
+)
+from live_trading.regime_taxonomy import (
+    FINAL_RISK_LABELS,
+    FinalRiskRegimeRef,
+)
 from live_trading.regime_signal import (
     RegimeSignal,
     annotation_for_session,
@@ -67,7 +85,7 @@ def validate_regime_v2_annotations(
 ) -> Dict[str, RegimeSignal]:
     """Validate the exact-date, shadow-only V2 annotation boundary.
 
-    V2 signals deliberately remain separate from legacy integer HMM regimes.
+    V2 signals deliberately remain separate from final-overlay integers.
     This function accepts no numeric states, performs no forward fill, and
     returns no order-facing projection.
     """
@@ -98,16 +116,14 @@ def lag_daily_regime_map(regimes: Dict[str, int], trading_dates: List[str]) -> D
     is available for the next trading session by default. This helper converts a
     close-dated trace into the map consumed by run_put_credit_spread_backtest().
     """
-    if not regimes:
+    if not regimes or not trading_dates:
         return {}
-    lagged = {}
-    previous_state = None
-    for td in trading_dates:
-        if previous_state is not None:
-            lagged[td] = previous_state
-        if td in regimes:
-            previous_state = regimes[td]
-    return lagged
+    prior_sessions = prior_nyse_session_map(trading_dates)
+    return {
+        entry_session: regimes[signal_session]
+        for entry_session, signal_session in prior_sessions.items()
+        if signal_session in regimes
+    }
 
 
 def _forward_return_assignment_strike(
@@ -189,26 +205,17 @@ def _build_trade_entry_regime_inputs(feature_df: pd.DataFrame) -> Tuple[Dict[str
     """
     Build the regime map and labels used by the backtester.
 
-    Preference order:
-      1. Audit-consistent causal stress overlay from train_regime_hmm()
-      2. Raw HMM state trace as a fallback
-
-    This keeps the backtest aligned with the probability audit script, which
-    uses the detected overlay as the final actionable regime and then lags it
-    one trading day for entry.
+    Only the closed final stress overlay is accepted. Raw HMM state identifiers
+    belong to a model-specific taxonomy and can never substitute for this map.
     """
     if feature_df is None or feature_df.empty:
         return {}, {}
 
-    if {"Detected_Regime_State", "Detected_Regime_Label"}.issubset(feature_df.columns):
-        state_col = "Detected_Regime_State"
-        label_col = "Detected_Regime_Label"
-    elif {"Raw_Overlay_State", "Raw_Overlay_Label"}.issubset(feature_df.columns):
-        state_col = "Raw_Overlay_State"
-        label_col = "Raw_Overlay_Label"
-    else:
-        state_col = "HMM_State"
-        label_col = "Regime_Label"
+    required = {"Detected_Regime_State", "Detected_Regime_Label"}
+    if not required.issubset(feature_df.columns):
+        raise RegimeBridgeUnavailable("FINAL_OVERLAY_COLUMNS_REQUIRED")
+    state_col = "Detected_Regime_State"
+    label_col = "Detected_Regime_Label"
 
     close_regimes = {
         d.strftime("%Y-%m-%d"): int(s)
@@ -216,12 +223,107 @@ def _build_trade_entry_regime_inputs(feature_df: pd.DataFrame) -> Tuple[Dict[str
     }
 
     regime_labels = {}
-    if label_col in feature_df.columns:
-        label_pairs = feature_df[[state_col, label_col]].dropna().drop_duplicates(subset=[state_col])
-        for _, row in label_pairs.iterrows():
-            regime_labels[int(row[state_col])] = str(row[label_col])
+    label_pairs = (
+        feature_df[[state_col, label_col]]
+        .dropna()
+        .drop_duplicates(subset=[state_col])
+    )
+    for _, row in label_pairs.iterrows():
+        ref = FinalRiskRegimeRef(
+            int(row[state_col]),
+            str(row[label_col]),
+        )
+        regime_labels[ref.state] = ref.label
 
     return close_regimes, regime_labels
+
+
+def _resolve_regime_assignment_entry(
+    *,
+    protocol: BacktestRegimeProtocol,
+    regime_cache: ExactRegimeRunCache,
+    target_cache: ExactAssignmentTargetCache,
+    entry_session: str,
+    signal_session: str,
+    final_risk_regime: FinalRiskRegimeRef,
+    horizon_calendar_days: int,
+    spot: float,
+    target_assignment_probability: float,
+    bucket_builder,
+    fit_model,
+    query_probability,
+    solve_root,
+):
+    """Resolve one causal raw-HMM assignment target without fallback."""
+
+    raw_resolution = regime_cache.resolve(
+        signal_as_of=signal_session,
+        horizon_calendar_days=horizon_calendar_days,
+        n_components=protocol.raw_hmm_components,
+        builder=bucket_builder,
+    )
+    if raw_resolution.value is None:
+        return (
+            None,
+            make_regime_decision_evidence(
+                protocol=protocol,
+                entry_session=entry_session,
+                signal_as_of_session=signal_session,
+                final_risk_regime=final_risk_regime,
+                raw_resolution=raw_resolution,
+                raw_context_required=True,
+            ),
+            None,
+        )
+    raw = raw_resolution.value
+    target_resolution = target_cache.resolve(
+        raw=raw,
+        target_assignment_probability=target_assignment_probability,
+        fit_model=fit_model,
+        query_probability=query_probability,
+        solve_root=solve_root,
+    )
+    if target_resolution.value is None:
+        return (
+            None,
+            make_regime_decision_evidence(
+                protocol=protocol,
+                entry_session=entry_session,
+                signal_as_of_session=signal_session,
+                final_risk_regime=final_risk_regime,
+                raw_resolution=raw_resolution,
+                raw_context_required=True,
+                unavailable_code=target_resolution.unavailable_code,
+            ),
+            dict(raw.bucket_manifest),
+        )
+    target_strike = float(spot) * np.exp(
+        target_resolution.value.target_log_return
+    )
+    if not np.isfinite(target_strike) or target_strike <= 0.0:
+        return (
+            None,
+            make_regime_decision_evidence(
+                protocol=protocol,
+                entry_session=entry_session,
+                signal_as_of_session=signal_session,
+                final_risk_regime=final_risk_regime,
+                raw_resolution=raw_resolution,
+                raw_context_required=True,
+                unavailable_code="INVALID_ASSIGNMENT_TARGET_STRIKE",
+            ),
+            dict(raw.bucket_manifest),
+        )
+    evidence = make_regime_decision_evidence(
+        protocol=protocol,
+        entry_session=entry_session,
+        signal_as_of_session=signal_session,
+        final_risk_regime=final_risk_regime,
+        raw_resolution=raw_resolution,
+        raw_context_required=True,
+        assignment_probability=float(target_assignment_probability),
+    )
+    return target_strike, evidence, dict(raw.bucket_manifest)
 
 
 @dataclass
@@ -259,6 +361,7 @@ class SpreadTrade:
     is_roll: bool = False # If opened from rollover
     entry_regime: int = -1
     entry_regime_name: str = ""
+    regime_evidence: Optional[RegimeDecisionEvidence] = None
     entry_regime_v2: Optional[Dict[str, Any]] = None
     profit_target: float = 0.70 # Default to early_profit_pct
     short_ticker: str = ""
@@ -353,6 +456,14 @@ class BacktestResult:
     risk_free_rates: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     regime_history: List[Tuple[str, int]] = field(default_factory=list)
     regime_labels: Dict[int, str] = field(default_factory=dict)
+    regime_protocol: Optional[BacktestRegimeProtocol] = None
+    regime_decision_history: List[RegimeDecisionEvidence] = field(
+        default_factory=list
+    )
+    regime_return_bucket_manifests: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )
+    regime_initialization_unavailable_code: str = ""
     regime_v2_history: List[Tuple[str, Optional[Dict[str, Any]]]] = field(
         default_factory=list
     )
@@ -447,7 +558,7 @@ class BacktestPathLogger:
         """Recursively sanitize objects for JSON serialization."""
         if isinstance(obj, dict):
             return {k: self._sanitize(v) for k, v in obj.items() if not k.startswith('_')}
-        elif isinstance(obj, list):
+        elif isinstance(obj, (list, tuple)):
             return [self._sanitize(v) for v in obj]
         elif isinstance(obj, (datetime, date)):
             return obj.isoformat()
@@ -1235,6 +1346,8 @@ async def run_put_credit_spread_backtest(
     output_log_path: Optional[str] = None,
     hold_itm_to_expiration: bool = False,
     regime_labels: Optional[dict] = None, # state int -> name string
+    regime_protocol: Optional[BacktestRegimeProtocol] = None,
+    lagged_final_regimes: Optional[LaggedFinalRiskMap] = None,
     dynamic_delta_variant: bool = True,
     panic_delta_multiplier: float = 4.0,
     panic_width_multiplier: float = 2.0,
@@ -1274,11 +1387,15 @@ async def run_put_credit_spread_backtest(
     
     # Extract strategy-level configurations
     entry_config = (strategy_config or {}).get("entry", {})
-    regime_dynamic_delta = bool(entry_config.get("regime_dynamic_delta", False))
-    regime_aware = bool((strategy_config or {}).get("regime_aware", False)) or regime_dynamic_delta
-    
-    # New Delta & Margin Configs
     dynamic_delta_method = entry_config.get("dynamic_delta_method", None)
+    regime_dynamic_delta = bool(entry_config.get("regime_dynamic_delta", False))
+    regime_aware = (
+        bool((strategy_config or {}).get("regime_aware", False))
+        or regime_dynamic_delta
+        or dynamic_delta_method == "regime_assignment_prob"
+    )
+
+    # New Delta & Margin Configs
     vix_delta_scale_factor = entry_config.get("vix_delta_scale_factor", None)
     target_assignment_prob = float(entry_config.get("target_assignment_prob", 0.05))
     far_long_leg_enabled = bool(entry_config.get("far_long_leg_enabled", False))
@@ -1404,7 +1521,7 @@ async def run_put_credit_spread_backtest(
         )
     if panic_transition_roll_enabled:
         print(
-            f"  Panic Transition Roll: enabled | From states: {sorted(panic_transition_from_states)} "
+            f"  Panic Transition Reduction: enabled | From states: {sorted(panic_transition_from_states)} "
             f"-> {panic_transition_to_state} | Min remaining DTE: {panic_transition_min_remaining_dte_fraction:.0%}"
         )
     if far_long_leg_enabled:
@@ -1418,41 +1535,239 @@ async def run_put_credit_spread_backtest(
     trading_date_index = {date: idx for idx, date in enumerate(trading_dates)}
     decision_times = _session_decision_times(trading_dates)
     print(f"\n  Trading days: {len(trading_dates)}")
-    
-    # If the strategy is regime-aware and no regimes are provided, auto-train walk-forward HMM
-    if regime_aware and regimes is None:
-        print("  [Regime Detection] Strategy is regime-aware. Training HMM walk-forward...")
+
+    final_regime_by_entry: Dict[str, FinalRiskRegimeRef] = {}
+    regime_signal_by_entry: Dict[str, str] = {}
+    regime_unavailable_by_entry: Dict[str, str] = {}
+    regime_run_cache = None
+    assignment_target_cache = ExactAssignmentTargetCache()
+
+    auto_regime_context = (
+        regime_aware
+        and regimes is None
+        and regime_protocol is None
+        and lagged_final_regimes is None
+    )
+
+    if (
+        regime_aware
+        and (regime_protocol is None) != (lagged_final_regimes is None)
+    ):
+        result.regime_initialization_unavailable_code = (
+            "INCOMPLETE_TYPED_EXTERNAL_REGIME_CONTEXT"
+        )
+    elif regime_aware and regime_protocol is not None:
         try:
-            from live_trading.ev_engine import fetch_historical_data, train_regime_hmm, get_regime_labels
+            if type(regime_protocol) is not BacktestRegimeProtocol:
+                raise RegimeBridgeUnavailable(
+                    "TYPED_REGIME_PROTOCOL_REQUIRED"
+                )
+            if type(lagged_final_regimes) is not LaggedFinalRiskMap:
+                raise RegimeBridgeUnavailable(
+                    "TYPED_FINAL_REGIME_MAP_REQUIRED"
+                )
+            if (
+                regime_protocol.inference_method
+                != "external_exact_lagged_overlay"
+                or regime_protocol.test_start != trading_dates[0]
+                or regime_protocol.test_end != trading_dates[-1]
+            ):
+                raise RegimeBridgeUnavailable(
+                    "EXTERNAL_REGIME_PROTOCOL_RANGE_MISMATCH"
+                )
+            expected_signals = prior_nyse_session_map(trading_dates)
+            if (
+                set(lagged_final_regimes.signal_session_by_entry)
+                != set(trading_dates)
+                or any(
+                    lagged_final_regimes.signal_session_by_entry.get(td)
+                    != expected_signals[td]
+                    for td in trading_dates
+                )
+            ):
+                raise RegimeBridgeUnavailable(
+                    "EXTERNAL_REGIME_SIGNAL_SESSION_MISMATCH"
+                )
+            result.regime_protocol = regime_protocol
+            regime_run_cache = ExactRegimeRunCache(result.regime_protocol)
+            regime_signal_by_entry.update(expected_signals)
+            final_regime_by_entry.update(
+                lagged_final_regimes.by_entry_session
+            )
+            regime_unavailable_by_entry.update(
+                lagged_final_regimes.unavailable_code_by_entry
+            )
+            regimes = {
+                td: ref.state
+                for td, ref in final_regime_by_entry.items()
+            }
+            result.regime_labels = dict(FINAL_RISK_LABELS)
+            result.causal_validity_reasons.extend(
+                [
+                    "regime_protocol_unverified",
+                    "regime_evidence_not_execution_eligible",
+                ]
+            )
+        except Exception as error:
+            result.regime_initialization_unavailable_code = getattr(
+                error,
+                "code",
+                "REGIME_PROTOCOL_INITIALIZATION_FAILED",
+            )
+    elif regime_aware and regimes is not None:
+        result.regime_initialization_unavailable_code = (
+            "UNTYPED_EXTERNAL_REGIME_MAP_REJECTED"
+        )
+    elif auto_regime_context and trading_dates:
+        try:
+            calibration_end = latest_nyse_session_before(trading_dates[0])
+            result.regime_protocol = BacktestRegimeProtocol(
+                calibration_end=calibration_end,
+                test_start=trading_dates[0],
+                test_end=trading_dates[-1],
+                inference_method="walk_forward_expanding",
+            )
+            regime_run_cache = ExactRegimeRunCache(result.regime_protocol)
+            regime_signal_by_entry.update(
+                prior_nyse_session_map(trading_dates)
+            )
+            result.causal_validity_reasons.extend(
+                [
+                    "regime_protocol_unverified",
+                    "regime_evidence_not_execution_eligible",
+                ]
+            )
+        except Exception as error:
+            result.regime_initialization_unavailable_code = getattr(
+                error,
+                "code",
+                "REGIME_PROTOCOL_INITIALIZATION_FAILED",
+            )
+
+    # If no external final overlay exists, produce a causal expanding trace
+    # calibrated strictly before the out-of-sample test range.
+    if auto_regime_context and result.regime_protocol:
+        print(
+            "  [Regime Detection] Training an explicitly calibrated "
+            "walk-forward HMM trace..."
+        )
+        try:
+            from live_trading.ev_engine import (
+                fetch_historical_data,
+                train_regime_hmm,
+            )
+
             df_hist = fetch_historical_data()
-            if not df_hist.empty:
-                cal_start_date = pd.to_datetime(start_date) - timedelta(days=365 * 5)
-                df_cal = df_hist[
-                    (df_hist.index >= cal_start_date) &
-                    (df_hist.index <= pd.to_datetime(end_date))
-                ].copy()
-                print(f"  [Walk-Forward] Training causal HMM trace from {cal_start_date.strftime('%Y-%m-%d')} to {end_date}...")
-                best_hmm, k, feature_df = train_regime_hmm(df_cal, n_components=3, expanding_window=True)
-                if best_hmm is not None and not feature_df.empty:
-                    close_regimes, detected_labels = _build_trade_entry_regime_inputs(feature_df)
-                    regime_labels = detected_labels or get_regime_labels(best_hmm, feature_df)
-                    regimes = lag_daily_regime_map(close_regimes, trading_dates)
-                    result.regime_labels = regime_labels
-                    # Keep the daily probabilities for plotting
-                    prob_cols = [f'prob_state_{i}' for i in range(k)]
-                    if all(col in feature_df.columns for col in prob_cols):
-                        result.regime_probabilities = (
-                            feature_df[prob_cols]
-                            .reindex(trading_dates)
-                            .ffill()
+            if df_hist.empty:
+                raise RegimeBridgeUnavailable(
+                    "HISTORICAL_REGIME_DATA_UNAVAILABLE"
+                )
+            cal_start_date = pd.to_datetime(start_date) - timedelta(
+                days=365 * 5
+            )
+            df_cal = df_hist[
+                (df_hist.index >= cal_start_date)
+                & (df_hist.index <= pd.to_datetime(end_date))
+            ].copy()
+            calibration_end = result.regime_protocol.calibration_end
+            if (
+                df_cal.empty
+                or pd.Timestamp(calibration_end) not in df_cal.index
+            ):
+                raise RegimeBridgeUnavailable(
+                    "CAUSAL_CALIBRATION_PREFIX_UNAVAILABLE"
+                )
+            print(
+                "  [Walk-Forward] "
+                f"Calibration through {calibration_end}; OOS "
+                f"{trading_dates[0]} to {trading_dates[-1]}..."
+            )
+            best_hmm, k, feature_df = train_regime_hmm(
+                df_cal,
+                n_components=result.regime_protocol.raw_hmm_components,
+                expanding_window=True,
+                fit_end=calibration_end,
+            )
+            if best_hmm is None or feature_df.empty:
+                raise RegimeBridgeUnavailable(
+                    "CAUSAL_REGIME_TRACE_UNAVAILABLE"
+                )
+            lagged = build_lagged_final_risk_map(
+                feature_df,
+                trading_dates,
+            )
+            final_regime_by_entry.update(lagged.by_entry_session)
+            regime_signal_by_entry.update(
+                lagged.signal_session_by_entry
+            )
+            regime_unavailable_by_entry.update(
+                lagged.unavailable_code_by_entry
+            )
+            regimes = {
+                td: ref.state
+                for td, ref in final_regime_by_entry.items()
+            }
+            regime_labels = dict(FINAL_RISK_LABELS)
+            result.regime_labels = dict(FINAL_RISK_LABELS)
+
+            # Plot-only raw probabilities are aligned to the entry date here.
+            # Consumers must use the current trade-date key, never prev_td.
+            prob_cols = [f"prob_state_{i}" for i in range(k)]
+            if all(col in feature_df.columns for col in prob_cols):
+                probability_rows = []
+                normalized_features = feature_df.copy()
+                normalized_features.index = pd.DatetimeIndex(
+                    normalized_features.index
+                ).normalize()
+                for td in trading_dates:
+                    signal_session = regime_signal_by_entry[td]
+                    signal_ts = pd.Timestamp(signal_session)
+                    if signal_ts in normalized_features.index:
+                        probability_rows.append(
+                            normalized_features.loc[
+                                signal_ts,
+                                prob_cols,
+                            ].to_numpy(dtype=float)
                         )
-                    print("  [Regime Timing] Using one-trading-day-lagged close_T overlay regimes for trade entry.")
-                else:
-                    print("  WARNING: Could not build causal regime trace.")
-            else:
-                print("  WARNING: Historical data for regimes is empty.")
-        except Exception as e:
-            print(f"  WARNING: Failed to auto-train regimes: {e}")
+                    else:
+                        probability_rows.append(
+                            np.full(len(prob_cols), np.nan)
+                        )
+                result.regime_probabilities = pd.DataFrame(
+                    probability_rows,
+                    index=trading_dates,
+                    columns=prob_cols,
+                    dtype=float,
+                )
+            print(
+                "  [Regime Timing] Exact prior-NYSE-session final overlays "
+                "are indexed by entry session; missing rows remain unavailable."
+            )
+        except Exception as error:
+            code = getattr(
+                error,
+                "code",
+                "REGIME_INITIALIZATION_FAILED",
+            )
+            result.regime_initialization_unavailable_code = code
+            final_regime_by_entry.clear()
+            regimes = {}
+            for td in trading_dates:
+                regime_unavailable_by_entry[td] = code
+            print(
+                f"  [Regime Detection] UNAVAILABLE ({code}); "
+                "regime-aware openings will be blocked."
+            )
+
+    if (
+        regime_aware
+        and regime_dynamic_delta
+        and dynamic_delta_method != "regime_assignment_prob"
+    ):
+        result.regime_initialization_unavailable_code = (
+            "LEGACY_REGIME_DYNAMIC_DELTA_UNSUPPORTED"
+        )
+
     print(f"  Debug: trading_dates sample: {trading_dates[:5]} ... {trading_dates[-5:]}")
     feb_dates = [d for d in trading_dates if "2026-02" in d]
     print(f"  Debug: Feb trading dates count: {len(feb_dates)}")
@@ -1523,6 +1838,14 @@ async def run_put_credit_spread_backtest(
             "historical_execution_proven": False,
             "max_time_delta_minutes": max_time_delta_minutes,
             "max_quote_age_minutes": max_quote_age_minutes,
+            "regime_protocol": (
+                asdict(result.regime_protocol)
+                if result.regime_protocol is not None
+                else None
+            ),
+            "regime_initialization_unavailable_code": (
+                result.regime_initialization_unavailable_code
+            ),
         })
 
     async with MassiveAPIClient(cache=cache, offline_only=offline_only) as client:
@@ -1532,14 +1855,7 @@ async def run_put_credit_spread_backtest(
         universe_requests = set()  # (trade_date, expiration, contract_type)
 
         for td in trading_dates:
-            current_regime = regimes.get(td, -1) if regimes else -1
-            current_regime_name = result.regime_labels.get(current_regime, "")
-            is_panic = "Panic / Crisis" in current_regime_name
-            
             eff_target_dte = target_dte
-            if dynamic_delta_variant and is_panic:
-                eff_target_dte = panic_dte_target
-                
             candidates = find_target_expiration_friday(td, eff_target_dte)
             trade_plan.append((td, candidates))
 
@@ -1681,10 +1997,7 @@ async def run_put_credit_spread_backtest(
             if td not in underlying_prices.index:
                 continue
 
-            current_regime = regimes.get(td, -1) if regimes else -1
-            current_regime_name = result.regime_labels.get(current_regime, "")
-            is_panic = "Panic / Crisis" in current_regime_name
-            eff_target_dte = target_dte if not (dynamic_delta_variant and is_panic) else panic_dte_target
+            eff_target_dte = target_dte
             possible_exps = find_target_expiration_friday(td, eff_target_dte)
 
             selected_exp = None
@@ -2204,9 +2517,23 @@ async def run_put_credit_spread_backtest(
             risk_free_rate = float(risk_free_rates.get(td, risk_free_rate))
             daily_events = []
             
-            # 0. Track Regime (for plotting only, not used in strategy logic)
-            current_regime = regimes.get(td, -1) if regimes else -1
-            current_regime_name = result.regime_labels.get(current_regime, "")
+            # 0. Track the final risk overlay. Raw HMM states are never
+            # represented in these legacy integer plotting fields.
+            current_final_regime = (
+                final_regime_by_entry.get(td)
+                if regime_aware
+                else None
+            )
+            current_regime = (
+                current_final_regime.state
+                if current_final_regime is not None
+                else (regimes.get(td, -1) if regimes and not regime_aware else -1)
+            )
+            current_regime_name = (
+                current_final_regime.label
+                if current_final_regime is not None
+                else result.regime_labels.get(current_regime, "")
+            )
             result.regime_history.append((td, current_regime))
             current_regime_v2 = annotation_for_session(
                 regime_v2_annotations,
@@ -2221,19 +2548,27 @@ async def run_put_credit_spread_backtest(
                 (td, current_regime_v2_payload)
             )
             td_idx = trading_date_index.get(td, -1)
-            prev_regime = regimes.get(trading_dates[td_idx - 1], -1) if regimes and td_idx > 0 else -1
+            previous_final_regime = (
+                final_regime_by_entry.get(trading_dates[td_idx - 1])
+                if regime_aware and td_idx > 0
+                else None
+            )
+            prev_regime = (
+                previous_final_regime.state
+                if previous_final_regime is not None
+                else -1
+            )
             regime_switched_to_panic = (
                 panic_transition_roll_enabled
-                and current_regime == panic_transition_to_state
+                and current_final_regime is not None
+                and current_final_regime.state == 2
+                and panic_transition_to_state == 2
                 and prev_regime in panic_transition_from_states
             )
-            
-            # Retrieve lagged panic probability (State 2) from prev trading day to avoid look-ahead bias
-            lagged_panic_prob = 0.0
-            if td_idx > 0 and result.regime_probabilities is not None:
-                prev_td = trading_dates[td_idx - 1]
-                if prev_td in result.regime_probabilities.index:
-                    lagged_panic_prob = float(result.regime_probabilities.loc[prev_td, "prob_state_2"])
+            current_is_panic = (
+                current_final_regime is not None
+                and current_final_regime.state == 2
+            )
             
             # Update NLV placeholder (will be finalized at end of daily loop)
             current_nlv = current_cash 
@@ -2484,29 +2819,14 @@ async def run_put_credit_spread_backtest(
                     exit_reason = "paired_put_exit"
                 if not exit_triggered:
                     if panic_transition_roll_enabled and regime_switched_to_panic and 0 < current_dte < (trade.entry_dte * panic_transition_min_remaining_dte_fraction) and (trade.option_type or "put").lower() == "put":
-                        roll_qty = trade.num_contracts
-                        roll_width = trade.short_strike - trade.long_strike
                         print(
-                            f"  {td}: [PANIC TRANSITION ROLL] "
-                            f"{trade.num_contracts}x {trade.short_strike}/{trade.long_strike}p -> "
-                            f"roll to {roll_qty}x at {trade.entry_dte} DTE target, width=${roll_width:.0f}, "
-                            f"target even credit=${current_debit:.2f}"
-                        )
-                        replacement_requests.append(
-                            _build_roll_request(
-                                trade=trade,
-                                current_trade_pnl_dollars=current_trade_pnl_dollars,
-                                reason="panic_transition_roll",
-                                spot=spot,
-                                roll_strike_behavior=roll_strike_behavior,
-                                roll_dte_multiplier=1.0,
-                                num_contracts=roll_qty,
-                                spread_width_override=roll_width,
-                                target_net_credit=current_debit,
-                            )
+                            f"  {td}: [PANIC TRANSITION REDUCTION] "
+                            f"Closing {trade.num_contracts}x "
+                            f"{trade.short_strike}/{trade.long_strike}p; "
+                            "the final overlay cannot open replacement risk."
                         )
                         exit_triggered = True
-                        exit_reason = "panic_transition_roll"
+                        exit_reason = "panic_transition_reduce"
                     elif getattr(trade, "is_roll", False):
                         # Rolled positions stay open until the chain has fully recovered.
                         if stop_when_chain_breakeven:
@@ -2623,8 +2943,8 @@ async def run_put_credit_spread_backtest(
                             exit_triggered = True
                             exit_reason = "roll"
 
-                    # HMM Panic Exit Rule: Close if current DTE < half of entry DTE when lagged panic probability >= 50%
-                    if panic_exit_enabled and not exit_triggered and lagged_panic_prob >= 0.50 and current_dte < (trade.entry_dte / 2.0):
+                    # Final-overlay panic may reduce existing risk only.
+                    if panic_exit_enabled and not exit_triggered and current_is_panic and current_dte < (trade.entry_dte / 2.0):
                         exit_triggered = True
                         exit_reason = "panic_exit"
 
@@ -3061,13 +3381,6 @@ async def run_put_credit_spread_backtest(
                 else:
                     eff_short_delta = target_short_delta
 
-            elif regime_dynamic_delta:
-                # Legacy compatibility only. V2 never enters this path.
-                is_crisis = current_regime_name and any(
-                    term in current_regime_name
-                    for term in ["Panic", "Crisis", "Turmoil"]
-                )
-                eff_short_delta = -0.20 if is_crisis else -0.10
             eff_spread_width = spread_width
             if (
                 dynamic_delta_method == "vix_double_above_25"
@@ -3094,6 +3407,78 @@ async def run_put_credit_spread_backtest(
             last_long_mid = 0.0
             
             for i in range(entries_to_attempt):
+                entry_regime_evidence = None
+                if regime_aware:
+                    protocol = result.regime_protocol
+                    signal_session = regime_signal_by_entry.get(td)
+                    if protocol is None or signal_session is None:
+                        unavailable_code = (
+                            result.regime_initialization_unavailable_code
+                            or "REGIME_PROTOCOL_INITIALIZATION_FAILED"
+                        )
+                        daily_events.append(
+                            {
+                                "type": "regime_entry_blocked",
+                                "reason": unavailable_code,
+                                "regime_evidence": None,
+                            }
+                        )
+                        print(
+                            f"  {td}: [REGIME ENTRY BLOCKED] "
+                            f"{unavailable_code}"
+                        )
+                        break
+                    unavailable_code = (
+                        result.regime_initialization_unavailable_code
+                        or regime_unavailable_by_entry.get(td, "")
+                    )
+                    entry_regime_evidence = make_regime_decision_evidence(
+                        protocol=protocol,
+                        entry_session=td,
+                        signal_as_of_session=signal_session,
+                        final_risk_regime=current_final_regime,
+                        raw_context_required=False,
+                        unavailable_code=unavailable_code,
+                    )
+                    if entry_regime_evidence.validity_status == "UNAVAILABLE":
+                        result.regime_decision_history.append(
+                            entry_regime_evidence
+                        )
+                        daily_events.append(
+                            {
+                                "type": "regime_entry_blocked",
+                                "reason": (
+                                    entry_regime_evidence.unavailable_code
+                                ),
+                                "regime_evidence": asdict(
+                                    entry_regime_evidence
+                                ),
+                            }
+                        )
+                        print(
+                            f"  {td}: [REGIME ENTRY BLOCKED] "
+                            f"{entry_regime_evidence.unavailable_code}"
+                        )
+                        break
+                    if current_is_panic:
+                        result.regime_decision_history.append(
+                            entry_regime_evidence
+                        )
+                        daily_events.append(
+                            {
+                                "type": "regime_entry_veto",
+                                "reason": "FINAL_PANIC_RISK_VETO",
+                                "regime_evidence": asdict(
+                                    entry_regime_evidence
+                                ),
+                            }
+                        )
+                        print(
+                            f"  {td}: [REGIME ENTRY VETO] "
+                            "Final panic overlay blocks new and replacement risk."
+                        )
+                        break
+
                 current_margin_usage = _portfolio_margin_requirement(active_trades)
                 is_roll = i < len(replacement_requests)  # Rolls come first in the queue
                 req = replacement_requests[i] if is_roll else None
@@ -3216,37 +3601,63 @@ async def run_put_credit_spread_backtest(
                         eff_target_strike = None
 
                         if dynamic_delta_method == "regime_assignment_prob":
-                            from live_trading.ev_engine import build_regime_return_arrays, fit_gmm, query_gmm
+                            from live_trading.ev_engine import (
+                                build_regime_return_arrays,
+                                fit_gmm,
+                                query_gmm,
+                            )
                             import scipy.optimize as opt
 
-                            if not hasattr(result, "gmm_cache"):
-                                result.gmm_cache = {}
-
-                            cache_key = (td, current_regime, selected_exp)
-                            if cache_key not in result.gmm_cache:
-                                regime_dict, _, _ = build_regime_return_arrays(
-                                    "dummy",
-                                    horizon=dte_days,
-                                    n_components=3,
-                                    as_of_date=td,
+                            (
+                                eff_target_strike,
+                                entry_regime_evidence,
+                                bucket_manifest,
+                            ) = _resolve_regime_assignment_entry(
+                                protocol=result.regime_protocol,
+                                regime_cache=regime_run_cache,
+                                target_cache=assignment_target_cache,
+                                entry_session=td,
+                                signal_session=regime_signal_by_entry[td],
+                                final_risk_regime=current_final_regime,
+                                horizon_calendar_days=dte_days,
+                                spot=spot,
+                                target_assignment_probability=(
+                                    target_assignment_prob
+                                ),
+                                bucket_builder=build_regime_return_arrays,
+                                fit_model=fit_gmm,
+                                query_probability=query_gmm,
+                                solve_root=opt.brentq,
+                            )
+                            if bucket_manifest is not None:
+                                manifest_key = (
+                                    entry_regime_evidence
+                                    .return_bucket_manifest_sha256
                                 )
-                                bucket = regime_dict.get(f"State_{current_regime}", np.array([0.0]))
-                                if len(bucket) >= 10:
-                                    gmm_model = fit_gmm(bucket, regime_label=f"State_{current_regime}")
-                                else:
-                                    gmm_model = None
-                                result.gmm_cache[cache_key] = gmm_model
-
-                            gmm_model = result.gmm_cache[cache_key]
-                            if gmm_model is not None:
-                                def obj(r):
-                                    return query_gmm(gmm_model, 1.0, np.exp(r)) - target_assignment_prob
-
-                                try:
-                                    target_log_return = opt.brentq(obj, -1.0, 0.5)
-                                    eff_target_strike = spot * np.exp(target_log_return)
-                                except Exception:
-                                    eff_short_delta = target_short_delta
+                                result.regime_return_bucket_manifests[
+                                    manifest_key
+                                ] = bucket_manifest
+                            if eff_target_strike is None:
+                                result.regime_decision_history.append(
+                                    entry_regime_evidence
+                                )
+                                daily_events.append(
+                                    {
+                                        "type": "regime_entry_blocked",
+                                        "reason": (
+                                            entry_regime_evidence
+                                            .unavailable_code
+                                        ),
+                                        "regime_evidence": asdict(
+                                            entry_regime_evidence
+                                        ),
+                                    }
+                                )
+                                print(
+                                    f"  {td}: [REGIME ENTRY BLOCKED] "
+                                    f"{entry_regime_evidence.unavailable_code}"
+                                )
+                                break
                         elif dynamic_delta_method == "forward_assignment_prob":
                             eff_target_strike, strike_diag = _forward_return_assignment_strike(
                                 underlying_prices=underlying_prices,
@@ -3881,6 +4292,7 @@ async def run_put_credit_spread_backtest(
                                     status="open",
                                     entry_regime=current_regime,
                                     entry_regime_name=current_regime_name,
+                                    regime_evidence=entry_regime_evidence,
                                     entry_regime_v2=current_regime_v2_payload,
                                     entry_dte=dte_days,
                                     short_entry_mid=short_mid,
@@ -3923,6 +4335,10 @@ async def run_put_credit_spread_backtest(
 
                                 active_trades.append(trade)
                                 result.trades.append(trade)
+                                if entry_regime_evidence is not None:
+                                    result.regime_decision_history.append(
+                                        entry_regime_evidence
+                                    )
                                 current_cash += net_credit * 100 * num_contracts - entry_fee
                                 realized_capital -= entry_fee
 
@@ -3963,6 +4379,11 @@ async def run_put_credit_spread_backtest(
                                         "roll_chain_depth": trade.roll_chain_depth,
                                         "roll_chain_realized_pnl_before_entry": trade.roll_chain_realized_pnl_before_entry,
                                         "fill_diagnostics": entry_fill_diagnostics,
+                                        "regime_evidence": (
+                                            asdict(entry_regime_evidence)
+                                            if entry_regime_evidence is not None
+                                            else None
+                                        ),
                                     })
 
                                 if call_side_enabled and not is_roll:
@@ -4180,6 +4601,17 @@ async def run_put_credit_spread_backtest(
                                                         2,
                                                         fee_per_contract_per_side,
                                                     )
+                                                    call_regime_evidence = (
+                                                        make_regime_decision_evidence(
+                                                            protocol=result.regime_protocol,
+                                                            entry_session=td,
+                                                            signal_as_of_session=regime_signal_by_entry[td],
+                                                            final_risk_regime=current_final_regime,
+                                                            raw_context_required=False,
+                                                        )
+                                                        if regime_aware
+                                                        else None
+                                                    )
                                                     candidate_call = SpreadTrade(
                                                         short_ticker=call_short_ticker,
                                                         long_ticker=call_long_ticker,
@@ -4197,6 +4629,7 @@ async def run_put_credit_spread_backtest(
                                                         status="open",
                                                         entry_regime=current_regime,
                                                         entry_regime_name=current_regime_name,
+                                                        regime_evidence=call_regime_evidence,
                                                         entry_regime_v2=current_regime_v2_payload,
                                                         entry_dte=dte_days,
                                                         short_entry_mid=call_short_mid,
@@ -4242,6 +4675,10 @@ async def run_put_credit_spread_backtest(
                                                     else:
                                                         active_trades.append(candidate_call)
                                                         result.trades.append(candidate_call)
+                                                        if call_regime_evidence is not None:
+                                                            result.regime_decision_history.append(
+                                                                call_regime_evidence
+                                                            )
                                                         current_cash += call_net_credit * 100 * num_contracts - call_entry_fee
                                                         realized_capital -= call_entry_fee
                                                         print(
@@ -4263,6 +4700,11 @@ async def run_put_credit_spread_backtest(
                                                                 "trade_id": candidate_call.trade_id,
                                                                 "incremental_margin": float(incremental_margin),
                                                                 "fill_diagnostics": call_entry_fill_diagnostics,
+                                                                "regime_evidence": (
+                                                                    asdict(call_regime_evidence)
+                                                                    if call_regime_evidence is not None
+                                                                    else None
+                                                                ),
                                                             })
                                 selection_retry = False
                                     
@@ -4293,7 +4735,7 @@ async def run_put_credit_spread_backtest(
                     date_str=td,
                     spot=spot,
                     regime=current_regime,
-                    regime_name="",
+                    regime_name=current_regime_name,
                     regime_v2=current_regime_v2_payload,
                     nlv=current_nlv,
                     cash=current_cash,
@@ -4321,6 +4763,21 @@ async def run_put_credit_spread_backtest(
                 "abnormalities": result.abnormalities,
                 "causal_validity": result.causal_validity,
                 "causal_validity_reasons": result.causal_validity_reasons,
+                "regime_protocol": (
+                    asdict(result.regime_protocol)
+                    if result.regime_protocol is not None
+                    else None
+                ),
+                "regime_initialization_unavailable_code": (
+                    result.regime_initialization_unavailable_code
+                ),
+                "regime_decision_history": [
+                    asdict(evidence)
+                    for evidence in result.regime_decision_history
+                ],
+                "regime_return_bucket_manifests": (
+                    result.regime_return_bucket_manifests
+                ),
                 "historical_fill_mode": result.historical_fill_mode,
                 "entry_fill_mode": result.entry_fill_mode,
                 "exit_fill_mode": result.exit_fill_mode,
@@ -4421,7 +4878,7 @@ def plot_results(result: BacktestResult, ticker: str):
     axs = axes.flatten()
     ax1, ax2, ax3, ax4, ax5, ax6 = axs[0], axs[1], axs[2], axs[3], axs[4], axs[5]
 
-    # --- Add HMM Backgrounds to ALL subplots ---
+    # --- Add final-risk-overlay backgrounds to all subplots ---
     if result.regime_history:
         reg_dates = [datetime.strptime(d, "%Y-%m-%d") for d, _ in result.regime_history]
         reg_vals = [v for _, v in result.regime_history]
@@ -4538,7 +4995,7 @@ def plot_results(result: BacktestResult, ticker: str):
         
         # ax3.step(reg_dates, reg_vals, where='post', color='black', linewidth=1, alpha=0.8)
         ax3.set_title("Market Regime History & VIX Overlay", fontsize=14, fontweight='bold')
-        ax3.set_ylabel("HMM State", fontsize=12)
+        ax3.set_ylabel("Final Risk Overlay", fontsize=12)
         ax3.set_yticks(sorted(list(set(reg_vals))))
         ax3.grid(True, alpha=0.1)
         
@@ -4659,114 +5116,11 @@ def plot_results(result: BacktestResult, ticker: str):
 
 
 def _compute_regime_assignment_data(result: BacktestResult):
-    """
-    Post-hoc computation of regime-conditioned assignment probabilities and
-    terminal outcomes for each non-roll trade in the backtest.
+    """Read persisted entry-time evidence; never refit or rebucket post hoc."""
 
-    For each non-roll trade:
-      1. Use the entry-date regime state (already lagged one day by the backtester)
-      2. Collect all causal forward returns (horizon = trade DTE in trading days)
-         that belong to the same regime and whose outcomes resolved before entry
-      3. Fit a BIC-selected GMM to those returns
-      4. Query P(fwd_return < cutoff) where cutoff = ln(strike/spot)
-      5. Record entry_delta as the market-implied assignment probability
-
-    Returns a dict with keys:
-      'dates'            - list of entry date strings
-      'entry_deltas'     - list of abs(entry_delta) per trade
-      'regime_gmm_probs' - list of regime GMM P(assignment) per trade
-      'regime_labels'    - list of regime label strings
-      'terminal_dates'   - list of exit/expiration dates for resolved trades
-      'terminal_dists'   - list of (spot_at_exit - short_strike) values
-    """
-    from live_trading.ev_engine import fit_gmm, query_gmm
-
-    trades = result.trades
-    underlying = result.underlying_prices
-
-    if not trades or underlying.empty:
+    if not result.trades or result.underlying_prices.empty:
         return None
 
-    regime_hist = result.regime_history   # list of (date_str, state_int)
-    regime_labels_map = dict(result.regime_labels)  # {state_int: label_str}
-
-    # Check if regime data is meaningful (not all -1, which means regime_aware=false)
-    has_meaningful_regimes = regime_hist and any(s >= 0 for _, s in regime_hist)
-
-    # If the backtester didn't populate regime data (regime_aware=false),
-    # skip the slow post-hoc walk-forward HMM/GMM training, as it is not relevant
-    # for non-regime strategies and adds significant execution overhead.
-    if not has_meaningful_regimes:
-        print("    [Audit] Non-regime strategy. Skipping post-hoc HMM walk-forward training for audit plots.")
-        return None
-
-    # Build a date -> regime_state lookup from regime_history
-    regime_by_date = {d: s for d, s in regime_hist}
-
-    # Build numeric price series indexed by date string for forward returns
-    price_dates = list(underlying.index)
-    price_vals = np.array(underlying.values, dtype=float)
-    date_to_idx = {d: i for i, d in enumerate(price_dates)}
-
-    # Default trading horizon ≈ 42 calendar days → ~30 trading days
-    default_trading_horizon = 30
-
-    # Pre-compute regime-labelled forward returns for the default horizon.
-    # For trades with different DTEs, we'll recompute as needed.
-    def _get_forward_returns_by_regime(trading_horizon, as_of_idx):
-        """
-        Collect all regime-labelled forward returns using data whose outcomes
-        have fully resolved before as_of_idx.
-
-        Returns: dict {regime_state: np.array of fractional returns}
-        """
-        regime_returns = {}
-        # An entry at index i has its outcome at i + trading_horizon.
-        # The outcome must be known before as_of_idx (strictly causal).
-        max_entry_idx = as_of_idx - trading_horizon
-        if max_entry_idx <= 0:
-            return regime_returns
-
-        for i in range(max_entry_idx):
-            d = price_dates[i]
-            state = regime_by_date.get(d)
-            if state is None:
-                continue
-            end_idx = i + trading_horizon
-            if end_idx >= len(price_vals):
-                continue
-            fwd_ret = (price_vals[end_idx] / price_vals[i]) - 1.0
-            if not np.isfinite(fwd_ret):
-                continue
-            if state not in regime_returns:
-                regime_returns[state] = []
-            regime_returns[state].append(fwd_ret)
-
-        return {s: np.array(v) for s, v in regime_returns.items()}
-
-    # GMM cache keyed by (regime_state, trading_horizon, as_of_date_bucket)
-    # We bucket as_of_date by month to avoid refitting GMM for every single trade day
-    _gmm_cache = {}
-
-    def _get_gmm_model(regime_state, trading_horizon, as_of_idx):
-        """Get or compute a cached GMM model for the given regime and horizon."""
-        # Bucket by 21-trading-day intervals to balance freshness vs compute
-        bucket = as_of_idx // 21
-        cache_key = (regime_state, trading_horizon, bucket)
-        if cache_key in _gmm_cache:
-            return _gmm_cache[cache_key]
-
-        regime_returns = _get_forward_returns_by_regime(trading_horizon, as_of_idx)
-        bucket_returns = regime_returns.get(regime_state)
-        if bucket_returns is None or len(bucket_returns) < 10:
-            _gmm_cache[cache_key] = None
-            return None
-
-        model = fit_gmm(bucket_returns, regime_label=f"State_{regime_state}")
-        _gmm_cache[cache_key] = model
-        return model
-
-    # Compute per-trade probabilities
     dates = []
     entry_deltas = []
     regime_gmm_probs = []
@@ -4774,88 +5128,65 @@ def _compute_regime_assignment_data(result: BacktestResult):
     terminal_dates = []
     terminal_dists = []
 
-    for t in trades:
-        # Skip rolls — only newly opened trades
+    for t in result.trades:
         if t.is_roll:
             continue
-        # The assignment-probability audit is currently calibrated for put
-        # spreads. Call-side trades are tracked in PnL/margin, but excluded
-        # from this put-specific probability panel.
         if (t.option_type or "put").lower() != "put":
             continue
-
+        evidence = t.regime_evidence
+        if (
+            evidence is None
+            or evidence.raw_hmm_state is None
+            or evidence.assignment_probability is None
+        ):
+            continue
         entry_date = t.entry_date
-        if entry_date not in date_to_idx:
-            continue
-
-        entry_idx = date_to_idx[entry_date]
-        spot = price_vals[entry_idx]
-        strike = t.short_strike
-
-        # Use the trade's stored regime if available, otherwise look up from
-        # the (possibly auto-trained) regime map
-        regime_state = t.entry_regime
-        if regime_state < 0:
-            regime_state = regime_by_date.get(entry_date, -1)
-
-        if spot <= 0 or strike <= 0 or regime_state < 0:
-            continue
-
-        # Determine trading horizon for this trade's DTE
-        dte = t.entry_dte
-        if dte and dte > 0:
-            # Rough calendar-to-trading conversion: dte * 5/7
-            trading_horizon = max(5, int(round(dte * 5.0 / 7.0)))
-        else:
-            trading_horizon = default_trading_horizon
-
-        # Get GMM model for this regime, causally
-        gmm_model = _get_gmm_model(regime_state, trading_horizon, entry_idx)
-
-        if gmm_model is not None:
-            # query_gmm returns P(log_return < ln(strike/spot))
-            # For puts: assignment = spot falls below strike = P(return < cutoff)
-            gmm_prob = query_gmm(gmm_model, spot, strike)
-        else:
-            gmm_prob = float('nan')
-
         dates.append(entry_date)
         entry_deltas.append(abs(t.entry_delta))
-        regime_gmm_probs.append(gmm_prob)
+        regime_gmm_probs.append(float(evidence.assignment_probability))
         regime_label_strs.append(
-            regime_labels_map.get(regime_state, f"Regime {regime_state}")
+            (
+                evidence.final_risk_regime.label
+                if evidence.final_risk_regime is not None
+                else "Final overlay unavailable"
+            )
         )
-
-        # Terminal outcome for resolved trades
         if t.status == "closed" and t.exit_date:
-            exit_date = t.exit_date
-            # Use the actual exit/expiration date spot price
-            spot_at_exit = underlying.get(exit_date)
+            spot_at_exit = result.underlying_prices.get(t.exit_date)
             if spot_at_exit is not None and np.isfinite(float(spot_at_exit)):
                 terminal_dates.append(entry_date)
-                terminal_dists.append(float(spot_at_exit) - strike)
+                terminal_dists.append(
+                    float(spot_at_exit) - t.short_strike
+                )
             else:
                 terminal_dates.append(entry_date)
-                terminal_dists.append(float('nan'))
+                terminal_dists.append(float("nan"))
         else:
             terminal_dates.append(entry_date)
-            terminal_dists.append(float('nan'))
+            terminal_dists.append(float("nan"))
 
     if not dates:
-        print("    [Audit] No valid trades processed for assignment probability plots.")
+        print(
+            "    [Audit] No trades contain persisted raw-regime "
+            "assignment evidence."
+        )
         return None
 
-    valid_gmm = sum(1 for p in regime_gmm_probs if not np.isnan(p))
-    valid_terminal = sum(1 for v in terminal_dists if not np.isnan(v))
-    print(f"    [Audit] Processed {len(dates)} trades: {valid_gmm} with GMM prob, {valid_terminal} with terminal outcomes")
+    valid_terminal = sum(
+        1 for value in terminal_dists if not np.isnan(value)
+    )
+    print(
+        f"    [Audit] Loaded persisted entry evidence for {len(dates)} "
+        f"trades; {valid_terminal} terminal outcomes."
+    )
 
     return {
-        'dates': dates,
-        'entry_deltas': entry_deltas,
-        'regime_gmm_probs': regime_gmm_probs,
-        'regime_labels': regime_label_strs,
-        'terminal_dates': terminal_dates,
-        'terminal_dists': terminal_dists,
+        "dates": dates,
+        "entry_deltas": entry_deltas,
+        "regime_gmm_probs": regime_gmm_probs,
+        "regime_labels": regime_label_strs,
+        "terminal_dates": terminal_dates,
+        "terminal_dists": terminal_dists,
     }
 
 
@@ -4877,8 +5208,8 @@ def plot_results_interactive(result: BacktestResult, ticker: str, output_path: s
     margin_vals = [v for _, v in result.margin_history]
     capital_vals = [v for _, v in result.capital_history] if result.capital_history else nvl_vals
 
-    # Compute regime assignment data for the new audit subplots
-    print("  Computing regime assignment probabilities (causal GMM)...", flush=True)
+    # Load the exact entry-time evidence for the audit subplots.
+    print("  Loading persisted regime assignment evidence...", flush=True)
     try:
         audit_data = _compute_regime_assignment_data(result)
     except Exception as e:
@@ -4893,7 +5224,7 @@ def plot_results_interactive(result: BacktestResult, ticker: str, output_path: s
         subplot_titles=(
             f"{ticker} Price & Trade Entry/Exit", 
             "Capital & Portfolio Value (NLV)", 
-            "Market Regimes (HMM) & VIX",
+            "Final Risk Overlay & VIX",
             "Entry Leg Premiums",
             "Position Distribution (ITM/OTM)",
             "Entry DTE & Bid-Ask Spread",
@@ -4985,7 +5316,7 @@ def plot_results_interactive(result: BacktestResult, ticker: str, output_path: s
                 plot_end = pd.to_datetime(hist_dates[-1])
                 prob_index = pd.to_datetime(prob_df.index)
                 prob_df = prob_df.loc[(prob_index >= plot_start) & (prob_index <= plot_end)]
-            # Color map matching HMM states: State 0 (Robust Expansion) = Blue, State 1 (Cautious Decline) = Amber/Orange, State 2 (Panic / Crisis) = Red
+            # Closed final-overlay colors: 0 expansion, 1 cautious, 2 panic.
             colors = ['#3b82f6', '#f59e0b', '#ef4444', '#10b981', '#8b5cf6', '#ec4899']
             for col in sorted(prob_cols):
                 state_id = int(col.split('_')[-1])
@@ -5010,8 +5341,8 @@ def plot_results_interactive(result: BacktestResult, ticker: str, output_path: s
         
         # (Background loop moved to end of function to ensure subplot initialization)
         
-        # Add HMM State line and VIX
-        fig.add_trace(go.Scatter(x=reg_dates, y=reg_vals, name='HMM State', line=dict(color='black', width=1.5), legend='legend3'), row=2, col=1)
+        # Add final risk overlay line and VIX.
+        fig.add_trace(go.Scatter(x=reg_dates, y=reg_vals, name='Final Risk Overlay', line=dict(color='black', width=1.5), legend='legend3'), row=2, col=1)
 
     if not result.vix_prices.empty:
         vix_clean = result.vix_prices.dropna()
@@ -5196,7 +5527,7 @@ def plot_results_interactive(result: BacktestResult, ticker: str, output_path: s
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     fig.update_yaxes(title_text="NLV ($)", row=1, col=2)
     fig.update_yaxes(title_text="Margin ($)", secondary_y=True, row=1, col=2)
-    fig.update_yaxes(title_text="HMM State", row=2, col=1)
+    fig.update_yaxes(title_text="Final Risk Overlay", row=2, col=1)
     fig.update_yaxes(title_text="VIX", secondary_y=True, row=2, col=1)
     fig.update_yaxes(title_text="Premium ($)", row=2, col=2)
     fig.update_yaxes(title_text="Pair Value ($)", row=3, col=1)
