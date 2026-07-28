@@ -16,6 +16,7 @@ BOOTSTRAP = REPO_ROOT / "deploy" / "pi_bootstrap.sh"
 SYNC = REPO_ROOT / "deploy" / "sync_to_pi.sh"
 RELEASE_HELPER = REPO_ROOT / "deploy" / "pi_release.sh"
 HYGIENE_CHECKER = REPO_ROOT / "scripts" / "check_repo_hygiene.py"
+SECRET_CHECKER = REPO_ROOT / "scripts" / "check_secret_content.py"
 
 
 def _write_probe(bin_dir: Path, name: str, marker: Path) -> None:
@@ -82,6 +83,11 @@ def _clean_sync_fixture(tmp_path: Path) -> tuple[Path, Path]:
     hygiene_checker.parent.mkdir()
     hygiene_checker.write_text(
         HYGIENE_CHECKER.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    secret_checker = application / "scripts" / "check_secret_content.py"
+    secret_checker.write_text(
+        SECRET_CHECKER.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     (application / "safe.py").write_text("committed = True\n", encoding="utf-8")
@@ -269,7 +275,10 @@ def test_sync_rejects_a_tracked_secret_before_remote_actions_without_naming_it(
     combined_output = completed.stdout + completed.stderr
     assert completed.returncode == 78
     assert "failed deployment hygiene" in completed.stderr
-    assert "violating paths are redacted" in completed.stderr
+    assert "LITERAL_CREDENTIAL_ASSIGNMENT" in completed.stderr
+    assert "path_fingerprint=" in completed.stderr
+    assert "match_fingerprint=" in completed.stderr
+    assert "SECRET_GATE_BLOCKED_REPOSITORY_HYGIENE" in completed.stderr
     assert secret_path.name not in combined_output
     assert secret_value not in combined_output
     assert not marker.exists()

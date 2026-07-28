@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fail when generated, runtime, or local-secret state is tracked by Git.
+"""Fail when unsafe content or local/runtime state is tracked by Git.
 
-The default checker examines only the repository index. Deployment callers may
-instead select one exact Git tree and an optional literal path prefix. Neither
-mode walks the working tree or inspects file contents.
+The CLI first delegates to the exact-blob secret-content gate, then applies the
+path policy below. The default path scan examines only the repository index;
+deployment callers may select one exact Git tree and an optional literal path
+prefix. Neither stage reads tracked bytes through the mutable working tree.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -485,6 +487,58 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_secret_content_gate(
+    *,
+    start: Path,
+    tree: str | None,
+    tree_prefix: str,
+) -> int:
+    """Run the exact-blob content gate before evaluating path hygiene."""
+
+    checker = Path(__file__).resolve().with_name("check_secret_content.py")
+    try:
+        metadata = checker.lstat()
+    except OSError:
+        print("SECRET_GATE_CHECKER_UNAVAILABLE", file=sys.stderr)
+        return 2
+    if not stat.S_ISREG(metadata.st_mode):
+        print("SECRET_GATE_CHECKER_UNAVAILABLE", file=sys.stderr)
+        return 2
+    arguments = [
+        sys.executable,
+        "-I",
+        str(checker),
+        "--start",
+        str(start),
+    ]
+    if tree is not None:
+        arguments.extend(("--tree", tree))
+    if tree_prefix:
+        arguments.extend(("--tree-prefix", tree_prefix))
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        print("SECRET_GATE_CHECKER_UNAVAILABLE", file=sys.stderr)
+        return 2
+    if completed.returncode == 0:
+        return 0
+    diagnostic = completed.stderr.decode("utf-8", errors="replace").strip()
+    if diagnostic:
+        print(diagnostic, file=sys.stderr)
+    else:
+        print("SECRET_GATE_SCAN_ERROR", file=sys.stderr)
+    print(
+        "SECRET_GATE_BLOCKED_REPOSITORY_HYGIENE",
+        file=sys.stderr,
+    )
+    return 1 if completed.returncode == 1 else 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.tree_prefix and not args.tree:
@@ -500,6 +554,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         return 2
+    try:
+        _validate_git_environment()
+        resolved_root = resolve_git_root(args.start)
+    except RepositoryConfigurationError as exc:
+        if args.redact_paths:
+            print(
+                "repository hygiene configuration error; details redacted.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"repository hygiene configuration error: {exc}", file=sys.stderr)
+        return 2
+    secret_gate_status = _run_secret_content_gate(
+        start=resolved_root,
+        tree=args.tree,
+        tree_prefix=args.tree_prefix,
+    )
+    if secret_gate_status:
+        return secret_gate_status
     try:
         if args.tree:
             result = scan_tree(

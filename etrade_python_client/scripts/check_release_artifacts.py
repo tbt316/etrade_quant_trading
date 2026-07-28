@@ -190,6 +190,50 @@ def _resolve_commit(repository_root: Path, revision: str) -> str:
     return commit
 
 
+def _run_secret_content_gate(
+    repository_root: Path,
+    *,
+    tree: str | None = None,
+    archives: Sequence[Path] = (),
+) -> None:
+    """Fail closed on redacted exact-tree or bounded archive findings."""
+
+    if (tree is None) == (not archives):
+        raise ArtifactContractError(
+            "secret content gate requires exactly one source class"
+        )
+    checker = Path(__file__).resolve().with_name("check_secret_content.py")
+    try:
+        checker_metadata = checker.lstat()
+    except OSError as error:
+        raise ArtifactContractError("secret content gate is unavailable") from error
+    if not stat.S_ISREG(checker_metadata.st_mode):
+        raise ArtifactContractError("secret content gate is not a regular file")
+    arguments = [sys.executable, "-I", str(checker)]
+    if tree is not None:
+        arguments.extend(("--start", str(repository_root), "--tree", tree))
+    else:
+        for archive in archives:
+            arguments.extend(("--archive", str(archive)))
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise ArtifactContractError("secret content gate could not execute") from error
+    if completed.returncode == 0:
+        return
+    redacted = completed.stderr.decode("utf-8", errors="replace").strip()
+    if completed.returncode == 1 and redacted:
+        raise ArtifactContractError(
+            "secret content gate rejected exact content: " + redacted
+        )
+    raise ArtifactContractError("secret content gate failed closed")
+
+
 def _git_blob(repository_root: Path, object_id: str) -> bytes:
     if not re.fullmatch(r"[0-9a-f]{40,64}", object_id):
         raise ArtifactContractError(f"Git returned an invalid object id: {object_id!r}")
@@ -789,9 +833,11 @@ def inspect_release(
 ) -> tuple[Path, Path]:
     """Inspect the single wheel and sdist against a committed Git revision."""
 
+    resolved_commit = _resolve_commit(repository_root, git_revision)
+    _run_secret_content_gate(repository_root, tree=resolved_commit)
     commit, expected_payload, tracked_sdist = _expected_git_payload(
         repository_root,
-        git_revision,
+        resolved_commit,
     )
     try:
         expected_epoch = int(
@@ -807,6 +853,10 @@ def inspect_release(
         raise ArtifactContractError("Git commit timestamp is invalid") from error
     contract = _metadata_contract(tracked_sdist["pyproject.toml"])
     wheel, sdist = _release_artifacts(dist_dir, contract)
+    _run_secret_content_gate(
+        repository_root,
+        archives=(wheel, sdist),
+    )
     wheel_metadata = _inspect_wheel(
         wheel,
         expected_payload,

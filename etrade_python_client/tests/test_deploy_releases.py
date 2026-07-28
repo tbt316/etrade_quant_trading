@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SYNC = REPO_ROOT / "deploy" / "sync_to_pi.sh"
 RELEASE_HELPER = REPO_ROOT / "deploy" / "pi_release.sh"
 HYGIENE_CHECKER = REPO_ROOT / "scripts" / "check_repo_hygiene.py"
+SECRET_CHECKER = REPO_ROOT / "scripts" / "check_secret_content.py"
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
 
@@ -655,6 +656,11 @@ def _sync_fixture(tmp_path: Path) -> tuple[Path, Path]:
     hygiene_checker.parent.mkdir()
     hygiene_checker.write_text(
         HYGIENE_CHECKER.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    secret_checker = application / "scripts" / "check_secret_content.py"
+    secret_checker.write_text(
+        SECRET_CHECKER.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     (application / "safe.py").write_text("release = 1\n", encoding="utf-8")

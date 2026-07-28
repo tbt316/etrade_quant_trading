@@ -42,14 +42,22 @@ The release ID is `<exact-commit>-<archive-sha256>`. The command rejects staged
 or unstaged tracked changes before creating a snapshot or contacting the Pi.
 Untracked working-tree files, including ignored local files, are never
 archived. A forced-tracked ignored path is still part of Git, so the exact
-resolved tree is also checked against the repository's semantic deployment
-hygiene policy before SSH. Known credential, authentication, session, runtime
-state, cache, database, log, backup, and generated-artifact path classes fail
-with redacted diagnostics. Static JSON contracts and examples are allowed by
-their semantics rather than rejected merely because a broad local ignore rule
-matches `*.json`. This path policy does not inspect file contents; code review
-and credential scanning remain required for secrets hidden under an otherwise
-safe source name.
+resolved tree first passes the exact-content secret gate and then the
+repository's semantic deployment hygiene policy before SSH. The content gate
+reads immutable Git blobs rather than mutable working-tree paths and reports
+only rule IDs plus redacted path/value fingerprints. It rejects private-key
+blocks, credible provider-token formats, literal credential assignments, and
+credential-bearing URLs even when they use an otherwise safe filename. Known
+credential, authentication, session, runtime state, cache, database, log,
+backup, and generated-artifact path classes then fail the semantic path gate
+with redacted diagnostics. Static JSON contracts and examples remain allowed
+when their contents contain only explicit placeholders.
+
+The same content policy scans bounded regular members of built wheel and sdist
+artifacts before the existing byte-for-byte package contract proceeds. It is a
+current-index/tree and release-artifact gate, not credential remediation: it
+does not scan Git history, runtime files, service logs, external caches, or
+downstream clones, and it cannot revoke a credential that was already exposed.
 
 The extracted snapshot is checked against a NUL-delimited committed-tree
 manifest: every entry must be a regular Git blob, its executable bit must
