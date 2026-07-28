@@ -73,6 +73,7 @@ python -m build --wheel --no-isolation \
 cmp "$release_dist"/*.whl "$sdist_dist"/*.whl
 python -m pip install --no-deps --no-build-isolation "$release_dist"/*.whl
 env -u PYTHONPATH ETRADE_TEST_ARTIFACT=1 ETRADE_TEST_NETWORK=deny \
+  MASSIVE_OFFLINE_ONLY=1 \
   python -m pytest -q -m "not integration" etrade_python_client/tests \
   --ignore=etrade_python_client/tests/test_etrade_mutation_boundary.py \
   --ignore=etrade_python_client/tests/test_repo_hygiene.py

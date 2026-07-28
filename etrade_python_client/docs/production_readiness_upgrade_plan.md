@@ -9,17 +9,23 @@ root.
 
 ## Executive decision
 
-The repository is **not ready for unattended live trading**. It has a useful
-research engine and several strong incident-driven safeguards, but there are
-stop-ship risks in account selection, live arming, pre-trade controls,
-idempotency, secret handling, broker failure behavior, and deployment.
+The repository is **not ready for unattended live trading**. Source-level
+containment now provides exact account/arm checks, durable intent identity,
+restart-safe opening/closing/cancellation state machines, a pure fail-closed
+pre-trade policy, and a static legacy-mutation quarantine. Those components are
+deliberately not composed into the live process. Complete independent portfolio,
+quote, open-order, and aggregate-risk evidence; complex broker-state procedures;
+credential remediation; and deployment/operations acceptance remain stop-ship
+gates.
 
-Existing regime-aware backtest results are also **not yet eligible for investment
-claims**. The canonical path contains good causal mechanisms, but the complete
-five-field causal record is not stored per run, historical contract selection
-uses information through expiration, preprocessing still makes some
-full-sample choices, and the final regime overlay is not consistently matched to
-the return buckets used by EV logic.
+Existing regime-aware backtest results are also **not eligible for investment
+claims**. The maintained path now records the five-field causal protocol,
+uses exact prior-NYSE-session signals, separates raw HMM taxonomy from the final
+risk overlay, and validates strict timestamped historical marks. Results remain
+hard-locked `UNVERIFIED`: provider availability and retained-byte evidence,
+market-data rights, complete OHLCV coverage truth, quantity-aware executable
+fills, official expiration settlement, immutable full-run replay, and
+prospective model validation are not established.
 
 The detector-specific replacement design and 2026 causal shadow replay are in
 `docs/regime_detection_v2_design.md`.
@@ -37,7 +43,7 @@ Until Phase 0 exits, automatic live execution should remain disabled. Until the
 backtest validity gates exit, regime-aware reports should be labeled
 `UNVERIFIED` rather than ranked beside valid experiments.
 
-## Delivery status as of 2026-07-26
+## Delivery status as of 2026-07-27
 
 R5 / PR #28 established a clean dependency/import baseline and passed 134 tests
 in clean CI. R6 implements the first live-startup containment slice, and
@@ -75,6 +81,17 @@ source/file freshness, has no writer or broker capability, and pins its iframe
 to the SHA-256 reported by status so an intervening replacement returns a
 fail-closed conflict rather than mixed data.
 
+The subsequent production-readiness slices extend that baseline with schema-17
+durable closing and per-intent cancellation, crash-safe one-send fences,
+terminal capacity absorption, a deterministic pre-trade risk domain,
+append-only non-authorizing opening-risk evidence, replayable quote/capacity
+lineage, exact current-content secret gates, contract-reference cache truth,
+strict multi-leg historical NBBO mark evidence, prefix-causal feature
+preparation, and a typed causal regime/backtest bridge. Raw HMM states may
+select only taxonomy-matched resolved return buckets. The final stress overlay
+may only veto new risk or reduce existing exposure. None of these research or
+isolated execution components grants broker-mutation authority.
+
 These changes do **not** satisfy Phase 0 or make the repository production
 ready. R7a–R7e preserve the arm/account check and add isolated durable intent identity,
 capacity reservations, mutation fencing, direct known-order reconciliation,
@@ -86,11 +103,11 @@ Python source. Raw broker mutation remains permitted only in the hardened
 transport and exact transport calls only in the gateway. Service installation
 and remote restart are suspended.
 The current local dashboard settings are intentionally rejected until stronger
-credentials are provisioned. The user reports that the repository was made
-private on 2026-07-26, and authenticated SSH pushes now succeed. Privacy limits
-future visibility but does not undo prior public exposure: OAuth keys retained
-in Git history must be treated as compromised, requiring external revoke/rotate
-followed by a coordinated history purge and downstream cleanup. No live service restart, deployment,
+credentials are provisioned. The GitHub repository is currently public. Making
+it private is an external release gate and will not undo prior exposure: OAuth
+keys retained in Git history must be treated as compromised, requiring external
+revoke/rotate followed by a coordinated history purge and downstream clone,
+fork, cache, and build cleanup. No live service restart, deployment,
 E*TRADE mutation, deployed restart, or exact deployed-dashboard verification
 has been performed. The exact broker-isolated local handler and signed
 positions artifact were inspected at desktop and mobile widths for R8e-B,
@@ -226,7 +243,7 @@ deployment can be re-enabled.
 | P0-B5 | Causal features | Feature dropping, fractional-d selection, and PCA dimension selection make full-request-sample choices. | `live_trading/data_ingestion.py:793-854,920-982`; `live_trading/ev_engine.py:759-769` | Prefix-invariance tests prove adding future rows cannot change earlier features, dimensions, states, or EV. |
 | P0-B6 | Regime taxonomy | Trades use final stress-overlay regime IDs while return buckets are grouped by raw HMM state IDs. | `backtesting/backtest_runner.py:136-172,2310-2330`; `live_trading/ev_engine.py:1657-1666` | Raw archetype and final overlay are separate types; bucket key and trade regime must share the exact taxonomy/version. |
 | P0-B7 | Market-data rights | Public/individual Massive and Cboe terms do not by themselves establish permission for retained, non-display, strategy-derived use. API access is being mistaken for production entitlement. | `docs/regime_data_provider_entitlements.md`; provider terms linked there | Before the first scheduled request, record a current agreement covering the subscriber, dataset, non-display strategy use, raw retention, derived signals, and deletion duties. Missing or expired rights fail closed. |
-| P0-O1 | Reproducibility | Package metadata is incomplete/conflicting, runtime dependencies can be installed during a run, and critical tests/deploy/docs are untracked. | `../pyproject.toml:5-13`; `../setup.py:1-8`; `backtesting/run_comparison.py:6-10`; `../.github/workflows/ci.yml:13-31` | A clean clone builds an immutable artifact and runs all offline gates with one documented command. |
+| P0-O1 | Reproducibility | Package metadata is incomplete/conflicting, runtime dependencies can be installed during a run, and critical tests/deploy/docs are untracked. | `../pyproject.toml:5-13`; `../setup.py:1-8`; `backtesting/run_comparison.py:6-10`; `../.github/workflows/ci.yml:13-31` | A clean clone builds an immutable artifact and runs all offline gates with one documented sequence. |
 
 P0 means the issue blocks unattended live execution or causal certification.
 P1 and P2 findings are captured in the phased work below; they include bounded
@@ -234,11 +251,31 @@ broker timeouts, complete pagination, durable state, web hardening,
 observability, atomic publication, schema validation, dependency locking,
 deployment rollback, and decomposition of the three monoliths.
 
-R6 partially mitigates P0-L1, P0-L2, and P0-L7 in the current source. Their
-release conditions remain open: the placement-time compatibility guard is not
-yet a durable, centralized mutation gateway; affected OAuth keys have not been revoked or rotated;
-public history has not been purged; and no deployed process has been verified.
-P0-L3 through P0-L6 and P0-L8 remain stop-ship issues.
+The table records the original audit findings. Current implementation status is
+more advanced but does not close the release gates:
+
+- P0-L1/L2/L4/L5 are source-contained; P0-L3 has a pure typed decision domain;
+  P0-L8 has a typed fail-closed model contract. They remain live stop-ships
+  because complete independent evidence and the reviewed live composition root
+  do not exist.
+- P0-L7 has exact index/tree/archive current-content scanning. External
+  revoke/rotate, all-ref history remediation, downstream cleanup, and strong
+  runtime credential provisioning remain open.
+- P0-B1/B2/B5/B6 have maintained containment implementations. P0-B3 is closed
+  only for exact contract-reference cache truth, not complete provider/OHLCV
+  replay. P0-B4 validates strict historical NBBO **marks**, never executable
+  quantity-aware fills or official settlement.
+- P0-B7 remains open. P0-O1 has a reproducible artifact-first CI path on this
+  branch, but merge protection, signed release provenance, and deployment
+  acceptance are external gates.
+
+The current source contains a durable centralized gateway and pure risk domain,
+but no live caller can reach them. Release conditions remain open: independent
+authorization-grade inputs and complex-state procedures are incomplete;
+affected OAuth keys have not been revoked or rotated; public history has not
+been purged; and no deployed process has been verified. P0-L1 through P0-L8
+therefore remain release gates even where their isolated source components are
+delivered.
 
 P0-B1/P0-B2 now have an executable containment slice. The backtest requests
 Massive reference contracts by exact trade date, expiration, and option type;
@@ -253,7 +290,8 @@ This is not causal certification. Massive documents date-granular `as_of`
 behavior but not an observed intraday `available_at`, and the current adapter
 does not retain complete-page/request evidence. Snapshot manifests and
 `BacktestResult` therefore state that availability and completeness are
-`UNVERIFIED`; fills remain separately uncertified under P0-B4. Exact daily
+`UNVERIFIED`; historical marks remain separately uncertified as executable
+fills under P0-B4. Exact daily
 snapshots also amplify reference requests: the default put-only plan produces
 2,000 snapshot requests versus 112 expiration-level requests for calendar 2025
 (17.86x), and 12,848 versus 674 for 2020-01-01 through 2026-05-23 (19.06x).
@@ -268,9 +306,20 @@ statistically collapsed HMM raise an explicit unavailable result instead of
 returning a zero-probability function. Every tracked caller uses the typed
 contract. The retained read-only candidate scanner records `UNAVAILABLE` or
 `UNVERIFIED` with `execution_eligible=false`, and the research plot path stops
-on failure. This does not close P0-L8: the engine still lacks a certified
-point-in-time input/model manifest and taxonomy-safe return buckets, so it
-cannot authorize an order.
+on failure. This does not close P0-L8. The engine now records a causal
+preparation manifest, taxonomy-bound raw-state buckets, exact inference as-of,
+and resolved outcome cutoff, but that evidence is explicitly uncertified and
+non-authorizing. Provider bytes/availability, entitlement, prospective
+calibration, independent risk evidence, and live composition must all pass
+before an order can depend on the model.
+
+The model tail, return-bucket object, cache payload, and typed probability
+result must now share one exact completed-NYSE-session as-of date. Raw HMM
+labels are display/bucket diagnostics only and no longer alter risk in the
+legacy EV CLI. That CLI fails closed when VIX is unavailable and does not honor
+its legacy risk-gate override. Its old forward-outcome `--gmm-plots`,
+`--calibrate`, and `--samples` modes are stable tombstones pending migration to
+the typed exact-as-of protocol.
 
 ## Required regime-aware causal record
 
@@ -279,15 +328,16 @@ the result is marked `VALID`.
 
 | Mandatory field | Current status | Upgrade requirement |
 |---|---|---|
-| Training/calibration end date | **Implemented for R4 V2 annotations only.** The typed signal records the last selection-fold session from the pinned artifact. Legacy action paths remain unverified. | Store the cutoff for every model/refit and a calibration-policy hash. |
-| Test date range | **Implemented for R4 V2 annotations only.** The retrospective range is copied from the immutable plan; the prospective holdout is not complete. | Store calibration, validation, and locked test ranges plus selection lineage. |
-| Inference method | **Implemented for R4 V2 annotations only.** Calibrated signals record `causal_prefix_filter`; raw research signals leave it null and abstain. Legacy paths remain mixed. | Enumerate and store `walk_forward_filter`, prohibit smoothed/Viterbi history for backtest decisions. |
-| Regime lag | **Enforced for R4 V2 annotations.** The adapter proves close T maps to the exact next NYSE session and never fills a gap. Legacy scripts can still pass same-day states. | Persist `lag_trading_days >= 1` and assert it at trade-entry construction. |
-| Return-bucket causality | **Explicitly not used in R4.** Typed signals record `not_used_shadow_annotation`; the non-regime empirical helper now requires outcomes resolved strictly before entry. Legacy HMM/overlay buckets remain invalid end-to-end. | Store `as_of`, horizon convention, resolved cutoff, taxonomy/version, and assert only resolved outcomes enter the matching final-regime bucket. |
+| Training/calibration end date | **Implemented for maintained typed runs.** `BacktestRegimeProtocol` records a pre-test cutoff; each raw-state decision records its exact model training end. | Bind the completed prospective calibration artifact and provider evidence before promotion. |
+| Test date range | **Implemented for maintained typed runs.** The immutable protocol records exact test start/end and is hashed into every decision. | Add immutable full-run input/output registry and prospective holdout signoff. |
+| Inference method | **Implemented for maintained typed runs.** The protocol and decision evidence enumerate expanding/fixed-prefix filtering; Viterbi is prohibited. | Certify the selected model and runtime against prospective evidence. |
+| Regime lag | **Enforced for maintained typed runs.** Close T maps to the exact prior NYSE signal session for entry T+1; missing rows remain unavailable and are never forward-filled. | Retain exchange-calendar/version evidence in the immutable run registry. |
+| Return-bucket causality | **Implemented but `UNVERIFIED`.** Buckets record as-of, calendar/trading horizon, resolved-through cutoff, value hashes, and the exact **raw HMM** taxonomy. The final risk overlay is a different type and can never index a bucket. | Establish provider-byte/availability evidence, entitlements, and prospective statistical validation. |
 
 If any field is absent, the run status is `UNVERIFIED`. If a gate is known to
-fail, the status is `INVALID`. Only `VALID` runs appear in performance
-leaderboards.
+fail, the status is `INVALID`. The current implementation does not promote a
+regime-aware run to `VALID`; that future state requires all external data,
+execution, settlement, and prospective-validation gates.
 
 ## Target production architecture
 
@@ -449,6 +499,14 @@ Required gates include:
 Risk overlays may reduce exposure or block a trade. A crisis/panic state must not
 increase exposure.
 
+Implementation status: `live_trading/pretrade_risk.py` provides the pure typed
+decision and exhaustive fail-closed reason domain. Schema-17 lineage persists
+non-authorizing decisions and replayable quote/capacity evidence. Current
+evidence remains `INDEPENDENT_EVIDENCE_PENDING`; it cannot reserve capacity or
+authorize broker I/O because complete existing-position/open-order aggregates,
+Greeks, marked daily P&L, session counters, and a reviewed live collector are
+not composed.
+
 ### Boundary 5: durable order state machine
 
 The browser and scheduler create commands; neither calls E*TRADE directly.
@@ -469,7 +527,7 @@ intent, idempotency key, preview, broker IDs, price budget, every transition,
 actor, timestamps, retries, and reconciliation generation. Repricing has one
 owner and absolute slippage/debit/credit/time limits.
 
-Implementation status: schema 14 supports isolated opening and closing
+Implementation status: schema 17 supports isolated opening and closing
 verticals, opening price-only reprice, and one-shot cancellation flows with
 `INTENT`, `CLAIMED`, `FAILED`,
 `SUBMISSION_UNKNOWN`, `SUBMITTED`, and terminal states. Terminal-fill
@@ -486,11 +544,19 @@ fail-closed release gate.
 - The same strategy/risk domain logic is used in replay and live proposal
   generation.
 - Contract eligibility is point-in-time and based on `available_at`.
-- Every fill records observed bid/ask/trade timestamps, source, synchronization
-  delta, slippage, fees, and fallback class.
+- Every historical mark records observed bid/ask/trade timestamps, source,
+  synchronization delta, slippage policy, fees, and fallback class. It never
+  claims executable size or a broker fill.
 - Strict modes do not silently degrade. Fallback policies are explicit
   sensitivity scenarios and reported separately.
 - Missing/partial data makes a run `INVALID` when thresholds are exceeded.
+
+Implementation status: the maintained runner has point-in-time contract
+snapshots, strict 2/3-leg close-time NBBO mark validation, prefix-causal feature
+preparation, exact T-1 regime evidence, taxonomy-safe resolved buckets, and
+explicit `UNVERIFIED` lineage. A pure cache-free simulator, immutable complete
+catalog/registry, provider-byte replay, quantity-aware execution evidence,
+official settlement, and golden parity remain open.
 
 ### Boundary 7: experiment and model registry
 
@@ -559,7 +625,8 @@ Exit gate:
 - Every direct broker call has a timeout.
 - Each required dependency failure yields zero submissions.
 - Secret scans of history, working tree, build output, and logs are clean.
-- Existing 11 focused reliability tests remain green.
+- The complete maintained offline suite and all static/content gates remain
+  green.
 
 R6/R7f status: explicit mode, exact identity, short-lived signed arm,
 refresh-time revalidation, loopback dashboard, restrictive CORS, strong local
@@ -567,11 +634,11 @@ credential checks, owner-only/redacted client logging, unconditional legacy
 mutation tombstones, read-only UI/routes, a tracked-source mutation gate, and
 deployment install/restart suspension are implemented in source. Phase 0
 remains open because no durable gateway is composed into a production process,
-the full pure pre-trade and failure policy is incomplete, exposed keys still
-require external revoke/rotate and coordinated history cleanup, the current
-local settings fail the new policy, and no deployed service has been restarted
-or verified. Closing and cancellation now pass deterministic restart/crash
-contracts inside the isolated stack only.
+complete independent authorization-grade evidence is unavailable, exposed keys
+still require external revoke/rotate and coordinated history cleanup, the
+current local settings fail the new policy, and no deployed service has been
+restarted or verified. Closing and cancellation now pass deterministic
+restart/crash contracts inside the isolated stack only.
 
 ### Phase 1 — reproducible repository baseline (week 1)
 
@@ -666,7 +733,7 @@ Deliver:
 
 Exit gate:
 
-- A clean checkout builds and passes offline CI with one documented command.
+- A clean checkout builds and passes offline CI with one documented sequence.
 - Build/test leave a clean worktree.
 - Core domain coverage is at least 80%; execution/risk/config safety paths at
   least 95% branch coverage.
@@ -703,16 +770,17 @@ Exit gate:
 
 ### Phase 3 — durable live control plane (weeks 3–5)
 
-Status: partially delivered. The R7 stack now provides the schema-14 ledger,
+Status: partially delivered. The R7 stack now provides the schema-17 ledger,
 stable opening and closing intent identity, outbox-style send claims,
 reconciliation, margin and exact-contract capacity reservations, one isolated
 opening reprice owner, one-shot opening/closing cancellation, and exact
 zero/full terminal-risk absorption. Filled opening margin remains counted, and
 filled closing capacity requires an exact post-position delta before release.
 R7f also removes all current legacy mutation call sites and makes future
-bypasses fail CI. Partial/complex terminal states, the broader pure risk policy,
-process decomposition, a single reviewed composition root, dashboard command
-creation, and hardened live deployment remain open.
+bypasses fail CI. The pure risk decision domain is delivered; independent
+authorization-grade aggregates, partial/complex terminal procedures, process
+decomposition, a single reviewed composition root, dashboard command creation,
+and hardened live deployment remain open.
 
 Deliver:
 
@@ -736,11 +804,21 @@ Exit gate:
 
 ### Phase 4 — causally valid deterministic research (weeks 3–6)
 
+Status: partially delivered. The maintained path now contains exact-date
+contract-reference snapshots, prefix-causal feature preparation, strict
+timestamped multi-leg historical marks, explicit raw-HMM/final-overlay types,
+resolved-only taxonomy-bound buckets, an exact one-session lag, and immutable
+per-decision protocol evidence. Legacy global-fit and panic replacement-risk
+entry points are quarantined. The immutable complete provider catalog, raw-byte
+availability replay, typed full strategy schema, pure simulator, run registry,
+quantity/settlement truth, and prospective validation remain open; every result
+stays `UNVERIFIED`.
+
 Deliver:
 
 1. Build the immutable point-in-time data catalog and coverage ledger.
 2. Repair contract-universe timing, strike filtering, cache completeness,
-   strict NBBO, and synchronized pricing.
+   strict NBBO historical marks, and synchronized mark evidence.
 3. Move transform/feature/PCA/model choices inside causal refits or freeze them
    before the OOS interval.
 4. Separate raw archetype state from final stress-overlay state and unify return
@@ -765,6 +843,12 @@ Exit gate:
   scenarios pass.
 
 ### Phase 5 — release engineering and operator usability (weeks 5–7)
+
+Status: partially delivered. Exact Git-tree release selection, current-content
+secret scanning, reproducible wheel/sdist construction, and installed-artifact
+offline CI are implemented on this branch. Signed provenance, merge protection,
+hardened systemd activation, stopped-Pi rehearsal, health-checked rollback,
+backup/restore, and SLO drills remain open.
 
 Deliver:
 
@@ -803,39 +887,31 @@ automatically rolls the system back to read-only.
 
 ## Implementation queue
 
-Use small, independently releasable changes:
+The original twelve-PR decomposition was useful for planning, but the current
+branch now contains a cohesive, dependency-ordered integration slice:
 
-1. **PR 0 — Evidence baseline:** inventory tracked/untracked runtime sources,
-   freeze legacy regime artifacts, capture current behavior with fixtures.
-2. **PR 1 — Live containment:** unarmed default, exact account binding, kill
-   switch, hard ceilings, no automatic margin release.
-3. **PR 2 — Secret and log containment:** rotation checklist, file modes,
-   structured redaction, history/artifact/log scanning.
-4. **PR 3 — Broker result types:** deadlines, typed failures, common auth,
-   pagination completeness, no ambiguous empty results.
-5. **PR 4 — Durable intent facade:** stable IDs, dedupe, outbox, placement
-   reconciliation, bounded repricing.
-6. **PR 5 — Risk engine:** pure typed limits and exhaustive allow/deny tests;
-   route every old placement call through it.
-7. **PR 6 — Snapshot/read split:** transactional snapshots and dashboard-only
-   read models.
-8. **PR 7 — Reproducible build/CI:** canonical package, lock, offline gates,
-   immutable artifact.
-9. **PR 8 — Historical data correctness:** immutable catalog, coverage ledger,
-   contract availability, NBBO/synchronization provenance.
-10. **PR 9 — Causal/model correctness:** prefix-invariant preprocessing,
-    versioned model bundles, taxonomy-safe resolved buckets.
-11. **PR 10 — Pure simulator/registry:** no-network replay, complete manifest,
-    validity gates, artifact checksums.
-12. **PR 11 — Hardened web/deploy:** separate units, auth, health, metrics,
-    rollback, restore, and operator runbooks.
+1. reproducible packaging, exact-content hygiene, offline artifact CI, and
+   strict runtime configuration;
+2. legacy mutation quarantine, durable schema-17 intent/gateway/reader/
+   transport domains, closing/cancellation, and pre-trade evidence lineage;
+3. point-in-time contract containment, cache truth, and strict historical mark
+   evidence;
+4. causal Regime V2 shadow infrastructure, prefix-causal HMM preparation,
+   taxonomy-safe return buckets, and the typed regime/backtest bridge.
 
-The existing monoliths should remain behind compatibility facades while these
-boundaries are extracted. Remove old paths only after golden tests and
-shadow-parity prove equivalent intended behavior.
+After the exact full gate is green, merge this branch through **one integration
+PR** so CI evaluates the composition as a unit. Do not create twelve stacked
+PRs retroactively. Subsequent changes should again be small and independently
+reviewable, grouped by the remaining gates: provider/entitlement evidence,
+pure simulator and registry, reviewed live composition/complex-state
+procedures, and hardened deployment/operations.
+
+The legacy monoliths remain behind reject-only compatibility boundaries.
+Remove them only after golden tests, shadow/paper evidence, and supervised
+operational acceptance prove the intended replacement behavior.
 
 The current stacked delivery names the source-level startup containment slice
-R6. R7 implements an isolated schema-14 execution core: strict vertical-spread
+R6. R7 implements an isolated schema-17 execution core: strict vertical-spread
 validation, stable intent/client identity, durable margin and exact-contract
 capacity reservations, monotonic submission/amendment/cancellation fences,
 exact immutable outbound authorization, a no-retry mutation transport,
@@ -851,8 +927,9 @@ live caller instantiates the durable stack.
 
 Closing-position capacity and per-intent cancellation now pass deterministic
 restart/crash tests. A reviewed live composition root still cannot be enabled
-until the pure risk policy, complex-state procedures, deployment, and staged
-sandbox gates pass. The direct-legacy mutation prohibition must remain green.
+until complete independent risk evidence, complex-state procedures,
+deployment, and staged sandbox gates pass. The direct-legacy mutation
+prohibition must remain green.
 See `docs/order_intent_ledger.md`.
 
 ## Test and verification matrix
@@ -860,12 +937,12 @@ See `docs/order_intent_ledger.md`.
 | Layer | Required tests |
 |---|---|
 | Broker adapter | OAuth expiry, 401/403/404/429/5xx, timeout, malformed body, partial pagination, rate budget, redaction |
-| Execution | duplicate command, uncertain POST, crash before/after POST, restart reconciliation, single repricer, bounded slippage, kill switch |
-| Risk | account/environment mismatch, stale snapshots, closed/holiday/early-close market, quote spread/age, quantity/notional/max-loss/margin/delta/daily-loss/concentration limits |
+| Execution | duplicate command, uncertain POST, crash before/after POST, restart reconciliation, opening/closing/cancellation one-send fences, single repricer, terminal absorption, kill switch |
+| Risk | account/environment mismatch, stale/tampered lineage, closed/holiday/early-close market, quote spread/age, quantity/notional/max-loss/margin/delta/daily-loss/concentration limits |
 | Data cache | attempt vs success, partial-page preservation, middle-of-range holes, checksums, schema migration, cache-on/off parity |
-| Causality | feature/PCA/HMM prefix invariance, final-prefix posterior, one-day lag, resolved-only buckets, taxonomy/version mismatch, complete cache-key invalidation |
-| Simulator | deterministic golden trade ledger, accounting invariants, expiration/assignment/rolls, fees/slippage, missing-data invalidation, no network |
-| Packaging | clean build/install, import smoke, template/schema inclusion, locked dependency resolution, secret/artifact exclusion |
+| Causality | feature/PCA/HMM prefix invariance, canonical NYSE-only modeling rows, final-prefix posterior, exact T-1/no-gap mapping, resolved-only raw buckets, raw/final taxonomy mismatch, complete cache-key invalidation |
+| Simulator | deterministic golden trade ledger, strict-mark-not-fill assertions, accounting invariants, expiration/assignment/rolls, fees/slippage, missing-data invalidation, no network |
+| Packaging | clean build/install, import smoke, template/schema inclusion, locked dependency resolution, exact index/tree/archive secret and artifact exclusion |
 | Web | authentication, authorization, CSRF, rate/body limits, restrictive CORS, read-only behavior, command confirmation |
 | Operations | readiness transitions, graceful shutdown, rollback, backup/restore, alert drills, clock/DST/holiday behavior |
 | Artifacts | atomic generation, provenance visible, exact served HTML and chart/canvas visually inspected |
@@ -895,16 +972,23 @@ This review used static source/configuration inspection and the existing focused
 offline reliability tests. It did not call E*TRADE, Massive, Yahoo, or Cboe; did
 not submit or alter orders; did not run a full historical backtest; did not
 inspect the deployed Pi; and did not restart the user's deployed dashboard.
+On 2026-07-27 the maintained offline source suite passed **968 tests with one
+skip** under `ETRADE_TEST_NETWORK=deny` and `MASSIVE_OFFLINE_ONLY=1`; that is
+source-level evidence, not provider, deployment, execution, or model-promotion
+evidence. A generated Plotly backtest report was inspected as source, but exact
+browser/canvas visual verification remains incomplete because the available
+in-app browser rejected local-file navigation. No HTML-facing fix is claimed
+from that report.
 R5 later added an isolated browser verification of the actual dashboard handler
 and source template for both a sealed synthetic advisory and the missing-signal
 failure state. That proves the code/HTML path, not deployment or live provider
 operation. Its PR #28 clean CI job passed 134 tests.
 
-R6/R7f have not restarted or inspected the deployed dashboard, called E*TRADE, or
-exercised a live/sandbox mutation. Current-source credential removal also does
-not establish secret hygiene merely because the repository is now reported
-private while the old keys remain in Git history. External revoke/rotate,
-coordinated history purge,
+R6/R7f have not restarted or inspected the deployed dashboard, called E*TRADE,
+or exercised a live/sandbox mutation. Current-source credential removal and
+exact-content scanning do not remediate old keys in Git history. The repository
+is currently public; making it private limits future visibility but is not
+credential remediation. External revoke/rotate, coordinated history purge,
 strong local credential reprovisioning, the remaining R7
 partial/complex-state protocols, durable-gateway composition, and deployment
 verification remain required. The isolated R7 stack has focused deterministic

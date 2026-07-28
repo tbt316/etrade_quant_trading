@@ -6,30 +6,44 @@ This document explains how `live_trading/ev_plots.py` and its core math engine `
 
 `ev_plots.py` compares SPY and SPX put-credit-spread opportunities by:
 
-1. **Fetching Market Data**: Gets live prices (SPY, SPX, VIX) and 15 years of daily history via `yfinance`. Now includes **VVIX** for state detection.
-2. **HMM Regime Detection**: Uses a Continuous **Hidden Markov Model (HMM)** to dynamically detect hidden market states based on Log Returns, **EWMA Realized Volatility**, VIX, and VVIX.
-3. **GMM Probability Projection**: Uses a BIC-selected Gaussian Mixture Model (GMM) *within* each HMM state to estimate multi-week breach probabilities ($P(spot \le strike)$).
-4. **Forward Projection**: Projects today's state probabilities forward to option expiration using **Matrix Exponentiation** of the HMM transition matrix.
+1. **Fetching Market Data**: Gets live SPY/SPX/VIX prices and a historical
+   multi-source feature panel, then models only exact NYSE sessions.
+2. **HMM Regime Detection**: Uses a Gaussian **Hidden Markov Model (HMM)** on
+   prefix-causal scaled/PCA features. VIX close is excluded from HMM emissions
+   and retained for the separately named stress overlay.
+3. **GMM Probability Projection**: Uses a BIC-selected Gaussian Mixture Model
+   within each exact raw-HMM taxonomy to estimate multi-week breach
+   probabilities ($P(spot \le strike)$).
+4. **Optional Forward Projection**: When explicitly enabled, projects the
+   causal tail posterior to expiration using the validated HMM transition
+   matrix. It is disabled by default.
 5. **EV & Risk Integration**: Numerically integrates the payout function over the projected probability mixture to find Expected Value (EV), Expected Shortfall (ES), and Loss Probability.
 6. **Portfolio Normalization**: Scales metrics to a consistent $10,000 margin budget.
 7. **Liquidity Analysis**: Tracks slippage relative to net credit and volume/OI across deltas.
 
-It supports multiple diagnostic modes:
+It supports these research diagnostic modes:
 
 - `--distributions`: Plots historical return distributions by VIX regime with normality tests.
-- `--gmm-plots`: Visualizes internal GMM clustering of historical returns.
 - `--gmm-dist`: Overlays GMM density fits on empirical return histograms (with AIC/BIC metrics).
-- `--calibrate`: Runs a temporal walk-forward backtest to validate probability accuracy.
-- `--samples`: Performs spot-checks on specific historical dates to see model predictions vs outcomes.
+- `--timeline`: Plots an explicitly calibrated causal raw-HMM trace and a
+  separately labeled final stress overlay.
+- `--regime-log-return-gmm`: Fits research return models to a causal raw-HMM
+  trace.
+
+`--gmm-plots`, `--calibrate`, and `--samples` are intentionally disabled with
+stable error codes. Their legacy forward-outcome paths do not satisfy the
+typed exact-as-of return-bucket protocol.
 
 ## 2. Core Math Engine (`ev_engine.py`)
 
 To ensure reliability and speed, the heavy lifting is moved to `ev_engine.py`:
 
 - **Data Persistence**: Caches raw yfinance data (`s_and_p_data/spy_vix_historical_raw.csv`) including SPY, VIX, and VVIX.
-- **Feature Engineering**: Implements 10-day **EWMA Volatility** to eliminate the "ghosting" lag of standard rolling volatility windows.
+- **Feature Engineering**: Applies prefix-fitted stationarity decisions,
+  trailing volatility filters, causal scaling, and prefix-fitted PCA.
 - **HMM Training**: Dynamically selects the optimal number of hidden states ($K$) using **AIC/BIC scores** to prevent overfitting.
-- **Regime Bucketing**: Buckets $T$-horizon returns by the starting HMM state rather than static VIX levels.
+- **Regime Bucketing**: Buckets only strictly resolved $T$-horizon returns by
+  an exact raw-HMM taxonomy, never by a final stress-overlay integer.
 - **GMM Implementation**: Logic for fitting BIC-selected mixtures to multi-week horizon data (capturing fat tails only when supported by the data) and querying CDFs is centralized here.
 
 ## 3. Global configuration
@@ -38,8 +52,9 @@ Key globals near the top of the file:
 
 - `PROBABILITY_MODEL = 'gmm'`
   - Options: `'bootstrap'`, `'parametric'`, `'gmm'`
-- `USE_MARKOV_TRANSITIONS = True`
-  - If `True`, probabilities are blended across projected future VIX regimes instead of using only the current regime.
+- `USE_MARKOV_TRANSITIONS = False`
+  - The current default uses the causal tail posterior. If explicitly enabled,
+    a validated raw-HMM transition matrix projects that posterior.
 - `TARGET_MARGIN_DOLLARS = 10000.0`
   - Used to normalize portfolio EV/ES across different spread widths.
 - `COST_PER_SPREAD = 1.0`
@@ -55,15 +70,24 @@ Key globals near the top of the file:
 
 ### `train_regime_hmm(df)`
 
-- Standardizes features: `[Log_Return, EWMA_Vol_10d, VIX, VVIX]`.
-- Iterates through $K=1 \to 6$ states.
-- Selects the model with the minimum **BIC** to strike a balance between granularity and noise filtering.
+- Prepares stationary features through a causal feature manifest and a
+  prefix-fitted scaler/PCA pipeline.
+- Walk-forward plot traces require an explicit `fit_end` strictly before the
+  first displayed or evaluated session.
+- The returned fitted model carries an exact raw-HMM taxonomy ID. Numeric HMM
+  states are meaningful only with that ID. Walk-forward output records the
+  exact taxonomy per row because each refit creates a new fitted identity.
 
-### `build_regime_return_arrays(cache_key, horizon=45)`
+### `build_regime_return_arrays(cache_key, horizon=45, as_of_date=...)`
 
-- Computes forward-looking returns for the given horizon: `df['SPY_Close'].shift(-horizon) / df['SPY_Close'] - 1`.
-- Buckets returns by the **discovered HMM State** (e.g., State 0, State 1, ... State $K-1$).
-- Captures the empirical return behavior associated with each machine-learned regime.
+- Converts the calendar-day option horizon to a trading-session horizon.
+- Requires an explicit date-only `as_of_date`; there is no wall-clock default.
+- Records the exact terminal session for every forward return and includes it
+  only when that session is strictly before `as_of_date`.
+- Returns `RegimeReturnBuckets`, not a plain dictionary. The bucket values,
+  horizon, resolution cutoff, model cutoff, and exact fitted-HMM taxonomy are
+  bound into the cache contract.
+- Rejects legacy/unbound cache content instead of silently reusing it.
 
 ## 4. Markov transition modeling
 
@@ -75,10 +99,13 @@ Instead of a custom build, the engine uses the **Transition Matrix** (`transmat_
 
 ### `get_probability_engine(...)`
 
-1. **Posterior Probability**: Today's features are passed to `hmm_model.predict_proba()` to find the probability distribution of current states (e.g., 80% State 0, 20% State 1).
-2. **Matrix Exponentiation**: The Transition Matrix is raised to the power of the `horizon` (days to expiration) using `np.linalg.matrix_power`.
-3. **Future Projection**: Today's state vector is multiplied by the projected matrix to yield the expected regime distribution AT expiration.
-4. **Mixture Summation**: The final `prob_func` is a weighted sum of the GMMs for each state, using the projected weights.
+1. **Contract validation**: Requires typed return buckets whose taxonomy,
+   training cutoff, state count, and horizon exactly match the HMM.
+2. **Posterior Probability**: Uses the causal tail probabilities stored by the
+   model pipeline.
+3. **Matrix Exponentiation**: The Transition Matrix is raised to the power of the `horizon` (days to expiration) using `np.linalg.matrix_power`.
+4. **Future Projection**: Today's state vector is multiplied by the projected matrix to yield the expected regime distribution AT expiration.
+5. **Mixture Summation**: The final `prob_func` is a weighted sum of the GMMs for each state, using the projected weights.
 
 ## 5. Probability engines
 
@@ -115,13 +142,17 @@ This design captures the real-world Non-Normality (fat tails, skew) observed in 
 
 ## 6. Building the final probability function
 
-### `get_probability_engine(spot_price, current_vix, regime_dict, horizon=45, hmm_model=None)`
+### `get_probability_engine(spot_price, current_vix, regime_buckets, horizon=45, hmm_model=None)`
 
-Returns:
+Returns one `ProbabilityEngineResult` containing:
 
-- `prob_func`: The final weighted-mixture probability function.
-- `regime_name`: The label of the currently dominant state.
-- `projected_weights`: The estimated regime probabilities at expiration.
+- `probability(strike)`: The final weighted-mixture probability function.
+- the dominant raw HMM state and current/projected probabilities;
+- the exact taxonomy ID and resolved-through date; and
+- permanent `UNVERIFIED` / `execution_eligible=false` status.
+
+Raw `dict[str, array]` buckets are not accepted. Final stress-overlay integers
+also cannot index raw HMM return buckets.
 
 In **Markov-Switching** mode, the engine dynamically adjusts the return distribution's "tails" as expiration time increases, naturally reflecting the increasing risk of transitioning into a high-volatility crash state over longer trade durations.
 
@@ -171,33 +202,30 @@ Saved to: `/Users/btian/.gemini/antigravity/artifacts/ev_delta_normalized_margin
 - Typically shows that specific HMM states are significantly more non-Normal than others.
 
 ### B) GMM Clustering (`--gmm-plots`)
-- Visualizes how the selected GMM finds supported sub-distributions within the HMM-learned states, identifying internal multi-modality only when it improves penalized fit.
+- Disabled with `UNSAFE_REGIME_GMM_CLUSTER_DIAGNOSTIC_DISABLED` until rebuilt
+  on exact-as-of typed return buckets.
 
 ### C) GMM Distribution Fit (`--gmm-dist`)
 - Overlays the final GMM density mixture on histograms for each HMM state.
 - Displays **Log-Likelihood**, **AIC**, and **BIC** to justify the use of Gaussian Mixtures over simple Parametric models.
 
 ### D) Model Calibration (`--calibrate`)
-- A rigorous **Out-Of-Sample (OOS) Walk-Forward Backtest**.
-- **Refit Mechanism**: Every 21 trading days (approx. 1 month), the HMM is retrained from scratch using only data *strictly prior* to the validation date.
-- **Statistical Separation**: Applies the **Kruskal-Wallis** H-test to verify that the predicted HMM regimes legitimately correlate with statistically distinct future return outcomes out-of-sample.
-- Prints overall **Brier Score**, **Log-Loss**, and **ECE** (Expected Calibration Error).
+- Disabled with `UNSAFE_REGIME_CALIBRATION_BACKTEST_DISABLED`. Use the typed
+  backtest protocol and prospective Regime V2 calibration workflow instead.
 
 ### E) Prediction Samples (`--samples`)
-- Performs spot-checks on specific historical dates (e.g., 2020 peak, 2022 bear) to see model predictions vs realized outcomes without look-forward bias.
+- Disabled with `UNSAFE_REGIME_SAMPLE_OUTCOMES_DISABLED` until migrated to
+  completed-NYSE-session snapshots and strictly resolved outcomes.
 
 ## 12. CLI Usage Examples
 
 ### Diagnostic Suite (No Login Needed)
 ```bash
-# View GMM clustering internals
-python live_trading/ev_plots.py --gmm-plots
-
 # View GMM density fits with AIC/BIC
 python live_trading/ev_plots.py --gmm-dist
 
-# Check historical calibration
-python live_trading/ev_plots.py --calibrate
+# View a causal raw-HMM timeline with separate stress overlays
+python live_trading/ev_plots.py --timeline
 ```
 
 ### Full Analysis (Requires Login)
@@ -205,9 +233,14 @@ python live_trading/ev_plots.py --calibrate
 python live_trading/ev_plots.py --username YOUR_USER --password YOUR_PASS
 ```
 
+The live analysis path treats the raw HMM label as display-only. It cannot
+veto or resize an order. Missing VIX fails closed, and risk-gate overrides stay
+disabled until a durable time-scoped operator-override ledger exists.
+
 ## 13. System Requirements
 
 - `hmmlearn`: Required for `GaussianHMM` regime detection.
 - `scikit-learn`: Required for `GaussianMixture` (internal state distributions).
-- `yfinance`: For daily historical data (SPY, VIX, VVIX) and price fallback.
+- `yfinance`: For daily historical data and the bounded VIX fallback; if both
+  configured VIX sources fail, the live analysis stops.
 - `scipy`: For statistical tests (Kruskal-Wallis, Shapiro-Wilk) and GMM mixture CDFs.
