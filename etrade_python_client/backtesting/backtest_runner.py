@@ -10,7 +10,7 @@ Strategy workflow:
   1. For each trading day, find target expiration (~42 DTE Friday)
   2. Fetch option chain and compute BS deltas
   3. Select short leg at target delta, long leg at spread_width below
-  4. Use EOD NBBO midpoint as execution price
+  4. Mark every leg through the typed strict-NBBO or research-fallback boundary
   5. Close at close_dte days remaining
 """
 import asyncio
@@ -34,7 +34,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas_market_calendars as mcal
 
 from backtesting.option_data_cache import OptionDataCache
-from backtesting.massive_api_client import MassiveAPIClient
+from backtesting.massive_api_client import (
+    HistoricalFillEvidence,
+    HistoricalFillSource,
+    MassiveAPIClient,
+    fill_bundle_diagnostics,
+)
 from backtesting.greeks_calculator import compute_chain_deltas, bs_put_delta, implied_volatility
 from backtesting.contract_universe import (
     ContractUniverseSnapshot,
@@ -259,6 +264,32 @@ class SpreadTrade:
     short_ticker: str = ""
     long_ticker: str = ""
     entry_price: float = 0.0
+    entry_fill_mode: str = ""
+    entry_fill_sources: List[str] = field(default_factory=list)
+    entry_fill_timestamps_utc: List[Optional[str]] = field(default_factory=list)
+    entry_fill_temporally_synchronized: Optional[bool] = None
+    entry_fill_strict_nbbo_mark_validated: bool = False
+    entry_fill_strict_nbbo_authorized: bool = False
+    entry_fill_strict_nbbo_authorized_deprecated: str = (
+        "Always false: historical NBBO validates a mark, not execution."
+    )
+    entry_execution_proven: bool = False
+    entry_pricing_assumption: str = (
+        "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+    )
+    exit_fill_mode: str = ""
+    exit_fill_sources: List[str] = field(default_factory=list)
+    exit_fill_timestamps_utc: List[Optional[str]] = field(default_factory=list)
+    exit_fill_temporally_synchronized: Optional[bool] = None
+    exit_fill_strict_nbbo_mark_validated: bool = False
+    exit_fill_strict_nbbo_authorized: bool = False
+    exit_fill_strict_nbbo_authorized_deprecated: str = (
+        "Always false: historical NBBO validates a mark, not execution."
+    )
+    exit_execution_proven: bool = False
+    exit_pricing_assumption: str = (
+        "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+    )
     trade_id: str = ""
     root_trade_id: str = ""
     parent_trade_id: str = ""
@@ -334,12 +365,22 @@ class BacktestResult:
     data_gap_count: int = 0
     critical_gap_count: int = 0
     abnormalities: List[Dict[str, Any]] = field(default_factory=list)
+    historical_fill_mode: str = "research_fallback"
+    entry_fill_mode: str = "research_fallback"
+    exit_fill_mode: str = "research_fallback"
+    historical_execution_proven: bool = False
+    max_time_delta_minutes: float = 5.0
+    max_quote_age_minutes: float = 5.0
+    fill_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     causal_validity: str = "UNVERIFIED"
     causal_validity_reasons: List[str] = field(
         default_factory=lambda: [
             "contract_reference_available_at_is_modeled_not_provider_observed",
             "ohlcv_range_coverage_truth_unverified",
             "fill_timestamp_causality_not_certified",
+            "historical_fill_provider_response_bytes_not_retained",
+            "historical_quote_size_and_execution_not_proven",
+            "expiration_settlement_style_and_reference_unverified",
         ]
     )
     contract_universe_manifest_sha256: Dict[str, str] = field(
@@ -905,21 +946,204 @@ def _adjust_exit_debit(short_mid: float, short_bid: float, short_ask: float,
     return short_mid - long_mid
 
 
-def _pricing_source_label(*quotes: Optional[dict]) -> str:
+def _adjust_long_entry_cost(
+    mid: float,
+    bid: Optional[float],
+    ask: Optional[float],
+    model: str,
+) -> float:
+    if model == "worst_case" and ask is not None and ask > 0:
+        return ask
+    if (
+        model == "steer_50"
+        and bid is not None
+        and ask is not None
+        and bid > 0
+        and ask >= bid
+    ):
+        return mid + 0.25 * (ask - bid)
+    return mid
+
+
+def _adjust_long_exit_credit(
+    mid: float,
+    bid: Optional[float],
+    ask: Optional[float],
+    model: str,
+) -> float:
+    if model == "worst_case" and bid is not None and bid > 0:
+        return bid
+    if (
+        model == "steer_50"
+        and bid is not None
+        and ask is not None
+        and bid > 0
+        and ask >= bid
+    ):
+        return mid - 0.25 * (ask - bid)
+    return mid
+
+
+def _pricing_source_label(*quotes: Optional[Mapping[str, Any]]) -> str:
     sources = {
-        str(q.get("source", "")).lower()
+        str(q.get("source", "")).upper()
         for q in quotes
         if q and not isinstance(q, Exception)
     }
     if not sources:
         return "UNKNOWN"
-    if all(src in {"quote", "quote_cache"} for src in sources):
+    if sources == {HistoricalFillSource.OBSERVED_NBBO.value}:
         return "NBBO"
-    if all(src in {"trade", "trade_cache"} for src in sources):
-        return "TRADE"
-    if all(src in {"ohlcv_close", "ohlcv_close_cache"} for src in sources):
-        return "OHLCV"
+    if sources == {HistoricalFillSource.SYNCHRONIZED_MINUTE_AGGREGATE.value}:
+        return "SYNCHRONIZED_MINUTE_AGGREGATE"
+    if sources == {HistoricalFillSource.TRADE_PRINT.value}:
+        return "TRADE_PRINT"
+    if sources == {HistoricalFillSource.THEORETICAL.value}:
+        return "THEORETICAL"
+    if sources == {HistoricalFillSource.DAILY_CLOSE.value}:
+        return "DAILY_CLOSE"
     return "MIXED"
+
+
+def _fill_path_diagnostics(
+    evidence: Tuple[HistoricalFillEvidence, ...],
+    *,
+    phase: str,
+    pricing_date: str,
+    fill_mode: str,
+    max_time_delta_minutes: float,
+    max_quote_age_minutes: float,
+) -> Dict[str, Any]:
+    diagnostics = fill_bundle_diagnostics(
+        evidence,
+        max_time_delta_minutes,
+        max_quote_age_minutes,
+    )
+    diagnostics.update(
+        {
+            "phase": phase,
+            "pricing_date": pricing_date,
+            "fill_mode": fill_mode,
+            "provider_proof": "NO_RAW_PROVIDER_BYTES_RETAINED",
+        }
+    )
+    return diagnostics
+
+
+def _resolve_historical_fill_thresholds(
+    *,
+    explicit_max_time_delta_minutes: Optional[float],
+    explicit_max_quote_age_minutes: Optional[float],
+    execution_config: Mapping[str, Any],
+    entry_config: Mapping[str, Any],
+) -> Tuple[float, float]:
+    """Resolve fill limits with explicit argument > config > legacy > default."""
+
+    max_time_delta = explicit_max_time_delta_minutes
+    if max_time_delta is None:
+        if "max_time_delta_minutes" in execution_config:
+            max_time_delta = execution_config["max_time_delta_minutes"]
+        elif "max_time_delta_minutes" in entry_config:
+            max_time_delta = entry_config["max_time_delta_minutes"]
+        else:
+            max_time_delta = 5.0
+
+    max_quote_age = explicit_max_quote_age_minutes
+    if max_quote_age is None:
+        max_quote_age = execution_config.get(
+            "max_quote_age_minutes",
+            5.0,
+        )
+
+    if isinstance(max_time_delta, bool) or isinstance(max_quote_age, bool):
+        raise ValueError("historical fill thresholds must be numeric")
+    try:
+        max_time_delta = float(max_time_delta)
+        max_quote_age = float(max_quote_age)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "historical fill thresholds must be numeric"
+        ) from exc
+    if not np.isfinite(max_time_delta) or max_time_delta < 0:
+        raise ValueError(
+            "max_time_delta_minutes must be finite and non-negative"
+        )
+    if not np.isfinite(max_quote_age) or max_quote_age <= 0:
+        raise ValueError(
+            "max_quote_age_minutes must be finite and positive"
+        )
+    return max_time_delta, max_quote_age
+
+
+def _resolve_historical_fill_modes(
+    execution_config: Mapping[str, Any],
+) -> Tuple[str, str]:
+    """Resolve explicit entry/exit mark policies without legacy ambiguity."""
+
+    if "require_entry_nbbo" in execution_config:
+        raise ValueError(
+            "execution.require_entry_nbbo is deprecated and ambiguous. "
+            "Use execution.entry_fill_mode and execution.exit_fill_mode, "
+            "or execution.fill_mode to set both."
+        )
+
+    shared_mode = execution_config.get("fill_mode")
+    entry_mode = execution_config.get("entry_fill_mode")
+    exit_mode = execution_config.get("exit_fill_mode")
+    valid_modes = {"strict_nbbo", "research_fallback"}
+
+    if shared_mode is not None and shared_mode not in valid_modes:
+        raise ValueError(
+            "execution.fill_mode must be 'strict_nbbo' or "
+            "'research_fallback'"
+        )
+    if shared_mode is not None:
+        if entry_mode is not None and entry_mode != shared_mode:
+            raise ValueError(
+                "execution.fill_mode conflicts with execution.entry_fill_mode"
+            )
+        if exit_mode is not None and exit_mode != shared_mode:
+            raise ValueError(
+                "execution.fill_mode conflicts with execution.exit_fill_mode"
+            )
+        entry_mode = shared_mode
+        exit_mode = shared_mode
+
+    entry_mode = entry_mode or "research_fallback"
+    exit_mode = exit_mode or "research_fallback"
+    if entry_mode not in valid_modes:
+        raise ValueError(
+            "execution.entry_fill_mode must be 'strict_nbbo' or "
+            "'research_fallback'"
+        )
+    if exit_mode not in valid_modes:
+        raise ValueError(
+            "execution.exit_fill_mode must be 'strict_nbbo' or "
+            "'research_fallback'"
+        )
+    return entry_mode, exit_mode
+
+
+def _research_mark_evidence(
+    option_ticker: str,
+    pricing_date: str,
+    source: HistoricalFillSource,
+    price: float,
+    *,
+    event_timestamp_utc: Optional[str] = None,
+    provider_route: str,
+) -> HistoricalFillEvidence:
+    return HistoricalFillEvidence(
+        option_ticker=option_ticker,
+        pricing_date=pricing_date,
+        source=source,
+        mid=float(price),
+        bid=float(price),
+        ask=float(price),
+        event_timestamp_utc=event_timestamp_utc,
+        provider="massive" if source is HistoricalFillSource.TRADE_PRINT else "derived",
+        provider_route=provider_route,
+    )
 
 
 def _ticker_matches_contract_type(option_ticker: str, contract_type: str) -> bool:
@@ -1023,10 +1247,11 @@ async def run_put_credit_spread_backtest(
     daily_pacing_slots: int = 0,
     roll_spread_width_multiplier: float = 1.0,
     slippage_model: str = "none",
-    max_time_delta_minutes: float = 5.0,
+    max_time_delta_minutes: Optional[float] = None,
     regime_probabilities: Optional[pd.DataFrame] = None,
     regime_v2_annotations: Optional[Mapping[str, RegimeSignal]] = None,
     offline_only: bool = False,
+    max_quote_age_minutes: Optional[float] = None,
 ) -> BacktestResult:
     """
     Run a put credit spread backtest with capital management and advanced tracking.
@@ -1080,7 +1305,29 @@ async def run_put_credit_spread_backtest(
             execution_config.get("option_fee_per_contract_per_side", 0.0),
         )
     )
-    require_entry_nbbo = bool(execution_config.get("require_entry_nbbo", False))
+    entry_fill_mode, exit_fill_mode = _resolve_historical_fill_modes(
+        execution_config
+    )
+    historical_fill_mode = (
+        entry_fill_mode
+        if entry_fill_mode == exit_fill_mode
+        else "split_entry_exit"
+    )
+    max_time_delta_minutes, max_quote_age_minutes = (
+        _resolve_historical_fill_thresholds(
+            explicit_max_time_delta_minutes=max_time_delta_minutes,
+            explicit_max_quote_age_minutes=max_quote_age_minutes,
+            execution_config=execution_config,
+            entry_config=entry_config,
+        )
+    )
+    strict_entry_mark_mode = entry_fill_mode == "strict_nbbo"
+    strict_exit_mark_mode = exit_fill_mode == "strict_nbbo"
+    result.historical_fill_mode = historical_fill_mode
+    result.entry_fill_mode = entry_fill_mode
+    result.exit_fill_mode = exit_fill_mode
+    result.max_time_delta_minutes = max_time_delta_minutes
+    result.max_quote_age_minutes = max_quote_age_minutes
     call_side_enabled = bool(call_side_config.get("enabled", False))
     call_side_short_delta = float(call_side_config.get("short_delta", abs(target_short_delta) / 2.0))
     call_side_spread_width = float(call_side_config.get("spread_width", spread_width))
@@ -1131,8 +1378,22 @@ async def run_put_credit_spread_backtest(
     print(f"  Initial Capital: ${initial_capital:,.0f} | Margin Limit: {margin_limit_pct:.0%}")
     if fee_per_contract_per_side:
         print(f"  Option Fee: ${fee_per_contract_per_side:.2f}/contract/side")
-    if require_entry_nbbo:
-        print("  Entry Pricing: strict NBBO required")
+    if strict_entry_mark_mode and strict_exit_mark_mode:
+        print(
+            "  Historical Mark Pricing: strict synchronized observed NBBO "
+            "marks required for entry and non-expiration exit"
+        )
+    else:
+        print(
+            "  Historical Mark Pricing: "
+            f"entry={entry_fill_mode}, exit={exit_fill_mode}; every source "
+            "class and non-executable assumption is recorded"
+        )
+    print(
+        "  Historical Mark Limits: "
+        f"leg skew ≤ {max_time_delta_minutes:g}m | "
+        f"quote age at session close ≤ {max_quote_age_minutes:g}m"
+    )
     if call_side_enabled:
         print(
             f"  Call Side: enabled | Short Delta: {call_side_short_delta:+.2f} | "
@@ -1255,7 +1516,13 @@ async def run_put_credit_spread_backtest(
             "margin_limit_pct": margin_limit_pct,
             "early_profit_pct": early_profit_pct,
             "hold_itm_to_expiration": hold_itm_to_expiration,
-            "dividend_yield": dividend_yield
+            "dividend_yield": dividend_yield,
+            "historical_fill_mode": historical_fill_mode,
+            "entry_fill_mode": entry_fill_mode,
+            "exit_fill_mode": exit_fill_mode,
+            "historical_execution_proven": False,
+            "max_time_delta_minutes": max_time_delta_minutes,
+            "max_quote_age_minutes": max_quote_age_minutes,
         })
 
     async with MassiveAPIClient(cache=cache, offline_only=offline_only) as client:
@@ -1565,7 +1832,6 @@ async def run_put_credit_spread_backtest(
         active_trades: List[SpreadTrade] = []
         call_side_vix_cooldown_start_idx: Optional[int] = None
         call_side_vix_last_seen_above = False
-        sync_quote_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         latest_trade_tasks: Dict[str, asyncio.Task] = {}
 
         def _finalize_trade_close(
@@ -1581,6 +1847,7 @@ async def run_put_credit_spread_backtest(
             long_quote: Optional[dict] = None,
             far_long_quote: Optional[dict] = None,
             sync_quotes: Optional[list] = None,
+            exit_fill_diagnostics: Optional[Dict[str, Any]] = None,
         ) -> None:
             nonlocal current_cash, realized_capital, closed_today, daily_events
             trade.exit_date = td
@@ -1601,6 +1868,30 @@ async def run_put_credit_spread_backtest(
             trade.exit_dte = current_dte
             trade.status = "closed"
             trade.exit_reason = exit_reason
+            exit_fill_diagnostics = exit_fill_diagnostics or {}
+            trade.exit_fill_mode = str(
+                exit_fill_diagnostics.get("fill_mode", exit_fill_mode)
+            )
+            trade.exit_fill_sources = list(
+                exit_fill_diagnostics.get("sources", [])
+            )
+            trade.exit_fill_timestamps_utc = list(
+                exit_fill_diagnostics.get("timestamps_utc", [])
+            )
+            trade.exit_fill_temporally_synchronized = (
+                exit_fill_diagnostics.get("temporally_synchronized")
+            )
+            trade.exit_fill_strict_nbbo_mark_validated = bool(
+                exit_fill_diagnostics.get(
+                    "strict_nbbo_mark_validated",
+                    False,
+                )
+            )
+            trade.exit_fill_strict_nbbo_authorized = False
+            trade.exit_execution_proven = False
+            trade.exit_pricing_assumption = (
+                "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+            )
 
             current_cash -= trade.net_debit_close * 100 * trade.num_contracts + trade.exit_fee
             realized_capital += gross_trade_pnl - trade.exit_fee
@@ -1638,131 +1929,234 @@ async def run_put_credit_spread_backtest(
             long_cached = bars_map.get(long_ticker)
             far_long_cached = bars_map.get(far_long_ticker) if far_long_ticker else None
 
-            short_quote = quotes_map.get(short_ticker)
-            long_quote = quotes_map.get(long_ticker)
-            far_long_quote = quotes_map.get(far_long_ticker) if far_long_ticker else None
-
-            if isinstance(short_quote, Exception):
-                short_quote = None
-            if isinstance(long_quote, Exception):
-                long_quote = None
-            if isinstance(far_long_quote, Exception):
-                far_long_quote = None
-
             abnormalities = []
             sync_quotes = None
-            current_short_mid = 0.0
-            current_long_mid = 0.0
+            fill_tickers = (
+                (short_ticker, long_ticker, far_long_ticker)
+                if far_long_ticker
+                else (short_ticker, long_ticker)
+            )
+            fill_task_key = (
+                fill_tickers,
+                strict_exit_mark_mode,
+                max_time_delta_minutes,
+                max_quote_age_minutes,
+            )
+            fill_task = fill_bundle_tasks.get(fill_task_key)
+            if fill_task is None:
+                fill_task = asyncio.create_task(
+                    client.fetch_multileg_eod_marks(
+                        fill_tickers,
+                        td,
+                        strict_nbbo=strict_exit_mark_mode,
+                        max_time_delta_minutes=max_time_delta_minutes,
+                        max_quote_age_minutes=max_quote_age_minutes,
+                    )
+                )
+                fill_bundle_tasks[fill_task_key] = fill_task
+            fill_evidence = await fill_task
 
-            if short_quote and long_quote:
-                current_short_mid = short_quote["mid"]
-                current_long_mid = long_quote["mid"]
-            else:
-                sync_key = (short_ticker, long_ticker)
-                sync_task = sync_quote_tasks.get(sync_key)
-                if sync_task is None:
-                    sync_task = asyncio.create_task(
-                        client.fetch_synchronized_ohlcv(
-                            short_ticker,
-                            long_ticker,
-                            td,
-                            max_time_delta_minutes=max_time_delta_minutes,
-                        )
+            # A theoretical fallback is research-only and only supports the
+            # two-leg vertical. A three-leg position remains unavailable unless
+            # all three legs have one explicit source bundle.
+            if (
+                fill_evidence is None
+                and not strict_exit_mark_mode
+                and not far_long_ticker
+            ):
+                trade_task = latest_trade_tasks.get(short_ticker)
+                if trade_task is None:
+                    trade_task = asyncio.create_task(
+                        client.fetch_latest_trade(short_ticker, td)
                     )
-                    sync_quote_tasks[sync_key] = sync_task
-                sync_quotes = await sync_task
-                if sync_quotes:
-                    current_short_mid = sync_quotes[0]["mid"]
-                    current_long_mid = sync_quotes[1]["mid"]
-                    print(
-                        f"  [SYNC FALLBACK] Found synchronized 1m bars for {td} "
-                        f"(timestamp: {sync_quotes[0]['timestamp']})"
-                    )
-                else:
-                    trade_task = latest_trade_tasks.get(short_ticker)
-                    if trade_task is None:
-                        trade_task = asyncio.create_task(client.fetch_latest_trade(short_ticker, td))
-                        latest_trade_tasks[short_ticker] = trade_task
-                    short_trade = await trade_task
-                    if short_trade:
-                        short_p = short_trade["price"]
+                    latest_trade_tasks[short_ticker] = trade_task
+                short_trade = await trade_task
+                if short_trade:
+                    short_source_text = short_trade.get("source")
+                    if short_source_text in {
+                        HistoricalFillSource.TRADE_PRINT.value,
+                        HistoricalFillSource.DAILY_CLOSE.value,
+                    }:
+                        short_source = HistoricalFillSource(short_source_text)
+                        try:
+                            short_evidence = _research_mark_evidence(
+                                short_ticker,
+                                td,
+                                short_source,
+                                short_trade["price"],
+                                event_timestamp_utc=short_trade.get("timestamp"),
+                                provider_route=(
+                                    f"/v3/trades/{short_ticker}"
+                                    if short_source is HistoricalFillSource.TRADE_PRINT
+                                    else "option_prices.close"
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            short_evidence = None
+                    else:
+                        short_evidence = None
+                    if short_evidence is not None:
                         theo_long = await client.fetch_theoretical_price(
                             long_ticker,
                             short_ticker,
-                            short_p,
+                            short_evidence.mid,
                             spot,
                             td,
                             dte_years,
                             risk_free_rate=risk_free_rate,
+                            option_type=(
+                                trade.option_type or "put"
+                            ).lower(),
                             dividend_yield=dividend_yield,
                         )
-                        if theo_long is not None:
-                            current_short_mid = short_p
-                            current_long_mid = theo_long
-                            print(f"  [THEO FALLBACK] Extrapolated {long_ticker} from {short_ticker} trade (${short_p}) on {td}")
-                        else:
-                            current_short_mid = short_p
-                            current_long_mid = long_cached.get("close", 0) if long_cached else 0
-                    else:
-                        current_short_mid = short_cached.get("close", 0) if short_cached else 0
-                        current_long_mid = long_cached.get("close", 0) if long_cached else 0
+                        try:
+                            if theo_long is not None:
+                                long_evidence = _research_mark_evidence(
+                                    long_ticker,
+                                    td,
+                                    HistoricalFillSource.THEORETICAL,
+                                    theo_long,
+                                    provider_route=(
+                                        "black_scholes_from_reference/"
+                                        f"{short_ticker}"
+                                    ),
+                                )
+                            else:
+                                long_close = (
+                                    long_cached.get("close")
+                                    if long_cached
+                                    else None
+                                )
+                                long_evidence = _research_mark_evidence(
+                                    long_ticker,
+                                    td,
+                                    HistoricalFillSource.DAILY_CLOSE,
+                                    long_close,
+                                    provider_route="option_prices.close",
+                                )
+                        except (TypeError, ValueError):
+                            long_evidence = None
+                        if long_evidence is not None:
+                            fill_evidence = (
+                                short_evidence,
+                                long_evidence,
+                            )
+                            print(
+                                f"  [THEORETICAL RESEARCH FALLBACK] "
+                                f"{short_ticker}/{long_ticker} on {td}"
+                            )
 
-                    if not current_short_mid or not current_long_mid:
-                        reason = "Missing NBBO Quote & No Sync 1m Bars & No Theo Fallback"
-                        abnormalities.append({
-                            "date": td,
-                            "type": "MISSING_NBBO_QUOTE",
-                            "reason": reason,
-                            "short_ticker": short_ticker,
-                            "long_ticker": long_ticker,
-                            "fallback": "OHLCV Close (Unsynchronized)",
-                        })
-                        print(f"{CLR_RED}  [DATA GAP] {reason} on {td}. Falling back to unsynchronized OHLCV Close.{CLR_RST}")
-
-                    if not current_short_mid or not current_long_mid:
-                        reason_crit = "Total Data Gap (Quote + OHLCV + Theo)"
-                        abnormalities.append({
-                            "date": td,
-                            "type": "CRITICAL_DATA_GAP",
-                            "reason": reason_crit,
-                            "short_ticker": short_ticker,
-                            "long_ticker": long_ticker,
-                            "fallback": "Entry Mid",
-                        })
-                        print(f"{CLR_RED}  [CRITICAL GAP] {reason_crit} on {td}. Falling back to Entry Mid.{CLR_RST}")
-                        current_short_mid = trade.short_entry_mid
-                        current_long_mid = trade.long_entry_mid
-
-            if far_long_ticker:
-                if far_long_quote:
-                    current_far_long_mid = far_long_quote.get("mid", 0.0) or 0.0
-                elif far_long_cached:
-                    current_far_long_mid = far_long_cached.get("close", 0.0) or 0.0
-                else:
-                    current_far_long_mid = trade.far_long_entry_mid
+            mark_available = fill_evidence is not None
+            if fill_evidence is not None:
+                fill_diagnostics = _fill_path_diagnostics(
+                    fill_evidence,
+                    phase="exit",
+                    pricing_date=td,
+                    fill_mode=exit_fill_mode,
+                    max_time_delta_minutes=max_time_delta_minutes,
+                    max_quote_age_minutes=max_quote_age_minutes,
+                )
+                if strict_exit_mark_mode and not fill_diagnostics[
+                    "strict_nbbo_mark_validated"
+                ]:
+                    mark_available = False
+                short_quote = fill_evidence[0]
+                long_quote = fill_evidence[1]
+                far_long_quote = (
+                    fill_evidence[2] if far_long_ticker else None
+                )
+                if all(
+                    item.source
+                    is HistoricalFillSource.SYNCHRONIZED_MINUTE_AGGREGATE
+                    for item in fill_evidence
+                ):
+                    sync_quotes = fill_evidence
+                current_short_mid = short_quote.mid
+                current_long_mid = long_quote.mid
+                current_far_long_mid = (
+                    far_long_quote.mid if far_long_quote is not None else 0.0
+                )
+                current_debit = _adjust_exit_debit(
+                    current_short_mid,
+                    short_quote.bid,
+                    short_quote.ask,
+                    current_long_mid,
+                    long_quote.bid,
+                    long_quote.ask,
+                    slippage_model,
+                )
             else:
-                current_far_long_mid = 0.0
-
-            if short_quote and long_quote:
-                s_mid = current_short_mid
-                s_bid = short_quote.get("bid", s_mid)
-                s_ask = short_quote.get("ask", s_mid)
-                l_mid = current_long_mid
-                l_bid = long_quote.get("bid", l_mid)
-                l_ask = long_quote.get("ask", l_mid)
-                current_debit = _adjust_exit_debit(s_mid, s_bid, s_ask, l_mid, l_bid, l_ask, slippage_model)
-            elif sync_quotes:
-                s_mid = current_short_mid
-                s_bid = sync_quotes[0].get("bid", s_mid)
-                s_ask = sync_quotes[0].get("ask", s_mid)
-                l_mid = current_long_mid
-                l_bid = sync_quotes[1].get("bid", l_mid)
-                l_ask = sync_quotes[1].get("ask", l_mid)
-                current_debit = _adjust_exit_debit(s_mid, s_bid, s_ask, l_mid, l_bid, l_ask, slippage_model)
-            else:
+                short_quote = None
+                long_quote = None
+                far_long_quote = None
+                current_short_mid = trade.short_entry_mid
+                current_long_mid = trade.long_entry_mid
+                current_far_long_mid = (
+                    trade.far_long_entry_mid if far_long_ticker else 0.0
+                )
                 current_debit = current_short_mid - current_long_mid
+                fill_diagnostics = {
+                    "schema_version": 1,
+                    "phase": "exit",
+                    "pricing_date": td,
+                    "fill_mode": exit_fill_mode,
+                    "tickers": list(fill_tickers),
+                    "sources": [],
+                    "timestamps_utc": [],
+                    "temporally_synchronized": False,
+                    "strict_nbbo_mark_validated": False,
+                    "strict_nbbo_authorized": False,
+                    "strict_nbbo_authorized_deprecated": (
+                        "Historical NBBO validates a mark, not execution."
+                    ),
+                    "execution_assumption": (
+                        "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+                    ),
+                    "configured_max_delta_minutes": max_time_delta_minutes,
+                    "configured_max_quote_age_minutes": (
+                        max_quote_age_minutes
+                    ),
+                    "strict_rejection_reasons": [
+                        "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE"
+                    ],
+                    "available": False,
+                    "reason": "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE",
+                    "provider_proof": (
+                        "NO_RAW_PROVIDER_BYTES_RETAINED"
+                    ),
+                }
+                abnormalities.append(
+                    {
+                        "date": td,
+                        "type": "HISTORICAL_MARK_UNAVAILABLE",
+                        "reason": fill_diagnostics["reason"],
+                        "short_ticker": short_ticker,
+                        "long_ticker": long_ticker,
+                        "far_long_ticker": far_long_ticker or None,
+                        "fallback": "ENTRY_MARK_FOR_VALUATION_ONLY_NO_EXIT",
+                    }
+                )
+                print(
+                    f"{CLR_RED}  [MARK UNAVAILABLE] No complete "
+                    f"{exit_fill_mode} mark bundle for {fill_tickers} on "
+                    f"{td}; no non-expiration exit may use the valuation "
+                    f"mark.{CLR_RST}"
+                )
             if far_long_ticker:
-                current_debit -= current_far_long_mid
+                current_debit -= _adjust_long_exit_credit(
+                    current_far_long_mid,
+                    (
+                        far_long_quote.bid
+                        if far_long_quote is not None
+                        else None
+                    ),
+                    (
+                        far_long_quote.ask
+                        if far_long_quote is not None
+                        else None
+                    ),
+                    slippage_model,
+                )
 
             gain_pct = (trade.net_credit - current_debit) / trade.net_credit if trade.net_credit > 0 else 0
             current_trade_pnl_dollars = (trade.net_credit - current_debit) * 100 * trade.num_contracts
@@ -1788,6 +2182,9 @@ async def run_put_credit_spread_backtest(
                 "current_trade_pnl_dollars": current_trade_pnl_dollars,
                 "pair_key": pair_key,
                 "current_dte": current_dte,
+                "mark_available": mark_available,
+                "fill_evidence": fill_evidence,
+                "fill_diagnostics": fill_diagnostics,
                 "abnormalities": abnormalities,
             }
 
@@ -1885,15 +2282,18 @@ async def run_put_credit_spread_backtest(
                     # Update memory cache to include newly fetched bars
                     cache.set_daily_memory_cache(td, list(unique_tickers))
                 
-                # Phase B: Now fetch EOD quotes (which can hit the newly cached daily bars instantaneously!)
-                quote_tasks = {ticker: client.fetch_eod_quote(ticker, td) for ticker in unique_tickers}
-                quote_results = await asyncio.gather(*quote_tasks.values(), return_exceptions=True)
-                quotes_map = dict(zip(quote_tasks.keys(), quote_results))
+                # Multi-leg fills are fetched inside each trade context. A
+                # contract-by-contract prefetch cannot prove pairwise timing
+                # and would let independently selected end-of-day rows appear
+                # synchronized.
                 
             print(f"  {td}: [FETCH] Data pre-fetched.", flush=True)
 
-            sync_quote_tasks = {}
             latest_trade_tasks = {}
+            fill_bundle_tasks: Dict[
+                Tuple[Tuple[str, ...], bool, float, float],
+                asyncio.Task,
+            ] = {}
             curr_dt = datetime.strptime(td, "%Y-%m-%d")
             trade_context_specs = []
             for trade in active_trades:
@@ -1925,6 +2325,9 @@ async def run_put_credit_spread_backtest(
                 exit_reason = ""
                 profit_exit_candidate = False
                 profit_exit_snapshot = None
+                replacement_request_count_before_trade = len(
+                    replacement_requests
+                )
 
                 if isinstance(trade_context, Exception):
                     print(f"  {td}: [CONTEXT ERROR] {trade_context}")
@@ -1947,6 +2350,45 @@ async def run_put_credit_spread_backtest(
                         "gain_pct": 0.0,
                         "current_trade_pnl_dollars": 0.0,
                         "pair_key": (trade.entry_date, trade.expiration),
+                        "mark_available": False,
+                        "fill_evidence": None,
+                        "fill_diagnostics": {
+                            "schema_version": 1,
+                            "phase": "exit",
+                            "pricing_date": td,
+                            "fill_mode": exit_fill_mode,
+                            "tickers": [
+                                trade.short_ticker,
+                                trade.long_ticker,
+                            ] + (
+                                [trade.far_long_ticker]
+                                if trade.far_long_ticker
+                                else []
+                            ),
+                            "sources": [],
+                            "timestamps_utc": [],
+                            "temporally_synchronized": False,
+                            "strict_nbbo_mark_validated": False,
+                            "strict_nbbo_authorized": False,
+                            "strict_nbbo_authorized_deprecated": (
+                                "Historical NBBO validates a mark, not "
+                                "execution."
+                            ),
+                            "execution_assumption": (
+                                "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+                            ),
+                            "configured_max_delta_minutes": (
+                                max_time_delta_minutes
+                            ),
+                            "configured_max_quote_age_minutes": (
+                                max_quote_age_minutes
+                            ),
+                            "strict_rejection_reasons": [
+                                "TRADE_CONTEXT_RESOLUTION_FAILED"
+                            ],
+                            "available": False,
+                            "reason": "TRADE_CONTEXT_RESOLUTION_FAILED",
+                        },
                         "abnormalities": [{
                             "date": td,
                             "type": "CRITICAL_DATA_GAP",
@@ -1974,14 +2416,63 @@ async def run_put_credit_spread_backtest(
                 gain_pct = trade_context["gain_pct"]
                 current_trade_pnl_dollars = trade_context["current_trade_pnl_dollars"]
                 pair_key = trade_context["pair_key"]
+                exit_mark_available = bool(
+                    trade_context.get("mark_available", False)
+                )
+                exit_fill_diagnostics = trade_context.get(
+                    "fill_diagnostics",
+                    {},
+                )
+                if current_dte != 0:
+                    result.fill_diagnostics.append(
+                        {
+                            **exit_fill_diagnostics,
+                            "trade_id": trade.trade_id,
+                        }
+                    )
 
-                for abnormality in trade_context.get("abnormalities", []):
-                    result.abnormalities.append(abnormality)
-                    daily_events.append({"type": "abnormality", **abnormality})
-                    if abnormality.get("type") == "CRITICAL_DATA_GAP":
-                        result.critical_gap_count += 1
-                    else:
-                        result.data_gap_count += 1
+                    for abnormality in trade_context.get(
+                        "abnormalities",
+                        [],
+                    ):
+                        result.abnormalities.append(abnormality)
+                        daily_events.append(
+                            {"type": "abnormality", **abnormality}
+                        )
+                        if abnormality.get("type") == "CRITICAL_DATA_GAP":
+                            result.critical_gap_count += 1
+                        else:
+                            result.data_gap_count += 1
+
+                if not exit_mark_available and current_dte != 0:
+                    still_active.append(trade)
+                    daily_total_unrealized += (
+                        current_debit * 100 * trade.num_contracts
+                    )
+                    daily_events.append(
+                        {
+                            "type": "exit_skipped",
+                            "reason": "NO_VALIDATED_HISTORICAL_MARK",
+                            "trade_id": trade.trade_id,
+                            "fill_diagnostics": exit_fill_diagnostics,
+                        }
+                    )
+                    if short_cached and long_cached:
+                        itm = (
+                            spot > trade.short_strike
+                            if (trade.option_type or "put").lower() == "call"
+                            else spot < trade.short_strike
+                        )
+                        result.daily_scatter_data.append(
+                            {
+                                "date": td,
+                                "val": current_debit * 100,
+                                "itm": itm,
+                                "expiration": trade.expiration,
+                                "is_exit": False,
+                            }
+                        )
+                    continue
 
                 if (
                     call_side_enabled
@@ -2045,6 +2536,7 @@ async def run_put_credit_spread_backtest(
                                         "current_debit": current_debit,
                                         "current_dte": current_dte,
                                         "current_trade_pnl_dollars": current_trade_pnl_dollars,
+                                        "exit_fill_diagnostics": exit_fill_diagnostics,
                                     }
                                 else:
                                     exit_triggered = True
@@ -2138,58 +2630,198 @@ async def run_put_credit_spread_backtest(
 
                 # Expiration exit (always check)
                 if current_dte == 0:
-                    # On expiration day, the value is simply the intrinsic value.
-                    # This prevents false "max loss" results due to missing EOD quotes.
+                    # DTE-0 research marking takes precedence over any earlier
+                    # scheduled/panic decision. Discard any replacement request
+                    # produced by those non-expiration rules for this trade.
+                    del replacement_requests[
+                        replacement_request_count_before_trade:
+                    ]
+                    # Research-only close mark. The contract settlement style
+                    # and official settlement reference are not provider
+                    # verified; same-day underlying close is especially unsafe
+                    # for AM-settled index options such as some SPX series.
                     if (trade.option_type or "put").lower() == "call":
                         intrinsic_short = max(0, spot - trade.short_strike)
                         intrinsic_long = max(0, spot - trade.long_strike)
+                        intrinsic_far_long = (
+                            max(0, spot - trade.far_long_strike)
+                            if trade.far_long_ticker
+                            else 0.0
+                        )
                     else:
                         intrinsic_short = max(0, trade.short_strike - spot)
                         intrinsic_long = max(0, trade.long_strike - spot)
+                        intrinsic_far_long = (
+                            max(0, trade.far_long_strike - spot)
+                            if trade.far_long_ticker
+                            else 0.0
+                        )
                     
                     current_short_mid = intrinsic_short
                     current_long_mid = intrinsic_long
-                    current_debit = intrinsic_short - intrinsic_long
+                    current_far_long_mid = intrinsic_far_long
+                    current_debit = (
+                        intrinsic_short
+                        - intrinsic_long
+                        - intrinsic_far_long
+                    )
+                    gain_pct = (
+                        (trade.net_credit - current_debit) / trade.net_credit
+                        if trade.net_credit > 0
+                        else 0
+                    )
+                    current_trade_pnl_dollars = (
+                        (trade.net_credit - current_debit)
+                        * 100
+                        * trade.num_contracts
+                    )
+                    exit_fill_diagnostics = {
+                        "schema_version": 1,
+                        "phase": "exit",
+                        "pricing_date": td,
+                        "fill_mode": "research_expiration_close_mark",
+                        "pricing_method": (
+                            "EXPIRATION_CLOSE_MARK_RESEARCH_ONLY"
+                        ),
+                        "settlement_claimed": False,
+                        "settlement_style": "UNVERIFIED",
+                        "settlement_reference": (
+                            "UNDERLYING_SAME_DAY_CLOSE_RESEARCH_PROXY"
+                        ),
+                        "am_settlement_risk": underlying.upper() in {
+                            "SPX",
+                            "NDX",
+                            "RUT",
+                        },
+                        "tickers": [
+                            trade.short_ticker,
+                            trade.long_ticker,
+                        ] + (
+                            [trade.far_long_ticker]
+                            if trade.far_long_ticker
+                            else []
+                        ),
+                        "sources": [],
+                        "timestamps_utc": [],
+                        "temporally_synchronized": None,
+                        "strict_nbbo_mark_validated": False,
+                        "strict_nbbo_authorized": False,
+                        "strict_nbbo_authorized_deprecated": (
+                            "Historical NBBO validates a mark, not execution."
+                        ),
+                        "execution_assumption": (
+                            "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+                        ),
+                        "configured_max_delta_minutes": (
+                            max_time_delta_minutes
+                        ),
+                        "configured_max_quote_age_minutes": (
+                            max_quote_age_minutes
+                        ),
+                        "strict_rejection_reasons": [
+                            "EXPIRATION_SETTLEMENT_REFERENCE_UNVERIFIED"
+                        ],
+                        "raw_provider_bytes_retained": False,
+                    }
+                    result.fill_diagnostics.append(
+                        {
+                            **exit_fill_diagnostics,
+                            "trade_id": trade.trade_id,
+                        }
+                    )
+                    expiration_abnormality = {
+                        "date": td,
+                        "type": (
+                            "CRITICAL_EXPIRATION_REFERENCE_UNVERIFIED"
+                        ),
+                        "reason": (
+                            "Contract settlement style and official "
+                            "settlement reference were not verified"
+                        ),
+                        "trade_id": trade.trade_id,
+                        "underlying": underlying,
+                        "fallback": (
+                            "UNDERLYING_SAME_DAY_CLOSE_RESEARCH_PROXY"
+                        ),
+                    }
+                    result.abnormalities.append(expiration_abnormality)
+                    daily_events.append(
+                        {
+                            "type": "abnormality",
+                            **expiration_abnormality,
+                        }
+                    )
+                    result.critical_gap_count += 1
                     
-                    if not exit_triggered:
-                        exit_triggered = True
-                        exit_reason = "expired"
-                        if (
-                            rolling_enabled
-                            and (
-                                (getattr(trade, "is_roll", False) and repeat_roll_itm_at_expiration)
-                                or (not getattr(trade, "is_roll", False) and rolling_config.get("roll_at_expiration", False))
+                    exit_triggered = True
+                    exit_reason = "expiration_close_mark_research_only"
+                    if (
+                        rolling_enabled
+                        and (
+                            (
+                                getattr(trade, "is_roll", False)
+                                and repeat_roll_itm_at_expiration
                             )
-                            and (
-                                spot >= trade.short_strike
-                                if (trade.option_type or "put").lower() == "call"
-                                else spot <= trade.short_strike
-                            )
-                        ):
-                            import math
-                            roll_qty = max(1, math.ceil(trade.num_contracts / 2))
-                            if roll_strike_behavior == "follow_underlying":
-                                roll_width = spread_width * roll_spread_width_multiplier
-                            else:
-                                roll_width = (trade.short_strike - trade.long_strike) * roll_spread_width_multiplier
-                            print(
-                                f"  {td}: [ROLL REQUEST (ITM at expiration)] "
-                                f"{trade.num_contracts}x {trade.short_strike}/{trade.long_strike}p -> "
-                                f"Roll to {roll_qty}x with ATM Long Leg, width=${roll_width:.0f}"
-                            )
-                            replacement_requests.append(
-                                _build_roll_request(
-                                    trade=trade,
-                                    current_trade_pnl_dollars=current_trade_pnl_dollars,
-                                    reason="roll_itm_expired",
-                                    spot=spot,
-                                    roll_strike_behavior=roll_strike_behavior,
-                                    roll_dte_multiplier=roll_dte_multiplier,
-                                    num_contracts=roll_qty,
-                                    spread_width_override=roll_width,
+                            or (
+                                not getattr(trade, "is_roll", False)
+                                and rolling_config.get(
+                                    "roll_at_expiration",
+                                    False,
                                 )
                             )
-                            exit_reason = "roll_itm_expired"
+                        )
+                        and (
+                            spot >= trade.short_strike
+                            if (trade.option_type or "put").lower() == "call"
+                            else spot <= trade.short_strike
+                        )
+                    ):
+                        import math
+                        roll_qty = max(
+                            1,
+                            math.ceil(trade.num_contracts / 2),
+                        )
+                        if roll_strike_behavior == "follow_underlying":
+                            roll_width = (
+                                spread_width
+                                * roll_spread_width_multiplier
+                            )
+                        else:
+                            roll_width = (
+                                trade.short_strike - trade.long_strike
+                            ) * roll_spread_width_multiplier
+                        print(
+                            f"  {td}: [ROLL REQUEST (expiration close "
+                            f"mark; settlement unverified)] "
+                            f"{trade.num_contracts}x "
+                            f"{trade.short_strike}/{trade.long_strike}p -> "
+                            f"Roll to {roll_qty}x with ATM Long Leg, "
+                            f"width=${roll_width:.0f}"
+                        )
+                        replacement_requests.append(
+                            _build_roll_request(
+                                trade=trade,
+                                current_trade_pnl_dollars=(
+                                    current_trade_pnl_dollars
+                                ),
+                                reason=(
+                                    "roll_itm_expiration_close_mark_"
+                                    "research_only"
+                                ),
+                                spot=spot,
+                                roll_strike_behavior=(
+                                    roll_strike_behavior
+                                ),
+                                roll_dte_multiplier=(
+                                    roll_dte_multiplier
+                                ),
+                                num_contracts=roll_qty,
+                                spread_width_override=roll_width,
+                            )
+                        )
+                        exit_reason = (
+                            "roll_itm_expiration_close_mark_research_only"
+                        )
                     
                 if exit_triggered:
                     if call_side_enabled and (trade.option_type or "put").lower() == "put":
@@ -2219,6 +2851,7 @@ async def run_put_credit_spread_backtest(
                         long_quote=long_quote,
                         far_long_quote=far_long_quote,
                         sync_quotes=sync_quotes,
+                        exit_fill_diagnostics=exit_fill_diagnostics,
                     )
                     if (trade.option_type or "put").lower() == "call":
                         paired_call_exit_requests.pop(pair_key, None)
@@ -2380,6 +3013,9 @@ async def run_put_credit_spread_backtest(
                             current_debit=candidate["current_debit"],
                             current_dte=candidate["current_dte"],
                             exit_reason="early_profit",
+                            exit_fill_diagnostics=candidate[
+                                "exit_fill_diagnostics"
+                            ],
                         )
                 print(
                     f"  {td}: [EXIT CAP] Closed {len(selected_candidates)} high-PnL profit candidates "
@@ -2847,103 +3483,274 @@ async def run_put_credit_spread_backtest(
                                 if not short_ticker or not long_ticker:
                                     continue
 
-                                quote_tasks = [
-                                    client.fetch_eod_quote(short_ticker, td, allow_trade_fallback=not require_entry_nbbo),
-                                    client.fetch_eod_quote(long_ticker, td, allow_trade_fallback=not require_entry_nbbo),
-                                ]
-                                if far_long_requested and far_long_ticker:
-                                    quote_tasks.append(
-                                        client.fetch_eod_quote(far_long_ticker, td, allow_trade_fallback=not require_entry_nbbo)
+                                entry_tickers = (
+                                    (
+                                        short_ticker,
+                                        long_ticker,
+                                        far_long_ticker,
                                     )
-                                quote_results = await asyncio.gather(*quote_tasks, return_exceptions=True)
-                                short_entry_quote = quote_results[0]
-                                long_entry_quote = quote_results[1]
-                                far_long_entry_quote = quote_results[2] if len(quote_results) > 2 else None
-                                if isinstance(short_entry_quote, Exception): short_entry_quote = None
-                                if isinstance(long_entry_quote, Exception): long_entry_quote = None
-                                if isinstance(far_long_entry_quote, Exception): far_long_entry_quote = None
-                                sync_quotes = None
-                                entry_priced = False
-                                if short_entry_quote and long_entry_quote:
-                                    short_mid = short_entry_quote["mid"]
-                                    short_bid = short_entry_quote.get("bid", short_mid)
-                                    short_ask = short_entry_quote.get("ask", short_mid)
-                                    long_mid = long_entry_quote["mid"]
-                                    long_bid = long_entry_quote.get("bid", long_mid)
-                                    long_ask = long_entry_quote.get("ask", long_mid)
-                                    net_credit = _adjust_entry_credit(short_mid, short_bid, short_ask, long_mid, long_bid, long_ask, slippage_model)
-                                    entry_priced = True
-                                    source_label = _pricing_source_label(short_entry_quote, long_entry_quote)
-                                    if offset > 0:
-                                        print(f"  [ENTRY {source_label} FALLBACK] {source_label} pricing found for fallback strike {short_strike}/{long_strike} on {td}: Short=${short_mid}, Long=${long_mid}, Net=${net_credit:.2f}")
-                                    else:
-                                        print(f"  [ENTRY {source_label}] {source_label} pricing found for {td}: Short=${short_mid}, Long=${long_mid}, Net=${net_credit:.2f}")
-                                elif require_entry_nbbo:
-                                    print(f"  {td}: [ENTRY FAILED] Missing strict NBBO quote for {short_strike}/{long_strike}p")
-                                    continue
-                                else:
-                                    sync_quotes = await client.fetch_synchronized_ohlcv(short_ticker, long_ticker, td, max_time_delta_minutes=max_time_delta_minutes)
-                                
-                                if sync_quotes:
-                                    short_mid = sync_quotes[0]["mid"]
-                                    short_bid = sync_quotes[0].get("bid", short_mid)
-                                    short_ask = sync_quotes[0].get("ask", short_mid)
-                                    long_mid = sync_quotes[1]["mid"]
-                                    long_bid = sync_quotes[1].get("bid", long_mid)
-                                    long_ask = sync_quotes[1].get("ask", long_mid)
-                                    net_credit = _adjust_entry_credit(short_mid, short_bid, short_ask, long_mid, long_bid, long_ask, slippage_model)
-                                    entry_priced = True
-                                    if offset > 0:
-                                        print(f"  [ENTRY SYNC FALLBACK] Synchronized pricing found for fallback strike {short_strike}/{long_strike} on {td}: Short=${short_mid}, Long=${long_mid}, Net=${net_credit:.2f}")
-                                    else:
-                                        print(f"  [ENTRY SYNC] Synchronized pricing found for {td}: Short=${short_mid}, Long=${long_mid}, Net=${net_credit:.2f}")
-                                if not entry_priced:
-                                    # THEO FALLBACK for Entry
-                                    short_trade = await client.fetch_latest_trade(short_ticker, td)
-                                    if short_trade:
-                                        short_p = short_trade["price"]
-                                        theo_long = await client.fetch_theoretical_price(
-                                            long_ticker, short_ticker, short_p, spot, td, dte_years, risk_free_rate=risk_free_rate
+                                    if far_long_requested
+                                    else (short_ticker, long_ticker)
+                                )
+                                entry_evidence = (
+                                    await client.fetch_multileg_eod_marks(
+                                        entry_tickers,
+                                        td,
+                                        strict_nbbo=strict_entry_mark_mode,
+                                        max_time_delta_minutes=(
+                                            max_time_delta_minutes
+                                        ),
+                                        max_quote_age_minutes=(
+                                            max_quote_age_minutes
+                                        ),
+                                    )
+                                )
+
+                                # Theory is an explicitly labeled research
+                                # fallback for a two-leg vertical only. A
+                                # far-long trade must price all three legs from
+                                # one complete typed bundle.
+                                if (
+                                    entry_evidence is None
+                                    and not strict_entry_mark_mode
+                                    and not far_long_requested
+                                ):
+                                    short_trade = (
+                                        await client.fetch_latest_trade(
+                                            short_ticker,
+                                            td,
                                         )
-                                        long_mid = theo_long if theo_long is not None else (long_cached.get("close", 0) if long_cached else 0)
-                                        if not long_mid:
-                                            print(
-                                                f"  [ENTRY THEO FAILED] Unable to derive a fallback price for {long_ticker} "
-                                                f"from {short_ticker} on {td}; skipping {short_strike}/{long_strike}."
+                                    )
+                                    short_evidence = None
+                                    if short_trade and short_trade.get(
+                                        "source"
+                                    ) in {
+                                        HistoricalFillSource.TRADE_PRINT.value,
+                                        HistoricalFillSource.DAILY_CLOSE.value,
+                                    }:
+                                        short_source = HistoricalFillSource(
+                                            short_trade["source"]
+                                        )
+                                        try:
+                                            short_evidence = (
+                                                _research_mark_evidence(
+                                                    short_ticker,
+                                                    td,
+                                                    short_source,
+                                                    short_trade["price"],
+                                                    event_timestamp_utc=(
+                                                        short_trade.get(
+                                                            "timestamp"
+                                                        )
+                                                    ),
+                                                    provider_route=(
+                                                        f"/v3/trades/{short_ticker}"
+                                                        if short_source
+                                                        is HistoricalFillSource.TRADE_PRINT
+                                                        else "option_prices.close"
+                                                    ),
+                                                )
                                             )
-                                            continue
-                                        short_mid = short_p
-                                        net_credit = short_mid - long_mid
-                                        if theo_long is not None:
-                                            if offset > 0:
-                                                print(f"  [ENTRY THEO FALLBACK] Extrapolated {long_ticker} from {short_ticker} trade (${short_p}) on {td} at fallback strike {short_strike}/{long_strike}: Net=${net_credit:.2f}")
+                                        except (TypeError, ValueError):
+                                            short_evidence = None
+                                    if short_evidence is not None:
+                                        theo_long = (
+                                            await client.fetch_theoretical_price(
+                                                long_ticker,
+                                                short_ticker,
+                                                short_evidence.mid,
+                                                spot,
+                                                td,
+                                                dte_years,
+                                                risk_free_rate=(
+                                                    risk_free_rate
+                                                ),
+                                                option_type="put",
+                                            )
+                                        )
+                                        long_evidence = None
+                                        try:
+                                            if theo_long is not None:
+                                                long_evidence = (
+                                                    _research_mark_evidence(
+                                                        long_ticker,
+                                                        td,
+                                                        HistoricalFillSource.THEORETICAL,
+                                                        theo_long,
+                                                        provider_route=(
+                                                            "black_scholes_from_reference/"
+                                                            f"{short_ticker}"
+                                                        ),
+                                                    )
+                                                )
                                             else:
-                                                print(f"  [ENTRY THEO] Extrapolated {long_ticker} from {short_ticker} trade (${short_p}) on {td}: Net=${net_credit:.2f}")
-                                        else:
-                                            print(
-                                                f"  [ENTRY THEO FALLBACK] Used {short_ticker} trade (${short_p}) and cached "
-                                                f"close for {long_ticker} on {td}: Net=${net_credit:.2f}"
+                                                long_row = next(
+                                                    (
+                                                        row
+                                                        for row in chain_data
+                                                        if abs(
+                                                            row["strike"]
+                                                            - long_strike
+                                                        )
+                                                        < 0.01
+                                                        and _row_matches_contract_type(
+                                                            row,
+                                                            "put",
+                                                        )
+                                                    ),
+                                                    None,
+                                                )
+                                                long_evidence = (
+                                                    _research_mark_evidence(
+                                                        long_ticker,
+                                                        td,
+                                                        HistoricalFillSource.DAILY_CLOSE,
+                                                        (
+                                                            long_row.get(
+                                                                "close"
+                                                            )
+                                                            if long_row
+                                                            else None
+                                                        ),
+                                                        provider_route=(
+                                                            "option_prices.close"
+                                                        ),
+                                                    )
+                                                )
+                                        except (TypeError, ValueError):
+                                            long_evidence = None
+                                        if long_evidence is not None:
+                                            entry_evidence = (
+                                                short_evidence,
+                                                long_evidence,
                                             )
-                                    else:
-                                        print(
-                                            f"  [ENTRY THEO FAILED] No latest trade for {short_ticker} on {td}; "
-                                            f"skipping {short_strike}/{long_strike}."
-                                        )
-                                        continue
+
+                                if entry_evidence is None:
+                                    failed_diagnostics = {
+                                        "schema_version": 1,
+                                        "phase": "entry",
+                                        "pricing_date": td,
+                                        "fill_mode": entry_fill_mode,
+                                        "tickers": list(entry_tickers),
+                                        "sources": [],
+                                        "timestamps_utc": [],
+                                        "temporally_synchronized": False,
+                                        "strict_nbbo_mark_validated": False,
+                                        "strict_nbbo_authorized": False,
+                                        "strict_nbbo_authorized_deprecated": (
+                                            "Historical NBBO validates a mark, "
+                                            "not execution."
+                                        ),
+                                        "execution_assumption": (
+                                            "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+                                        ),
+                                        "configured_max_delta_minutes": (
+                                            max_time_delta_minutes
+                                        ),
+                                        "configured_max_quote_age_minutes": (
+                                            max_quote_age_minutes
+                                        ),
+                                        "strict_rejection_reasons": [
+                                            "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE"
+                                        ],
+                                        "available": False,
+                                        "reason": (
+                                            "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE"
+                                        ),
+                                    }
+                                    result.fill_diagnostics.append(
+                                        failed_diagnostics
+                                    )
+                                    print(
+                                        f"  {td}: [ENTRY FAILED] No complete "
+                                        f"{entry_fill_mode} mark bundle "
+                                        f"for {entry_tickers}"
+                                    )
+                                    continue
+
+                                entry_fill_diagnostics = (
+                                    _fill_path_diagnostics(
+                                        entry_evidence,
+                                        phase="entry",
+                                        pricing_date=td,
+                                        fill_mode=entry_fill_mode,
+                                        max_time_delta_minutes=(
+                                            max_time_delta_minutes
+                                        ),
+                                        max_quote_age_minutes=(
+                                            max_quote_age_minutes
+                                        ),
+                                    )
+                                )
+                                if (
+                                    strict_entry_mark_mode
+                                    and not entry_fill_diagnostics[
+                                        "strict_nbbo_mark_validated"
+                                    ]
+                                ):
+                                    result.fill_diagnostics.append(
+                                        entry_fill_diagnostics
+                                    )
+                                    print(
+                                        f"  {td}: [ENTRY FAILED] Strict NBBO "
+                                        f"bundle did not pass temporal "
+                                        f"validation for {entry_tickers}"
+                                    )
+                                    continue
+                                result.fill_diagnostics.append(
+                                    entry_fill_diagnostics
+                                )
+                                short_entry_quote = entry_evidence[0]
+                                long_entry_quote = entry_evidence[1]
+                                far_long_entry_quote = (
+                                    entry_evidence[2]
+                                    if far_long_requested
+                                    else None
+                                )
+                                short_mid = short_entry_quote.mid
+                                long_mid = long_entry_quote.mid
+                                short_bid = short_entry_quote.bid
+                                short_ask = short_entry_quote.ask
+                                long_bid = long_entry_quote.bid
+                                long_ask = long_entry_quote.ask
+                                net_credit = _adjust_entry_credit(
+                                    short_mid,
+                                    short_bid,
+                                    short_ask,
+                                    long_mid,
+                                    long_bid,
+                                    long_ask,
+                                    slippage_model,
+                                )
+                                source_label = _pricing_source_label(
+                                    *entry_evidence
+                                )
+                                print(
+                                    f"  [ENTRY {source_label}] Pricing "
+                                    f"{short_strike}/{long_strike}"
+                                    f"{f'/{far_long_strike}' if far_long_requested else ''} "
+                                    f"on {td}: Short=${short_mid}, "
+                                    f"Long=${long_mid}, "
+                                    f"Net before far long=${net_credit:.2f}"
+                                )
 
                                 if far_long_requested:
-                                    if far_long_entry_quote:
-                                        far_long_mid = far_long_entry_quote["mid"]
-                                        if not entry_priced:
-                                            entry_priced = True
-                                        print(
-                                            f"  [ENTRY FAR LONG] Added 2x-width far long leg {far_long_strike}p "
-                                            f"for VIX {prev_vix:.2f}; mid=${far_long_mid:.2f}"
-                                        )
-                                    elif require_entry_nbbo:
-                                        print(f"  {td}: [ENTRY FAILED] Missing strict NBBO quote for far long {far_long_strike}p")
-                                        continue
-                                    net_credit -= far_long_mid
+                                    far_long_mid = (
+                                        far_long_entry_quote.mid
+                                    )
+                                    net_credit -= _adjust_long_entry_cost(
+                                        far_long_mid,
+                                        far_long_entry_quote.bid,
+                                        far_long_entry_quote.ask,
+                                        slippage_model,
+                                    )
+                                    print(
+                                        f"  [ENTRY FAR LONG] Added "
+                                        f"{far_long_strike}p for VIX "
+                                        f"{prev_vix:.2f}; "
+                                        f"{far_long_entry_quote.source.value} "
+                                        f"price=${far_long_mid:.2f}"
+                                    )
 
                                 if net_credit >= min_credit and net_credit < actual_spread_width:
                                     found_valid_strike_pair = True
@@ -3082,6 +3889,26 @@ async def run_put_credit_spread_backtest(
                                     profit_target=eff_profit_target,
                                     entry_delta=short_delta,
                                     is_roll=is_roll,
+                                    entry_fill_mode=entry_fill_mode,
+                                    entry_fill_sources=list(
+                                        entry_fill_diagnostics["sources"]
+                                    ),
+                                    entry_fill_timestamps_utc=list(
+                                        entry_fill_diagnostics[
+                                            "timestamps_utc"
+                                        ]
+                                    ),
+                                    entry_fill_temporally_synchronized=(
+                                        entry_fill_diagnostics[
+                                            "temporally_synchronized"
+                                        ]
+                                    ),
+                                    entry_fill_strict_nbbo_mark_validated=bool(
+                                        entry_fill_diagnostics[
+                                            "strict_nbbo_mark_validated"
+                                        ]
+                                    ),
+                                    entry_fill_strict_nbbo_authorized=False,
                                     trade_id=uuid.uuid4().hex[:8],
                                     root_trade_id=(req.get("root_trade_id") if req else None) or "",
                                     parent_trade_id=(req.get("parent_trade_id") if req else None) or "",
@@ -3135,6 +3962,7 @@ async def run_put_credit_spread_backtest(
                                         "parent_trade_id": trade.parent_trade_id,
                                         "roll_chain_depth": trade.roll_chain_depth,
                                         "roll_chain_realized_pnl_before_entry": trade.roll_chain_realized_pnl_before_entry,
+                                        "fill_diagnostics": entry_fill_diagnostics,
                                     })
 
                                 if call_side_enabled and not is_roll:
@@ -3231,25 +4059,96 @@ async def run_put_credit_spread_backtest(
                                                 call_net_credit = call_short_mid - call_long_mid
                                                 call_short_ticker = _find_ticker_for_strike(call_chain, call_short_strike, "call")
                                                 call_long_ticker = _find_ticker_for_strike(call_chain, call_long_strike, "call")
-
+                                                call_entry_evidence = None
+                                                call_entry_fill_diagnostics = None
                                                 if call_short_ticker and call_long_ticker:
-                                                    sync_quotes = await client.fetch_synchronized_ohlcv(call_short_ticker, call_long_ticker, td, max_time_delta_minutes=max_time_delta_minutes)
-                                                    if sync_quotes:
-                                                        call_short_mid = sync_quotes[0]["mid"] or 0.0
-                                                        call_long_mid = sync_quotes[1]["mid"] or 0.0
-                                                        call_short_bid = sync_quotes[0].get("bid", call_short_mid)
-                                                        call_short_ask = sync_quotes[0].get("ask", call_short_mid)
-                                                        call_long_bid = sync_quotes[1].get("bid", call_long_mid)
-                                                        call_long_ask = sync_quotes[1].get("ask", call_long_mid)
-                                                        call_net_credit = _adjust_entry_credit(
-                                                            call_short_mid, call_short_bid, call_short_ask,
-                                                            call_long_mid, call_long_bid, call_long_ask,
-                                                            slippage_model
+                                                    call_entry_evidence = await client.fetch_multileg_eod_marks(
+                                                        (
+                                                            call_short_ticker,
+                                                            call_long_ticker,
+                                                        ),
+                                                        td,
+                                                        strict_nbbo=strict_entry_mark_mode,
+                                                        max_time_delta_minutes=max_time_delta_minutes,
+                                                        max_quote_age_minutes=max_quote_age_minutes,
+                                                    )
+                                                    if call_entry_evidence:
+                                                        call_entry_fill_diagnostics = _fill_path_diagnostics(
+                                                            call_entry_evidence,
+                                                            phase="entry",
+                                                            pricing_date=td,
+                                                            fill_mode=entry_fill_mode,
+                                                            max_time_delta_minutes=max_time_delta_minutes,
+                                                            max_quote_age_minutes=max_quote_age_minutes,
                                                         )
-                                                        print(
-                                                            f"  [CALL ENTRY SYNC] Synchronized pricing found for {td}: "
-                                                            f"Short=${call_short_mid}, Long=${call_long_mid}, Net=${call_net_credit:.2f}"
-                                                        )
+                                                        if (
+                                                            strict_entry_mark_mode
+                                                            and not call_entry_fill_diagnostics[
+                                                                "strict_nbbo_mark_validated"
+                                                            ]
+                                                        ):
+                                                            call_entry_evidence = None
+                                                        else:
+                                                            call_short_mid = call_entry_evidence[0].mid
+                                                            call_long_mid = call_entry_evidence[1].mid
+                                                            call_short_bid = call_entry_evidence[0].bid
+                                                            call_short_ask = call_entry_evidence[0].ask
+                                                            call_long_bid = call_entry_evidence[1].bid
+                                                            call_long_ask = call_entry_evidence[1].ask
+                                                            call_net_credit = _adjust_entry_credit(
+                                                                call_short_mid,
+                                                                call_short_bid,
+                                                                call_short_ask,
+                                                                call_long_mid,
+                                                                call_long_bid,
+                                                                call_long_ask,
+                                                                slippage_model,
+                                                            )
+                                                            print(
+                                                                f"  [CALL ENTRY {_pricing_source_label(*call_entry_evidence)}] "
+                                                                f"Pricing found for {td}: Short=${call_short_mid}, "
+                                                                f"Long=${call_long_mid}, Net=${call_net_credit:.2f}"
+                                                            )
+
+                                                    if call_entry_evidence is None:
+                                                        call_entry_fill_diagnostics = {
+                                                            "schema_version": 1,
+                                                            "phase": "entry",
+                                                            "pricing_date": td,
+                                                            "fill_mode": entry_fill_mode,
+                                                            "tickers": [
+                                                                call_short_ticker,
+                                                                call_long_ticker,
+                                                            ],
+                                                            "sources": [],
+                                                            "timestamps_utc": [],
+                                                            "temporally_synchronized": False,
+                                                            "strict_nbbo_mark_validated": False,
+                                                            "strict_nbbo_authorized": False,
+                                                            "strict_nbbo_authorized_deprecated": (
+                                                                "Historical NBBO validates a "
+                                                                "mark, not execution."
+                                                            ),
+                                                            "execution_assumption": (
+                                                                "HISTORICAL_MARK_NOT_EXECUTABLE_FILL"
+                                                            ),
+                                                            "configured_max_delta_minutes": (
+                                                                max_time_delta_minutes
+                                                            ),
+                                                            "configured_max_quote_age_minutes": (
+                                                                max_quote_age_minutes
+                                                            ),
+                                                            "strict_rejection_reasons": [
+                                                                "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE"
+                                                            ],
+                                                            "available": False,
+                                                            "reason": (
+                                                                "NO_COMPLETE_EXPLICIT_MULTILEG_MARK_BUNDLE"
+                                                            ),
+                                                        }
+                                                    result.fill_diagnostics.append(
+                                                        call_entry_fill_diagnostics
+                                                    )
 
                                                 call_width_ok = _spread_width_within_tolerance(
                                                     actual_call_width,
@@ -3258,6 +4157,12 @@ async def run_put_credit_spread_backtest(
                                                 )
                                                 if not call_short_ticker or not call_long_ticker:
                                                     print(f"  {td}: [CALL ENTRY SKIPPED] Missing call tickers for {call_short_strike}/{call_long_strike}c")
+                                                elif call_entry_evidence is None:
+                                                    print(
+                                                        f"  {td}: [CALL ENTRY SKIPPED] No complete "
+                                                        f"{entry_fill_mode} mark bundle for "
+                                                        f"{call_short_ticker}/{call_long_ticker}"
+                                                    )
                                                 elif not call_width_ok:
                                                     print(
                                                         f"  {td}: [CALL ENTRY SKIPPED] Width ${actual_call_width:.2f} outside "
@@ -3300,6 +4205,28 @@ async def run_put_credit_spread_backtest(
                                                         entry_delta=call_short_delta,
                                                         is_roll=False,
                                                         hold_to_expiration=call_side_hold_to_expiration,
+                                                        entry_fill_mode=entry_fill_mode,
+                                                        entry_fill_sources=list(
+                                                            call_entry_fill_diagnostics[
+                                                                "sources"
+                                                            ]
+                                                        ),
+                                                        entry_fill_timestamps_utc=list(
+                                                            call_entry_fill_diagnostics[
+                                                                "timestamps_utc"
+                                                            ]
+                                                        ),
+                                                        entry_fill_temporally_synchronized=(
+                                                            call_entry_fill_diagnostics[
+                                                                "temporally_synchronized"
+                                                            ]
+                                                        ),
+                                                        entry_fill_strict_nbbo_mark_validated=bool(
+                                                            call_entry_fill_diagnostics[
+                                                                "strict_nbbo_mark_validated"
+                                                            ]
+                                                        ),
+                                                        entry_fill_strict_nbbo_authorized=False,
                                                         trade_id=uuid.uuid4().hex[:8],
                                                     )
                                                     candidate_call.root_trade_id = candidate_call.trade_id
@@ -3335,6 +4262,7 @@ async def run_put_credit_spread_backtest(
                                                                 "num_contracts": num_contracts,
                                                                 "trade_id": candidate_call.trade_id,
                                                                 "incremental_margin": float(incremental_margin),
+                                                                "fill_diagnostics": call_entry_fill_diagnostics,
                                                             })
                                 selection_retry = False
                                     
@@ -3393,6 +4321,15 @@ async def run_put_credit_spread_backtest(
                 "abnormalities": result.abnormalities,
                 "causal_validity": result.causal_validity,
                 "causal_validity_reasons": result.causal_validity_reasons,
+                "historical_fill_mode": result.historical_fill_mode,
+                "entry_fill_mode": result.entry_fill_mode,
+                "exit_fill_mode": result.exit_fill_mode,
+                "historical_execution_proven": (
+                    result.historical_execution_proven
+                ),
+                "max_time_delta_minutes": result.max_time_delta_minutes,
+                "max_quote_age_minutes": result.max_quote_age_minutes,
+                "fill_diagnostics": result.fill_diagnostics,
                 "contract_universe_manifest_sha256": (
                     result.contract_universe_manifest_sha256
                 ),
@@ -4538,8 +5475,19 @@ def _print_results(result: BacktestResult):
     print(f"  Cache Hit Rate:  {hit_rate:.1f}%")
     
     print(f"  ─────────────────────────────────────")
-    print(f"  NBBO Data Gaps:  {result.data_gap_count} (fell back to OHLCV)")
-    print(f"  Critical Gaps:   {result.critical_gap_count} (fell back to entry)")
+    print(f"  Mark Mode:       {result.historical_fill_mode}")
+    print(
+        f"  Mark Policies:   entry={result.entry_fill_mode}, "
+        f"exit={result.exit_fill_mode}"
+    )
+    print("  Execution Proof: none (historical marks only)")
+    print(
+        "  Fill Limits:     "
+        f"skew ≤ {result.max_time_delta_minutes:g}m, "
+        f"age ≤ {result.max_quote_age_minutes:g}m"
+    )
+    print(f"  Fill/Data Gaps:  {result.data_gap_count}")
+    print(f"  Critical Gaps:   {result.critical_gap_count}")
 
     if not result.trades:
         print("\n  No trades recorded.")
@@ -4596,7 +5544,58 @@ async def main():
         help="Use cached option data only and never attempt Massive/Polygon API calls.",
     )
     parser.add_argument("--slippage_model", type=str, choices=["none", "worst_case", "steer_50"], default="none", help="Slippage model to use")
-    parser.add_argument("--max_time_delta_minutes", type=float, default=5.0, help="Constraint on the allowed time delta between option legs in minutes")
+    parser.add_argument(
+        "--fill-mode",
+        choices=["strict_nbbo", "research_fallback"],
+        default=None,
+        help=(
+            "Set both entry and exit historical-mark policies. strict_nbbo "
+            "requires synchronized observed quotes but does not claim an "
+            "executable fill; research_fallback records explicit non-NBBO "
+            "source classes."
+        ),
+    )
+    parser.add_argument(
+        "--entry-fill-mode",
+        choices=["strict_nbbo", "research_fallback"],
+        default=None,
+        help=(
+            "Entry historical-mark policy. Conflicts with --fill-mode if "
+            "different."
+        ),
+    )
+    parser.add_argument(
+        "--exit-fill-mode",
+        choices=["strict_nbbo", "research_fallback"],
+        default=None,
+        help=(
+            "Exit historical-mark policy. Conflicts with --fill-mode if "
+            "different."
+        ),
+    )
+    parser.add_argument(
+        "--max-time-delta-minutes",
+        "--max_time_delta_minutes",
+        dest="max_time_delta_minutes",
+        type=float,
+        default=None,
+        help=(
+            "Maximum timestamp skew across fill legs. An explicit CLI value "
+            "overrides execution.max_time_delta_minutes; default is 5."
+        ),
+    )
+    parser.add_argument(
+        "--max-quote-age-minutes",
+        "--max_quote_age_minutes",
+        dest="max_quote_age_minutes",
+        type=float,
+        default=None,
+        help=(
+            "Maximum strict quote age relative to the exact exchange-calendar "
+            "close. An explicit CLI value overrides "
+            "execution.max_quote_age_minutes; default is 5."
+        ),
+    )
     args = parser.parse_args()
 
     # Load base config
@@ -4650,14 +5649,21 @@ async def main():
             if "description" in custom_cfg:
                 config["description"] = custom_cfg["description"]
 
+    if args.fill_mode is not None:
+        config.setdefault("execution", {})["fill_mode"] = args.fill_mode
+    if args.entry_fill_mode is not None:
+        config.setdefault("execution", {})[
+            "entry_fill_mode"
+        ] = args.entry_fill_mode
+    if args.exit_fill_mode is not None:
+        config.setdefault("execution", {})[
+            "exit_fill_mode"
+        ] = args.exit_fill_mode
+
     entry_cfg = config.get("entry", {})
     exit_cfg = config.get("exit", {})
     sizing_cfg = config.get("sizing", {})
     rolling_cfg = config.get("rolling", {})
-
-    max_time_delta = args.max_time_delta_minutes
-    if "entry" in config and "max_time_delta_minutes" in config["entry"]:
-        max_time_delta = float(config["entry"]["max_time_delta_minutes"])
 
     # Determine underlying: CLI argument overrides, otherwise fall back to strategy config
     underlying = args.underlying or config.get("underlying", "SPY")
@@ -4680,7 +5686,8 @@ async def main():
         db_path=args.db_path,
         roll_spread_width_multiplier=rolling_cfg.get("spread_width_multiplier", 1.0),
         slippage_model=args.slippage_model,
-        max_time_delta_minutes=max_time_delta,
+        max_time_delta_minutes=args.max_time_delta_minutes,
+        max_quote_age_minutes=args.max_quote_age_minutes,
         offline_only=args.offline_only or os.environ.get("MASSIVE_OFFLINE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"},
         plot=args.plot,
         enable_logging=args.log,

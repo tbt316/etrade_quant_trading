@@ -4,6 +4,11 @@ Cache-aware: checks OptionDataCache before making API calls.
 Supports batch request aggregation with semaphore-based concurrency.
 """
 import asyncio
+from bisect import bisect_left
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from functools import lru_cache
 import hashlib
 import json
 import logging
@@ -11,13 +16,14 @@ import math
 import os
 import ssl
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import certifi
+import pandas_market_calendars as mcal
 import pytz
 
 from backtesting.massive_config import API_KEY, BASE_URL
@@ -65,6 +71,454 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "token",
     }
 )
+_NYSE = mcal.get_calendar("NYSE")
+
+
+class HistoricalFillSource(str, Enum):
+    """Closed source taxonomy for historical option-price evidence."""
+
+    OBSERVED_NBBO = "OBSERVED_NBBO"
+    SYNCHRONIZED_MINUTE_AGGREGATE = "SYNCHRONIZED_MINUTE_AGGREGATE"
+    TRADE_PRINT = "TRADE_PRINT"
+    THEORETICAL = "THEORETICAL"
+    DAILY_CLOSE = "DAILY_CLOSE"
+
+
+class HistoricalFillEvidenceError(ValueError):
+    """Raised when historical fill evidence is malformed or contradictory."""
+
+
+@lru_cache(maxsize=4096)
+def _regular_session_bounds_utc(pricing_date: str) -> Optional[Tuple[datetime, datetime]]:
+    if type(pricing_date) is not str:
+        return None
+    try:
+        parsed = datetime.strptime(pricing_date, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if parsed.strftime("%Y-%m-%d") != pricing_date:
+        return None
+
+    schedule = _NYSE.schedule(start_date=pricing_date, end_date=pricing_date)
+    if len(schedule.index) != 1:
+        return None
+    market_open = schedule.iloc[0]["market_open"].to_pydatetime()
+    market_close = schedule.iloc[0]["market_close"].to_pydatetime()
+    return (
+        market_open.astimezone(timezone.utc),
+        market_close.astimezone(timezone.utc),
+    )
+
+
+def _parse_explicit_utc_timestamp(value: str) -> datetime:
+    if type(value) is not str or not value:
+        raise HistoricalFillEvidenceError("event timestamp must be a non-empty string")
+    if not (value.endswith("Z") or value.endswith("+00:00")):
+        raise HistoricalFillEvidenceError("event timestamp must declare UTC explicitly")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HistoricalFillEvidenceError("event timestamp is not ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise HistoricalFillEvidenceError("event timestamp must be UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def _finite_number(value: Any, field_name: str) -> float:
+    if type(value) not in (int, float) or type(value) is bool:
+        raise HistoricalFillEvidenceError(f"{field_name} must be a number")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise HistoricalFillEvidenceError(f"{field_name} must be finite")
+    return normalized
+
+
+def _positive_finite_minutes(value: Any, field_name: str) -> float:
+    normalized = _finite_number(value, field_name)
+    if normalized <= 0:
+        raise HistoricalFillEvidenceError(f"{field_name} must be positive")
+    return normalized
+
+
+def _nonnegative_finite_minutes(value: Any, field_name: str) -> float:
+    normalized = _finite_number(value, field_name)
+    if normalized < 0:
+        raise HistoricalFillEvidenceError(
+            f"{field_name} must be non-negative"
+        )
+    return normalized
+
+
+@dataclass(frozen=True)
+class HistoricalFillEvidence(Mapping[str, Any]):
+    """Immutable per-leg evidence used by the historical mark boundary.
+
+    Parsed provider JSON is not raw-response proof. The object therefore records
+    that provider bytes were not retained. Quote evidence validates a historical
+    mark only; displayed size and modeled execution are not proven.
+    """
+
+    option_ticker: str
+    pricing_date: str
+    source: HistoricalFillSource
+    mid: float
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    bid_size: float = 0.0
+    ask_size: float = 0.0
+    event_timestamp_utc: Optional[str] = None
+    provider: str = "massive"
+    provider_route: str = ""
+    ticker_binding: str = "exact_requested_ticker"
+    raw_provider_bytes_retained: bool = False
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.option_ticker) is not str or not self.option_ticker:
+            raise HistoricalFillEvidenceError("option_ticker must be a non-empty string")
+        bounds = _regular_session_bounds_utc(self.pricing_date)
+        if bounds is None:
+            raise HistoricalFillEvidenceError("pricing_date must be an NYSE trading session")
+        if type(self.source) is not HistoricalFillSource:
+            raise HistoricalFillEvidenceError("source must be HistoricalFillSource")
+        if type(self.provider) is not str or not self.provider:
+            raise HistoricalFillEvidenceError("provider must be a non-empty string")
+        if type(self.provider_route) is not str:
+            raise HistoricalFillEvidenceError("provider_route must be a string")
+        if self.ticker_binding != "exact_requested_ticker":
+            raise HistoricalFillEvidenceError("ticker binding is not exact")
+        if type(self.raw_provider_bytes_retained) is not bool:
+            raise HistoricalFillEvidenceError("raw_provider_bytes_retained must be bool")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise HistoricalFillEvidenceError("unsupported fill evidence schema")
+
+        mid = _finite_number(self.mid, "mid")
+        if mid < 0:
+            raise HistoricalFillEvidenceError("mid must be non-negative")
+        object.__setattr__(self, "mid", mid)
+        for field_name in ("bid", "ask"):
+            value = getattr(self, field_name)
+            if value is not None:
+                normalized = _finite_number(value, field_name)
+                if normalized < 0:
+                    raise HistoricalFillEvidenceError(
+                        f"{field_name} must be non-negative"
+                    )
+                object.__setattr__(self, field_name, normalized)
+        if (
+            self.bid is not None
+            and self.ask is not None
+            and self.ask < self.bid
+        ):
+            raise HistoricalFillEvidenceError("bid/ask market is crossed")
+        object.__setattr__(
+            self,
+            "bid_size",
+            _finite_number(self.bid_size, "bid_size"),
+        )
+        object.__setattr__(
+            self,
+            "ask_size",
+            _finite_number(self.ask_size, "ask_size"),
+        )
+        if self.bid_size < 0 or self.ask_size < 0:
+            raise HistoricalFillEvidenceError("quote sizes must be non-negative")
+
+        if self.source is HistoricalFillSource.OBSERVED_NBBO:
+            if self.provider != "massive":
+                raise HistoricalFillEvidenceError(
+                    "observed NBBO provider is not Massive"
+                )
+            if self.bid is None or self.ask is None:
+                raise HistoricalFillEvidenceError("observed NBBO requires bid and ask")
+            if self.bid <= 0 or self.ask < self.bid:
+                raise HistoricalFillEvidenceError("observed NBBO is zero or crossed")
+            expected_mid = round((self.bid + self.ask) / 2.0, 4)
+            if not math.isclose(self.mid, expected_mid, rel_tol=0.0, abs_tol=1e-9):
+                raise HistoricalFillEvidenceError("observed NBBO midpoint is inconsistent")
+            if self.provider_route != f"/v3/quotes/{self.option_ticker}":
+                raise HistoricalFillEvidenceError(
+                    "observed NBBO is not bound to the exact contract endpoint"
+                )
+            if self.event_timestamp_utc is None:
+                raise HistoricalFillEvidenceError(
+                    "observed NBBO requires an event timestamp"
+                )
+
+        if self.source in {
+            HistoricalFillSource.OBSERVED_NBBO,
+            HistoricalFillSource.SYNCHRONIZED_MINUTE_AGGREGATE,
+            HistoricalFillSource.TRADE_PRINT,
+        } and self.event_timestamp_utc is None:
+            raise HistoricalFillEvidenceError(
+                f"{self.source.value} requires an event timestamp"
+            )
+
+        if self.event_timestamp_utc is not None:
+            event_time = _parse_explicit_utc_timestamp(self.event_timestamp_utc)
+            market_open, market_close = bounds
+            if event_time < market_open or event_time > market_close:
+                raise HistoricalFillEvidenceError(
+                    "event timestamp is outside the requested NYSE session"
+                )
+            object.__setattr__(
+                self,
+                "event_timestamp_utc",
+                event_time.isoformat().replace("+00:00", "Z"),
+            )
+
+    @property
+    def strict_nbbo_mark_eligible(self) -> bool:
+        return self.source is HistoricalFillSource.OBSERVED_NBBO
+
+    @property
+    def strict_nbbo_eligible(self) -> bool:
+        """Deprecated: historical evidence never proves executable eligibility."""
+
+        return False
+
+    @property
+    def session_close_utc(self) -> str:
+        bounds = _regular_session_bounds_utc(self.pricing_date)
+        if bounds is None:  # Guarded by construction.
+            raise HistoricalFillEvidenceError("pricing date has no trading session")
+        return bounds[1].isoformat().replace("+00:00", "Z")
+
+    @property
+    def quote_age_at_close_seconds(self) -> Optional[float]:
+        if (
+            self.source is not HistoricalFillSource.OBSERVED_NBBO
+            or self.event_timestamp_utc is None
+        ):
+            return None
+        close = _parse_explicit_utc_timestamp(self.session_close_utc)
+        event = _parse_explicit_utc_timestamp(self.event_timestamp_utc)
+        return (close - event).total_seconds()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "option_ticker": self.option_ticker,
+            "pricing_date": self.pricing_date,
+            "source": self.source.value,
+            "mid": self.mid,
+            "bid": self.bid,
+            "ask": self.ask,
+            "bid_size": self.bid_size,
+            "ask_size": self.ask_size,
+            "quote_timestamp": self.event_timestamp_utc,
+            "timestamp": self.event_timestamp_utc,
+            "event_timestamp_utc": self.event_timestamp_utc,
+            "provider": self.provider,
+            "provider_route": self.provider_route,
+            "ticker_binding": self.ticker_binding,
+            "raw_provider_bytes_retained": self.raw_provider_bytes_retained,
+            "strict_nbbo_mark_eligible": self.strict_nbbo_mark_eligible,
+            "strict_nbbo_eligible": False,
+            "strict_nbbo_eligible_deprecated": (
+                "Use strict_nbbo_mark_eligible; historical quotes do not prove "
+                "an executable fill."
+            ),
+            "session_close_utc": self.session_close_utc,
+            "quote_age_at_close_seconds": self.quote_age_at_close_seconds,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
+
+
+def validate_strict_nbbo_bundle(
+    evidence: Sequence[HistoricalFillEvidence],
+    expected_tickers: Sequence[str],
+    pricing_date: str,
+    max_time_delta_minutes: float,
+    max_quote_age_minutes: float = 5.0,
+) -> Tuple[HistoricalFillEvidence, ...]:
+    """Validate exact binding, close freshness, and pairwise timing."""
+
+    max_delta = _nonnegative_finite_minutes(
+        max_time_delta_minutes,
+        "max_time_delta_minutes",
+    )
+    max_quote_age = _positive_finite_minutes(
+        max_quote_age_minutes,
+        "max_quote_age_minutes",
+    )
+    if len(expected_tickers) not in {2, 3}:
+        raise HistoricalFillEvidenceError(
+            "strict mark bundle requires exactly two or three legs"
+        )
+    if len(evidence) != len(expected_tickers):
+        raise HistoricalFillEvidenceError(
+            "mark evidence does not match expected legs"
+        )
+    if len(set(expected_tickers)) != len(expected_tickers):
+        raise HistoricalFillEvidenceError("expected option tickers must be unique")
+    if any(type(ticker) is not str or not ticker for ticker in expected_tickers):
+        raise HistoricalFillEvidenceError(
+            "expected option tickers must be non-empty strings"
+        )
+
+    timestamps = []
+    validated = []
+    for item, expected_ticker in zip(evidence, expected_tickers):
+        if type(item) is not HistoricalFillEvidence:
+            raise HistoricalFillEvidenceError(
+                "mark evidence type is not exact"
+            )
+        if item.option_ticker != expected_ticker:
+            raise HistoricalFillEvidenceError(
+                "mark evidence ticker mismatch"
+            )
+        if item.pricing_date != pricing_date:
+            raise HistoricalFillEvidenceError(
+                "mark evidence pricing-date mismatch"
+            )
+        if item.source is not HistoricalFillSource.OBSERVED_NBBO:
+            raise HistoricalFillEvidenceError("strict mode requires observed NBBO")
+        if item.provider != "massive":
+            raise HistoricalFillEvidenceError("strict NBBO provider mismatch")
+        if not item.strict_nbbo_mark_eligible:
+            raise HistoricalFillEvidenceError(
+                "evidence is not eligible for strict NBBO mark validation"
+            )
+        event_timestamp = _parse_explicit_utc_timestamp(
+            item.event_timestamp_utc
+        )
+        bounds = _regular_session_bounds_utc(pricing_date)
+        if bounds is None:  # Guarded by the evidence constructor.
+            raise HistoricalFillEvidenceError("pricing date has no trading session")
+        session_close = bounds[1]
+        quote_age = session_close - event_timestamp
+        if quote_age < timedelta(0):
+            raise HistoricalFillEvidenceError(
+                "strict observed NBBO timestamp is after the session close"
+            )
+        if quote_age > timedelta(minutes=max_quote_age):
+            raise HistoricalFillEvidenceError(
+                "strict observed NBBO is too old relative to the session close"
+            )
+        timestamps.append(event_timestamp)
+        validated.append(item)
+
+    if max(timestamps) - min(timestamps) > timedelta(minutes=max_delta):
+        raise HistoricalFillEvidenceError(
+            "multi-leg observed NBBO timestamps exceed the configured delta"
+        )
+    return tuple(validated)
+
+
+def fill_bundle_diagnostics(
+    evidence: Sequence[HistoricalFillEvidence],
+    max_time_delta_minutes: float,
+    max_quote_age_minutes: float = 5.0,
+) -> Dict[str, Any]:
+    max_delta = _nonnegative_finite_minutes(
+        max_time_delta_minutes,
+        "max_time_delta_minutes",
+    )
+    max_quote_age = _positive_finite_minutes(
+        max_quote_age_minutes,
+        "max_quote_age_minutes",
+    )
+    timestamps = [
+        _parse_explicit_utc_timestamp(item.event_timestamp_utc)
+        for item in evidence
+        if item.event_timestamp_utc is not None
+    ]
+    aligned = None
+    max_delta_seconds = None
+    if len(timestamps) == len(evidence) and timestamps:
+        max_delta_seconds = (max(timestamps) - min(timestamps)).total_seconds()
+        aligned = max_delta_seconds <= max_delta * 60.0
+    quote_freshness = []
+    for item in evidence:
+        age_seconds = item.quote_age_at_close_seconds
+        quote_freshness.append(
+            {
+                "ticker": item.option_ticker,
+                "source": item.source.value,
+                "session_close_utc": item.session_close_utc,
+                "event_timestamp_utc": item.event_timestamp_utc,
+                "quote_age_at_close_seconds": age_seconds,
+                "within_max_quote_age": (
+                    age_seconds is not None
+                    and 0.0 <= age_seconds <= max_quote_age * 60.0
+                ),
+            }
+        )
+    all_observed = bool(evidence) and all(
+        item.source is HistoricalFillSource.OBSERVED_NBBO
+        for item in evidence
+    )
+    tickers = [item.option_ticker for item in evidence]
+    pricing_dates = [item.pricing_date for item in evidence]
+    valid_leg_count = len(evidence) in {2, 3}
+    unique_tickers = len(set(tickers)) == len(tickers)
+    same_pricing_date = (
+        bool(pricing_dates) and len(set(pricing_dates)) == 1
+    )
+    bundle_shape_valid = (
+        valid_leg_count and unique_tickers and same_pricing_date
+    )
+    observed_quote_freshness = [
+        item
+        for item in quote_freshness
+        if item["source"] == HistoricalFillSource.OBSERVED_NBBO.value
+    ]
+    all_quotes_close_fresh = bool(observed_quote_freshness) and all(
+        item["within_max_quote_age"] for item in observed_quote_freshness
+    )
+    rejection_reasons = []
+    if not valid_leg_count:
+        rejection_reasons.append("INVALID_LEG_COUNT")
+    if not unique_tickers:
+        rejection_reasons.append("DUPLICATE_OPTION_TICKER")
+    if not same_pricing_date:
+        rejection_reasons.append("MIXED_PRICING_DATES")
+    if evidence and not all_observed:
+        rejection_reasons.append("NON_OBSERVED_NBBO_SOURCE")
+    if observed_quote_freshness and not all_quotes_close_fresh:
+        rejection_reasons.append("OBSERVED_NBBO_TOO_OLD_AT_SESSION_CLOSE")
+    if aligned is False:
+        rejection_reasons.append("MULTILEG_TIMESTAMP_DELTA_EXCEEDED")
+    return {
+        "schema_version": 1,
+        "sources": [item.source.value for item in evidence],
+        "timestamps_utc": [item.event_timestamp_utc for item in evidence],
+        "tickers": tickers,
+        "pricing_dates": pricing_dates,
+        "valid_leg_count": valid_leg_count,
+        "unique_tickers": unique_tickers,
+        "same_pricing_date": same_pricing_date,
+        "bundle_shape_valid": bundle_shape_valid,
+        "temporally_synchronized": aligned,
+        "max_observed_delta_seconds": max_delta_seconds,
+        "configured_max_delta_minutes": max_delta,
+        "configured_max_quote_age_minutes": max_quote_age,
+        "quote_close_freshness": quote_freshness,
+        "all_observed_quotes_close_fresh": all_quotes_close_fresh,
+        "strict_rejection_reasons": rejection_reasons,
+        "strict_nbbo_mark_validated": bundle_shape_valid
+        and all_observed
+        and aligned is True
+        and all_quotes_close_fresh,
+        "strict_nbbo_authorized": False,
+        "strict_nbbo_authorized_deprecated": (
+            "Historical NBBO evidence validates a mark only; quote size and "
+            "execution are not proven."
+        ),
+        "execution_assumption": "HISTORICAL_MARK_NOT_EXECUTABLE_FILL",
+        "raw_provider_bytes_retained": bool(evidence) and all(
+            item.raw_provider_bytes_retained for item in evidence
+        ),
+    }
 
 
 class _ContractReferenceAcquisitionError(RuntimeError):
@@ -162,48 +616,39 @@ class MassiveAPIClient:
         option_ticker: str,
         date: str,
         allow_trade_fallback: bool = True,
-    ) -> Optional[dict]:
-        """Return cached quote, OHLCV close, or trade midpoint for this option/date."""
+    ) -> Optional[HistoricalFillEvidence]:
+        """Return only an unambiguous research fallback from the legacy cache.
+
+        The legacy row has no quote/trade timestamp or source column. Its
+        bid/ask/mid fields therefore cannot prove NBBO, a trade, a synchronized
+        aggregate, or a theoretical mark. Only the daily OHLCV close column has
+        an unambiguous class, and it is never strict-NBBO eligible.
+        """
         cached = self.cache.get_ohlcv(option_ticker, date)
         if not cached:
             return None
 
-        bid = cached.get("bid")
-        ask = cached.get("ask")
-        if bid is not None and ask is not None and bid > 0 and ask > 0 and bid != ask:
-            self.cache_hits += 1
-            return {
-                "bid": bid,
-                "ask": ask,
-                "mid": cached.get("mid") or round((bid + ask) / 2.0, 4),
-                "bid_size": cached.get("bid_size") or 0,
-                "ask_size": cached.get("ask_size") or 0,
-                "source": "quote_cache",
-            }
-
         close_price = cached.get("close")
+        try:
+            close_price = _finite_number(close_price, "daily close")
+        except HistoricalFillEvidenceError:
+            close_price = None
         if close_price is not None and close_price > 0:
+            try:
+                evidence = HistoricalFillEvidence(
+                    option_ticker=option_ticker,
+                    pricing_date=date,
+                    source=HistoricalFillSource.DAILY_CLOSE,
+                    mid=close_price,
+                    bid=close_price,
+                    ask=close_price,
+                    provider="legacy_option_price_cache",
+                    provider_route="option_prices.close",
+                )
+            except HistoricalFillEvidenceError:
+                return None
             self.cache_hits += 1
-            return {
-                "bid": close_price,
-                "ask": close_price,
-                "mid": close_price,
-                "bid_size": 0,
-                "ask_size": 0,
-                "source": "ohlcv_close_cache",
-            }
-
-        mid = cached.get("mid")
-        if allow_trade_fallback and mid is not None and mid > 0:
-            self.cache_hits += 1
-            return {
-                "bid": mid,
-                "ask": mid,
-                "mid": mid,
-                "bid_size": cached.get("bid_size") or 0,
-                "ask_size": cached.get("ask_size") or 0,
-                "source": "trade_cache",
-            }
+            return evidence
 
         return None
 
@@ -765,16 +1210,176 @@ class MassiveAPIClient:
 
     # ── EOD Quote (Bid/Ask) ─────────────────────────────────────────
 
+    @staticmethod
+    def _quote_timestamp(quote: Mapping[str, Any]) -> Optional[str]:
+        for field_name in (
+            "participant_timestamp",
+            "sip_timestamp",
+            "timestamp",
+        ):
+            value = quote.get(field_name)
+            if value is not None:
+                return MassiveAPIClient._format_timestamp(value)
+        return None
+
+    @staticmethod
+    def _evidence_from_trade_result(
+        option_ticker: str,
+        pricing_date: str,
+        trade: Mapping[str, Any],
+    ) -> Optional[HistoricalFillEvidence]:
+        try:
+            price = _finite_number(trade.get("price"), "trade price")
+            if price <= 0:
+                return None
+            source = trade.get("source")
+            if source == HistoricalFillSource.DAILY_CLOSE.value:
+                return HistoricalFillEvidence(
+                    option_ticker=option_ticker,
+                    pricing_date=pricing_date,
+                    source=HistoricalFillSource.DAILY_CLOSE,
+                    mid=price,
+                    bid=price,
+                    ask=price,
+                    provider="legacy_option_price_cache",
+                    provider_route="option_prices.close",
+                )
+            if source != HistoricalFillSource.TRADE_PRINT.value:
+                return None
+            return HistoricalFillEvidence(
+                option_ticker=option_ticker,
+                pricing_date=pricing_date,
+                source=HistoricalFillSource.TRADE_PRINT,
+                mid=price,
+                bid=price,
+                ask=price,
+                bid_size=trade.get("size") or 0,
+                ask_size=trade.get("size") or 0,
+                event_timestamp_utc=trade.get("timestamp"),
+                provider="massive",
+                provider_route=f"/v3/trades/{option_ticker}",
+            )
+        except HistoricalFillEvidenceError:
+            return None
+
+    async def fetch_observed_nbbo(
+        self,
+        option_ticker: str,
+        date: str,
+        max_quote_age_minutes: Optional[float] = 5.0,
+    ) -> Optional[HistoricalFillEvidence]:
+        """Fetch one exact-contract, regular-session observed NBBO.
+
+        This intentionally bypasses legacy cache rows. Parsed JSON is validated
+        in memory, but raw provider response bytes are not retained by this
+        client, so the result is not a durable/replayable provider receipt.
+        A finite positive ``max_quote_age_minutes`` constrains acquisition and
+        acceptance to quotes near the exact exchange-calendar close. ``None``
+        is research-only and may return an older in-session quote.
+        """
+
+        max_quote_age = (
+            None
+            if max_quote_age_minutes is None
+            else _positive_finite_minutes(
+                max_quote_age_minutes,
+                "max_quote_age_minutes",
+            )
+        )
+        if self.offline_only or self._date_before(
+            date,
+            OPTION_QUOTE_HISTORY_START_DATE,
+        ):
+            return None
+        bounds = _regular_session_bounds_utc(date)
+        if bounds is None:
+            return None
+        market_open, market_close = bounds
+        if max_quote_age_minutes is None:
+            quote_window_start = market_open
+        else:
+            quote_window_start = max(
+                market_open,
+                market_close - timedelta(minutes=max_quote_age),
+            )
+        url = f"{BASE_URL}/v3/quotes/{option_ticker}"
+        params = {
+            "timestamp.gte": quote_window_start.isoformat().replace(
+                "+00:00",
+                "Z",
+            ),
+            "timestamp.lte": market_close.isoformat().replace("+00:00", "Z"),
+            "order": "desc",
+            "sort": "timestamp",
+            "limit": 100,
+        }
+        print(
+            f"{CLR_YEL}  [API FETCH] Observed NBBO for "
+            f"{option_ticker} on {date}{CLR_RST}"
+        )
+        data = await self._get(url, params)
+        if not isinstance(data, Mapping) or not isinstance(
+            data.get("results"),
+            list,
+        ):
+            return None
+
+        for quote in data["results"]:
+            if not isinstance(quote, Mapping):
+                continue
+            response_ticker = quote.get("ticker") or quote.get("option_ticker")
+            if response_ticker is not None and response_ticker != option_ticker:
+                continue
+            try:
+                bid = _finite_number(quote.get("bid_price"), "bid")
+                ask = _finite_number(quote.get("ask_price"), "ask")
+                evidence = HistoricalFillEvidence(
+                    option_ticker=option_ticker,
+                    pricing_date=date,
+                    source=HistoricalFillSource.OBSERVED_NBBO,
+                    bid=bid,
+                    ask=ask,
+                    mid=round((bid + ask) / 2.0, 4),
+                    bid_size=quote.get("bid_size") or 0,
+                    ask_size=quote.get("ask_size") or 0,
+                    event_timestamp_utc=self._quote_timestamp(quote),
+                    provider="massive",
+                    provider_route=f"/v3/quotes/{option_ticker}",
+                )
+            except HistoricalFillEvidenceError:
+                continue
+            if max_quote_age_minutes is not None:
+                age_seconds = evidence.quote_age_at_close_seconds
+                if (
+                    age_seconds is None
+                    or age_seconds < 0
+                    or age_seconds > max_quote_age * 60.0
+                ):
+                    continue
+            return evidence
+        return None
+
     async def fetch_eod_quote(
         self,
         option_ticker: str,
         date: str,
         allow_trade_fallback: bool = True,
-    ) -> Optional[dict]:
+        strict_nbbo: bool = False,
+        max_quote_age_minutes: float = 5.0,
+    ) -> Optional[HistoricalFillEvidence]:
+        """Get typed historical price evidence for one option contract.
+
+        ``strict_nbbo=True`` never reads the legacy cache and never falls back
+        to a trade or daily close. Research mode may return an explicitly
+        classified non-NBBO source.
         """
-        Get end-of-day NBBO quote for a contract on a specific date.
-        Returns {"bid": float, "ask": float, "mid": float, ...} or None.
-        """
+        if strict_nbbo:
+            return await self.fetch_observed_nbbo(
+                option_ticker,
+                date,
+                max_quote_age_minutes=max_quote_age_minutes,
+            )
+
         cached_price = self._cached_price_result(
             option_ticker,
             date,
@@ -786,110 +1391,32 @@ class MassiveAPIClient:
         if self.offline_only:
             return None
 
-        quote_available = not self._date_before(date, OPTION_QUOTE_HISTORY_START_DATE)
-
-        # For historical dates before quote coverage starts, do not waste an API
-        # request on /v3/quotes. Go directly to trades when fallback is allowed.
-        if not quote_available:
-            if not allow_trade_fallback:
-                return None
+        quote_result = None
+        if not self._date_before(date, OPTION_QUOTE_HISTORY_START_DATE):
+            quote_result = await self.fetch_observed_nbbo(
+                option_ticker,
+                date,
+                max_quote_age_minutes=None,
+            )
+        elif allow_trade_fallback:
             print(
                 f"{CLR_YEL}  [API FETCH] Quote history unavailable before "
-                f"{OPTION_QUOTE_HISTORY_START_DATE}; fetching TRADES for {option_ticker} on {date}{CLR_RST}"
+                f"{OPTION_QUOTE_HISTORY_START_DATE}; considering an explicit "
+                f"trade fallback for {option_ticker} on {date}{CLR_RST}"
+            )
+
+        if not quote_result and allow_trade_fallback:
+            print(
+                f"{CLR_YEL}  [API FETCH] No observed NBBO for "
+                f"{option_ticker} on {date}, trying an explicit trade source...{CLR_RST}"
             )
             trade = await self.fetch_latest_trade(option_ticker, date)
-            if not trade:
-                return None
-            return {
-                "bid": trade["price"],
-                "ask": trade["price"],
-                "mid": trade["price"],
-                "bid_size": trade.get("size", 0),
-                "ask_size": trade.get("size", 0),
-                "source": "trade",
-                "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
-            }
-
-        # Check negative quote cache after checking actual cached prices. A prior
-        # failed quote fetch may still have a cached trade midpoint for the day.
-        if self.cache.is_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="quote"):
-            self.cache_hits += 1
-            return None
-
-        # 3. Fetch from API
-        print(f"{CLR_YEL}  [API FETCH] EOD Quote for {option_ticker} on {date}{CLR_RST}")
-        url = f"{BASE_URL}/v3/quotes/{option_ticker}"
-        params = {
-            "timestamp.gte": f"{date}T00:00:00Z",
-            "timestamp.lte": f"{date}T23:59:59Z", # Search up to end of day
-            "order": "desc",
-            "sort": "timestamp",
-            "limit": 100,
-        }
-
-        data = await self._get(url, params)
-        quote_result = None
-        
-        if data and "results" in data and data["results"]:
-            # Find first quote with valid bid and ask, filtering blown-out spreads
-            for quote in data["results"]:
-                bid = quote.get("bid_price", 0)
-                ask = quote.get("ask_price", 0)
-                if bid > 0 and ask > 0:
-                    # Reject blown-out spreads (ask-bid > 200% of bid)
-                    spread_ratio = (ask - bid) / bid
-                    if spread_ratio > 2.0:
-                        continue
-                    quote_result = {
-                        "bid": bid,
-                        "ask": ask,
-                        "mid": round((bid + ask) / 2.0, 4),
-                        "bid_size": quote.get("bid_size", 0),
-                        "ask_size": quote.get("ask_size", 0),
-                        "source": "quote",
-                        "quote_timestamp": self._format_timestamp(
-                            quote.get("participant_timestamp")
-                            or quote.get("sip_timestamp")
-                            or quote.get("timestamp")
-                        ),
-                    }
-                    break
-
-        # 4. Fallback to Actual Trades if Quote is missing or bad
-        if not quote_result and allow_trade_fallback:
-            print(f"{CLR_YEL}  [API FETCH] No valid quote for {option_ticker} on {date}, trying TRADES...{CLR_RST}")
-            trade = await self.fetch_latest_trade(option_ticker, date)
             if trade:
-                print(f"  [TRADE FALLBACK] Found trade for {option_ticker} at ${trade['price']}")
-                quote_result = {
-                    "bid": trade["price"],
-                    "ask": trade["price"],
-                    "mid": trade["price"],
-                    "bid_size": trade.get("size", 0),
-                    "ask_size": trade.get("size", 0),
-                    "source": "trade",
-                    "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
-                }
-
-        # 5. Save to cache if found
-        if quote_result:
-            meta = self._parse_ticker(option_ticker)
-            record = {
-                "option_ticker": option_ticker,
-                "pricing_date": date,
-                "mid": quote_result["mid"],
-                "bid_size": quote_result.get("bid_size"),
-                "ask_size": quote_result.get("ask_size"),
-                "fetched_at": datetime.now().isoformat(),
-                **meta
-            }
-            if quote_result.get("source") == "quote":
-                record["bid"] = quote_result["bid"]
-                record["ask"] = quote_result["ask"]
-            self.cache.upsert_full_record(record)
-        else:
-            # Mark as empty result so we don't try again
-            self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="quote")
+                quote_result = self._evidence_from_trade_result(
+                    option_ticker,
+                    date,
+                    trade,
+                )
 
         return quote_result
 
@@ -898,7 +1425,7 @@ class MassiveAPIClient:
         option_ticker: str,
         timestamp,
         allow_trade_fallback: bool = True,
-    ) -> Optional[dict]:
+    ) -> Optional[HistoricalFillEvidence]:
         """
         Get the latest quote at or before a specific execution timestamp.
 
@@ -918,15 +1445,23 @@ class MassiveAPIClient:
             return None
 
         if ts_dt.tzinfo is None:
-            ts_dt = ts_dt.replace(tzinfo=pytz.utc)
-        ts_utc = ts_dt.astimezone(pytz.utc)
+            return None
+        ts_utc = ts_dt.astimezone(timezone.utc)
         ts_iso = ts_utc.isoformat().replace("+00:00", "Z")
-        day_start = ts_utc.strftime("%Y-%m-%dT00:00:00Z")
+        pricing_date = ts_utc.astimezone(
+            pytz.timezone("America/New_York")
+        ).strftime("%Y-%m-%d")
+        bounds = _regular_session_bounds_utc(pricing_date)
+        if bounds is None:
+            return None
+        market_open, market_close = bounds
+        if ts_utc < market_open or ts_utc > market_close:
+            return None
 
         print(f"{CLR_YEL}  [API FETCH] Quote at {ts_iso} for {option_ticker}{CLR_RST}")
         url = f"{BASE_URL}/v3/quotes/{option_ticker}"
         params = {
-            "timestamp.gte": day_start,
+            "timestamp.gte": market_open.isoformat().replace("+00:00", "Z"),
             "timestamp.lte": ts_iso,
             "order": "desc",
             "sort": "timestamp",
@@ -934,43 +1469,41 @@ class MassiveAPIClient:
         }
 
         data = await self._get(url, params)
-        quote_result = None
+        quote_result: Optional[HistoricalFillEvidence] = None
         if data and "results" in data and data["results"]:
             for quote in data["results"]:
-                bid = quote.get("bid_price", 0)
-                ask = quote.get("ask_price", 0)
-                if bid > 0 and ask > 0:
-                    spread_ratio = (ask - bid) / bid if bid else float("inf")
-                    if spread_ratio > 2.0:
-                        continue
-                    quote_result = {
-                        "bid": bid,
-                        "ask": ask,
-                        "mid": round((bid + ask) / 2.0, 4),
-                        "bid_size": quote.get("bid_size", 0),
-                        "ask_size": quote.get("ask_size", 0),
-                        "source": "quote",
-                        "quote_timestamp": self._format_timestamp(
-                            quote.get("participant_timestamp")
-                            or quote.get("sip_timestamp")
-                            or quote.get("timestamp")
-                        ),
-                    }
-                    break
+                response_ticker = quote.get("ticker") or quote.get("option_ticker")
+                if response_ticker is not None and response_ticker != option_ticker:
+                    continue
+                try:
+                    bid = _finite_number(quote.get("bid_price"), "bid")
+                    ask = _finite_number(quote.get("ask_price"), "ask")
+                    quote_result = HistoricalFillEvidence(
+                        option_ticker=option_ticker,
+                        pricing_date=pricing_date,
+                        source=HistoricalFillSource.OBSERVED_NBBO,
+                        bid=bid,
+                        ask=ask,
+                        mid=round((bid + ask) / 2.0, 4),
+                        bid_size=quote.get("bid_size") or 0,
+                        ask_size=quote.get("ask_size") or 0,
+                        event_timestamp_utc=self._quote_timestamp(quote),
+                        provider="massive",
+                        provider_route=f"/v3/quotes/{option_ticker}",
+                    )
+                except HistoricalFillEvidenceError:
+                    continue
+                break
 
         if not quote_result and allow_trade_fallback:
             print(f"{CLR_YEL}  [API FETCH] No valid quote at {ts_iso} for {option_ticker}, trying TRADES...{CLR_RST}")
             trade = await self.fetch_latest_trade_at_timestamp(option_ticker, ts_iso)
             if trade:
-                quote_result = {
-                    "bid": trade["price"],
-                    "ask": trade["price"],
-                    "mid": trade["price"],
-                    "bid_size": trade.get("size", 0),
-                    "ask_size": trade.get("size", 0),
-                    "source": "trade",
-                    "quote_timestamp": self._format_timestamp(trade.get("timestamp")),
-                }
+                quote_result = self._evidence_from_trade_result(
+                    option_ticker,
+                    pricing_date,
+                    trade,
+                )
 
         return quote_result
 
@@ -982,48 +1515,37 @@ class MassiveAPIClient:
         """
         Fetch the last trade for a contract on a specific date.
         """
-        trade_fetch_complete = self.cache.is_fetch_complete(
-            underlying="",
-            pricing_date=date,
-            expiration=option_ticker,
-            data_type="trade",
-        )
         cached = self.cache.get_ohlcv(option_ticker, date)
         if cached:
             close_price = cached.get("close")
-            if close_price is not None and close_price > 0:
+            if (
+                type(close_price) in (int, float)
+                and type(close_price) is not bool
+                and math.isfinite(float(close_price))
+                and close_price > 0
+            ):
                 self.cache_hits += 1
                 return {
                     "price": close_price,
                     "size": cached.get("volume") or 0,
                     "timestamp": None,
-                    "source": "ohlcv_close_cache",
-                }
-            mid = cached.get("mid")
-            if trade_fetch_complete and mid is not None and mid > 0:
-                self.cache_hits += 1
-                return {
-                    "price": mid,
-                    "size": cached.get("bid_size") or cached.get("ask_size") or 0,
-                    "timestamp": None,
-                    "source": "trade_cache",
+                    "source": HistoricalFillSource.DAILY_CLOSE.value,
                 }
 
         if self._date_before(date, OPTION_TRADE_HISTORY_START_DATE):
             return None
 
-        if trade_fetch_complete:
-            self.cache_hits += 1
-            return None
-
         if self.offline_only:
-            self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
             return None
 
+        bounds = _regular_session_bounds_utc(date)
+        if bounds is None:
+            return None
+        market_open, market_close = bounds
         url = f"{BASE_URL}/v3/trades/{option_ticker}"
         params = {
-            "timestamp.gte": f"{date}T00:00:00Z",
-            "timestamp.lte": f"{date}T23:59:59Z",
+            "timestamp.gte": market_open.isoformat().replace("+00:00", "Z"),
+            "timestamp.lte": market_close.isoformat().replace("+00:00", "Z"),
             "order": "desc",
             "sort": "timestamp",
             "limit": 1,
@@ -1031,25 +1553,20 @@ class MassiveAPIClient:
         data = await self._get(url, params)
         if data and "results" in data and data["results"]:
             t = data["results"][0]
+            if not isinstance(t, Mapping):
+                return None
+            response_ticker = t.get("ticker") or t.get("option_ticker")
+            if response_ticker is not None and response_ticker != option_ticker:
+                return None
             res = {
                 "price": t.get("price"),
                 "size": t.get("size"),
                 "timestamp": self._format_timestamp(
                     t.get("participant_timestamp") or t.get("sip_timestamp") or t.get("timestamp")
                 ),
+                "source": HistoricalFillSource.TRADE_PRINT.value,
             }
-            # Cache this as the latest trade midpoint for EOD fallback reuse.
-            meta = self._parse_ticker(option_ticker)
-            self.cache.upsert_full_record({
-                "option_ticker": option_ticker,
-                "pricing_date": date,
-                "mid": res["price"],
-                "fetched_at": datetime.now().isoformat(),
-                **meta
-            })
-            self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
             return res
-        self.cache.mark_fetch_complete(underlying="", pricing_date=date, expiration=option_ticker, data_type="trade")
         return None
 
     async def fetch_latest_trade_at_timestamp(
@@ -1072,7 +1589,7 @@ class MassiveAPIClient:
             return None
 
         if ts_dt.tzinfo is None:
-            ts_dt = ts_dt.replace(tzinfo=pytz.utc)
+            return None
         ts_utc = ts_dt.astimezone(pytz.utc)
         ts_iso = ts_utc.isoformat().replace("+00:00", "Z")
         day_start = ts_utc.strftime("%Y-%m-%dT00:00:00Z")
@@ -1091,12 +1608,18 @@ class MassiveAPIClient:
         data = await self._get(url, params)
         if data and "results" in data and data["results"]:
             t = data["results"][0]
+            if not isinstance(t, Mapping):
+                return None
+            response_ticker = t.get("ticker") or t.get("option_ticker")
+            if response_ticker is not None and response_ticker != option_ticker:
+                return None
             return {
                 "price": t.get("price"),
                 "size": t.get("size"),
                 "timestamp": self._format_timestamp(
                     t.get("participant_timestamp") or t.get("sip_timestamp") or t.get("timestamp")
                 ),
+                "source": HistoricalFillSource.TRADE_PRINT.value,
             }
         return None
 
@@ -1143,143 +1666,266 @@ class MassiveAPIClient:
 
         return len(tasks)
 
+    async def fetch_synchronized_minute_aggregates(
+        self,
+        option_tickers: Sequence[str],
+        date: str,
+        max_time_delta_minutes: float = 5.0,
+    ) -> Optional[Tuple[HistoricalFillEvidence, ...]]:
+        """Return a two-or-more-leg synchronized aggregate research fallback.
+
+        Minute aggregate closes are explicitly not NBBO. Legacy
+        ``is_synchronized`` cache flags are ignored because those rows do not
+        retain event timestamps or source provenance.
+        """
+
+        tickers = tuple(option_tickers)
+        if len(tickers) < 2 or len(set(tickers)) != len(tickers):
+            return None
+        if any(type(ticker) is not str or not ticker for ticker in tickers):
+            return None
+        if self.offline_only or _regular_session_bounds_utc(date) is None:
+            return None
+        if (
+            type(max_time_delta_minutes) not in (int, float)
+            or type(max_time_delta_minutes) is bool
+            or not math.isfinite(float(max_time_delta_minutes))
+            or float(max_time_delta_minutes) < 0
+        ):
+            return None
+
+        print(
+            f"{CLR_YEL}  [API FETCH] Synchronizing 1m aggregates for "
+            f"{len(tickers)} legs on {date}{CLR_RST}"
+        )
+        urls = [
+            f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{date}/{date}"
+            for ticker in tickers
+        ]
+        responses = await asyncio.gather(
+            *[
+                self._get(
+                    url,
+                    {
+                        "adjusted": "false",
+                        "sort": "desc",
+                        "limit": 1440,
+                    },
+                )
+                for url in urls
+            ],
+            return_exceptions=True,
+        )
+
+        streams: List[List[Tuple[float, HistoricalFillEvidence]]] = []
+        for ticker, route_url, response in zip(tickers, urls, responses):
+            if isinstance(response, Exception) or not isinstance(response, Mapping):
+                return None
+            rows = response.get("results")
+            if not isinstance(rows, list) or not rows:
+                return None
+            stream: List[Tuple[float, HistoricalFillEvidence]] = []
+            provider_route = urlsplit(route_url).path
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                response_ticker = row.get("ticker") or row.get(
+                    "option_ticker"
+                )
+                if (
+                    response_ticker is not None
+                    and response_ticker != ticker
+                ):
+                    continue
+                try:
+                    timestamp_ms = _finite_number(row.get("t"), "aggregate timestamp")
+                    close_price = _finite_number(row.get("c"), "aggregate close")
+                    if close_price <= 0:
+                        continue
+                    item = HistoricalFillEvidence(
+                        option_ticker=ticker,
+                        pricing_date=date,
+                        source=HistoricalFillSource.SYNCHRONIZED_MINUTE_AGGREGATE,
+                        mid=close_price,
+                        bid=close_price,
+                        ask=close_price,
+                        event_timestamp_utc=self._format_timestamp(timestamp_ms),
+                        provider="massive",
+                        provider_route=provider_route,
+                    )
+                except HistoricalFillEvidenceError:
+                    continue
+                normalized_timestamp_ms = (
+                    _parse_explicit_utc_timestamp(
+                        item.event_timestamp_utc
+                    ).timestamp()
+                    * 1000.0
+                )
+                stream.append((normalized_timestamp_ms, item))
+            if not stream:
+                return None
+            stream.sort(key=lambda pair: pair[0])
+            streams.append(stream)
+
+        timestamp_lists = [[pair[0] for pair in stream] for stream in streams]
+        anchors = sorted(
+            {timestamp for timestamps in timestamp_lists for timestamp in timestamps},
+            reverse=True,
+        )
+        max_delta_ms = float(max_time_delta_minutes) * 60.0 * 1000.0
+        for anchor in anchors:
+            selected: List[Tuple[float, HistoricalFillEvidence]] = []
+            for timestamps, stream in zip(timestamp_lists, streams):
+                index = bisect_left(timestamps, anchor)
+                candidate_indexes = [
+                    candidate
+                    for candidate in (index - 1, index)
+                    if 0 <= candidate < len(stream)
+                ]
+                if not candidate_indexes:
+                    selected = []
+                    break
+                best_index = min(
+                    candidate_indexes,
+                    key=lambda candidate: abs(timestamps[candidate] - anchor),
+                )
+                selected.append(stream[best_index])
+            if not selected:
+                continue
+            selected_timestamps = [pair[0] for pair in selected]
+            if max(selected_timestamps) - min(selected_timestamps) <= max_delta_ms:
+                return tuple(pair[1] for pair in selected)
+        return None
+
     async def fetch_synchronized_ohlcv(
         self,
         ticker_a: str,
         ticker_b: str,
         date: str,
         max_time_delta_minutes: float = 5.0,
-    ) -> Optional[Tuple[dict, dict]]:
-        """
-        Fetch 1-minute aggregates for both legs and find the latest minute where both traded
-        within max_time_delta_minutes of each other.
-        Returns (quote_a, quote_b) where each is {"bid", "ask", "mid", "timestamp"} or None.
-        """
-        # Check cache first for both tickers on this date
-        cached_a = self.cache.get_ohlcv(ticker_a, date)
-        cached_b = self.cache.get_ohlcv(ticker_b, date)
+    ) -> Optional[Tuple[HistoricalFillEvidence, HistoricalFillEvidence]]:
+        """Compatibility wrapper for the typed two-leg aggregate fallback."""
 
-        # If either ticker was already queried and found to have no daily bar (empty day),
-        # or if the cached record has no daily close and no bid/ask quote (not traded),
-        # we can't possibly have synchronized 1-minute bars, so skip API calls entirely.
-        if (cached_a is None and self.cache.is_ticker_range_fetched(ticker_a, date, date)) or \
-           (cached_a is not None and (cached_a.get("close") is None or cached_a.get("close") == 0) and cached_a.get("bid") is None):
+        evidence = await self.fetch_synchronized_minute_aggregates(
+            (ticker_a, ticker_b),
+            date,
+            max_time_delta_minutes=max_time_delta_minutes,
+        )
+        if evidence is None:
             return None
-        if (cached_b is None and self.cache.is_ticker_range_fetched(ticker_b, date, date)) or \
-           (cached_b is not None and (cached_b.get("close") is None or cached_b.get("close") == 0) and cached_b.get("bid") is None):
+        return evidence[0], evidence[1]
+
+    async def fetch_multileg_eod_marks(
+        self,
+        option_tickers: Sequence[str],
+        date: str,
+        *,
+        strict_nbbo: bool,
+        max_time_delta_minutes: float,
+        max_quote_age_minutes: float = 5.0,
+    ) -> Optional[Tuple[HistoricalFillEvidence, ...]]:
+        """Fetch one coherent two- or three-leg historical mark bundle."""
+
+        max_time_delta = _nonnegative_finite_minutes(
+            max_time_delta_minutes,
+            "max_time_delta_minutes",
+        )
+        max_quote_age = _positive_finite_minutes(
+            max_quote_age_minutes,
+            "max_quote_age_minutes",
+        )
+        tickers = tuple(option_tickers)
+        if len(tickers) not in {2, 3} or len(set(tickers)) != len(tickers):
             return None
-
-        if self.offline_only:
-            return None
-
-        def is_sync(rec):
-            if not rec:
-                return False
-            # Check explicit flag
-            if rec.get("is_synchronized") == 1:
-                return True
-            # Check if valid EOD quote
-            bid = rec.get("bid")
-            ask = rec.get("ask")
-            if bid is not None and ask is not None and bid > 0 and ask > 0 and bid != ask:
-                return True
-            # Check if valid daily OHLCV close
-            if rec.get("close") is not None and rec.get("close") > 0:
-                return True
-            return False
-
-        if cached_a and cached_b and is_sync(cached_a) and is_sync(cached_b):
-            self.cache_hits += 1
-            mid_a = cached_a.get("mid") or cached_a.get("close")
-            mid_b = cached_b.get("mid") or cached_b.get("close")
-            return (
-                {
-                    "bid": cached_a.get("bid") or mid_a,
-                    "ask": cached_a.get("ask") or mid_a,
-                    "mid": mid_a,
-                    "timestamp": 0,
-                },
-                {
-                    "bid": cached_b.get("bid") or mid_b,
-                    "ask": cached_b.get("ask") or mid_b,
-                    "mid": mid_b,
-                    "timestamp": 0,
-                }
+        if strict_nbbo:
+            responses = await asyncio.gather(
+                *[
+                    self.fetch_observed_nbbo(
+                        ticker,
+                        date,
+                        max_quote_age_minutes=max_quote_age,
+                    )
+                    for ticker in tickers
+                ],
+                return_exceptions=True,
             )
+            if any(
+                isinstance(item, Exception) or item is None for item in responses
+            ):
+                return None
+            try:
+                return validate_strict_nbbo_bundle(
+                    responses,
+                    tickers,
+                    date,
+                    max_time_delta,
+                    max_quote_age,
+                )
+            except HistoricalFillEvidenceError:
+                return None
 
-        print(f"{CLR_YEL}  [API FETCH] Synchronizing 1m bars for {ticker_a} & {ticker_b} on {date}{CLR_RST}")
-        
-        # 1. Fetch both 1m aggregate streams. A cached daily mid, quote, or
-        # theoretical price is not enough to prove the two legs are synchronized.
-        url_a = f"{BASE_URL}/v2/aggs/ticker/{ticker_a}/range/1/minute/{date}/{date}"
-        url_b = f"{BASE_URL}/v2/aggs/ticker/{ticker_b}/range/1/minute/{date}/{date}"
-        params = {"adjusted": "false", "sort": "desc", "limit": 1440}
-
-        data_a, data_b = await asyncio.gather(
-            self._get(url_a, params),
-            self._get(url_b, params),
+        responses = await asyncio.gather(
+            *[
+                self.fetch_eod_quote(
+                    ticker,
+                    date,
+                    allow_trade_fallback=True,
+                    strict_nbbo=False,
+                    max_quote_age_minutes=max_quote_age,
+                )
+                for ticker in tickers
+            ],
             return_exceptions=True,
         )
-        if isinstance(data_a, Exception) or not data_a:
-            results_a = []
-        else:
-            results_a = data_a.get("results", [])
-        if isinstance(data_b, Exception) or not data_b:
-            results_b = []
-        else:
-            results_b = data_b.get("results", [])
+        complete = not any(
+            isinstance(item, Exception) or item is None for item in responses
+        )
+        if complete:
+            evidence = tuple(responses)
+            diagnostics = fill_bundle_diagnostics(
+                evidence,
+                max_time_delta,
+                max_quote_age,
+            )
+            if (
+                all(
+                    item.source is HistoricalFillSource.OBSERVED_NBBO
+                    for item in evidence
+                )
+                and diagnostics["temporally_synchronized"] is False
+            ):
+                synchronized = await self.fetch_synchronized_minute_aggregates(
+                    tickers,
+                    date,
+                    max_time_delta_minutes=max_time_delta,
+                )
+                return synchronized or evidence
+            return evidence
 
-        if not results_a or not results_b:
-            return None
+        return await self.fetch_synchronized_minute_aggregates(
+            tickers,
+            date,
+            max_time_delta_minutes=max_time_delta,
+        )
 
-        # 2. Find valid pairs within max_time_delta_minutes.
-        max_delta_ms = max_time_delta_minutes * 60.0 * 1000.0
-        valid_pairs = []
-        for bar_a in results_a:
-            ts_a = bar_a["t"]
-            for bar_b in results_b:
-                ts_b = bar_b["t"]
-                delta_ms = abs(ts_a - ts_b)
-                if delta_ms <= max_delta_ms:
-                    valid_pairs.append((bar_a, bar_b, ts_a, ts_b))
+    async def fetch_multileg_eod_fills(
+        self,
+        option_tickers: Sequence[str],
+        date: str,
+        *,
+        strict_nbbo: bool,
+        max_time_delta_minutes: float,
+        max_quote_age_minutes: float = 5.0,
+    ) -> Optional[Tuple[HistoricalFillEvidence, ...]]:
+        """Deprecated compatibility name; this returns marks, not fills."""
 
-        if not valid_pairs:
-            return None
-
-        # Sort valid pairs by average timestamp descending (latest time in day / closest to close)
-        valid_pairs.sort(key=lambda x: (x[2] + x[3]) / 2.0, reverse=True)
-        best_pair = valid_pairs[0]
-        bar_a, bar_b, ts_a, ts_b = best_pair
-
-        price_a = bar_a["c"]
-        price_b = bar_b["c"]
-        
-        # Treat OHLCV close as mid for both
-        quote_a = {"bid": price_a, "ask": price_a, "mid": price_a, "timestamp": ts_a}
-        quote_b = {"bid": price_b, "ask": price_b, "mid": price_b, "timestamp": ts_b}
-        
-        # Cache them (upsert style)
-        meta_a = self._parse_ticker(ticker_a)
-        meta_b = self._parse_ticker(ticker_b)
-        
-        self.cache.upsert_full_record({
-            "option_ticker": ticker_a, 
-            "pricing_date": date, 
-            "mid": price_a, 
-            "is_synchronized": 1,
-            "fetched_at": datetime.now().isoformat(),
-            **meta_a
-        })
-        self.cache.upsert_full_record({
-            "option_ticker": ticker_b, 
-            "pricing_date": date, 
-            "mid": price_b, 
-            "is_synchronized": 1,
-            "fetched_at": datetime.now().isoformat(),
-            **meta_b
-        })
-
-        return (quote_a, quote_b)
+        return await self.fetch_multileg_eod_marks(
+            option_tickers,
+            date,
+            strict_nbbo=strict_nbbo,
+            max_time_delta_minutes=max_time_delta_minutes,
+            max_quote_age_minutes=max_quote_age_minutes,
+        )
 
     async def fetch_theoretical_price(
         self,
@@ -1290,50 +1936,71 @@ class MassiveAPIClient:
         date: str,
         dte_years: float,
         risk_free_rate: float,
+        option_type: str,
         dividend_yield: float = 0.0
     ) -> Optional[float]:
         """
         Estimate price of target_ticker using the implied vol of reference_ticker.
         Used when the deep OTM leg (target) has no trades but the closer leg (reference) does.
         """
-        # Check cache first
-        cached = self.cache.get_ohlcv(target_ticker, date)
-        if cached and cached.get("mid") is not None:
-            self.cache_hits += 1
-            return cached["mid"]
-
         if self.offline_only:
             return None
 
-        from backtesting.greeks_calculator import implied_volatility, bs_put_price
+        from backtesting.greeks_calculator import (
+            bs_call_price,
+            bs_put_price,
+            implied_volatility,
+        )
+
+        normalized_option_type = str(option_type).strip().lower()
+        if normalized_option_type not in {"put", "call"}:
+            raise ValueError("option_type must be 'put' or 'call'")
+        expected_flag = "C" if normalized_option_type == "call" else "P"
+        if any(
+            len(ticker) < 9 or ticker[-9].upper() != expected_flag
+            for ticker in (target_ticker, reference_ticker)
+        ):
+            raise ValueError(
+                "option_type does not match target/reference contract symbols"
+            )
         
         # 1. Parse strikes from tickers
         # O:SPY150117P00200000 -> 200.0
         try:
             ref_strike = float(reference_ticker[-8:]) / 1000.0
             tgt_strike = float(target_ticker[-8:]) / 1000.0
-        except:
+        except (TypeError, ValueError):
             return None
 
         # 2. Solve IV for reference leg
-        iv = implied_volatility(reference_price, underlying_price, ref_strike, dte_years, risk_free_rate, dividend_yield, "put")
+        iv = implied_volatility(
+            reference_price,
+            underlying_price,
+            ref_strike,
+            dte_years,
+            risk_free_rate,
+            dividend_yield,
+            normalized_option_type,
+        )
         if iv is None:
             return None
             
         # 3. Calculate theoretical price for target leg
-        theo_price = bs_put_price(underlying_price, tgt_strike, dte_years, risk_free_rate, iv, dividend_yield)
+        price_function = (
+            bs_call_price
+            if normalized_option_type == "call"
+            else bs_put_price
+        )
+        theo_price = price_function(
+            underlying_price,
+            tgt_strike,
+            dte_years,
+            risk_free_rate,
+            iv,
+            dividend_yield,
+        )
         theo_price = round(theo_price, 4)
         
-        # Cache it
-        meta = self._parse_ticker(target_ticker)
-        self.cache.upsert_full_record({
-            "option_ticker": target_ticker,
-            "pricing_date": date,
-            "mid": theo_price,
-            "fetched_at": datetime.now().isoformat(),
-            **meta
-        })
-
         return theo_price
 
     async def fetch_chain_quotes_batch(
@@ -1349,42 +2016,17 @@ class MassiveAPIClient:
         Returns {strike: {"bid", "ask", "mid"}} dict.
         """
         results = {}
-        update_rows = []
 
         async def _fetch_one(c):
             ticker = c["option_ticker"]
             strike = c["strike"]
 
-            # Check cache first (allows mid-point from fallbacks)
-            cached = self.cache.get_ohlcv(ticker, date)
-            if cached and cached.get("mid") is not None:
-                self.cache_hits += 1
-                results[strike] = {
-                    "bid": cached.get("bid"),
-                    "ask": cached.get("ask"),
-                    "mid": cached["mid"],
-                }
-                return
-
             quote = await self.fetch_eod_quote(ticker, date)
             if quote:
                 results[strike] = quote
-                update_rows.append(
-                    (
-                        quote["bid"],
-                        quote["ask"],
-                        quote["mid"],
-                        quote.get("bid_size"),
-                        quote.get("ask_size"),
-                        ticker,
-                        date,
-                    )
-                )
 
         tasks = [_fetch_one(c) for c in contracts]
         await asyncio.gather(*tasks, return_exceptions=True)
-        if update_rows:
-            self.cache.bulk_update_quotes(update_rows)
 
         return results
     async def fetch_option_snapshot(self, underlying: str) -> List[dict]:
